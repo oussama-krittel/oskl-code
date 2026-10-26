@@ -30,6 +30,9 @@ pub struct DiffEditView {
     pub left: Entity<Editor>,
     pub right: Entity<Editor>,
     inline: bool,
+    split: f32,
+    dragging_split: bool,
+    body_bounds: Rc<Cell<Bounds<Pixels>>>,
     _subs: Vec<Subscription>,
     _blame_task: Option<Task<()>>,
 }
@@ -81,7 +84,7 @@ impl DiffEditView {
                 }
             }),
         ];
-        let mut view = Self { root, spec, left, right, inline: false, _subs: subs, _blame_task: None };
+        let mut view = Self { root, spec, left, right, inline: false, split: 0.5, dragging_split: false, body_bounds: Default::default(), _subs: subs, _blame_task: None };
         view.load_left_blame(cx);
         view
     }
@@ -151,6 +154,12 @@ impl DiffEditView {
 impl Render for DiffEditView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (added, removed) = self.right.read(cx).decors.as_ref().map(|d| (d.added, d.removed)).unwrap_or((0, 0));
+        // A file that isn't in the index yet has nothing on the left: show it full width.
+        let one_sided = self.right.read(cx).decors.as_ref().is_some_and(|d| d.base.is_empty());
+        if one_sided && !self.inline {
+            self.inline = true;
+            self.right.update(cx, |r, cx| r.set_inline_diff(true, cx));
+        }
         let dirty = self.right.read(cx).buf.is_dirty();
         let path = self.root.join(&self.spec.path);
         let header = div()
@@ -171,7 +180,7 @@ impl Render for DiffEditView {
             .child(div().flex_1())
             .child(ui::icon_button("de-prev", "arrow-up").on_click(cx.listener(|v, _, w, cx| v.step(false, w, cx))))
             .child(ui::icon_button("de-next", "arrow-down").on_click(cx.listener(|v, _, w, cx| v.step(true, w, cx))))
-            .child(ui::icon_button("de-inline", if self.inline { "split" } else { "inline" }).on_click(cx.listener(|v, _, _, cx| v.toggle_inline(cx))))
+            .when(!one_sided, |d| d.child(ui::icon_button("de-inline", if self.inline { "split" } else { "inline" }).on_click(cx.listener(|v, _, _, cx| v.toggle_inline(cx)))))
             .child(ui::icon_button("de-blame", "blame").on_click(cx.listener(|v, _, _, cx| {
                 let on = !v.right.read(cx).blame_gutter;
                 v.set_blame(on, cx);
@@ -190,16 +199,49 @@ impl Render for DiffEditView {
             .flex_col()
             .bg(theme::bg_editor())
             .child(header)
-            .child(
+            .on_mouse_move(cx.listener(|v, ev: &MouseMoveEvent, _, cx| {
+                if !v.dragging_split {
+                    return;
+                }
+                if !ev.dragging() {
+                    v.dragging_split = false;
+                    return;
+                }
+                let b = v.body_bounds.get();
+                if b.size.width > px(0.) {
+                    v.split = ((ev.position.x - b.left()) / b.size.width).clamp(0.12, 0.88);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|v, _, _, _| v.dragging_split = false))
+            .child({
+                let cell = self.body_bounds.clone();
                 div()
+                    .relative()
                     .flex()
                     .flex_1()
                     .min_h_0()
+                    .child(canvas(move |b, _, _| cell.set(b), |_, _, _, _| {}).absolute().size_full())
                     .when(!self.inline, |d| {
-                        d.child(div().flex_1().min_w_0().h_full().child(self.left.clone()))
-                            .child(div().w(px(1.)).h_full().bg(theme::border()))
+                        d.child(div().flex_none().w(relative(self.split)).min_w_0().h_full().child(self.left.clone())).child(
+                            // Drag to resize old vs new.
+                            div()
+                                .id("de-divider")
+                                .flex()
+                                .flex_none()
+                                .justify_center()
+                                .w(px(5.))
+                                .h_full()
+                                .cursor(CursorStyle::ResizeLeftRight)
+                                .hover(|s| s.bg(theme::frame_focused().opacity(0.35)))
+                                .on_mouse_down(MouseButton::Left, cx.listener(|v, _, _, cx| {
+                                    v.dragging_split = true;
+                                    cx.stop_propagation();
+                                }))
+                                .child(div().w(px(1.)).h_full().bg(theme::border())),
+                        )
                     })
-                    .child(div().flex_1().min_w_0().h_full().child(self.right.clone())),
-            )
+                    .child(div().flex_1().min_w_0().h_full().child(self.right.clone()))
+            })
     }
 }

@@ -76,6 +76,10 @@ pub struct DiffView {
     right_blame: Option<Arc<BlameLines>>,
     pub show_blame: bool,
     inline: bool,
+    /// Width of the old (left) side, 0..1; drag the divider to change it.
+    split: f32,
+    dragging_split: bool,
+    body_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     selected: Option<usize>,
     scroll: UniformListScrollHandle,
     scroll_x: f32,
@@ -97,6 +101,9 @@ impl DiffView {
             right_blame: None,
             show_blame,
             inline: false,
+            split: 0.5,
+            dragging_split: false,
+            body_bounds: Default::default(),
             selected: None,
             scroll: UniformListScrollHandle::new(),
             scroll_x: 0.,
@@ -173,9 +180,18 @@ impl DiffView {
         }));
     }
 
+    /// New or deleted files have only one side: show it full width instead of half empty.
+    fn one_sided(&self) -> bool {
+        self.spec.left == Rev::Empty || self.spec.right == Rev::Empty
+    }
+
+    fn show_inline(&self) -> bool {
+        self.inline || self.one_sided()
+    }
+
     fn rows(&self) -> &[Row] {
         match &self.data {
-            Some(d) if self.inline => &d.inline,
+            Some(d) if self.show_inline() => &d.inline,
             Some(d) => &d.side,
             None => &[],
         }
@@ -304,10 +320,12 @@ impl DiffView {
             .child(div().flex_1())
             .child(ui::icon_button("prev-hunk", "arrow-up").on_click(cx.listener(|v, _, w, cx| v.prev_hunk(&PrevHunk, w, cx))))
             .child(ui::icon_button("next-hunk", "arrow-down").on_click(cx.listener(|v, _, w, cx| v.next_hunk(&NextHunk, w, cx))))
-            .child(
-                ui::icon_button("toggle-inline", if self.inline { "split" } else { "inline" })
-                    .on_click(cx.listener(|v, _, w, cx| v.toggle_inline(&ToggleInline, w, cx))),
-            )
+            .when(!self.one_sided(), |d| {
+                d.child(
+                    ui::icon_button("toggle-inline", if self.inline { "split" } else { "inline" })
+                        .on_click(cx.listener(|v, _, w, cx| v.toggle_inline(&ToggleInline, w, cx))),
+                )
+            })
             .child(
                 ui::icon_button("toggle-blame", "blame")
                     .when(self.show_blame, |b| b.bg(theme::selected()))
@@ -536,7 +554,7 @@ impl Render for DiffView {
         let body: AnyElement = if let Some(err) = &self.error {
             div().p(px(20.)).text_color(theme::fg_muted()).child(err.clone()).into_any_element()
         } else if let Some(data) = self.data.clone() {
-            let count = if self.inline { data.inline.len() } else { data.side.len() };
+            let count = if self.show_inline() { data.inline.len() } else { data.side.len() };
             if count == 0 || (count == 1 && data.side.iter().all(|r| r.kind == Kind::Equal) && data.left == data.right) {
                 div().p(px(20.)).text_color(theme::fg_muted()).child("No changes.").into_any_element()
             } else {
@@ -544,7 +562,7 @@ impl Render for DiffView {
                     "diff-rows",
                     count,
                     cx.processor(move |view, range: Range<usize>, _window, cx| {
-                        let rows = if view.inline { &data.inline } else { &data.side };
+                        let rows = if view.show_inline() { &data.inline } else { &data.side };
                         range
                             .map(|ix| {
                                 let row = rows[ix].clone();
@@ -565,12 +583,29 @@ impl Render for DiffView {
                                         }
                                         cx.notify();
                                     }));
-                                if view.inline {
+                                if view.show_inline() {
                                     let left = row.r.is_none();
                                     base.child(view.render_side(&row, left, &data, ix, cx))
                                 } else {
-                                    base.child(view.render_side(&row, true, &data, ix, cx))
-                                        .child(div().w(px(1.)).h_full().bg(theme::border()))
+                                    let split = view.split;
+                                    base.child(div().flex().flex_none().w(relative(split)).h_full().child(view.render_side(&row, true, &data, ix, cx)))
+                                        .child(
+                                            // Drag to resize old vs new.
+                                            div()
+                                                .id(("diff-divider", ix))
+                                                .flex()
+                                                .flex_none()
+                                                .justify_center()
+                                                .w(px(5.))
+                                                .h_full()
+                                                .cursor(CursorStyle::ResizeLeftRight)
+                                                .hover(|s| s.bg(theme::frame_focused().opacity(0.35)))
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|view, _, _, cx| {
+                                                    view.dragging_split = true;
+                                                    cx.stop_propagation();
+                                                }))
+                                                .child(div().w(px(1.)).h_full().bg(theme::border())),
+                                        )
                                         .child(view.render_side(&row, false, &data, ix, cx))
                                 }
                             })
@@ -605,6 +640,21 @@ impl Render for DiffView {
             .on_action(cx.listener(Self::page_down))
             .on_action(cx.listener(Self::page_up))
             .on_mouse_down(MouseButton::Left, cx.listener(|view, _, window, _| window.focus(&view.focus)))
+            .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _, cx| {
+                if !view.dragging_split {
+                    return;
+                }
+                if !ev.dragging() {
+                    view.dragging_split = false;
+                    return;
+                }
+                let b = view.body_bounds.get();
+                if b.size.width > px(0.) {
+                    view.split = ((ev.position.x - b.left()) / b.size.width).clamp(0.12, 0.88);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, _| view.dragging_split = false))
             .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, _, cx| {
                 let d = ev.delta.pixel_delta(px(ROW_H));
                 let dx = d.x / px(1.);
@@ -614,6 +664,16 @@ impl Render for DiffView {
                 }
             }))
             .child(self.render_header(cx))
-            .child(body)
+            .child({
+                let cell = self.body_bounds.clone();
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(canvas(move |b, _, _| cell.set(b), |_, _, _, _| {}).absolute().size_full())
+                    .child(body)
+            })
     }
 }
