@@ -9,6 +9,8 @@ pub struct DiffSpec {
     pub old_path: Option<String>,
     pub left: Rev,
     pub right: Rev,
+    /// The commit page this diff was opened from (shown as a link back).
+    pub from_commit: Option<String>,
 }
 
 impl DiffSpec {

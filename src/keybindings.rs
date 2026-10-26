@@ -86,7 +86,7 @@ fn is_pane_action(name: &str) -> bool {
         || n.starts_with("MoveItem")
         || n.starts_with("Split")
         || n.starts_with("Buffer")
-        || matches!(n, "ClosePane" | "ZoomPane" | "NextTab" | "PrevTab" | "CloseTab" | "PaneBuffers" | "NewTerminal" | "ToggleTerminal")
+        || matches!(n, "GoBack" | "GoForward" | "ClosePane" | "ZoomPane" | "NextTab" | "PrevTab" | "CloseTab" | "PaneBuffers" | "NewTerminal" | "ToggleTerminal")
 }
 
 /// Human description from the action name ("MoveWordLeft" → "Move word left").
@@ -122,6 +122,8 @@ fn describe(name: &str, ctx: Option<&str>) -> String {
         "MoveItemUp" => "Move file/terminal to the split above",
         "MoveItemDown" => "Move file/terminal to the split below",
         "FormatFile" => "Format file",
+        "GoBack" => "Go back (what this split showed before)",
+        "GoForward" => "Go forward",
         "ShowKeysPanel" => "Show shortcuts",
         "ToggleSidebarSide" => "Move sidebar left / right",
         "OpenFolderNewWindow" => "Open a project in a new window",

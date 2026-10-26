@@ -74,7 +74,7 @@ impl CommitView {
         };
         let right = if file.status == FileStatus::Deleted { Rev::Empty } else { Rev::Commit(d.sha.clone()) };
         cx.emit(Request::OpenDiff {
-            spec: DiffSpec { path: file.path.clone(), old_path: file.orig_path.clone(), left, right },
+            spec: DiffSpec { path: file.path.clone(), old_path: file.orig_path.clone(), left, right, from_commit: Some(d.sha.clone()) },
             preview,
         });
     }

@@ -67,6 +67,7 @@ pub struct GitPanel {
     commit_task: Option<Task<()>>,
     menu_open: bool,
     branch_menu: Option<(git::Ref, Point<Pixels>)>,
+    commit_menu: Option<(usize, Point<Pixels>)>,
     scope_open: bool,
     scope_branches: Vec<String>,
     scope_remotes: Vec<String>,
@@ -115,6 +116,7 @@ impl GitPanel {
             commit_task: None,
             menu_open: false,
             branch_menu: None,
+            commit_menu: None,
             scope_open: false,
             scope_branches: Vec::new(),
             scope_remotes: Vec::new(),
@@ -205,7 +207,7 @@ impl GitPanel {
             (Rev::Index, right)
         };
         cx.emit(Request::OpenDiff {
-            spec: DiffSpec { path: change.path.clone(), old_path: change.orig_path.clone(), left, right },
+            spec: DiffSpec { path: change.path.clone(), old_path: change.orig_path.clone(), left, right, from_commit: None },
             preview,
         });
     }
@@ -441,6 +443,84 @@ impl GitPanel {
                     .child(div().flex_1().child(label.to_string()))
                     .child(div().text_color(theme::fg_muted()).child(hint.to_string()))
             }))
+    }
+
+    /// Right-click menu for any commit in the graph.
+    fn render_commit_menu(&self, ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let repo = self.repo.read(cx);
+        let Some(commit) = repo.commits.get(ix).cloned() else { return div().into_any_element() };
+        let sha = commit.sha.clone();
+        let short = commit.short().to_string();
+        let item = |id: SharedString, label: String| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .h(px(24.))
+                .px(px(10.))
+                .mx(px(4.))
+                .rounded(px(3.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::selected_focused()))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(label)
+        };
+        let run = |args: Vec<String>| {
+            move |p: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                p.commit_menu = None;
+                let args = args.clone();
+                p.repo.update(cx, |repo, cx| repo.run_git(args, cx));
+                cx.notify();
+            }
+        };
+        let request = |req: fn(&str) -> Request, arg: String| {
+            move |p: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                p.commit_menu = None;
+                cx.emit(req(&arg));
+                cx.notify();
+            }
+        };
+        let sep = || div().my(px(4.)).h(px(1.)).bg(theme::border());
+        let mut menu = div()
+            .id("commit-menu")
+            .occlude()
+            .w(px(290.))
+            .py(px(4.))
+            .bg(theme::bg_popup())
+            .border_1()
+            .border_color(theme::border_input())
+            .rounded(px(6.))
+            .shadow_lg()
+            .text_size(px(11.))
+            .on_mouse_down_out(cx.listener(|p, _, _, cx| {
+                p.commit_menu = None;
+                cx.notify();
+            }))
+            .child(div().px(px(14.)).py(px(4.)).text_color(theme::fg_muted()).overflow_hidden().whitespace_nowrap().child(format!("{short} {}", commit.subject)))
+            .child(item("cm-open".into(), "Open commit".into()).on_click(cx.listener(request(|s| Request::OpenCommit(s.to_string()), sha.clone()))));
+        let locals: Vec<&git::Ref> = commit.refs.iter().filter(|r| r.kind == RefKind::Local && !r.is_head).collect();
+        if !locals.is_empty() {
+            menu = menu.child(sep());
+            for (i, r) in locals.iter().enumerate() {
+                menu = menu.child(item(SharedString::from(format!("cm-co-{i}")), format!("Checkout {}", r.name)).on_click(cx.listener(run(vec!["switch".into(), r.name.clone()]))));
+            }
+        }
+        menu = menu
+            .child(sep())
+            .child(item("cm-detach".into(), format!("Checkout {short} (detached)")).on_click(cx.listener(run(vec!["switch".into(), "--detach".into(), sha.clone()]))))
+            .child(item("cm-branch".into(), "Create branch here…".into()).on_click(cx.listener(request(|s| Request::CommandLine(format!("branch-from {s} ")), short.clone()))))
+            .child(sep())
+            .child(item("cm-pick".into(), "Cherry-pick onto current branch".into()).on_click(cx.listener(run(vec!["cherry-pick".into(), sha.clone()]))))
+            .child(item("cm-revert".into(), "Revert (new commit undoing it)".into()).on_click(cx.listener(run(vec!["revert".into(), "--no-edit".into(), sha.clone()]))))
+            .child(sep())
+            .child(item("cm-copy".into(), "Copy hash".into()).on_click(cx.listener(move |p, _, _, cx| {
+                p.commit_menu = None;
+                cx.write_to_clipboard(ClipboardItem::new_string(sha.clone()));
+                cx.emit(Request::Message("Commit hash copied".into()));
+                cx.notify();
+            })));
+        menu.into_any_element()
     }
 
     /// The menu for a branch/tag label in the graph.
@@ -920,10 +1000,11 @@ impl GitPanel {
                     .rounded(px(9.))
                     .cursor_pointer()
                     .hover(|s| s.opacity(0.85))
-                    .on_click(cx.listener(move |panel, ev: &ClickEvent, _, cx| {
-                        // Click a branch/tag label: checkout, detached checkout or delete.
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |panel, ev: &MouseDownEvent, _, cx| {
+                        // Right-click a branch/tag label: checkout, detached checkout or delete.
                         cx.stop_propagation();
-                        panel.branch_menu = Some((menu_ref.clone(), ev.position()));
+                        panel.commit_menu = None;
+                        panel.branch_menu = Some((menu_ref.clone(), ev.position));
                         cx.notify();
                     }))
                     .bg(color)
@@ -953,6 +1034,13 @@ impl GitPanel {
                 window.focus(&panel.focus);
                 panel.selected = Some(Item::Commit(ix));
                 cx.emit(Request::OpenCommit(sha.clone()));
+                cx.notify();
+            }))
+            .on_mouse_down(MouseButton::Right, cx.listener(move |panel, ev: &MouseDownEvent, _, cx| {
+                // Right-click any commit: checkout, branch from it, cherry-pick, revert…
+                panel.selected = Some(Item::Commit(ix));
+                panel.branch_menu = None;
+                panel.commit_menu = Some((ix, ev.position));
                 cx.notify();
             }))
             .child(graph)
@@ -1101,6 +1189,7 @@ impl Render for GitPanel {
             .child(canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, _, _, _| {}).absolute().size_full())
             .when(self.menu_open, |d| d.child(deferred(self.render_menu(cx)).with_priority(1)))
             .when(self.scope_open, |d| d.child(deferred(self.render_scope(cx)).with_priority(1)))
+            .when_some(self.commit_menu, |d, (ix, pos)| d.child(deferred(anchored().position(pos).snap_to_window().child(self.render_commit_menu(ix, cx))).with_priority(2)))
             .when_some(self.branch_menu.clone(), |d, (r, pos)| d.child(deferred(anchored().position(pos).snap_to_window().child(self.render_branch_menu(r, cx))).with_priority(2)))
             .child(
                 div()

@@ -308,6 +308,27 @@ impl DiffView {
             .gap(px(8.))
             .border_b_1()
             .border_color(theme::border())
+            .when_some(self.spec.from_commit.clone(), |d, sha| {
+                let short = sha[..sha.len().min(7)].to_string();
+                d.child(
+                    div()
+                        .id("back-to-commit")
+                        .flex()
+                        .items_center()
+                        .gap(px(2.))
+                        .px(px(6.))
+                        .h(px(20.))
+                        .rounded(px(4.))
+                        .bg(theme::bg_input())
+                        .text_color(theme::accent())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .tooltip(ui::tooltip("Back to the commit (⌃-)"))
+                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(Request::OpenCommit(sha.clone()))))
+                        .child(ui::small_icon("chevron-left", theme::accent()).size(px(12.)))
+                        .child(format!("commit {short}")),
+                )
+            })
             .child(ui::file_icon(&self.spec.path))
             .child(div().text_color(theme::fg_bright()).child(self.spec.path.clone()))
             .child(

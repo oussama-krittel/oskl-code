@@ -39,6 +39,7 @@ actions!(
         OpenFolder, OpenFolderNewWindow, NextWindow, SearchAll, ShowKeysPanel, ToggleSidebarSide,
         SplitRight, SplitDown, ClosePane, ZoomPane, FocusLeft, FocusRight, FocusUp, FocusDown,
         NewTerminal, ToggleTerminal, PaneBuffers,
+        GoBack, GoForward,
         MoveItemLeft, MoveItemRight, MoveItemUp, MoveItemDown,
         Buffer1, Buffer2, Buffer3, Buffer4, Buffer5, Buffer6, Buffer7, Buffer8, Buffer9,
     ]
@@ -111,6 +112,8 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-k cmd-s", ShowKeysPanel, None),
         crate::keybindings::kb("cmd-o", OpenFolder, None),
         crate::keybindings::kb("cmd-shift-n", OpenFolderNewWindow, None),
+        crate::keybindings::kb("ctrl--", GoBack, None),
+        crate::keybindings::kb("ctrl-shift--", GoForward, None),
         crate::keybindings::kb("cmd-`", NextWindow, None),
         crate::keybindings::kb("cmd-shift-f", SearchAll, None),
         crate::keybindings::kb("cmd-k cmd-b", ToggleSidebarSide, None),
@@ -292,6 +295,9 @@ struct Pane {
     /// Tab ids open in this pane (its "buffers").
     items: Vec<usize>,
     active: Option<usize>,
+    /// What was shown before / after (⌃- and ⌃⇧-), newest last.
+    back: Vec<usize>,
+    fwd: Vec<usize>,
 }
 
 struct Tab {
@@ -422,6 +428,7 @@ pub struct Workspace {
     pane_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
     split_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     dragging_split: Option<String>,
+    navigating: bool,
     drop_hint: Option<(usize, DropZone)>,
     extra_subs: Vec<Subscription>,
 }
@@ -524,7 +531,7 @@ impl Workspace {
             tsc_running: false,
             tsc_again: None,
             has_project,
-            panes: vec![Pane { id: 0, items: Vec::new(), active: None }],
+            panes: vec![Pane { id: 0, items: Vec::new(), active: None, back: Vec::new(), fwd: Vec::new() }],
             layout: Layout::Pane(0),
             focused_pane: 0,
             prev_pane: 0,
@@ -533,6 +540,7 @@ impl Workspace {
             pane_bounds: Default::default(),
             split_bounds: Default::default(),
             dragging_split: None,
+            navigating: false,
             drop_hint: None,
             extra_subs: Vec::new(),
         };
@@ -667,6 +675,10 @@ impl Workspace {
         if let Some(pane) = self.pane_mut(fp) {
             let pos = pane.active.and_then(|a| pane.items.iter().position(|x| *x == a)).map(|p| p + 1).unwrap_or(pane.items.len());
             pane.items.insert(pos, id);
+            if let Some(prev) = pane.active {
+                pane.back.push(prev);
+                pane.fwd.clear();
+            }
             pane.active = Some(id);
         }
         if let Some(old) = old_preview {
@@ -681,6 +693,8 @@ impl Workspace {
     /// Removes a tab everywhere (no dirty check).
     fn drop_tab(&mut self, id: usize) {
         for pane in &mut self.panes {
+            pane.back.retain(|t| *t != id);
+            pane.fwd.retain(|t| *t != id);
             if let Some(pos) = pane.items.iter().position(|x| *x == id) {
                 pane.items.remove(pos);
                 if pane.active == Some(id) {
@@ -702,7 +716,12 @@ impl Workspace {
         match self.pane_of_tab(id) {
             Some(p) => {
                 self.set_focused_pane(p);
+                let navigating = self.navigating;
                 if let Some(pane) = self.pane_mut(p) {
+                    if let Some(prev) = pane.active.filter(|prev| *prev != id && !navigating) {
+                        pane.back.push(prev);
+                        pane.fwd.clear();
+                    }
                     pane.active = Some(id);
                 }
             }
@@ -740,7 +759,7 @@ impl Workspace {
         }
         let new = self.next_id;
         self.next_id += 1;
-        self.panes.push(Pane { id: new, items: Vec::new(), active: None });
+        self.panes.push(Pane { id: new, items: Vec::new(), active: None, back: Vec::new(), fwd: Vec::new() });
         let fp = self.focused_pane;
         let node = Layout::Split { vertical, ratio: 0.5, a: Box::new(Layout::Pane(fp)), b: Box::new(Layout::Pane(new)) };
         if !self.layout.replace_pane(fp, node.clone()) {
@@ -871,7 +890,7 @@ impl Workspace {
             let _ = src_len;
             let new = self.next_id;
             self.next_id += 1;
-            self.panes.push(Pane { id: new, items: Vec::new(), active: None });
+            self.panes.push(Pane { id: new, items: Vec::new(), active: None, back: Vec::new(), fwd: Vec::new() });
             let vertical = matches!(zone, DropZone::Left | DropZone::Right);
             let before = matches!(zone, DropZone::Left | DropZone::Top);
             let (a, b) = if before { (Layout::Pane(new), Layout::Pane(target)) } else { (Layout::Pane(target), Layout::Pane(new)) };
@@ -920,7 +939,7 @@ impl Workspace {
             }
             let new = self.next_id;
             self.next_id += 1;
-            self.panes.push(Pane { id: new, items: Vec::new(), active: None });
+            self.panes.push(Pane { id: new, items: Vec::new(), active: None, back: Vec::new(), fwd: Vec::new() });
             let vertical = matches!(zone, DropZone::Left | DropZone::Right);
             let before = matches!(zone, DropZone::Left | DropZone::Top);
             let (a, b) = if before { (Layout::Pane(new), Layout::Pane(pane)) } else { (Layout::Pane(pane), Layout::Pane(new)) };
@@ -956,14 +975,14 @@ impl Workspace {
         // Otherwise open one in a new pane along the bottom.
         let new = self.next_id;
         self.next_id += 1;
-        self.panes.push(Pane { id: new, items: Vec::new(), active: None });
+        self.panes.push(Pane { id: new, items: Vec::new(), active: None, back: Vec::new(), fwd: Vec::new() });
         if self.layout.max_depth() >= MAX_SPLIT_DEPTH {
             // Wrapping everything would make some splits smaller than allowed:
             // split the focused one instead, or just open the terminal in it.
             self.panes.retain(|p| p.id != new);
             if self.can_split(self.focused_pane) {
                 let fp = self.focused_pane;
-                self.panes.push(Pane { id: new, items: Vec::new(), active: None });
+                self.panes.push(Pane { id: new, items: Vec::new(), active: None, back: Vec::new(), fwd: Vec::new() });
                 self.layout.replace_pane(fp, Layout::Split { vertical: false, ratio: 0.6, a: Box::new(Layout::Pane(fp)), b: Box::new(Layout::Pane(new)) });
                 self.set_focused_pane(new);
             }
@@ -1154,7 +1173,16 @@ impl Workspace {
         }
         let root = self.root(cx);
         let view = cx.new(|cx| CommitView::new(root, sha, cx));
-        let sub = cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx));
+        let sub = cx.subscribe_in(&view, window, |ws, view, req: &Request, window, cx| {
+            // Opening a file from a commit keeps the commit page (it was a preview, which
+            // the diff would otherwise replace) so you can go back to it.
+            if let Request::OpenDiff { .. } = req
+                && let Some(tab) = ws.tabs.iter_mut().find(|t| matches!(&t.kind, TabKind::Commit(c) if c == view))
+            {
+                tab.preview = false;
+            }
+            ws.handle_request(req, window, cx)
+        });
         self.add_tab(TabKind::Commit(view), sub, true, window, cx);
     }
 
@@ -1267,6 +1295,23 @@ impl Workspace {
         if let Some(ix) = self.tab_ix(next) {
             self.activate(ix, window, cx);
         }
+    }
+
+    /// ⌃- / ⌃⇧-: back / forward through what this split showed.
+    fn navigate(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let fp = self.focused_pane;
+        let Some(pane) = self.pane_mut(fp) else { return };
+        let (from, to) = if back { (&mut pane.back, &mut pane.fwd) } else { (&mut pane.fwd, &mut pane.back) };
+        let Some(target) = from.pop() else {
+            return self.flash(if back { "Nothing to go back to".into() } else { "Nothing to go forward to".into() }, false, cx);
+        };
+        if let Some(cur) = pane.active {
+            to.push(cur);
+        }
+        let Some(ix) = self.tab_ix(target) else { return };
+        self.navigating = true;
+        self.activate(ix, window, cx);
+        self.navigating = false;
     }
 
     /// ⌘1…⌘9: show the Nth item of the focused pane (⌘9 = last, like browsers).
@@ -2329,7 +2374,7 @@ impl Workspace {
             "lint" => self.lint(rest == "." || self.active_editor().is_none(), cx),
             "blame" => self.toggle_blame(&ToggleBlame, window, cx),
             "diff" => match active_rel {
-                Some(rel) => self.open_diff(DiffSpec { path: rel, old_path: None, left: Rev::Index, right: Rev::Working }, false, window, cx),
+                Some(rel) => self.open_diff(DiffSpec { path: rel, old_path: None, left: Rev::Index, right: Rev::Working, from_commit: None }, false, window, cx),
                 None => self.flash("Open a file to diff it".into(), true, cx),
             },
             "stage" | "add" => {
@@ -2380,6 +2425,17 @@ impl Workspace {
                 }
                 let branch = rest.strip_prefix("origin/").filter(|_| rest.starts_with("origin/")).unwrap_or(rest).to_string();
                 self.repo.update(cx, |r, cx| r.run_git(vec!["switch".into(), branch], cx));
+            }
+            "branch-from" => {
+                // branch-from <commit> <name>: create a branch at that commit and switch to it.
+                let mut parts = rest.split_whitespace();
+                match (parts.next(), parts.next()) {
+                    (Some(rev), Some(name)) => {
+                        let args = vec!["switch".into(), "-c".into(), name.to_string(), rev.to_string()];
+                        self.repo.update(cx, |r, cx| r.run_git(args, cx));
+                    }
+                    _ => self.flash("Type the new branch name after the commit, then Enter".into(), true, cx),
+                }
             }
             "branch" => {
                 if rest.is_empty() {
@@ -3465,6 +3521,8 @@ impl Render for Workspace {
                 ws.zoomed = !ws.zoomed;
                 cx.notify();
             }))
+            .on_action(cx.listener(|ws, _: &GoBack, w, cx| ws.navigate(true, w, cx)))
+            .on_action(cx.listener(|ws, _: &GoForward, w, cx| ws.navigate(false, w, cx)))
             .on_action(cx.listener(|ws, _: &MoveItemLeft, w, cx| ws.move_item_dir(-1, 0, w, cx)))
             .on_action(cx.listener(|ws, _: &MoveItemRight, w, cx| ws.move_item_dir(1, 0, w, cx)))
             .on_action(cx.listener(|ws, _: &MoveItemUp, w, cx| ws.move_item_dir(0, -1, w, cx)))
