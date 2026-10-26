@@ -34,7 +34,7 @@ actions!(
         FindFile, CommandPalette, FindInFile, FindNext, FindPrev, ShowFiles, ShowGit, ToggleSidebar,
         ToggleOutput, FocusEditor, FocusSidebar, Save, CloseTab, NextTab, PrevTab, FormatFile,
         ToggleBlame, ZoomIn, ZoomOut, Quit, GoToLine, RunShell, FocusCommit, ShowKeys, Lint,
-        OpenFolder, SearchAll, ShowKeysPanel, ToggleSidebarSide,
+        OpenFolder, OpenFolderNewWindow, NextWindow, SearchAll, ShowKeysPanel, ToggleSidebarSide,
         SplitRight, SplitDown, ClosePane, ZoomPane, FocusLeft, FocusRight, FocusUp, FocusDown,
         NewTerminal, ToggleTerminal, PaneBuffers,
         MoveItemLeft, MoveItemRight, MoveItemUp, MoveItemDown,
@@ -104,6 +104,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-1", RunShell, None),
         KeyBinding::new("cmd-k cmd-s", ShowKeysPanel, None),
         KeyBinding::new("cmd-o", OpenFolder, None),
+        KeyBinding::new("cmd-shift-n", OpenFolderNewWindow, None),
+        KeyBinding::new("cmd-`", NextWindow, None),
         KeyBinding::new("cmd-shift-f", SearchAll, None),
         KeyBinding::new("cmd-k cmd-b", ToggleSidebarSide, None),
     ]);
@@ -198,6 +200,21 @@ impl Layout {
         a.remove_pane(id) || b.remove_pane(id)
     }
 
+    /// How many times the area holding `id` has been halved (0 = whole area).
+    fn depth(&self, id: usize) -> Option<usize> {
+        match self {
+            Layout::Pane(p) => (*p == id).then_some(0),
+            Layout::Split { a, b, .. } => a.depth(id).or_else(|| b.depth(id)).map(|d| d + 1),
+        }
+    }
+
+    fn max_depth(&self) -> usize {
+        match self {
+            Layout::Pane(_) => 0,
+            Layout::Split { a, b, .. } => 1 + a.max_depth().max(b.max_depth()),
+        }
+    }
+
     fn at_path(&mut self, path: &str) -> Option<&mut Layout> {
         let mut node = self;
         for step in path.chars() {
@@ -243,6 +260,10 @@ impl DropZone {
         }
     }
 }
+
+/// Splits are limited by size, not count: an area can be halved until it is 1/8 of the
+/// window (half → quarter → eighth), which also caps the layout at 8 splits.
+const MAX_SPLIT_DEPTH: usize = 3;
 
 struct Pane {
     id: usize,
@@ -290,6 +311,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("stash", "git stash (stash pop to restore)", false),
     ("graph", "Graph scope: graph all | graph auto", true),
     ("open", "Open a folder in this window: open <dir> (⌘O for a picker)", true),
+    ("window", "Open a project in a new window: window [dir] (⌘⇧N)", true),
     ("recent", "Open a recent folder", true),
     ("search", "Search in all files: search <text> (⇧⌘F)", true),
     ("sidebar", "Sidebar side: sidebar left | right", true),
@@ -668,7 +690,18 @@ impl Workspace {
 
     // ------------------------------------------------------------ panes
 
+    fn can_split(&self, pane: usize) -> bool {
+        self.layout.depth(pane).is_some_and(|d| d < MAX_SPLIT_DEPTH)
+    }
+
+    fn split_limit_message(&mut self, cx: &mut Context<Self>) {
+        self.flash("This split is already at the smallest size (1/8 of the window) — split a bigger one, or close/merge splits".into(), true, cx);
+    }
+
     fn split(&mut self, vertical: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_split(self.focused_pane) {
+            return self.split_limit_message(cx);
+        }
         let new = self.next_id;
         self.next_id += 1;
         self.panes.push(Pane { id: new, items: Vec::new(), active: None });
@@ -796,9 +829,10 @@ impl Workspace {
             }
             target
         } else {
-            if src == target && src_len <= 1 {
-                return self.flash("It's the only item in this pane — open another file first, or move it onto another pane".into(), true, cx);
+            if !self.can_split(target) {
+                return self.split_limit_message(cx);
             }
+            let _ = src_len;
             let new = self.next_id;
             self.next_id += 1;
             self.panes.push(Pane { id: new, items: Vec::new(), active: None });
@@ -820,10 +854,7 @@ impl Workspace {
             p.items.push(tid);
             p.active = Some(tid);
         }
-        if self.pane(src).is_some_and(|p| p.items.is_empty()) && self.panes.len() > 1 {
-            self.layout.remove_pane(src);
-            self.panes.retain(|p| p.id != src);
-        }
+        // The split it came from stays, even when empty (close it with ⌘⇧W).
         self.zoomed = false;
         self.drop_hint = None;
         self.set_focused_pane(dest);
@@ -848,6 +879,9 @@ impl Workspace {
         let dest = if zone == DropZone::Center {
             pane
         } else {
+            if !self.can_split(pane) {
+                return self.split_limit_message(cx);
+            }
             let new = self.next_id;
             self.next_id += 1;
             self.panes.push(Pane { id: new, items: Vec::new(), active: None });
@@ -887,6 +921,18 @@ impl Workspace {
         let new = self.next_id;
         self.next_id += 1;
         self.panes.push(Pane { id: new, items: Vec::new(), active: None });
+        if self.layout.max_depth() >= MAX_SPLIT_DEPTH {
+            // Wrapping everything would make some splits smaller than allowed:
+            // split the focused one instead, or just open the terminal in it.
+            self.panes.retain(|p| p.id != new);
+            if self.can_split(self.focused_pane) {
+                let fp = self.focused_pane;
+                self.panes.push(Pane { id: new, items: Vec::new(), active: None });
+                self.layout.replace_pane(fp, Layout::Split { vertical: false, ratio: 0.6, a: Box::new(Layout::Pane(fp)), b: Box::new(Layout::Pane(new)) });
+                self.set_focused_pane(new);
+            }
+            return self.open_terminal_view(None, window, cx);
+        }
         let old = std::mem::replace(&mut self.layout, Layout::Pane(new));
         self.layout = Layout::Split { vertical: false, ratio: 0.68, a: Box::new(old), b: Box::new(Layout::Pane(new)) };
         self.zoomed = false;
@@ -1387,15 +1433,46 @@ impl Workspace {
     }
 
     fn open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Open".into()) });
+        self.pick_folder(false, window, cx);
+    }
+
+    /// ⌘⇧N: another project, side by side in its own window.
+    fn open_folder_new_window(&mut self, _: &OpenFolderNewWindow, window: &mut Window, cx: &mut Context<Self>) {
+        self.pick_folder(true, window, cx);
+    }
+
+    fn pick_folder(&mut self, new_window: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = if new_window { "Open in New Window" } else { "Open" };
+        let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: true, prompt: Some(prompt.into()) });
         cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await
-                && let Some(dir) = paths.into_iter().next()
-            {
-                this.update_in(cx, |ws, window, cx| ws.switch_project(dir, window, cx)).ok();
+            if let Ok(Ok(Some(paths))) = rx.await {
+                this.update_in(cx, |ws, window, cx| {
+                    for (i, dir) in paths.into_iter().enumerate() {
+                        if new_window || i > 0 {
+                            ws.settings.add_recent(dir.clone());
+                            ws.settings.save();
+                            crate::open_window(dir.canonicalize().unwrap_or(dir), cx);
+                        } else {
+                            ws.switch_project(dir, window, cx);
+                        }
+                    }
+                })
+                .ok();
             }
         })
         .detach();
+    }
+
+    /// ⌘`: cycle through open project windows.
+    fn next_window(&mut self, _: &NextWindow, window: &mut Window, cx: &mut Context<Self>) {
+        let windows = cx.windows();
+        if windows.len() < 2 {
+            return self.flash("Only one project open — ⌘⇧N opens another in a new window".into(), false, cx);
+        }
+        let me = window.window_handle();
+        let ix = windows.iter().position(|w| *w == me).unwrap_or(0);
+        let next = windows[(ix + 1) % windows.len()];
+        next.update(cx, |_, window, _| window.activate_window()).ok();
     }
 
     /// Replaces this window's project with another folder.
@@ -2069,6 +2146,7 @@ impl Workspace {
                 }
             }
             "cd" => self.flash(format!("Not a folder: {rest}"), true, cx),
+            "window" if rest.is_empty() => self.pick_folder(true, window, cx),
             "window" => crate::open_window(resolve(&root, rest), cx),
             "recent" => {
                 if rest.is_empty() {
@@ -2415,7 +2493,8 @@ impl Workspace {
                     .top(px(4.))
                     .flex()
                     .gap(px(2.))
-                    .child(ui::icon_button("tb-open", "folder").tooltip(ui::tooltip("Open Folder (⌘O)")).on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))))
+                    .child(ui::icon_button("tb-open", "folder").tooltip(ui::tooltip("Open Folder here (⌘O)")).on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))))
+                    .child(ui::icon_button("tb-open-new", "plus").tooltip(ui::tooltip("Open another project in a new window (⌘⇧N) · ⌘` switches")).on_click(cx.listener(|ws, _, w, cx| ws.pick_folder(true, w, cx))))
                     .child(ui::icon_button("tb-side", "split").tooltip(ui::tooltip("Move sidebar left/right (⌘K ⌘B)")).on_click(cx.listener(|ws, _, w, cx| ws.toggle_sidebar_side(&ToggleSidebarSide, w, cx))))
                     .child(ui::icon_button("tb-panel", "inline").tooltip(ui::tooltip("Toggle output panel (⌘J)")).on_click(cx.listener(|ws, _, w, cx| ws.toggle_output(&ToggleOutput, w, cx)))),
             )
@@ -3244,6 +3323,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_keys_panel))
             .on_action(cx.listener(Self::toggle_sidebar_side))
             .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::open_folder_new_window))
+            .on_action(cx.listener(Self::next_window))
             .on_action(cx.listener(|ws, _: &SplitRight, w, cx| ws.split(true, w, cx)))
             .on_action(cx.listener(|ws, _: &SplitDown, w, cx| ws.split(false, w, cx)))
             .on_action(cx.listener(|ws, _: &ClosePane, w, cx| ws.close_pane(ws.focused_pane, w, cx)))
@@ -3364,6 +3445,22 @@ mod tests {
         assert_eq!(DropZone::at(b, point(px(390.), px(100.))), DropZone::Right);
         assert_eq!(DropZone::at(b, point(px(200.), px(10.))), DropZone::Top);
         assert_eq!(DropZone::at(b, point(px(200.), px(190.))), DropZone::Bottom);
+    }
+
+    #[test]
+    fn split_depth_follows_halving() {
+        use super::MAX_SPLIT_DEPTH;
+        // half | (quarter / quarter): quarters are at depth 2, can be split once more.
+        let l = Layout::Split {
+            vertical: true,
+            ratio: 0.5,
+            a: Box::new(Layout::Pane(0)),
+            b: Box::new(Layout::Split { vertical: false, ratio: 0.5, a: Box::new(Layout::Pane(1)), b: Box::new(Layout::Pane(2)) }),
+        };
+        assert_eq!(l.depth(0), Some(1));
+        assert_eq!(l.depth(1), Some(2));
+        assert!(l.depth(1).unwrap() < MAX_SPLIT_DEPTH);
+        assert_eq!(l.max_depth(), 2);
     }
 
     #[test]
