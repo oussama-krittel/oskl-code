@@ -105,8 +105,6 @@ pub fn bind_keys() {
         crate::keybindings::kb("escape", Escape, c),
         crate::keybindings::kb("ctrl-alt-up", ScrollLineUp, c),
         crate::keybindings::kb("ctrl-alt-down", ScrollLineDown, c),
-        crate::keybindings::kb("ctrl-alt-{up}", ScrollLineUp, c),
-        crate::keybindings::kb("ctrl-alt-{down}", ScrollLineDown, c),
         crate::keybindings::kb("ctrl-cmd-space", ShowCharacterPalette, c),
     ]);
 }

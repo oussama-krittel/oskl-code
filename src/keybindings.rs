@@ -252,6 +252,40 @@ pub fn direction_letters() -> String {
     CURRENT.with(|c| c.borrow().dirs.concat())
 }
 
+/// Letters as arrow keys: the direction letters with a modifier set act as real arrows.
+///   ⌃⌥ [⇧] + letter   → [⇧] arrow        (move / select)
+///   ⌥ [⇧] + letter    → ⌥ [⇧] arrow      (word moves, move / duplicate line)
+///   ⌃⌥⌘ [⇧] + letter  → ⌘ [⇧] arrow      (line / file start and end)
+/// Combinations that already have their own letter shortcuts (⌘⌥, ⌘⌥⇧, ⌃⌘) aren't touched.
+pub fn translate_arrow(ks: &Keystroke) -> Option<Keystroke> {
+    let m = ks.modifiers;
+    if !m.alt || m.function {
+        return None;
+    }
+    let dirs = CURRENT.with(|c| c.borrow().dirs.clone());
+    let ix = dirs.iter().position(|d| d.eq_ignore_ascii_case(&ks.key))?;
+    let arrow = ["left", "down", "up", "right"][ix];
+    let mut out = m;
+    match (m.control, m.platform) {
+        (true, false) => {
+            out.control = false;
+            out.alt = false;
+        }
+        (false, false) => {}
+        (true, true) => {
+            out.control = false;
+            out.alt = false;
+        }
+        (false, true) => return None, // ⌘⌥ + letter: move between splits
+    }
+    Some(Keystroke { modifiers: out, key: arrow.into(), key_char: None })
+}
+
+/// Whether `keys` is one of the letter-as-arrow combinations (so it can't be assigned).
+pub fn is_arrow_alias(keys: &str) -> bool {
+    keys.split_whitespace().count() == 1 && Keystroke::parse(keys).ok().is_some_and(|ks| translate_arrow(&ks).is_some())
+}
+
 /// Rebinds everything from defaults + the user's config.
 pub fn apply(cx: &mut App) {
     let cfg = Config::load();
@@ -419,6 +453,21 @@ mod tests {
     }
 
     #[test]
+    fn letters_become_arrows() {
+        use super::translate_arrow;
+        use gpui::Keystroke;
+        let t = |k: &str| translate_arrow(&Keystroke::parse(k).unwrap()).map(|ks| ks.unparse());
+        assert_eq!(t("ctrl-alt-i").as_deref(), Some("up"));
+        assert_eq!(t("ctrl-alt-shift-j").as_deref(), Some("shift-left"));
+        assert_eq!(t("alt-l").as_deref(), Some("alt-right"));
+        assert_eq!(t("alt-shift-k").as_deref(), Some("alt-shift-down"));
+        assert_eq!(t("ctrl-alt-cmd-j").as_deref(), Some("cmd-left"));
+        assert_eq!(t("cmd-alt-j"), None); // move between splits stays a shortcut
+        assert_eq!(t("ctrl-j"), None);
+        assert_eq!(t("alt-a"), None);
+    }
+
+    #[test]
     fn directions_resolve() {
         let mut cfg = Config::default();
         assert_eq!(cfg.resolve("cmd-alt-{left}"), "cmd-alt-j");
@@ -458,6 +507,9 @@ mod defaults {
                 }
                 if let Some(other) = conflict(&cfg, &all, &k, e.ctx.as_deref(), &e.id) {
                     problems.push(format!("{k}: {} vs {}", e.id, other.id));
+                }
+                if super::is_arrow_alias(&k) {
+                    problems.push(format!("{k} on {} is a letter-arrow key", e.id));
                 }
                 if let Some(why) = reserved(&k)
                     && !e.id.ends_with("Quit")

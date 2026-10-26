@@ -3505,6 +3505,18 @@ impl Render for Workspace {
                 if ev.keystroke.key == "escape" && ws.cmd_mode.is_some() {
                     ws.cancel_cmd(window, cx);
                     cx.stop_propagation();
+                    return;
+                }
+                // Direction letters with ⌃⌥ / ⌥ / ⌃⌥⌘ act as real arrow keys everywhere
+                // (editor, inputs, popups, terminal, lists). Not while recording a shortcut.
+                if ws.keys.read(cx).is_recording() {
+                    return;
+                }
+                if let Some(arrow) = crate::keybindings::translate_arrow(&ev.keystroke) {
+                    cx.stop_propagation();
+                    window.defer(cx, move |window, cx| {
+                        window.dispatch_keystroke(arrow, cx);
+                    });
                 }
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(|ws, _, window, cx| {

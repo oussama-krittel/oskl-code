@@ -8,6 +8,12 @@ use gpui::*;
 
 /// (section, keys, what it does)
 pub const KEYS: &[(&str, &str, &str)] = &[
+    ("Arrows on letters", "⌃⌥ + I K J L", "↑ ↓ ← → everywhere — editor, search boxes, popups, terminal (your direction letters)"),
+    ("Arrows on letters", "⌃⌥⇧ + I K J L", "Select (⇧ + arrows)"),
+    ("Arrows on letters", "⌥ + J L  ·  ⌥⇧ + J L", "Word left / right · select word"),
+    ("Arrows on letters", "⌥ + I K  ·  ⌥⇧ + I K", "Move line up / down · duplicate line"),
+    ("Arrows on letters", "⌃⌥⌘ + I K J L", "File start / end · line start / end (⌘ + arrows)"),
+    ("Arrows on letters", "⌃⌥⌘⇧ + I K J L", "Select to file / line start and end"),
     ("General", "⌘P", "Find file by name (fuzzy). Add :line to jump, e.g. app.ts:42"),
     ("General", "⌘⇧P  ·  ⌘;", "Command line (type :keys-style commands, Tab completes)"),
     ("General", "⌘O", "Open folder in this window"),
@@ -166,7 +172,7 @@ pub const KEYS: &[(&str, &str, &str)] = &[
 ];
 
 /// Sections of `KEYS` that aren't rebindable shortcuts (mouse, built-in terminal keys, commands).
-const REFERENCE: &[&str] = &["Mouse & trackpad", "Terminal", "Commands (:)", "Problems"];
+const REFERENCE: &[&str] = &["Arrows on letters", "Mouse & trackpad", "Terminal", "Commands (:)", "Problems"];
 
 /// `:keys` — every shortcut as currently bound, then the reference list.
 pub fn as_text() -> String {
@@ -239,6 +245,10 @@ impl KeysPanel {
         self.filter.read(cx).focus(window);
     }
 
+    pub fn is_recording(&self) -> bool {
+        self.recording.is_some()
+    }
+
     fn start(&mut self, rec: Rec, window: &mut Window, cx: &mut Context<Self>) {
         self.recording = Some(rec);
         self.message = Some(("Press the new shortcut… (Esc cancels)".into(), false));
@@ -300,6 +310,9 @@ impl KeysPanel {
         }
         if kb::blocks_typing(&key, e.ctx.as_deref()) {
             return self.fail(format!("{label} alone would stop you typing — add ⌘, ⌃ or ⌥"), cx);
+        }
+        if kb::is_arrow_alias(&key) {
+            return self.fail(format!("{label} is an arrow key on your direction letters — pick another"), cx);
         }
         if let Some(other) = kb::conflict(&self.cfg, &self.entries, &key, e.ctx.as_deref(), &e.id) {
             return self.fail(format!("{label} is already used by {} › {}", other.section, other.desc), cx);
