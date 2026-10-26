@@ -3507,6 +3507,9 @@ impl Render for Workspace {
                     cx.stop_propagation();
                     return;
                 }
+                if std::env::var_os("KITE_DEBUG").is_some() {
+                    eprintln!("[kite] key {}", ev.keystroke.unparse());
+                }
                 // Direction letters with ⌃⌥ / ⌥ / ⌃⌥⌘ act as real arrow keys everywhere
                 // (editor, inputs, popups, terminal, lists). Not while recording a shortcut.
                 if ws.keys.read(cx).is_recording() {
@@ -3704,3 +3707,73 @@ pub fn no_project_dir() -> PathBuf {
 fn root_is_project(root: &Path) -> bool {
     root != no_project_dir()
 }
+
+#[cfg(test)]
+mod ui_tests {
+    use super::{CmdMode, Workspace};
+    use gpui::{TestAppContext, VisualTestContext};
+
+    fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
+        let home = std::env::temp_dir().join(format!("kite-ui-test-{}", std::process::id()));
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        // Keep the test away from the real settings and shortcuts.
+        unsafe { std::env::set_var("HOME", &home) };
+        cx.update(|cx| {
+            crate::editor::bind_keys();
+            crate::workspace::bind_keys();
+            crate::file_tree::bind_keys();
+            crate::git_panel::bind_keys();
+            crate::diff_view::bind_keys();
+            crate::commit_view::bind_keys();
+            crate::search::bind_keys();
+            crate::diff_edit::bind_keys();
+            crate::keybindings::apply(cx);
+        });
+        cx.add_window_view(|window, cx| Workspace::new(project, window, cx))
+    }
+
+    fn cursor(ws: &gpui::Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
+        ws.read_with(cx, |ws, cx| ws.cmd.read(cx).buf.sel.head)
+    }
+
+    #[gpui::test]
+    fn letter_arrows_move_the_cursor_in_inputs(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        ws.update_in(cx, |ws, window, cx| ws.open_cmd(CmdMode::Command, "abcd", window, cx));
+        cx.run_until_parked();
+        assert_eq!(cursor(&ws, cx), 4);
+        cx.simulate_keystrokes("left");
+        assert_eq!(cursor(&ws, cx), 3, "plain arrow");
+        cx.simulate_keystrokes("ctrl-alt-j");
+        assert_eq!(cursor(&ws, cx), 2, "⌃⌥J should act as ←");
+        cx.simulate_keystrokes("ctrl-alt-l ctrl-alt-l");
+        assert_eq!(cursor(&ws, cx), 4, "⌃⌥L should act as →");
+    }
+
+    #[gpui::test]
+    fn letter_arrows_in_finder_and_search(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        // File finder (⌘P)
+        ws.update_in(cx, |ws, window, cx| ws.open_cmd(CmdMode::Files, "abcd", window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-alt-j");
+        assert_eq!(cursor(&ws, cx), 3, "finder: ⌃⌥J should act as ←");
+        cx.simulate_keystrokes("escape");
+        // Project search box (⇧⌘F)
+        cx.simulate_keystrokes("cmd-shift-f");
+        cx.run_until_parked();
+        let query = ws.read_with(cx, |ws, cx| ws.search.read(cx).query.clone());
+        query.update(cx, |q, cx| q.set_text("abcd", cx));
+        cx.run_until_parked();
+        let pos = |cx: &mut VisualTestContext| query.read_with(cx, |q, _| q.buf.sel.head);
+        assert_eq!(pos(cx), 4);
+        cx.simulate_keystrokes("left");
+        assert_eq!(pos(cx), 3, "search: plain arrow");
+        cx.simulate_keystrokes("ctrl-alt-j");
+        assert_eq!(pos(cx), 2, "search: ⌃⌥J should act as ←");
+        cx.simulate_keystrokes("ctrl-alt-l");
+        assert_eq!(pos(cx), 3, "search: ⌃⌥L should act as →");
+    }
+}
+

@@ -44,3 +44,4 @@ opt-level = 3
 [dev-dependencies]
 resvg = "0.45.1"
 usvg = "0.45.1"
+gpui = { version = "0.2.2", features = ["runtime_shaders", "test-support"] }
