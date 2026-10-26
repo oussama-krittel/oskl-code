@@ -18,7 +18,7 @@ cargo build --release
 echo "→ rendering icon"
 rm -rf "$BUILD/icon" "$BUILD/AppIcon.iconset"
 cargo run -q --release --example render_icon -- "$BUILD/icon"
-cp "$BUILD/icon/icon_256.png" packaging/logo-256.png
+cp "$BUILD/icon/wordmark.png" packaging/wordmark.png
 ICONSET="$BUILD/AppIcon.iconset"
 mkdir -p "$ICONSET"
 for s in 16 32 128 256 512; do

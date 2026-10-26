@@ -2881,29 +2881,7 @@ impl Workspace {
     }
 
     fn render_welcome(&self, cx: &mut Context<Self>) -> AnyElement {
-        static LOGO: std::sync::OnceLock<Arc<gpui::Image>> = std::sync::OnceLock::new();
-        let logo = LOGO.get_or_init(|| Arc::new(gpui::Image::from_bytes(ImageFormat::Png, include_bytes!("../packaging/logo-256.png").to_vec()))).clone();
-        let row = |label: &str, keys: &str| {
-            div()
-                .flex()
-                .gap(px(16.))
-                .child(div().w(px(160.)).flex().justify_end().child(label.to_string()))
-                .child(div().w(px(130.)).text_color(theme::fg()).child(keys.to_string()))
-        };
-        // "OSKL code" wordmark, each letter in its color from the app icon.
-        let letter = |l: &'static str, color: u32| div().text_color(theme::c(color)).child(l);
-        let wordmark = div()
-            .flex()
-            .items_end()
-            .gap(px(2.))
-            .text_size(px(30.))
-            .font_weight(FontWeight::BOLD)
-            .child(letter("O", 0x61afef))
-            .child(letter("S", 0xc678dd))
-            .child(letter("K", 0xe5c07b))
-            .child(letter("L", 0x98c379))
-            .child(div().ml(px(10.)).text_size(px(22.)).font_weight(FontWeight::NORMAL).text_color(theme::fg_dim()).child("code"));
-        let mut screen = div()
+        let screen = div()
             .size_full()
             .flex()
             .flex_col()
@@ -2911,52 +2889,75 @@ impl Workspace {
             .justify_center()
             .gap(px(9.))
             .bg(theme::bg_editor())
-            .text_color(theme::fg_muted())
-            .child(img(logo).size(px(112.)))
-            .child(wordmark)
-            .child(div().mb(px(18.)).text_size(px(11.)).text_color(theme::fg_muted()).child("git-first · terminal-fast · light"))
-            .child(row("Find File", "⌘ P"))
-            .child(row("Command Line", "⌘ ⇧ P  or  :"))
-            .child(row("Source Control", "⌃ ⇧ G"))
-            .child(row("Search in Files", "⌘ ⇧ F"))
-            .child(row("Terminal", "⌘ T  ·  ⌃ `"))
-            .child(row("Split Right / Down", "⌘ D  ·  ⌘ ⇧ D"))
-            .child(row("Toggle Blame", "⌥ ⌘ B"))
-            .child(row("All Shortcuts", "⌘K ⌘S"));
-        // Open Folder and Recent only when no project is open yet.
-        if !self.has_project {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let recent: Vec<PathBuf> = self.settings.recent_folders.iter().filter(|f| f.is_dir() && !f.starts_with(std::env::temp_dir())).take(8).cloned().collect();
-            screen = screen
-                .child(row("Open Folder", "⌘ O"))
-                .child(
-                    div()
-                        .id("welcome-open")
-                        .mt(px(16.))
-                        .px(px(14.))
-                        .py(px(6.))
-                        .rounded(px(4.))
-                        .bg(theme::frame_focused())
-                        .text_color(theme::bg_app())
-                        .font_weight(FontWeight::BOLD)
-                        .cursor_pointer()
-                        .hover(|s| s.opacity(0.85))
-                        .on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx)))
-                        .child("Open Folder…"),
-                )
-                .when(!recent.is_empty(), |d| d.child(div().mt(px(14.)).text_size(px(10.5)).child("RECENT")))
-                .children(recent.into_iter().enumerate().map(|(i, f)| {
-                    let label = f.to_string_lossy().replacen(&home, "~", 1);
-                    div()
-                        .id(("recent", i))
-                        .text_color(theme::accent())
-                        .cursor_pointer()
-                        .hover(|s| s.underline())
-                        .on_click(cx.listener(move |ws, _, w, cx| ws.switch_project(f.clone(), w, cx)))
-                        .child(label)
-                }));
+            .text_color(theme::fg_muted());
+
+        if self.has_project {
+            // A project is open: just the keys to get going.
+            let row = |label: &str, keys: &str| {
+                div()
+                    .flex()
+                    .gap(px(16.))
+                    .child(div().w(px(160.)).flex().justify_end().child(label.to_string()))
+                    .child(div().w(px(130.)).text_color(theme::fg()).child(keys.to_string()))
+            };
+            return screen
+                .child(row("Find File", "⌘ P"))
+                .child(row("Command Line", "⌘ ⇧ P  or  :"))
+                .child(row("Source Control", "⌃ ⇧ G"))
+                .child(row("Search in Files", "⌘ ⇧ F"))
+                .child(row("Terminal", "⌘ T  ·  ⌃ `"))
+                .child(row("Split Right / Down", "⌘ D  ·  ⌘ ⇧ D"))
+                .child(row("Toggle Blame", "⌥ ⌘ B"))
+                .child(row("All Shortcuts", "⌘K ⌘S"))
+                .into_any_element();
         }
-        screen.into_any_element()
+
+        // No project yet: the logo, Open Folder and Recent.
+        static WORDMARK: std::sync::OnceLock<Arc<gpui::Image>> = std::sync::OnceLock::new();
+        let wordmark = WORDMARK
+            .get_or_init(|| Arc::new(gpui::Image::from_bytes(ImageFormat::Png, include_bytes!("../packaging/wordmark.png").to_vec())))
+            .clone();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let is_temp = |f: &Path| f.starts_with(std::env::temp_dir()) || f.starts_with("/private/tmp") || f.starts_with("/tmp") || f.starts_with("/private/var/folders");
+        let recent: Vec<PathBuf> = self.settings.recent_folders.iter().filter(|f| f.is_dir() && !is_temp(f)).take(8).cloned().collect();
+        screen
+            .child(img(wordmark).w(px(250.)).h(px(190.)))
+            .child(div().mb(px(22.)).text_size(px(12.)).text_color(theme::fg_dim()).child("OSKL Code"))
+            .child(
+                div()
+                    .id("welcome-open")
+                    .px(px(16.))
+                    .py(px(7.))
+                    .rounded(px(5.))
+                    .bg(theme::c(0x5ee7c4))
+                    .text_color(theme::bg_app())
+                    .font_weight(FontWeight::BOLD)
+                    .cursor_pointer()
+                    .hover(|s| s.opacity(0.85))
+                    .on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx)))
+                    .child("Open Folder…   ⌘O"),
+            )
+            .when(!recent.is_empty(), |d| d.child(div().mt(px(22.)).mb(px(4.)).text_size(px(10.5)).child("RECENT")))
+            .children(recent.into_iter().enumerate().map(|(i, f)| {
+                let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let parent = f.parent().map(|p| p.to_string_lossy().replacen(&home, "~", 1)).unwrap_or_default();
+                div()
+                    .id(("recent", i))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .w(px(360.))
+                    .px(px(10.))
+                    .py(px(4.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(move |ws, _, w, cx| ws.switch_project(f.clone(), w, cx)))
+                    .child(ui::folder_icon(&name, false))
+                    .child(div().text_color(theme::fg_bright()).child(name))
+                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_size(px(11.)).text_color(theme::fg_muted()).child(parent))
+            }))
+            .into_any_element()
     }
 
     fn render_output(&self, cx: &mut Context<Self>) -> impl IntoElement {

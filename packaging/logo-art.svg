@@ -1,0 +1,48 @@
+<!-- Brush-painted "oskl" artwork, shared by the app icon and the start-screen logo.
+     Drawn in a 1024x1024 space; letters live roughly in x 190..840, y 300..760. -->
+<defs>
+  <linearGradient id="paint" x1="190" y1="300" x2="840" y2="760" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#5ee7c4"/>
+    <stop offset="1" stop-color="#8b7cff"/>
+  </linearGradient>
+  <!-- barely-there edge roughness -->
+  <filter id="brush" filterUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+    <feTurbulence type="fractalNoise" baseFrequency="0.06" numOctaves="1" seed="4" result="noise"/>
+    <feDisplacementMap in="SourceGraphic" in2="noise" scale="3" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+  <g id="strokes">
+    <!-- o -->
+    <path d="M338 498 C268 486 226 548 252 600 C278 652 368 640 380 580 C392 522 352 486 304 500"/>
+    <!-- s -->
+    <path d="M498 474 C462 446 404 466 412 512 C420 556 500 556 500 606 C500 656 436 668 392 636"/>
+    <!-- k: tall stem + kicked arm -->
+    <path d="M574 318 C570 430 562 548 556 652"/>
+    <path d="M664 470 C620 512 586 540 560 558 C612 578 642 618 676 660"/>
+    <!-- l: tall loop with a flick -->
+    <path d="M742 652 C716 568 714 430 754 344 C774 300 822 314 806 370 C786 440 734 538 760 626 C772 664 812 664 836 638"/>
+  </g>
+</defs>
+<g filter="url(#brush)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+  <!-- flat brush held at 45°: parallel bristles give thick/thin calligraphy -->
+  <use href="#strokes" stroke="url(#paint)" stroke-width="7" stroke-opacity="0.55" transform="translate(-19.8 19.8)"/>
+  <use href="#strokes" stroke="url(#paint)" stroke-width="10" stroke-opacity="0.85" transform="translate(-14.8 14.8)"/>
+  <use href="#strokes" stroke="url(#paint)" stroke-width="11" stroke-opacity="0.95" transform="translate(-9.9 9.9)"/>
+  <use href="#strokes" stroke="url(#paint)" stroke-width="12" stroke-opacity="1" transform="translate(-4.9 4.9)"/>
+  <use href="#strokes" stroke="url(#paint)" stroke-width="13" stroke-opacity="1" transform="translate(0.0 0.0)"/>
+  <use href="#strokes" stroke="url(#paint)" stroke-width="12" stroke-opacity="1" transform="translate(4.9 -4.9)"/>
+  <use href="#strokes" stroke="url(#paint)" stroke-width="11" stroke-opacity="0.95" transform="translate(9.9 -9.9)"/>
+  <use href="#strokes" stroke="url(#paint)" stroke-width="10" stroke-opacity="0.85" transform="translate(14.8 -14.8)"/>
+  <use href="#strokes" stroke="url(#paint)" stroke-width="7" stroke-opacity="0.55" transform="translate(19.8 -19.8)"/>
+  <!-- swoosh -->
+  <path d="M214 742 C390 712 640 712 836 748" stroke="url(#paint)" stroke-width="4" stroke-opacity="0.5" transform="translate(-2.7 -9.0)"/>
+  <path d="M214 742 C390 712 640 712 836 748" stroke="url(#paint)" stroke-width="6" stroke-opacity="0.8" transform="translate(-1.8 -6.0)"/>
+  <path d="M214 742 C390 712 640 712 836 748" stroke="url(#paint)" stroke-width="7" stroke-opacity="1" transform="translate(-0.9 -3.0)"/>
+  <path d="M214 742 C390 712 640 712 836 748" stroke="url(#paint)" stroke-width="8" stroke-opacity="1" transform="translate(0.0 0.0)"/>
+  <path d="M214 742 C390 712 640 712 836 748" stroke="url(#paint)" stroke-width="7" stroke-opacity="1" transform="translate(0.9 3.0)"/>
+  <path d="M214 742 C390 712 640 712 836 748" stroke="url(#paint)" stroke-width="6" stroke-opacity="0.8" transform="translate(1.8 6.0)"/>
+  <path d="M214 742 C390 712 640 712 836 748" stroke="url(#paint)" stroke-width="4" stroke-opacity="0.5" transform="translate(2.7 9.0)"/>
+  <!-- paint flecks where the brush lifts off -->
+  <circle cx="856" cy="622" r="6" fill="#8b7cff" stroke="none"/>
+  <circle cx="874" cy="606" r="3.5" fill="#8b7cff" stroke="none"/>
+  <circle cx="198" cy="748" r="5" fill="#5ee7c4" stroke="none"/>
+</g>
