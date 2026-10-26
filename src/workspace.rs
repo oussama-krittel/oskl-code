@@ -68,18 +68,24 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-9", Buffer9, None),
         KeyBinding::new("cmd-alt-enter", ZoomPane, None),
         KeyBinding::new("cmd-0", FocusSidebar, None),
-        KeyBinding::new("ctrl-alt-h", FocusLeft, None),
-        KeyBinding::new("ctrl-alt-l", FocusRight, None),
-        KeyBinding::new("ctrl-alt-k", FocusUp, None),
-        KeyBinding::new("ctrl-alt-j", FocusDown, None),
+        // Directions: arrows, or j ← · k ↓ · l ↑ · ; → (home row).
+        KeyBinding::new("cmd-alt-j", FocusLeft, None),
+        KeyBinding::new("cmd-alt-k", FocusDown, None),
+        KeyBinding::new("cmd-alt-l", FocusUp, None),
+        KeyBinding::new("cmd-alt-;", FocusRight, None),
         KeyBinding::new("cmd-alt-shift-left", MoveItemLeft, None),
         KeyBinding::new("cmd-alt-shift-right", MoveItemRight, None),
         KeyBinding::new("cmd-alt-shift-up", MoveItemUp, None),
         KeyBinding::new("cmd-alt-shift-down", MoveItemDown, None),
-        KeyBinding::new("ctrl-alt-shift-h", MoveItemLeft, None),
-        KeyBinding::new("ctrl-alt-shift-l", MoveItemRight, None),
-        KeyBinding::new("ctrl-alt-shift-k", MoveItemUp, None),
-        KeyBinding::new("ctrl-alt-shift-j", MoveItemDown, None),
+        KeyBinding::new("cmd-alt-shift-j", MoveItemLeft, None),
+        KeyBinding::new("cmd-alt-shift-k", MoveItemDown, None),
+        KeyBinding::new("cmd-alt-shift-l", MoveItemUp, None),
+        KeyBinding::new("cmd-alt-shift-;", MoveItemRight, None),
+        KeyBinding::new("cmd-alt-:", MoveItemRight, None),
+        KeyBinding::new("ctrl-cmd-left", PrevTab, None),
+        KeyBinding::new("ctrl-cmd-right", NextTab, None),
+        KeyBinding::new("ctrl-cmd-j", PrevTab, None),
+        KeyBinding::new("ctrl-cmd-;", NextTab, None),
         KeyBinding::new("cmd-alt-up", FocusUp, None),
         KeyBinding::new("cmd-alt-down", FocusDown, None),
         KeyBinding::new("cmd-d", SplitRight, None),
@@ -3185,7 +3191,7 @@ impl Workspace {
                 .child(hint("⌘D", "split"))
                 .child(hint("⌘T", "term"))
                 .child(hint(":", "cmd"))
-                .when(pane_count > 1, |d| d.child(hint("⌘⌥←→", "pane")))
+                .when(pane_count > 1, |d| d.child(hint("⌘⌥ jkl;", "split")))
         })
         .child({
             let (e, w) = self.problem_counts();

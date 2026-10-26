@@ -105,6 +105,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", Escape, c),
         KeyBinding::new("ctrl-alt-up", ScrollLineUp, c),
         KeyBinding::new("ctrl-alt-down", ScrollLineDown, c),
+        KeyBinding::new("ctrl-alt-l", ScrollLineUp, c),
+        KeyBinding::new("ctrl-alt-k", ScrollLineDown, c),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, c),
     ]);
 }

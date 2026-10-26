@@ -256,7 +256,7 @@ impl TerminalView {
             return;
         }
         // Keys the app keeps even inside the terminal.
-        if m.control && (matches!(ks.key.as_str(), "`" | "tab") || (m.alt && matches!(ks.key.as_str(), "h" | "j" | "k" | "l"))) {
+        if m.control && matches!(ks.key.as_str(), "`" | "tab") {
             return;
         }
         let mode = *self.term.lock().mode();
@@ -510,6 +510,71 @@ fn key_bytes(ks: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
     })
 }
 
+// ---------------------------------------------------------------- block shapes
+
+/// Filled parts of a cell for block elements (U+2580–259F) and sextants (U+1FB00–1FB3B),
+/// as (x0, y0, x1, y1, alpha) fractions of the cell.
+fn block_shape(c: char) -> Option<Vec<(f32, f32, f32, f32, f32)>> {
+    let full = (0., 0., 1., 1., 1.);
+    let quad = |q: &[u8]| -> Vec<(f32, f32, f32, f32, f32)> {
+        // 0 = upper-left, 1 = upper-right, 2 = lower-left, 3 = lower-right
+        q.iter().map(|i| {
+            let (x, y) = ((i % 2) as f32 * 0.5, (i / 2) as f32 * 0.5);
+            (x, y, x + 0.5, y + 0.5, 1.)
+        }).collect()
+    };
+    let cp = c as u32;
+    Some(match c {
+        '█' => vec![full],
+        '▀' => vec![(0., 0., 1., 0.5, 1.)],
+        '▌' => vec![(0., 0., 0.5, 1., 1.)],
+        '▐' => vec![(0.5, 0., 1., 1., 1.)],
+        '▔' => vec![(0., 0., 1., 0.125, 1.)],
+        '▕' => vec![(0.875, 0., 1., 1., 1.)],
+        '░' => vec![(0., 0., 1., 1., 0.25)],
+        '▒' => vec![(0., 0., 1., 1., 0.5)],
+        '▓' => vec![(0., 0., 1., 1., 0.75)],
+        '▖' => quad(&[2]),
+        '▗' => quad(&[3]),
+        '▘' => quad(&[0]),
+        '▙' => quad(&[0, 2, 3]),
+        '▚' => quad(&[0, 3]),
+        '▛' => quad(&[0, 1, 2]),
+        '▜' => quad(&[0, 1, 3]),
+        '▝' => quad(&[1]),
+        '▞' => quad(&[1, 2]),
+        '▟' => quad(&[1, 2, 3]),
+        // ▁▂▃▄▅▆▇: lower eighths
+        '\u{2581}'..='\u{2587}' => {
+            let n = (cp - 0x2580) as f32 / 8.;
+            vec![(0., 1. - n, 1., 1., 1.)]
+        }
+        // ▉▊▋▌▍▎▏: left eighths (7/8 down to 1/8)
+        '\u{2589}'..='\u{258F}' => {
+            let n = (0x2590 - cp) as f32 / 8.;
+            vec![(0., 0., n, 1., 1.)]
+        }
+        // Sextants: a 2×3 grid; codes skip the patterns that exist elsewhere (▌ and ▐).
+        '\u{1FB00}'..='\u{1FB3B}' => {
+            let mut v = cp - 0x1FB00 + 1;
+            if v >= 21 {
+                v += 1;
+            }
+            if v >= 42 {
+                v += 1;
+            }
+            (0..6)
+                .filter(|bit| v & (1 << bit) != 0)
+                .map(|bit| {
+                    let (x, y) = ((bit % 2) as f32 * 0.5, (bit / 2) as f32 / 3.);
+                    (x, y, x + 0.5, y + 1. / 3., 1.)
+                })
+                .collect()
+        }
+        _ => return None,
+    })
+}
+
 // ---------------------------------------------------------------- colors
 
 const ANSI: [u32; 16] = [
@@ -694,6 +759,19 @@ impl TerminalView {
             if cell.c == ' ' || cell.c == '\0' || cell.flags.contains(Flags::HIDDEN) {
                 continue;
             }
+            // Block and sextant characters (QR codes, progress bars) are drawn as exact
+            // shapes filling the cell, like real terminals do; fonts can't align them.
+            if let Some(parts) = block_shape(cell.c) {
+                for (x0, y0, x1, y1, alpha) in parts {
+                    // Overlap neighbours by a hair so no seams show between cells.
+                    let bx = x + px(x0 * cell_w);
+                    let by = y + px(y0 * line_h);
+                    let w = (x1 - x0) * cell_w + if x1 >= 1. { 0.5 } else { 0. };
+                    let h = (y1 - y0) * line_h + if y1 >= 1. { 0.5 } else { 0. };
+                    quads.push(fill(Bounds::new(point(bx, by), size(px(w), px(h))), fg.opacity(fg.a * alpha)));
+                }
+                continue;
+            }
             let bold = cell.flags.contains(Flags::BOLD);
             let italic = cell.flags.contains(Flags::ITALIC);
             let underline = cell.flags.intersects(Flags::ALL_UNDERLINES);
@@ -815,5 +893,66 @@ mod tests {
             }
         }
         assert!(found, "shell output never appeared in the terminal grid");
+    }
+
+    #[test]
+    fn sextants_decode_like_unicode() {
+        use super::block_shape;
+        // U+1FB00 = top-left only; U+1FB13 = cells 0+2+4 skipped (that's ▌), so it's 1+2+4+16 = 0b10111? check a few
+        assert_eq!(block_shape('\u{1FB00}').unwrap(), vec![(0., 0., 0.5, 1. / 3., 1.)]);
+        // U+1FB3B: last sextant = all but bottom-left (value 62 → bits 1..5)
+        assert_eq!(block_shape('\u{1FB3B}').unwrap().len(), 5);
+        // Left half (value 21) is not a sextant code: U+1FB13 is value 20, U+1FB14 is 22.
+        assert_eq!(block_shape('\u{1FB14}').unwrap().len(), 3);
+        assert_eq!(block_shape('█').unwrap().len(), 1);
+        assert_eq!(block_shape('▄').unwrap(), vec![(0., 0.5, 1., 1., 1.)]);
+        assert!(block_shape('a').is_none());
+    }
+
+    #[test]
+    fn expo_qr_code_is_all_shapes() {
+        // The QR code `npx expo start` prints: every non-space char must be drawn as a shape.
+        let qr = r#"🬕🬰🬰🬒🬴🬎🬰🬎🬴🬥🬆🬴█🬕🬰🬰🬒▌
+▌▌ ▌█🬪🬣🬯🬹🬟🬎🬇🬙▌▌ ▌▌
+🬲🬰🬰🬮🬕▌🬣🬥🬲🬱🬄🬴🬱🬲🬰🬰🬮▌
+▌🬉🬚🬛🬒🬖🬤🬠🬂🬹🬮🬎🬇🬧🬕🬡🬌▌
+🬝🬸🬮🬡🬂🬦🬭🬉🬐🬢🬙🬛🬧🬓🬷🬶🬦▌
+🬺🬭🬺🬛🬰🬪🬵🬜🬁▌🬘🬱🬬🬈🬊🬞🬔▌
+🬺🬂🬇🬴🬣🬬🬖🬚🬖🬛🬐🬗🬨🬻🬗🬊🬃▌
+▌█🬜🬇🬌🬋🬛🬓🬞🬋🬭🬺🬫🬎🬴🬥🬇▌
+🬲🬮🬵🬳🬓🬉🬝🬮🬨🬳🬐🬸🬕🬯🬑🬧🬤▌
+▌🬚🬋🬓🬝🬟🬆🬮 🬛🬘🬹 🬌🬄🬟🬡▌
+▌🬲🬭▌🬛🬖🬤🬡🬵🬛🬐🬗🬞🬫🬆🬎 ▌
+🬌🬋🬋🬋🬌🬌🬍🬍🬍🬋🬋🬌🬋🬍🬎🬎🬎🬄"#;
+        for ch in qr.chars().filter(|c| !c.is_whitespace()) {
+            assert!(super::block_shape(ch).is_some(), "not drawn as a shape: {ch:?} U+{:X}", ch as u32);
+        }
+    }
+
+    #[test]
+    fn render_qr_preview() {
+        // Writes a PNG of the QR drawn with the terminal's block shapes (KITE_QR_PNG=path).
+        let Ok(out) = std::env::var("KITE_QR_PNG") else { return };
+        use resvg::tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
+        let qr = include_str!("../tests/expo_qr.txt");
+        let (cw, lh) = (8.0f32, 16.0f32);
+        let rows: Vec<&str> = qr.lines().collect();
+        let cols = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0);
+        let mut pm = Pixmap::new((cols as f32 * cw + 32.) as u32, (rows.len() as f32 * lh + 32.) as u32).unwrap();
+        pm.fill(Color::from_rgba8(17, 19, 24, 255));
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(200, 204, 212, 255);
+        for (r, line) in rows.iter().enumerate() {
+            for (c, ch) in line.chars().enumerate() {
+                for (x0, y0, x1, y1, _) in super::block_shape(ch).unwrap_or_default() {
+                    let x = 16. + c as f32 * cw;
+                    let y = 16. + r as f32 * lh;
+                    if let Some(rect) = Rect::from_ltrb(x + x0 * cw, y + y0 * lh, x + x1 * cw, y + y1 * lh) {
+                        pm.fill_rect(rect, &paint, Transform::identity(), None);
+                    }
+                }
+            }
+        }
+        pm.save_png(out).unwrap();
     }
 }
