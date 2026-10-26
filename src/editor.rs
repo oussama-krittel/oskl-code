@@ -742,8 +742,10 @@ impl Editor {
     fn duplicate_line_up(&mut self, _: &DuplicateLineUp, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| b.duplicate_lines(false)) }
     fn delete_line(&mut self, _: &DeleteLine, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| b.delete_lines()) }
     fn toggle_comment(&mut self, _: &ToggleComment, _: &mut Window, cx: &mut Context<Self>) {
-        let prefix = tools::comment_prefix(self.path.as_deref());
-        self.edit(cx, |b| b.toggle_comment(prefix))
+        match tools::comment_style(self.path.as_deref()) {
+            tools::CommentStyle::Line(prefix) => self.edit(cx, |b| b.toggle_comment(prefix)),
+            tools::CommentStyle::Block(open, close) => self.edit(cx, |b| b.toggle_block_comment(open, close)),
+        }
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| { b.undo(); }) }

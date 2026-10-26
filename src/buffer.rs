@@ -696,6 +696,52 @@ impl Buffer {
         self.sel = Sel::at(self.rc_to_pos(row, col));
     }
 
+    /// ⌘/ for languages without line comments (HTML, CSS…): wraps each line as `<!-- line -->`.
+    pub fn toggle_block_comment(&mut self, open: &str, close: &str) {
+        let (a, b) = self.selected_rows();
+        let lines: Vec<String> = (a..=b).map(|r| self.line(r)).collect();
+        let non_empty: Vec<&String> = lines.iter().filter(|l| !l.trim().is_empty()).collect();
+        if non_empty.is_empty() {
+            return;
+        }
+        let commented = |l: &str| {
+            let t = l.trim();
+            t.starts_with(open) && t.ends_with(close) && t.len() >= open.len() + close.len()
+        };
+        let all_commented = non_empty.iter().all(|l| commented(l));
+        let out: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                if l.trim().is_empty() {
+                    return l.clone();
+                }
+                let ws = l.len() - l.trim_start().len();
+                let (indent, body) = l.split_at(ws);
+                let body = body.trim_end();
+                if all_commented {
+                    let inner = &body[open.len()..body.len() - close.len()];
+                    let inner = inner.strip_prefix(' ').unwrap_or(inner);
+                    let inner = inner.strip_suffix(' ').unwrap_or(inner);
+                    format!("{indent}{inner}")
+                } else {
+                    format!("{indent}{open} {body} {close}")
+                }
+            })
+            .collect();
+        let had_selection = !self.sel.is_empty();
+        let (row, col) = self.pos_to_rc(self.sel.head);
+        let delta = out[row - a].chars().count() as isize - lines[row - a].chars().count() as isize;
+        let range = self.line_start(a)..self.line_start(b) + self.line_len(b);
+        self.replace(range, &out.join("\n"), None, EditKind::Other);
+        if had_selection {
+            self.sel = Sel { anchor: self.line_start(a), head: self.line_start(b) + self.line_len(b) };
+        } else {
+            let open_shift = if all_commented { 0 } else { open.chars().count() as isize + 1 };
+            let new_col = (col as isize + if col == 0 { 0 } else { open_shift.min(delta.max(-(col as isize))) }).max(0) as usize;
+            self.sel = Sel::at(self.rc_to_pos(row, new_col));
+        }
+    }
+
     pub fn toggle_comment(&mut self, prefix: &str) {
         let (a, b) = self.selected_rows();
         let lines: Vec<String> = (a..=b).map(|r| self.line(r)).collect();
@@ -880,6 +926,16 @@ mod tests {
         assert_eq!(b.text(), "  // let a = 1;\n  // let b = 2;");
         b.toggle_comment("//");
         assert_eq!(b.text(), "  let a = 1;\n  let b = 2;");
+    }
+
+    #[test]
+    fn block_comment_round_trips() {
+        let mut b = Buffer::new("  <div>hi</div>\n  <p/>");
+        b.select_all();
+        b.toggle_block_comment("<!--", "-->");
+        assert_eq!(b.text(), "  <!-- <div>hi</div> -->\n  <!-- <p/> -->");
+        b.toggle_block_comment("<!--", "-->");
+        assert_eq!(b.text(), "  <div>hi</div>\n  <p/>");
     }
 
     #[test]

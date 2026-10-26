@@ -245,13 +245,39 @@ pub fn shell(root: &Path, line: &str) -> ToolOutput {
     run(c, line.into(), None, root)
 }
 
-pub fn comment_prefix(path: Option<&Path>) -> &'static str {
-    match path.map(ext).as_deref() {
-        Some("py" | "sh" | "bash" | "zsh" | "rb" | "toml" | "yaml" | "yml" | "pl" | "r" | "conf" | "ini" | "dockerfile" | "mk") => "#",
-        Some("lua" | "sql" | "hs") => "--",
-        Some("lisp" | "clj" | "el") => ";",
-        Some("vim") => "\"",
-        _ => "//",
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommentStyle {
+    Line(&'static str),
+    Block(&'static str, &'static str),
+}
+
+/// How ⌘/ comments a line, per language (by file name first, then extension).
+pub fn comment_style(path: Option<&Path>) -> CommentStyle {
+    use CommentStyle::*;
+    let Some(path) = path else { return Line("//") };
+    let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let hash_names = [
+        "dockerfile", "makefile", "gnumakefile", "procfile", "gemfile", "rakefile", "podfile", "brewfile", "vagrantfile",
+        ".gitignore", ".gitattributes", ".gitmodules", ".dockerignore", ".npmrc", ".yarnrc", ".editorconfig", ".prettierignore",
+        ".eslintignore", ".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".profile", ".envrc", "codeowners",
+        ".htaccess", "requirements.txt", "pipfile", ".flake8", ".pylintrc", ".tool-versions", ".nvmrc", "caddyfile",
+    ];
+    if name.starts_with(".env") || name.starts_with("dockerfile") || hash_names.contains(&name.as_str()) {
+        return Line("#");
+    }
+    match ext(path).as_str() {
+        "py" | "pyi" | "sh" | "bash" | "zsh" | "fish" | "rb" | "toml" | "yaml" | "yml" | "pl" | "pm" | "r" | "conf" | "cfg"
+        | "properties" | "mk" | "cmake" | "tf" | "tfvars" | "hcl" | "nix" | "ps1" | "graphql" | "gql" | "jl" | "ex" | "exs"
+        | "cr" | "nim" | "coffee" | "dockerfile" | "env" | "gitignore" | "prisma" => Line("#"),
+        "sql" | "lua" | "hs" | "elm" | "ada" => Line("--"),
+        "ini" | "lisp" | "clj" | "cljs" | "el" | "scm" | "asm" | "s" => Line(";"),
+        "tex" | "sty" | "erl" | "hrl" => Line("%"),
+        "vim" => Line("\""),
+        "bat" | "cmd" => Line("REM"),
+        "html" | "htm" | "xhtml" | "xml" | "svg" | "vue" | "svelte" | "md" | "mdx" | "markdown" | "plist" | "xaml" | "csproj" => Block("<!--", "-->"),
+        "css" => Block("/*", "*/"),
+        // JS/TS/JSX, Rust, Go, C-family, Swift, Kotlin, Java, SCSS/LESS, JSON(C)…
+        _ => Line("//"),
     }
 }
 
@@ -270,4 +296,25 @@ pub fn run_tool(bin: &Path, args: &[&str], cwd: &Path) -> (bool, String, String)
     c.args(args);
     let out = run(c, String::new(), None, cwd);
     (out.ok, out.stdout, out.stderr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommentStyle::*, comment_style};
+    use std::path::Path;
+
+    #[test]
+    fn comment_styles_per_language() {
+        let st = |p: &str| comment_style(Some(Path::new(p)));
+        assert_eq!(st(".env"), Line("#"));
+        assert_eq!(st(".env.local"), Line("#"));
+        assert_eq!(st("app.yml"), Line("#"));
+        assert_eq!(st("Dockerfile"), Line("#"));
+        assert_eq!(st("index.html"), Block("<!--", "-->"));
+        assert_eq!(st("site.css"), Block("/*", "*/"));
+        assert_eq!(st("site.scss"), Line("//"));
+        assert_eq!(st("app.tsx"), Line("//"));
+        assert_eq!(st("q.sql"), Line("--"));
+        assert_eq!(st("README.md"), Block("<!--", "-->"));
+    }
 }

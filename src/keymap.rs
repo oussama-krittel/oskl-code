@@ -58,7 +58,7 @@ pub const KEYS: &[(&str, &str, &str)] = &[
     ("Editing", "⌥↑  ·  ⌥↓", "Move line(s) up / down"),
     ("Editing", "⇧⌥↑  ·  ⇧⌥↓", "Duplicate line(s) up / down"),
     ("Editing", "⌘⇧K", "Delete line(s)"),
-    ("Editing", "⌘/", "Toggle line comment"),
+    ("Editing", "⌘/", "Toggle comment in the file's language: // · # (.env, YAML, shell, Python) · <!-- --> (HTML, Markdown) · /* */ (CSS) · -- (SQL)"),
     ("Editing", "⌘C  ·  ⌘X", "Copy / cut (whole line when nothing is selected)"),
     ("Editing", "⌘V", "Paste (a copied whole line pastes above the cursor)"),
     ("Editing", "⌘Z  ·  ⌘⇧Z", "Undo / redo"),
