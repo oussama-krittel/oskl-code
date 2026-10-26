@@ -37,6 +37,7 @@ actions!(
         OpenFolder, SearchAll, ShowKeysPanel, ToggleSidebarSide,
         SplitRight, SplitDown, ClosePane, ZoomPane, FocusLeft, FocusRight, FocusUp, FocusDown,
         NewTerminal, ToggleTerminal, PaneBuffers,
+        Buffer1, Buffer2, Buffer3, Buffer4, Buffer5, Buffer6, Buffer7, Buffer8, Buffer9,
     ]
 );
 
@@ -53,7 +54,16 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-b", ToggleSidebar, None),
         KeyBinding::new("cmd-j", ToggleOutput, None),
         KeyBinding::new("ctrl-`", ToggleTerminal, None),
-        KeyBinding::new("cmd-1", FocusEditor, None),
+        KeyBinding::new("cmd-1", Buffer1, None),
+        KeyBinding::new("cmd-2", Buffer2, None),
+        KeyBinding::new("cmd-3", Buffer3, None),
+        KeyBinding::new("cmd-4", Buffer4, None),
+        KeyBinding::new("cmd-5", Buffer5, None),
+        KeyBinding::new("cmd-6", Buffer6, None),
+        KeyBinding::new("cmd-7", Buffer7, None),
+        KeyBinding::new("cmd-8", Buffer8, None),
+        KeyBinding::new("cmd-9", Buffer9, None),
+        KeyBinding::new("cmd-shift-enter", ZoomPane, None),
         KeyBinding::new("cmd-0", FocusSidebar, None),
         KeyBinding::new("ctrl-alt-h", FocusLeft, None),
         KeyBinding::new("ctrl-alt-l", FocusRight, None),
@@ -686,10 +696,18 @@ impl Workspace {
                 self.set_focused_pane(id);
                 self.focus_active(window, cx);
             }
-            None if self.side_visible && ((dx < 0 && !self.settings.sidebar_right) || (dx > 0 && self.settings.sidebar_right)) => {
-                self.focus_sidebar(window, cx);
+            None => {
+                // Nothing that way: cycle through panes in layout order (wraps around).
+                let mut ids = Vec::new();
+                self.layout.panes(&mut ids);
+                if ids.len() > 1 {
+                    let cur = ids.iter().position(|p| *p == self.focused_pane).unwrap_or(0);
+                    let forward = dx > 0 || dy > 0;
+                    let next = if forward { (cur + 1) % ids.len() } else { (cur + ids.len() - 1) % ids.len() };
+                    self.set_focused_pane(ids[next]);
+                    self.focus_active(window, cx);
+                }
             }
-            None => {}
         }
         cx.notify();
     }
@@ -986,6 +1004,15 @@ impl Workspace {
         let cur = pane.active.and_then(|a| pane.items.iter().position(|x| *x == a)).unwrap_or(0) as isize;
         let next = pane.items[((cur + delta) % n + n) as usize % n as usize];
         if let Some(ix) = self.tab_ix(next) {
+            self.activate(ix, window, cx);
+        }
+    }
+
+    /// ⌘1…⌘9: show the Nth item of the focused pane (⌘9 = last, like browsers).
+    fn show_buffer(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane(self.focused_pane) else { return };
+        let Some(&tid) = (if n == usize::MAX { pane.items.last() } else { pane.items.get(n) }) else { return };
+        if let Some(ix) = self.tab_ix(tid) {
             self.activate(ix, window, cx);
         }
     }
@@ -2319,6 +2346,15 @@ impl Workspace {
                 .child(ui::small_icon(icon, theme::fg_dim()).size(px(12.)))
         };
         let header = div()
+            .id(SharedString::from(format!("pane-header-{id}")))
+            .on_click(cx.listener(move |ws, ev: &ClickEvent, _, cx| {
+                // Double-click a pane's title bar to maximize / restore it.
+                if ev.click_count() == 2 {
+                    ws.set_focused_pane(id);
+                    ws.zoomed = !ws.zoomed;
+                    cx.notify();
+                }
+            }))
             .flex()
             .flex_none()
             .items_center()
@@ -2330,27 +2366,49 @@ impl Workspace {
             .border_b_1()
             .border_color(frame)
             .child(div().text_color(frame).child("─"))
-            .when(!is_term && active_ix.is_some(), |d| d.child(ui::file_icon(&icon_name).size(px(13.))))
-            .when(is_term, |d| d.child(ui::small_icon("terminal", theme::frame_focused()).size(px(13.))))
-            .child(div().overflow_hidden().whitespace_nowrap().text_color(if focused { theme::fg_bright() } else { theme::fg_dim() }).child(title))
-            .when(dirty, |d| d.child(div().text_color(theme::git_modified()).child("●")))
-            .when(count > 1, |d| {
-                d.child(
-                    div()
-                        .id(SharedString::from(format!("buffers-{id}")))
-                        .px(px(4.))
-                        .rounded(px(3.))
-                        .text_color(theme::fg_muted())
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
-                        .tooltip(ui::tooltip("Files in this pane (⌘E) · ⌃Tab cycles"))
-                        .on_click(cx.listener(move |ws, _, w, cx| {
-                            ws.set_focused_pane(id);
-                            ws.open_cmd(CmdMode::Buffers, "", w, cx);
-                        }))
-                        .child(format!("[{pos}/{count}]")),
-                )
-            })
+            .child(
+                // tmux-style list of what's open in this pane: "1 app.ts  2 $ zsh" (⌘1…⌘9 or click).
+                div().flex().items_center().gap(px(2.)).min_w_0().overflow_hidden().children(pane.items.iter().enumerate().filter_map(|(i, tid)| {
+                    let ix = self.tab_ix(*tid)?;
+                    let (title, icon_name, dirty) = self.tab_title(&self.tabs[ix], cx);
+                    let active = pane.active == Some(*tid);
+                    let term = matches!(self.tabs[ix].kind, TabKind::Terminal(_));
+                    let preview = self.tabs[ix].preview;
+                    Some(
+                        div()
+                            .id(SharedString::from(format!("chip-{id}-{tid}")))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(4.))
+                            .px(px(6.))
+                            .h(px(18.))
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .when(active, |d| d.bg(frame.opacity(0.22)).text_color(if focused { theme::fg_bright() } else { theme::fg() }))
+                            .when(!active, |d| d.text_color(theme::fg_muted()).hover(|s| s.bg(theme::hover()).text_color(theme::fg())))
+                            .on_click(cx.listener({
+                                let tid = *tid;
+                                move |ws, _, w, cx| {
+                                if let Some(ix) = ws.tab_ix(tid) {
+                                    ws.activate(ix, w, cx);
+                                }
+                            }}))
+                            .on_mouse_down(MouseButton::Middle, cx.listener({
+                                let tid = *tid;
+                                move |ws, _, w, cx| {
+                                    if let Some(ix) = ws.tab_ix(tid) {
+                                        ws.close_tab(ix, false, w, cx);
+                                    }
+                                }
+                            }))
+                            .child(div().text_color(if active { theme::frame_focused() } else { theme::fg_muted() }).child(if i < 9 { format!("{}", i + 1) } else { "·".into() }))
+                            .child(if term { ui::small_icon("terminal", theme::frame_focused()).size(px(12.)) } else { ui::file_icon(&icon_name).size(px(12.)) })
+                            .child(div().max_w(px(180.)).overflow_hidden().whitespace_nowrap().when(preview, |d| d.italic()).child(title))
+                            .when(dirty, |d| d.child(div().text_color(theme::git_modified()).child("●"))),
+                    )
+                })),
+            )
             .child(div().flex_1().h(px(1.)).bg(frame.opacity(0.5)))
             .when(count > 1, |d| {
                 d.child(glyph("prev", "chevron-left", "Previous file in pane (⌃⇧Tab)").on_click(cx.listener(move |ws, _, w, cx| {
@@ -2950,6 +3008,15 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &NewTerminal, w, cx| ws.new_terminal(w, cx)))
             .on_action(cx.listener(|ws, _: &ToggleTerminal, w, cx| ws.toggle_terminal(w, cx)))
             .on_action(cx.listener(|ws, _: &PaneBuffers, w, cx| ws.open_cmd(CmdMode::Buffers, "", w, cx)))
+            .on_action(cx.listener(|ws, _: &Buffer1, w, cx| ws.show_buffer(0, w, cx)))
+            .on_action(cx.listener(|ws, _: &Buffer2, w, cx| ws.show_buffer(1, w, cx)))
+            .on_action(cx.listener(|ws, _: &Buffer3, w, cx| ws.show_buffer(2, w, cx)))
+            .on_action(cx.listener(|ws, _: &Buffer4, w, cx| ws.show_buffer(3, w, cx)))
+            .on_action(cx.listener(|ws, _: &Buffer5, w, cx| ws.show_buffer(4, w, cx)))
+            .on_action(cx.listener(|ws, _: &Buffer6, w, cx| ws.show_buffer(5, w, cx)))
+            .on_action(cx.listener(|ws, _: &Buffer7, w, cx| ws.show_buffer(6, w, cx)))
+            .on_action(cx.listener(|ws, _: &Buffer8, w, cx| ws.show_buffer(7, w, cx)))
+            .on_action(cx.listener(|ws, _: &Buffer9, w, cx| ws.show_buffer(usize::MAX, w, cx)))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_output))
             .on_action(cx.listener(Self::on_focus_editor))
