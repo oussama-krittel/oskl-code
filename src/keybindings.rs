@@ -247,6 +247,9 @@ pub fn apply(cx: &mut App) {
             }
         }
     }
+    if std::env::var_os("KITE_DEBUG").is_some() {
+        eprintln!("[kite] key bindings applied: {}", bindings.len());
+    }
     cx.bind_keys(bindings);
 }
 
