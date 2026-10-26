@@ -661,3 +661,19 @@ mod tests {
         assert_eq!(b.lines[0].as_ref().unwrap().summary, "First");
     }
 }
+
+#[cfg(test)]
+mod live {
+    #[test]
+    fn reads_real_repo() {
+        let Ok(dir) = std::env::var("KITE_REPO") else { return };
+        let root = super::repo_root(std::path::Path::new(&dir)).expect("repo root");
+        let st = super::status(&root).expect("status");
+        println!("branch={:?} staged={} unstaged={}", st.branch, st.staged.len(), st.unstaged.len());
+        let log = super::log(&root, 800, false, &[]);
+        println!("log auto: {:?}", log.as_ref().map(|l| l.len()));
+        let all = super::log(&root, 800, true, &[]).expect("log all");
+        println!("log all: {}", all.len());
+        assert!(!log.unwrap().is_empty());
+    }
+}

@@ -36,11 +36,20 @@ pub struct Repo {
     log_task: Option<Task<()>>,
     files_task: Option<Task<()>>,
     op_task: Option<Task<()>>,
+    status_running: bool,
+    status_again: bool,
+    log_running: bool,
+    log_again: bool,
+    files_running: bool,
+    files_again: bool,
 }
 
 impl Repo {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let git_root = git::repo_root(&root);
+        if std::env::var_os("KITE_DEBUG").is_some() {
+            eprintln!("[kite] open {} -> git root {:?}", root.display(), git_root);
+        }
         let is_git = git_root.is_some();
         let root = git_root.unwrap_or(root);
         let user_email = if is_git { git::user_email(&root) } else { None };
@@ -61,6 +70,12 @@ impl Repo {
             log_task: None,
             files_task: None,
             op_task: None,
+            status_running: false,
+            status_again: false,
+            log_running: false,
+            log_again: false,
+            files_running: false,
+            files_again: false,
         };
         repo.refresh_all(cx);
         repo
@@ -72,16 +87,34 @@ impl Repo {
         self.refresh_files(cx);
     }
 
+    /// Refreshes never cancel each other: if one is running, exactly one more runs after it.
+    /// (Busy repos change constantly — shell prompts, dev servers, saves — and cancelling
+    /// in-flight refreshes meant none ever finished.)
     pub fn refresh_status(&mut self, cx: &mut Context<Self>) {
         if !self.is_git {
             return;
         }
+        if self.status_running {
+            self.status_again = true;
+            return;
+        }
+        self.status_running = true;
         let root = self.root.clone();
         let task = cx.background_executor().spawn(async move { git::status(&root) });
         self.status_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(status) = task.await else { return };
+            let status = task.await;
+            if std::env::var_os("KITE_DEBUG").is_some() {
+                eprintln!("[kite] status: {:?}", status.as_ref().map(|s| (s.branch.clone(), s.staged.len(), s.unstaged.len())));
+            }
             this.update(cx, |repo, cx| {
-                repo.set_status(status);
+                repo.status_running = false;
+                match status {
+                    Ok(status) => repo.set_status(status),
+                    Err(e) => cx.emit(RepoEvent::Error(format!("git status failed: {e}"))),
+                }
+                if std::mem::take(&mut repo.status_again) {
+                    repo.refresh_status(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -113,19 +146,36 @@ impl Repo {
         if !self.is_git {
             return;
         }
+        if self.log_running {
+            self.log_again = true;
+            return;
+        }
+        self.log_running = true;
         let root = self.root.clone();
         let all = self.graph_all;
         let only = self.graph_only.clone();
         let task = cx.background_executor().spawn(async move {
-            let commits = git::log(&root, 800, all, &only).unwrap_or_default();
-            let rows = graph::layout(&commits, theme::lane_colors().len());
+            let commits = git::log(&root, 800, all, &only);
+            let rows = commits.as_ref().map(|c| graph::layout(c, theme::lane_colors().len())).unwrap_or_default();
             (commits, rows)
         });
         self.log_task = Some(cx.spawn(async move |this, cx| {
             let (commits, rows) = task.await;
+            if std::env::var_os("KITE_DEBUG").is_some() {
+                eprintln!("[kite] log: {:?}", commits.as_ref().map(|c| c.len()));
+            }
             this.update(cx, |repo, cx| {
-                repo.commits = Arc::new(commits);
-                repo.graph = Arc::new(rows);
+                repo.log_running = false;
+                match commits {
+                    Ok(commits) => {
+                        repo.commits = Arc::new(commits);
+                        repo.graph = Arc::new(rows);
+                    }
+                    Err(e) => cx.emit(RepoEvent::Error(format!("git log failed: {e}"))),
+                }
+                if std::mem::take(&mut repo.log_again) {
+                    repo.refresh_log(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -133,6 +183,11 @@ impl Repo {
     }
 
     pub fn refresh_files(&mut self, cx: &mut Context<Self>) {
+        if self.files_running {
+            self.files_again = true;
+            return;
+        }
+        self.files_running = true;
         let root = self.root.clone();
         let is_git = self.is_git;
         let task = cx.background_executor().spawn(async move {
@@ -140,7 +195,14 @@ impl Repo {
         });
         self.files_task = Some(cx.spawn(async move |this, cx| {
             let files = task.await;
-            this.update(cx, |repo, _| repo.files = Arc::new(files)).ok();
+            this.update(cx, |repo, cx| {
+                repo.files_running = false;
+                repo.files = Arc::new(files);
+                if std::mem::take(&mut repo.files_again) {
+                    repo.refresh_files(cx);
+                }
+            })
+            .ok();
         }));
     }
 
