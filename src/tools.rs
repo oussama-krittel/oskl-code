@@ -129,7 +129,9 @@ pub fn format(root: &Path, path: &Path, text: &str) -> Result<(String, String), 
     let e = ext(path);
     let p = path.to_string_lossy().to_string();
     let (cmd, name) = if is_web(&e) {
-        let biome = find_tool("biome", dir, root);
+        let yaml = matches!(e.as_str(), "yml" | "yaml");
+        // Biome doesn't format YAML; Prettier does.
+        let biome = find_tool("biome", dir, root).filter(|_| !yaml);
         let prettier = find_tool("prettier", dir, root);
         let use_biome = biome.is_some() && (has_config(dir, root, BIOME_CONFIG) || !has_config(dir, root, PRETTIER_CONFIG) || prettier.is_none());
         if use_biome {
@@ -140,6 +142,14 @@ pub fn format(root: &Path, path: &Path, text: &str) -> Result<(String, String), 
             let mut c = command(&prettier);
             c.args(["--stdin-filepath", &p]);
             (c, "prettier")
+        } else if matches!(e.as_str(), "json") {
+            // Built-in JSON formatter keeps key order; files with comments need a real formatter.
+            let indent = if text.contains("\n    \"") && !text.contains("\n  \"") { "    " } else { "  " };
+            return crate::datafiles::format_json(text, indent)
+                .map(|out| (out, "built-in JSON formatter".to_string()))
+                .ok_or_else(|| "Can't format: the JSON has errors (or comments — install Prettier or Biome for JSONC).".to_string());
+        } else if yaml {
+            return Err("Install Prettier to format YAML (npm i -D prettier).".into());
         } else {
             return Err("No formatter found. Install Biome (npm i -D @biomejs/biome) or Prettier.".into());
         }

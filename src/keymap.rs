@@ -109,6 +109,8 @@ pub const KEYS: &[(&str, &str, &str)] = &[
     ("Problems", "Status bar ⊗ 2 ⚠ 3  ·  :problems", "List lint + TypeScript problems; click a line to jump"),
     ("Problems", "Save a file", "Lints it (ESLint or Biome) and type-checks its TS project (tsc --noEmit)"),
     ("Problems", ":check now|off", "Re-run checks / turn them off"),
+    ("Problems", "JSON / YAML", "Syntax errors and duplicate keys shown as you type (tsconfig & .vscode allow comments)"),
+    ("Editing", "⇧⌥F on JSON / YAML", "Biome or Prettier; JSON falls back to a built-in formatter (keeps key order)"),
     ("Problems", "Squiggles", "Red = error, yellow = warning; message shown at the end of the line"),
     ("Diff (editable)", "F7  ·  ⇧F7", "Next / previous change"),
     ("Diff (editable)", "⌘K I", "Inline ↔ side-by-side"),

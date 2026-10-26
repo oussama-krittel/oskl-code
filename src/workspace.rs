@@ -357,6 +357,8 @@ pub struct Workspace {
     autosave_tasks: std::collections::HashMap<EntityId, Task<()>>,
     lint_diags: FileDiags,
     ts_diags: FileDiags,
+    data_diags: FileDiags,
+    data_tasks: HashMap<EntityId, Task<()>>,
     lint_tasks: HashMap<PathBuf, Task<()>>,
     tsc_task: Option<Task<()>>,
     tsc_running: bool,
@@ -459,6 +461,8 @@ impl Workspace {
             autosave_tasks: Default::default(),
             lint_diags: Default::default(),
             ts_diags: Default::default(),
+            data_diags: Default::default(),
+            data_tasks: Default::default(),
             lint_tasks: Default::default(),
             tsc_task: None,
             tsc_running: false,
@@ -987,6 +991,7 @@ impl Workspace {
                         tab.preview = false;
                     }
                     ws.schedule_autosave(editor.clone(), cx);
+                    ws.check_data_file(editor.clone(), Duration::from_millis(250), cx);
                     cx.notify();
                 }
                 EditorEvent::OpenCommit(sha) => ws.open_commit(sha.clone(), window, cx),
@@ -1000,6 +1005,7 @@ impl Workspace {
             self.add_tab(TabKind::Editor(editor.clone()), sub, preview, window, cx);
             self.push_diagnostics(cx);
             self.check_file(path.clone(), cx);
+            self.check_data_file(editor, Duration::ZERO, cx);
         }
         if let (Some(line), Some(ed)) = (line, self.active_editor()) {
             ed.update(cx, |ed, cx| ed.go_to(line.saturating_sub(1), 0, cx));
@@ -1028,6 +1034,7 @@ impl Workspace {
                         tab.preview = false;
                     }
                     ws.schedule_autosave(editor.clone(), cx);
+                    ws.check_data_file(editor.clone(), Duration::from_millis(250), cx);
                     cx.notify();
                 }
                 EditorEvent::OpenCommit(sha) => ws.open_commit(sha.clone(), window, cx),
@@ -1508,6 +1515,28 @@ impl Workspace {
         }
     }
 
+    /// JSON / YAML: checked as you type (built in, no tools needed).
+    fn check_data_file(&mut self, editor: Entity<Editor>, delay: Duration, cx: &mut Context<Self>) {
+        let Some(path) = editor.read(cx).path.clone() else { return };
+        let Some(kind) = crate::datafiles::kind(&path) else { return };
+        let id = editor.entity_id();
+        let text = editor.read(cx).text();
+        let task = cx.spawn(async move |this, cx| {
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
+            let diags = cx.background_executor().spawn(async move { crate::datafiles::check(kind, &text) }).await;
+            this.update(cx, |ws, cx| {
+                ws.data_tasks.remove(&id);
+                let key = path.canonicalize().unwrap_or(path.clone());
+                ws.data_diags.insert(key, diags);
+                ws.push_diagnostics(cx);
+            })
+            .ok();
+        });
+        self.data_tasks.insert(id, task);
+    }
+
     fn typecheck(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.tsc_running {
             // One check at a time; run once more afterwards with the latest file.
@@ -1537,7 +1566,7 @@ impl Workspace {
 
     fn diags_for(&self, path: &Path) -> Vec<Diag> {
         let key = path.canonicalize().unwrap_or(path.to_path_buf());
-        let mut out: Vec<Diag> = self.lint_diags.get(&key).into_iter().chain(self.ts_diags.get(&key)).flatten().cloned().collect();
+        let mut out: Vec<Diag> = self.lint_diags.get(&key).into_iter().chain(self.ts_diags.get(&key)).chain(self.data_diags.get(&key)).flatten().cloned().collect();
         out.sort_by_key(|d| (d.row, d.col, d.severity));
         out
     }
@@ -1561,7 +1590,7 @@ impl Workspace {
     }
 
     fn problem_counts(&self) -> (usize, usize) {
-        let all = self.lint_diags.values().chain(self.ts_diags.values()).flatten();
+        let all = self.lint_diags.values().chain(self.ts_diags.values()).chain(self.data_diags.values()).flatten();
         all.fold((0, 0), |(e, w), d| match d.severity {
             Severity::Error => (e + 1, w),
             _ => (e, w + 1),
@@ -1574,6 +1603,7 @@ impl Workspace {
             .lint_diags
             .iter()
             .chain(self.ts_diags.iter())
+            .chain(self.data_diags.iter())
             .flat_map(|(p, ds)| ds.iter().map(move |d| (p.clone(), d.clone())))
             .collect();
         rows.sort_by(|a, b| (a.1.severity, &a.0, a.1.row).cmp(&(b.1.severity, &b.0, b.1.row)));
@@ -3149,7 +3179,7 @@ impl Render for Workspace {
                     ws.resizing_side = true;
                     cx.stop_propagation();
                 }));
-            let panel = div().flex_none().w(px(self.side_w)).h_full().min_w_0().overflow_hidden().bg(theme::bg_side()).child(sidebar);
+            let panel = div().flex_none().w(px(self.side_w)).h_full().min_w_0().overflow_hidden().px(px(5.)).bg(theme::bg_side()).child(sidebar);
             if right { div().flex().h_full().child(handle).child(panel) } else { div().flex().h_full().child(panel).child(handle) }
         });
         let main = div()
