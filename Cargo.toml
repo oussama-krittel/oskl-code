@@ -1,0 +1,41 @@
+[package]
+name = "kite"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight, git-first code editor for macOS"
+
+[dependencies]
+alacritty_terminal = "0.26"
+anyhow = "1"
+futures = "0.3"
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+notify = "6"
+regex = "1"
+ropey = "1.6"
+serde_json = "1.0.154"
+similar = "2"
+tree-sitter = "0.27"
+tree-sitter-bash = "0.25.1"
+tree-sitter-css = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-highlight = "0.27"
+tree-sitter-html = "0.23.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-yaml = "0.7.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
