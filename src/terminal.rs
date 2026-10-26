@@ -215,6 +215,23 @@ impl TerminalView {
     fn key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let m = &ks.modifiers;
+        // Keyboard scrollback (like iTerm): ⇧PgUp/⇧PgDn a page, ⇧⌘↑/⇧⌘↓ top/bottom.
+        // Full-screen apps (vim, less, htop) get these keys themselves.
+        if m.shift && !self.term.lock().mode().contains(TermMode::ALT_SCREEN) {
+            let scroll = match (ks.key.as_str(), m.platform) {
+                ("pageup", _) => Some(Scroll::PageUp),
+                ("pagedown", _) => Some(Scroll::PageDown),
+                ("up", true) | ("home", _) => Some(Scroll::Top),
+                ("down", true) | ("end", _) => Some(Scroll::Bottom),
+                _ => None,
+            };
+            if let Some(scroll) = scroll {
+                self.term.lock().scroll_display(scroll);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
         if m.platform {
             match ks.key.as_str() {
                 "c" => {

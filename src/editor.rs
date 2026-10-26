@@ -27,7 +27,7 @@ actions!(
         Newline, NewlineAbove, Indent, Outdent,
         SelectAll, SelectLine, Copy, Cut, Paste, Undo, Redo,
         MoveLineUp, MoveLineDown, DuplicateLineDown, DuplicateLineUp, DeleteLine, ToggleComment,
-        Escape, Submit, ShowCharacterPalette,
+        Escape, Submit, ShowCharacterPalette, ScrollLineUp, ScrollLineDown,
     ]
 );
 
@@ -103,6 +103,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-k", DeleteLine, c),
         KeyBinding::new("cmd-/", ToggleComment, c),
         KeyBinding::new("escape", Escape, c),
+        KeyBinding::new("ctrl-alt-up", ScrollLineUp, c),
+        KeyBinding::new("ctrl-alt-down", ScrollLineDown, c),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, c),
     ]);
 }
@@ -690,6 +692,16 @@ impl Editor {
         self.scroll_y += n as f32 * self.line_height();
         self.motion(cx, |b| b.move_vertical(n, false))
     }
+    /// ⌃⌥↑ / ⌃⌥↓: scroll the view a line, leaving the cursor where it is.
+    fn scroll_line_up(&mut self, _: &ScrollLineUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_y = (self.scroll_y - self.line_height()).max(0.);
+        cx.notify();
+    }
+    fn scroll_line_down(&mut self, _: &ScrollLineDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_y += self.line_height();
+        cx.notify();
+    }
+
     fn select_page_up(&mut self, _: &SelectPageUp, _: &mut Window, cx: &mut Context<Self>) { let n = self.page_rows(); self.motion(cx, |b| b.move_vertical(-n, true)) }
     fn select_page_down(&mut self, _: &SelectPageDown, _: &mut Window, cx: &mut Context<Self>) { let n = self.page_rows(); self.motion(cx, |b| b.move_vertical(n, true)) }
 
@@ -1842,6 +1854,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_comment))
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::show_character_palette))
+            .on_action(cx.listener(Self::scroll_line_up))
+            .on_action(cx.listener(Self::scroll_line_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))

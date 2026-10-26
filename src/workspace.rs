@@ -35,6 +35,7 @@ actions!(
         FindFile, CommandPalette, FindInFile, FindNext, FindPrev, ShowFiles, ShowGit, ToggleSidebar,
         ToggleOutput, FocusEditor, FocusSidebar, Save, CloseTab, NextTab, PrevTab, FormatFile,
         ToggleBlame, ZoomIn, ZoomOut, Quit, GoToLine, RunShell, FocusCommit, ShowKeys, Lint,
+        OutputDown, OutputUp, OutputPageDown, OutputPageUp, OutputTop, OutputBottom, OutputOpen, OutputLeave,
         OpenFolder, OpenFolderNewWindow, NextWindow, SearchAll, ShowKeysPanel, ToggleSidebarSide,
         SplitRight, SplitDown, ClosePane, ZoomPane, FocusLeft, FocusRight, FocusUp, FocusDown,
         NewTerminal, ToggleTerminal, PaneBuffers,
@@ -109,8 +110,24 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-f", SearchAll, None),
         KeyBinding::new("cmd-k cmd-b", ToggleSidebarSide, None),
     ]);
+    let o = Some("Output");
+    cx.bind_keys([
+        KeyBinding::new("j", OutputDown, o),
+        KeyBinding::new("down", OutputDown, o),
+        KeyBinding::new("k", OutputUp, o),
+        KeyBinding::new("up", OutputUp, o),
+        KeyBinding::new("space", OutputPageDown, o),
+        KeyBinding::new("pagedown", OutputPageDown, o),
+        KeyBinding::new("pageup", OutputPageUp, o),
+        KeyBinding::new("g", OutputTop, o),
+        KeyBinding::new("home", OutputTop, o),
+        KeyBinding::new("shift-g", OutputBottom, o),
+        KeyBinding::new("end", OutputBottom, o),
+        KeyBinding::new("enter", OutputOpen, o),
+        KeyBinding::new("escape", OutputLeave, o),
+    ]);
     // In the non-text panes, ":" opens the command line and "/" finds files, like a terminal UI.
-    for ctx in ["FileTree", "GitPanel", "DiffView", "CommitView"] {
+    for ctx in ["FileTree", "GitPanel", "DiffView", "CommitView", "Output"] {
         cx.bind_keys([
             KeyBinding::new("shift-;", CommandPalette, Some(ctx)),
             KeyBinding::new(":", CommandPalette, Some(ctx)),
@@ -355,6 +372,8 @@ pub struct Workspace {
     output_h: f32,
     resizing_output: bool,
     output_scroll: UniformListScrollHandle,
+    output_focus: FocusHandle,
+    output_sel: usize,
     cmd: Entity<Editor>,
     cmd_mode: Option<CmdMode>,
     cmd_items: Vec<CmdItem>,
@@ -464,6 +483,8 @@ impl Workspace {
             output_h: 220.,
             resizing_output: false,
             output_scroll: UniformListScrollHandle::new(),
+            output_focus: cx.focus_handle(),
+            output_sel: 0,
             cmd,
             cmd_mode: None,
             cmd_items: Vec::new(),
@@ -564,6 +585,7 @@ impl Workspace {
         }
         self.output_visible = true;
         self.output_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.output_sel = 0;
         cx.notify();
     }
 
@@ -1295,9 +1317,31 @@ impl Workspace {
         cx.notify();
     }
 
-    fn toggle_output(&mut self, _: &ToggleOutput, _: &mut Window, cx: &mut Context<Self>) {
+    /// ⌘J: open the output panel and put keyboard focus in it; again to close it.
+    fn toggle_output(&mut self, _: &ToggleOutput, window: &mut Window, cx: &mut Context<Self>) {
         self.output_visible = !self.output_visible;
+        if self.output_visible {
+            window.focus(&self.output_focus);
+        } else if self.output_focus.is_focused(window) {
+            self.focus_active(window, cx);
+        }
         cx.notify();
+    }
+
+    fn output_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let n = self.output.len();
+        if n == 0 {
+            return;
+        }
+        self.output_sel = (self.output_sel as isize + delta).clamp(0, n as isize - 1) as usize;
+        self.output_scroll.scroll_to_item(self.output_sel, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    fn output_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((file, row, _)) = self.output.get(self.output_sel).and_then(|l| l.loc.clone()) else { return };
+        let root = self.root(cx);
+        self.open_file(resolve(&root, &file), Some(row), false, window, cx);
     }
 
     fn on_focus_editor(&mut self, _: &FocusEditor, window: &mut Window, cx: &mut Context<Self>) {
@@ -2962,7 +3006,19 @@ impl Workspace {
 
     fn render_output(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.output.len();
+        let page = ((self.output_h - 40.) / 18.).max(1.) as isize;
         div()
+            .key_context("Output")
+            .track_focus(&self.output_focus)
+            .on_action(cx.listener(|ws, _: &OutputDown, _, cx| ws.output_move(1, cx)))
+            .on_action(cx.listener(|ws, _: &OutputUp, _, cx| ws.output_move(-1, cx)))
+            .on_action(cx.listener(move |ws, _: &OutputPageDown, _, cx| ws.output_move(page, cx)))
+            .on_action(cx.listener(move |ws, _: &OutputPageUp, _, cx| ws.output_move(-page, cx)))
+            .on_action(cx.listener(|ws, _: &OutputTop, _, cx| ws.output_move(isize::MIN / 2, cx)))
+            .on_action(cx.listener(|ws, _: &OutputBottom, _, cx| ws.output_move(isize::MAX / 2, cx)))
+            .on_action(cx.listener(|ws, _: &OutputOpen, w, cx| ws.output_open(w, cx)))
+            .on_action(cx.listener(|ws, _: &OutputLeave, w, cx| ws.focus_active(w, cx)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|ws, _, w, _| w.focus(&ws.output_focus)))
             .flex()
             .flex_col()
             .flex_none()
@@ -3006,8 +3062,10 @@ impl Workspace {
                             .map(|ix| {
                                 let line = &ws.output[ix];
                                 let loc = line.loc.clone();
+                                let selected = ix == ws.output_sel && ws.output_focus.is_focused(_window);
                                 div()
                                     .id(("out", ix))
+                                    .when(selected, |d| d.bg(theme::selected_focused()))
                                     .px(px(12.))
                                     .h(px(18.))
                                     .whitespace_nowrap()
