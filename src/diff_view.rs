@@ -13,30 +13,30 @@ use std::time::Duration;
 
 actions!(diff_view, [NextRow, PrevRow, NextHunk, PrevHunk, ToggleBlame, ToggleInline, OpenFile, CopyRow, Top, Bottom, PageDownRows, PageUpRows]);
 
-pub fn bind_keys(cx: &mut App) {
+pub fn bind_keys() {
     let c = Some("DiffView");
-    cx.bind_keys([
-        KeyBinding::new("j", NextRow, c),
-        KeyBinding::new("down", NextRow, c),
-        KeyBinding::new("k", PrevRow, c),
-        KeyBinding::new("up", PrevRow, c),
-        KeyBinding::new("n", NextHunk, c),
-        KeyBinding::new("alt-down", NextHunk, c),
-        KeyBinding::new("f7", NextHunk, c),
-        KeyBinding::new("p", PrevHunk, c),
-        KeyBinding::new("shift-n", PrevHunk, c),
-        KeyBinding::new("alt-up", PrevHunk, c),
-        KeyBinding::new("shift-f7", PrevHunk, c),
-        KeyBinding::new("b", ToggleBlame, c),
-        KeyBinding::new("i", ToggleInline, c),
-        KeyBinding::new("enter", OpenFile, c),
-        KeyBinding::new("o", OpenFile, c),
-        KeyBinding::new("cmd-c", CopyRow, c),
-        KeyBinding::new("g", Top, c),
-        KeyBinding::new("shift-g", Bottom, c),
-        KeyBinding::new("space", PageDownRows, c),
-        KeyBinding::new("pagedown", PageDownRows, c),
-        KeyBinding::new("pageup", PageUpRows, c),
+    crate::keybindings::collect([
+        crate::keybindings::kb("j", NextRow, c),
+        crate::keybindings::kb("down", NextRow, c),
+        crate::keybindings::kb("k", PrevRow, c),
+        crate::keybindings::kb("up", PrevRow, c),
+        crate::keybindings::kb("n", NextHunk, c),
+        crate::keybindings::kb("alt-down", NextHunk, c),
+        crate::keybindings::kb("f7", NextHunk, c),
+        crate::keybindings::kb("p", PrevHunk, c),
+        crate::keybindings::kb("shift-n", PrevHunk, c),
+        crate::keybindings::kb("alt-up", PrevHunk, c),
+        crate::keybindings::kb("shift-f7", PrevHunk, c),
+        crate::keybindings::kb("b", ToggleBlame, c),
+        crate::keybindings::kb("i", ToggleInline, c),
+        crate::keybindings::kb("enter", OpenFile, c),
+        crate::keybindings::kb("o", OpenFile, c),
+        crate::keybindings::kb("cmd-c", CopyRow, c),
+        crate::keybindings::kb("g", Top, c),
+        crate::keybindings::kb("shift-g", Bottom, c),
+        crate::keybindings::kb("space", PageDownRows, c),
+        crate::keybindings::kb("pagedown", PageDownRows, c),
+        crate::keybindings::kb("pageup", PageUpRows, c),
     ]);
 }
 

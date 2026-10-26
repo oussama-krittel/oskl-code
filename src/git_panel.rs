@@ -14,22 +14,22 @@ use std::rc::Rc;
 
 actions!(git_panel, [Down, Up, Open, ToggleStage, Discard, OpenFile, FocusCommit, Refresh, Top, Bottom]);
 
-pub fn bind_keys(cx: &mut App) {
+pub fn bind_keys() {
     let c = Some("GitPanel");
-    cx.bind_keys([
-        KeyBinding::new("j", Down, c),
-        KeyBinding::new("down", Down, c),
-        KeyBinding::new("k", Up, c),
-        KeyBinding::new("up", Up, c),
-        KeyBinding::new("enter", Open, c),
-        KeyBinding::new("space", ToggleStage, c),
-        KeyBinding::new("s", ToggleStage, c),
-        KeyBinding::new("d", Discard, c),
-        KeyBinding::new("o", OpenFile, c),
-        KeyBinding::new("c", FocusCommit, c),
-        KeyBinding::new("r", Refresh, c),
-        KeyBinding::new("g", Top, c),
-        KeyBinding::new("shift-g", Bottom, c),
+    crate::keybindings::collect([
+        crate::keybindings::kb("j", Down, c),
+        crate::keybindings::kb("down", Down, c),
+        crate::keybindings::kb("k", Up, c),
+        crate::keybindings::kb("up", Up, c),
+        crate::keybindings::kb("enter", Open, c),
+        crate::keybindings::kb("space", ToggleStage, c),
+        crate::keybindings::kb("s", ToggleStage, c),
+        crate::keybindings::kb("d", Discard, c),
+        crate::keybindings::kb("o", OpenFile, c),
+        crate::keybindings::kb("c", FocusCommit, c),
+        crate::keybindings::kb("r", Refresh, c),
+        crate::keybindings::kb("g", Top, c),
+        crate::keybindings::kb("shift-g", Bottom, c),
     ]);
 }
 
@@ -66,6 +66,7 @@ pub struct GitPanel {
     changes_scroll: ScrollHandle,
     commit_task: Option<Task<()>>,
     menu_open: bool,
+    branch_menu: Option<(git::Ref, Point<Pixels>)>,
     scope_open: bool,
     scope_branches: Vec<String>,
     scope_remotes: Vec<String>,
@@ -113,6 +114,7 @@ impl GitPanel {
             changes_scroll: ScrollHandle::new(),
             commit_task: None,
             menu_open: false,
+            branch_menu: None,
             scope_open: false,
             scope_branches: Vec::new(),
             scope_remotes: Vec::new(),
@@ -439,6 +441,76 @@ impl GitPanel {
                     .child(div().flex_1().child(label.to_string()))
                     .child(div().text_color(theme::fg_muted()).child(hint.to_string()))
             }))
+    }
+
+    /// The menu for a branch/tag label in the graph.
+    fn render_branch_menu(&self, r: git::Ref, cx: &mut Context<Self>) -> impl IntoElement {
+        let item = |id: &'static str, label: String, enabled: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .h(px(24.))
+                .px(px(10.))
+                .mx(px(4.))
+                .rounded(px(3.))
+                .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(theme::selected_focused())))
+                .when(!enabled, |d| d.text_color(theme::fg_muted()))
+                .child(label)
+        };
+        let name = r.name.clone();
+        let git = |panel: &mut Self, args: Vec<String>, cx: &mut Context<Self>| {
+            panel.branch_menu = None;
+            panel.repo.update(cx, |repo, cx| repo.run_git(args, cx));
+            cx.notify();
+        };
+        let mut menu = div()
+            .id("branch-menu")
+            .occlude()
+            .w(px(260.))
+            .py(px(4.))
+            .bg(theme::bg_popup())
+            .border_1()
+            .border_color(theme::border_input())
+            .rounded(px(6.))
+            .shadow_lg()
+            .text_size(px(11.))
+            .on_mouse_down_out(cx.listener(|p, _, _, cx| {
+                p.branch_menu = None;
+                cx.notify();
+            }))
+            .child(div().px(px(14.)).py(px(4.)).text_color(theme::fg_muted()).overflow_hidden().whitespace_nowrap().child(name.clone()));
+        match r.kind {
+            git::RefKind::Local => {
+                let (n1, n2, n3) = (name.clone(), name.clone(), name.clone());
+                menu = menu
+                    .child(item("bm-checkout", if r.is_head { "Checked out".into() } else { format!("Checkout {name}") }, !r.is_head).when(!r.is_head, |d| {
+                        d.on_click(cx.listener(move |p, _, _, cx| git(p, vec!["switch".into(), n1.clone()], cx)))
+                    }))
+                    .child(item("bm-detach", "Checkout detached".into(), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["switch".into(), "--detach".into(), n2.clone()], cx))))
+                    .child(div().my(px(4.)).h(px(1.)).bg(theme::border()))
+                    .child(
+                        item("bm-delete", if r.is_head { "Can't delete the checked-out branch".into() } else { format!("Delete {name}") }, !r.is_head)
+                            .when(!r.is_head, |d| d.text_color(theme::git_deleted()).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["branch".into(), "-d".into(), n3.clone()], cx)))),
+                    );
+            }
+            git::RefKind::Remote => {
+                let short = name.split_once('/').map(|(_, b)| b.to_string()).unwrap_or(name.clone());
+                let (n1, n2) = (short.clone(), name.clone());
+                menu = menu
+                    .child(item("bm-checkout", format!("Checkout {short} (tracks {name})"), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["switch".into(), n1.clone()], cx))))
+                    .child(item("bm-detach", "Checkout detached".into(), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["switch".into(), "--detach".into(), n2.clone()], cx))))
+                    .child(div().px(px(14.)).py(px(4.)).text_size(px(10.)).text_color(theme::fg_muted()).child("Remote branches can't be deleted from here"));
+            }
+            git::RefKind::Tag => {
+                let (n1, n2) = (name.clone(), name.clone());
+                menu = menu
+                    .child(item("bm-detach", format!("Checkout {name} (detached)"), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["switch".into(), "--detach".into(), n1.clone()], cx))))
+                    .child(div().my(px(4.)).h(px(1.)).bg(theme::border()))
+                    .child(item("bm-delete", format!("Delete tag {name}"), true).text_color(theme::git_deleted()).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["tag".into(), "-d".into(), n2.clone()], cx))));
+            }
+        }
+        menu
     }
 
     /// Graph filter: Auto, All, or any pick of local and remote branches.
@@ -828,7 +900,8 @@ impl GitPanel {
         .flex_none();
 
         // Every branch pointer is shown: local (blue) and its remote origin/… (orange) separately.
-        let badges = commit.refs.iter().filter_map(|r| {
+        let badges = commit.refs.iter().enumerate().filter_map(|(ri, r)| {
+            let menu_ref = r.clone();
             let (color, icon_name) = match r.kind {
                 RefKind::Local => (theme::ref_local(), if r.is_head { "target" } else { "git" }),
                 RefKind::Remote => (theme::ref_remote(), "cloud"),
@@ -836,6 +909,7 @@ impl GitPanel {
             };
             Some(
                 div()
+                    .id(SharedString::from(format!("ref-{ix}-{ri}")))
                     .flex()
                     .flex_none()
                     .items_center()
@@ -844,6 +918,14 @@ impl GitPanel {
                     .pr(px(7.))
                     .h(px(18.))
                     .rounded(px(9.))
+                    .cursor_pointer()
+                    .hover(|s| s.opacity(0.85))
+                    .on_click(cx.listener(move |panel, ev: &ClickEvent, _, cx| {
+                        // Click a branch/tag label: checkout, detached checkout or delete.
+                        cx.stop_propagation();
+                        panel.branch_menu = Some((menu_ref.clone(), ev.position()));
+                        cx.notify();
+                    }))
                     .bg(color)
                     .text_color(theme::c(0xffffff))
                     .text_size(px(10.5))
@@ -1019,6 +1101,7 @@ impl Render for GitPanel {
             .child(canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, _, _, _| {}).absolute().size_full())
             .when(self.menu_open, |d| d.child(deferred(self.render_menu(cx)).with_priority(1)))
             .when(self.scope_open, |d| d.child(deferred(self.render_scope(cx)).with_priority(1)))
+            .when_some(self.branch_menu.clone(), |d, (r, pos)| d.child(deferred(anchored().position(pos).snap_to_window().child(self.render_branch_menu(r, cx))).with_priority(2)))
             .child(
                 div()
                     .flex()

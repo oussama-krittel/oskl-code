@@ -9,17 +9,17 @@ use std::path::PathBuf;
 
 actions!(commit_view, [Next, Prev, OpenSelected, CopySha]);
 
-pub fn bind_keys(cx: &mut App) {
+pub fn bind_keys() {
     let c = Some("CommitView");
-    cx.bind_keys([
-        KeyBinding::new("j", Next, c),
-        KeyBinding::new("down", Next, c),
-        KeyBinding::new("k", Prev, c),
-        KeyBinding::new("up", Prev, c),
-        KeyBinding::new("enter", OpenSelected, c),
-        KeyBinding::new("o", OpenSelected, c),
-        KeyBinding::new("y", CopySha, c),
-        KeyBinding::new("cmd-c", CopySha, c),
+    crate::keybindings::collect([
+        crate::keybindings::kb("j", Next, c),
+        crate::keybindings::kb("down", Next, c),
+        crate::keybindings::kb("k", Prev, c),
+        crate::keybindings::kb("up", Prev, c),
+        crate::keybindings::kb("enter", OpenSelected, c),
+        crate::keybindings::kb("o", OpenSelected, c),
+        crate::keybindings::kb("y", CopySha, c),
+        crate::keybindings::kb("cmd-c", CopySha, c),
     ]);
 }
 

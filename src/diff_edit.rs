@@ -13,14 +13,14 @@ use std::rc::Rc;
 
 actions!(diff_edit, [NextChange, PrevChange, ToggleInlineDiff]);
 
-pub fn bind_keys(cx: &mut App) {
+pub fn bind_keys() {
     let c = Some("DiffEdit");
-    cx.bind_keys([
-        KeyBinding::new("f7", NextChange, c),
-        KeyBinding::new("shift-f7", PrevChange, c),
-        KeyBinding::new("alt-f5", NextChange, c),
-        KeyBinding::new("shift-alt-f5", PrevChange, c),
-        KeyBinding::new("cmd-k i", ToggleInlineDiff, c),
+    crate::keybindings::collect([
+        crate::keybindings::kb("f7", NextChange, c),
+        crate::keybindings::kb("shift-f7", PrevChange, c),
+        crate::keybindings::kb("alt-f5", NextChange, c),
+        crate::keybindings::kb("shift-alt-f5", PrevChange, c),
+        crate::keybindings::kb("cmd-k i", ToggleInlineDiff, c),
     ]);
 }
 

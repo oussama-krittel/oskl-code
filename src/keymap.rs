@@ -1,10 +1,10 @@
 //! The shortcuts manual: one list of every binding and command, shown as a sidebar tab.
 
 use crate::editor::{Editor, EditorEvent, EditorMode};
-use crate::{theme, ui, util};
+use crate::keybindings as kb;
+use crate::{theme, ui};
 use gpui::prelude::*;
 use gpui::*;
-use std::ops::Range;
 
 /// (section, keys, what it does)
 pub const KEYS: &[(&str, &str, &str)] = &[
@@ -92,6 +92,8 @@ pub const KEYS: &[(&str, &str, &str)] = &[
     ("Mouse & trackpad", "Click / drag line numbers", "Select whole lines"),
     ("Mouse & trackpad", "Two-finger scroll", "Smooth scroll (horizontal too); drag the scrollbar"),
     ("Mouse & trackpad", "Click blame gutter", "Open that commit"),
+    ("Mouse & trackpad", "Click a branch label in the graph", "Checkout · checkout detached · delete (local branches and tags only)"),
+    ("Mouse & trackpad", "Drag a split's item / an explorer file", "Move it to another split; drop near an edge to split"),
     ("Mouse & trackpad", "Middle-click tab", "Close tab; double-click a tab to keep it open"),
     ("Search in file", "⌘F", "Search in file (live, case-insensitive unless you type capitals)"),
     ("Search in file", "⌘G  ·  ⌘⇧G", "Next / previous match"),
@@ -163,28 +165,49 @@ pub const KEYS: &[(&str, &str, &str)] = &[
     ("Commands (:)", ":zoom in|out|reset  ·  :keys", "Font size / this manual"),
 ];
 
+/// Sections of `KEYS` that aren't rebindable shortcuts (mouse, built-in terminal keys, commands).
+const REFERENCE: &[&str] = &["Mouse & trackpad", "Terminal", "Commands (:)", "Problems"];
+
+/// `:keys` — every shortcut as currently bound, then the reference list.
 pub fn as_text() -> String {
+    let cfg = kb::Config::load();
     let mut out = String::new();
+    let mut section = String::new();
+    for e in kb::entries() {
+        if e.section != section {
+            out.push_str(&format!("\n{}\n", e.section.to_uppercase()));
+            section = e.section.clone();
+        }
+        let keys: Vec<String> = cfg.effective(&e).iter().map(|k| kb::label(k)).collect();
+        out.push_str(&format!("  {:<34} {}\n", keys.join("  ·  "), e.desc));
+    }
     let mut section = "";
-    for (s, k, d) in KEYS {
+    for (s, k, d) in KEYS.iter().filter(|(s, _, _)| REFERENCE.contains(s)) {
         if *s != section {
             out.push_str(&format!("\n{}\n", s.to_uppercase()));
             section = s;
         }
-        out.push_str(&format!("  {k:<38} {d}\n"));
+        out.push_str(&format!("  {k:<34} {d}\n"));
     }
     out
 }
 
-enum Line {
-    Header(&'static str),
-    Key(usize),
+#[derive(Clone, Copy, PartialEq)]
+enum Rec {
+    /// Recording a key for an entry; `None` slot means "add another key".
+    Key { entry: usize, slot: Option<usize> },
+    /// Recording a direction letter (0 ← · 1 ↓ · 2 ↑ · 3 →).
+    Dir(usize),
 }
 
 pub struct KeysPanel {
     focus: FocusHandle,
     filter: Entity<Editor>,
-    lines: Vec<Line>,
+    entries: Vec<kb::Entry>,
+    cfg: kb::Config,
+    recording: Option<Rec>,
+    message: Option<(String, bool)>,
+    scroll: ScrollHandle,
     _sub: Subscription,
 }
 
@@ -192,39 +215,227 @@ impl KeysPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| {
             let mut ed = Editor::new(EditorMode::SingleLine, cx);
-            ed.placeholder = "Filter shortcuts (e.g. blame, ⌘, delete)".into();
+            ed.placeholder = "Filter (e.g. split, blame, ⌘D)".into();
             ed
         });
-        let sub = cx.subscribe_in(&filter, window, |p, _, ev: &EditorEvent, _, cx| {
+        let sub = cx.subscribe_in(&filter, window, |_, _, ev: &EditorEvent, _, cx| {
             if let EditorEvent::Changed = ev {
-                p.rebuild(cx);
+                cx.notify();
             }
         });
-        let mut p = Self { focus: cx.focus_handle(), filter, lines: Vec::new(), _sub: sub };
-        p.rebuild(cx);
-        p
+        Self {
+            focus: cx.focus_handle(),
+            filter,
+            entries: kb::entries(),
+            cfg: kb::Config::load(),
+            recording: None,
+            message: None,
+            scroll: ScrollHandle::new(),
+            _sub: sub,
+        }
     }
 
     pub fn focus(&self, window: &mut Window, cx: &App) {
         self.filter.read(cx).focus(window);
     }
 
-    fn rebuild(&mut self, cx: &mut Context<Self>) {
-        let q = self.filter.read(cx).text().to_lowercase();
-        self.lines.clear();
-        let mut section = "";
-        for (ix, (s, k, d)) in KEYS.iter().enumerate() {
-            let hay = format!("{s} {k} {d}").to_lowercase();
-            if !q.is_empty() && !q.split_whitespace().all(|w| hay.contains(w)) && util::fuzzy(&q, d).is_none() {
-                continue;
-            }
-            if *s != section {
-                self.lines.push(Line::Header(s));
-                section = s;
-            }
-            self.lines.push(Line::Key(ix));
-        }
+    fn start(&mut self, rec: Rec, window: &mut Window, cx: &mut Context<Self>) {
+        self.recording = Some(rec);
+        self.message = Some(("Press the new shortcut… (Esc cancels)".into(), false));
+        window.focus(&self.focus);
         cx.notify();
+    }
+
+    fn commit(&mut self, cx: &mut Context<Self>, msg: String) {
+        self.cfg.save();
+        kb::apply(cx);
+        self.recording = None;
+        self.message = Some((msg, false));
+        cx.notify();
+    }
+
+    fn fail(&mut self, msg: String, cx: &mut Context<Self>) {
+        self.recording = None;
+        self.message = Some((msg, true));
+        cx.notify();
+    }
+
+    fn set_keys(&mut self, ix: usize, keys: Vec<String>, cx: &mut Context<Self>, msg: String) {
+        let e = &self.entries[ix];
+        let defaults: Vec<String> = e.defaults.iter().map(|k| self.cfg.resolve(k)).collect();
+        if keys == defaults {
+            self.cfg.overrides.remove(&e.id);
+        } else {
+            self.cfg.overrides.insert(e.id.clone(), keys);
+        }
+        self.commit(cx, msg);
+    }
+
+    fn key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(rec) = self.recording else { return };
+        cx.stop_propagation();
+        let mut ks = ev.keystroke.clone();
+        if ks.key == "escape" && !ks.modifiers.modified() {
+            self.recording = None;
+            self.message = None;
+            return cx.notify();
+        }
+        // fn is implied by Page Up/Down, Home/End and ⌦ on Mac keyboards.
+        ks.modifiers.function = false;
+        let key = ks.unparse();
+        match rec {
+            Rec::Dir(i) => self.record_direction(i, &ks, cx),
+            Rec::Key { entry, slot } => self.record_key(entry, slot, key, cx),
+        }
+    }
+
+    fn record_key(&mut self, ix: usize, slot: Option<usize>, key: String, cx: &mut Context<Self>) {
+        let Some(key) = kb::normalize(&key) else { return self.fail(format!("Can't use \"{key}\""), cx) };
+        let e = &self.entries[ix];
+        let label = kb::label(&key);
+        if let Some(why) = kb::reserved(&key)
+            && !(e.id.ends_with("Quit") && key == "cmd-q")
+        {
+            return self.fail(format!("{label} is used by {why} — pick another"), cx);
+        }
+        if kb::blocks_typing(&key, e.ctx.as_deref()) {
+            return self.fail(format!("{label} alone would stop you typing — add ⌘, ⌃ or ⌥"), cx);
+        }
+        if let Some(other) = kb::conflict(&self.cfg, &self.entries, &key, e.ctx.as_deref(), &e.id) {
+            return self.fail(format!("{label} is already used by {} › {}", other.section, other.desc), cx);
+        }
+        let mut keys = self.cfg.effective(e);
+        match slot {
+            Some(i) if i < keys.len() => keys[i] = key,
+            _ if keys.contains(&key) => {}
+            _ => keys.push(key),
+        }
+        let desc = e.desc.clone();
+        self.set_keys(ix, keys, cx, format!("{desc}: {label}"));
+    }
+
+    fn record_direction(&mut self, i: usize, ks: &Keystroke, cx: &mut Context<Self>) {
+        let m = &ks.modifiers;
+        if m.control || m.alt || m.platform || ks.key.chars().count() != 1 {
+            return self.fail("Direction keys are single letters or symbols, without modifiers".into(), cx);
+        }
+        let letter = ks.key.to_lowercase();
+        if self.cfg.dirs.iter().enumerate().any(|(j, d)| j != i && *d == letter) {
+            return self.fail(format!("\"{letter}\" is already another direction"), cx);
+        }
+        let mut next = self.cfg.clone();
+        next.dirs[i] = letter.clone();
+        // Every shortcut built from direction letters must stay valid with the new letter.
+        for e in self.entries.iter().filter(|e| !next.is_custom(e) && e.defaults.iter().any(|k| k.contains('{'))) {
+            for k in next.effective(e) {
+                if let Some(why) = kb::reserved(&k) {
+                    return self.fail(format!("{} would be {} ({why})", e.desc, kb::label(&k)), cx);
+                }
+                if let Some(other) = kb::conflict(&next, &self.entries, &k, e.ctx.as_deref(), &e.id) {
+                    return self.fail(format!("{} → {} clashes with {} › {}", e.desc, kb::label(&k), other.section, other.desc), cx);
+                }
+            }
+        }
+        self.cfg = next;
+        let arrow = ["←", "↓", "↑", "→"][i];
+        self.commit(cx, format!("{arrow} is now \"{letter}\""));
+    }
+
+    fn chip(&self, id: SharedString, text: String, active: bool) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(4.))
+            .px(px(6.))
+            .h(px(20.))
+            .rounded(px(4.))
+            .border_1()
+            .border_color(if active { theme::frame_focused() } else { theme::border_input() })
+            .bg(if active { theme::frame_focused().opacity(0.15) } else { theme::bg_input() })
+            .text_color(theme::fg_bright())
+            .font_family(theme::MONO_FONT)
+            .text_size(px(10.5))
+            .cursor_pointer()
+            .hover(|s| s.border_color(theme::frame_focused()))
+            .child(text)
+    }
+
+    fn render_entry(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let e = &self.entries[ix];
+        let keys = self.cfg.effective(e);
+        let custom = self.cfg.is_custom(e);
+        let mut chips = div().flex().flex_wrap().gap(px(4.)).items_center();
+        for (slot, k) in keys.iter().enumerate() {
+            let rec = Rec::Key { entry: ix, slot: Some(slot) };
+            let active = self.recording == Some(rec);
+            let text = if active { "press keys…".to_string() } else { kb::label(k) };
+            chips = chips.child(
+                self.chip(SharedString::from(format!("k-{ix}-{slot}")), text, active)
+                    .group(SharedString::from(format!("kg-{ix}-{slot}")))
+                    .tooltip(ui::tooltip("Click to change"))
+                    .on_click(cx.listener(move |p, _, w, cx| p.start(rec, w, cx)))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("kx-{ix}-{slot}")))
+                            .invisible()
+                            .group_hover(SharedString::from(format!("kg-{ix}-{slot}")), |s| s.visible())
+                            .text_color(theme::fg_muted())
+                            .hover(|s| s.text_color(theme::git_deleted()))
+                            .on_click(cx.listener(move |p, _, _, cx| {
+                                cx.stop_propagation();
+                                let mut keys = p.cfg.effective(&p.entries[ix]);
+                                if slot < keys.len() {
+                                    let removed = keys.remove(slot);
+                                    let desc = p.entries[ix].desc.clone();
+                                    p.set_keys(ix, keys, cx, format!("Removed {} from {desc}", kb::label(&removed)));
+                                }
+                            }))
+                            .child("✕"),
+                    ),
+            );
+        }
+        let adding = self.recording == Some(Rec::Key { entry: ix, slot: None });
+        chips = chips.child(
+            self.chip(SharedString::from(format!("k-{ix}-add")), if adding { "press keys…".into() } else { "+".into() }, adding)
+                .tooltip(ui::tooltip("Add another shortcut"))
+                .on_click(cx.listener(move |p, _, w, cx| p.start(Rec::Key { entry: ix, slot: None }, w, cx))),
+        );
+        if custom {
+            chips = chips.child(
+                div()
+                    .id(SharedString::from(format!("k-{ix}-reset")))
+                    .px(px(4.))
+                    .text_color(theme::fg_muted())
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme::fg_bright()))
+                    .tooltip(ui::tooltip("Reset to default"))
+                    .on_click(cx.listener(move |p, _, _, cx| {
+                        let id = p.entries[ix].id.clone();
+                        p.cfg.overrides.remove(&id);
+                        let desc = p.entries[ix].desc.clone();
+                        p.commit(cx, format!("{desc}: back to default"));
+                    }))
+                    .child("↺"),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .px(px(12.))
+            .py(px(5.))
+            .hover(|s| s.bg(theme::hover()))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(6.))
+                    .child(div().text_color(if custom { theme::frame_focused() } else { theme::fg() }).child(e.desc.clone()))
+                    .when(custom, |d| d.child(div().text_color(theme::fg_muted()).child("(custom)"))),
+            )
+            .child(chips)
+            .into_any_element()
     }
 }
 
@@ -237,12 +448,89 @@ impl Focusable for KeysPanel {
 impl Render for KeysPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.filter.read(cx).is_focused(window);
+        let q = self.filter.read(cx).text().to_lowercase();
+        let matches = |hay: &str| q.is_empty() || q.split_whitespace().all(|w| hay.to_lowercase().contains(w));
+
+        // Direction letters.
+        let mut dirs = div().flex().items_center().gap(px(6.)).px(px(12.)).pb(px(8.)).child(div().text_color(theme::fg_muted()).child("Directions"));
+        for (i, arrow) in ["←", "↓", "↑", "→"].iter().enumerate() {
+            let active = self.recording == Some(Rec::Dir(i));
+            let text = if active { "…".to_string() } else { format!("{arrow} {}", self.cfg.dirs[i].to_uppercase()) };
+            dirs = dirs.child(
+                self.chip(SharedString::from(format!("dir-{i}")), text, active)
+                    .tooltip(ui::tooltip("Letter used for this direction in ⌘⌥ / ⌘⌥⇧ / ⌃⌘ / ⌃⌥ shortcuts"))
+                    .on_click(cx.listener(move |p, _, w, cx| p.start(Rec::Dir(i), w, cx))),
+            );
+        }
+
+        let mut list = div().flex().flex_col();
+        let mut section = String::new();
+        for ix in 0..self.entries.len() {
+            let e = &self.entries[ix];
+            let keys_text: String = self.cfg.effective(e).iter().map(|k| format!("{} {k} ", kb::label(k))).collect();
+            if !matches(&format!("{} {} {}", e.section, e.desc, keys_text)) {
+                continue;
+            }
+            if e.section != section {
+                section = e.section.clone();
+                list = list.child(div().px(px(12.)).pt(px(12.)).pb(px(4.)).text_size(px(10.)).font_weight(FontWeight::BOLD).text_color(theme::accent()).child(section.to_uppercase()));
+            }
+            list = list.child(self.render_entry(ix, cx));
+        }
+        let mut ref_section = "";
+        for (s, k, d) in KEYS.iter().filter(|(s, _, _)| REFERENCE.contains(s)) {
+            if !matches(&format!("{s} {k} {d}")) {
+                continue;
+            }
+            if *s != ref_section {
+                ref_section = s;
+                list = list.child(div().px(px(12.)).pt(px(12.)).pb(px(4.)).text_size(px(10.)).font_weight(FontWeight::BOLD).text_color(theme::fg_muted()).child(format!("{} (built in)", s.to_uppercase())));
+            }
+            list = list.child(
+                div()
+                    .px(px(12.))
+                    .py(px(4.))
+                    .flex()
+                    .flex_col()
+                    .child(div().font_family(theme::MONO_FONT).text_color(theme::fg_dim()).child(*k))
+                    .child(div().text_color(theme::fg_muted()).child(*d)),
+            );
+        }
+
+        let custom_count = self.cfg.overrides.len();
         div()
+            .key_context("ShortcutsPanel")
             .track_focus(&self.focus)
+            .capture_key_down(cx.listener(Self::key_down))
             .size_full()
             .flex()
             .flex_col()
-            .child(div().flex().flex_none().items_center().h(px(35.)).px(px(20.)).text_size(px(10.5)).child("SHORTCUTS"))
+            .text_size(px(11.))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .h(px(35.))
+                    .px(px(12.))
+                    .child(div().flex_1().text_size(px(10.5)).child("SHORTCUTS"))
+                    .when(custom_count > 0, |d| {
+                        d.child(
+                            div()
+                                .id("keys-reset-all")
+                                .px(px(6.))
+                                .rounded(px(3.))
+                                .text_color(theme::fg_muted())
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::hover()).text_color(theme::fg_bright()))
+                                .on_click(cx.listener(|p, _, _, cx| {
+                                    p.cfg = kb::Config::default();
+                                    p.commit(cx, "All shortcuts reset to defaults".into());
+                                }))
+                                .child(format!("Reset all ({custom_count})")),
+                        )
+                    }),
+            )
             .child(
                 div().flex_none().px(px(12.)).pb(px(8.)).child(
                     div()
@@ -254,56 +542,10 @@ impl Render for KeysPanel {
                         .child(self.filter.clone()),
                 ),
             )
-            .child(
-                uniform_list(
-                    "keys",
-                    self.lines.len(),
-                    cx.processor(|p, range: Range<usize>, _, _| {
-                        range
-                            .map(|ix| match p.lines[ix] {
-                                Line::Header(s) => div()
-                                    .flex()
-                                    .items_end()
-                                    .h(px(30.))
-                                    .px(px(14.))
-                                    .pb(px(4.))
-                                    .text_size(px(10.5))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme::accent())
-                                    .child(s.to_uppercase())
-                                    .into_any_element(),
-                                Line::Key(k) => {
-                                    let (_, keys, desc) = KEYS[k];
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .justify_center()
-                                        .h(px(40.))
-                                        .px(px(14.))
-                                        .hover(|s| s.bg(theme::hover()))
-                                        .child(div().overflow_hidden().whitespace_nowrap().font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::fg_bright()).child(keys))
-                                        .child(div().overflow_hidden().whitespace_nowrap().text_size(px(11.)).text_color(theme::fg_dim()).child(desc))
-                                        .into_any_element()
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .flex_1(),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(14.))
-                    .py(px(6.))
-                    .border_t_1()
-                    .border_color(theme::border())
-                    .text_size(px(10.5))
-                    .text_color(theme::fg_muted())
-                    .flex()
-                    .gap(px(6.))
-                    .child(ui::small_icon("terminal", theme::fg_muted()))
-                    .child(":keys prints this list to the output panel"),
-            )
+            .child(dirs)
+            .when_some(self.message.clone(), |d, (msg, err)| {
+                d.child(div().flex_none().mx(px(12.)).mb(px(6.)).px(px(8.)).py(px(5.)).rounded(px(4.)).bg(if err { theme::git_deleted().opacity(0.15) } else { theme::frame_focused().opacity(0.12) }).text_color(if err { theme::git_deleted() } else { theme::fg() }).child(msg))
+            })
+            .child(div().id("keys-scroll").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.scroll).child(list))
     }
 }

@@ -11,27 +11,27 @@ use std::path::{Path, PathBuf};
 
 actions!(file_tree, [Down, Up, Expand, Collapse, Open, Top, Bottom, NewFile, NewFolder, Rename, CollapseAll]);
 
-pub fn bind_keys(cx: &mut App) {
+pub fn bind_keys() {
     let c = Some("FileTree");
-    cx.bind_keys([
-        KeyBinding::new("j", Down, c),
-        KeyBinding::new("down", Down, c),
-        KeyBinding::new("k", Up, c),
-        KeyBinding::new("up", Up, c),
-        KeyBinding::new("l", Expand, c),
-        KeyBinding::new("right", Expand, c),
-        KeyBinding::new("h", Collapse, c),
-        KeyBinding::new("left", Collapse, c),
-        KeyBinding::new("enter", Open, c),
-        KeyBinding::new("o", Open, c),
-        KeyBinding::new("space", Open, c),
-        KeyBinding::new("g", Top, c),
-        KeyBinding::new("shift-g", Bottom, c),
-        KeyBinding::new("a", NewFile, c),
-        KeyBinding::new("shift-a", NewFolder, c),
-        KeyBinding::new("r", Rename, c),
-        KeyBinding::new("f2", Rename, c),
-        KeyBinding::new("shift-h", CollapseAll, c),
+    crate::keybindings::collect([
+        crate::keybindings::kb("j", Down, c),
+        crate::keybindings::kb("down", Down, c),
+        crate::keybindings::kb("k", Up, c),
+        crate::keybindings::kb("up", Up, c),
+        crate::keybindings::kb("l", Expand, c),
+        crate::keybindings::kb("right", Expand, c),
+        crate::keybindings::kb("h", Collapse, c),
+        crate::keybindings::kb("left", Collapse, c),
+        crate::keybindings::kb("enter", Open, c),
+        crate::keybindings::kb("o", Open, c),
+        crate::keybindings::kb("space", Open, c),
+        crate::keybindings::kb("g", Top, c),
+        crate::keybindings::kb("shift-g", Bottom, c),
+        crate::keybindings::kb("a", NewFile, c),
+        crate::keybindings::kb("shift-a", NewFolder, c),
+        crate::keybindings::kb("r", Rename, c),
+        crate::keybindings::kb("f2", Rename, c),
+        crate::keybindings::kb("shift-h", CollapseAll, c),
     ]);
 }
 

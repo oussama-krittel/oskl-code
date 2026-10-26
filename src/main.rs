@@ -12,6 +12,7 @@ mod git_panel;
 mod graph;
 mod highlight;
 mod icons;
+mod keybindings;
 mod keymap;
 mod repo;
 mod request;
@@ -84,14 +85,15 @@ fn main() {
     std::thread::spawn(tools::init_shell_path);
 
     Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
-        editor::bind_keys(cx);
-        workspace::bind_keys(cx);
-        file_tree::bind_keys(cx);
-        git_panel::bind_keys(cx);
-        diff_view::bind_keys(cx);
-        commit_view::bind_keys(cx);
-        search::bind_keys(cx);
-        diff_edit::bind_keys(cx);
+        editor::bind_keys();
+        workspace::bind_keys();
+        file_tree::bind_keys();
+        git_panel::bind_keys();
+        diff_view::bind_keys();
+        commit_view::bind_keys();
+        search::bind_keys();
+        diff_edit::bind_keys();
+        keybindings::apply(cx);
         cx.on_action(|_: &QuitApp, cx| cx.quit());
         cx.set_menus(vec![Menu { name: "OSKL Code".into(), items: vec![MenuItem::action("Quit OSKL Code", QuitApp)] }]);
         open_window_with(root.clone(), file.clone(), cx);

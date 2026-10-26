@@ -14,30 +14,30 @@ use std::time::{Duration, SystemTime};
 
 actions!(search, [ToggleCase, ToggleWord, ToggleRegex, ResultDown, ResultUp, OpenResult, DismissResult, ReplaceResult, CollapseFile, ExpandFile, FocusQuery]);
 
-pub fn bind_keys(cx: &mut App) {
+pub fn bind_keys() {
     let p = Some("SearchPanel");
-    cx.bind_keys([
-        KeyBinding::new("alt-cmd-c", ToggleCase, p),
-        KeyBinding::new("alt-cmd-w", ToggleWord, p),
-        KeyBinding::new("alt-cmd-r", ToggleRegex, p),
+    crate::keybindings::collect([
+        crate::keybindings::kb("alt-cmd-c", ToggleCase, p),
+        crate::keybindings::kb("alt-cmd-w", ToggleWord, p),
+        crate::keybindings::kb("alt-cmd-r", ToggleRegex, p),
     ]);
     let r = Some("SearchResults");
-    cx.bind_keys([
-        KeyBinding::new("j", ResultDown, r),
-        KeyBinding::new("down", ResultDown, r),
-        KeyBinding::new("k", ResultUp, r),
-        KeyBinding::new("up", ResultUp, r),
-        KeyBinding::new("enter", OpenResult, r),
-        KeyBinding::new("o", OpenResult, r),
-        KeyBinding::new("x", DismissResult, r),
-        KeyBinding::new("delete", DismissResult, r),
-        KeyBinding::new("backspace", DismissResult, r),
-        KeyBinding::new("r", ReplaceResult, r),
-        KeyBinding::new("h", CollapseFile, r),
-        KeyBinding::new("left", CollapseFile, r),
-        KeyBinding::new("l", ExpandFile, r),
-        KeyBinding::new("right", ExpandFile, r),
-        KeyBinding::new("i", FocusQuery, r),
+    crate::keybindings::collect([
+        crate::keybindings::kb("j", ResultDown, r),
+        crate::keybindings::kb("down", ResultDown, r),
+        crate::keybindings::kb("k", ResultUp, r),
+        crate::keybindings::kb("up", ResultUp, r),
+        crate::keybindings::kb("enter", OpenResult, r),
+        crate::keybindings::kb("o", OpenResult, r),
+        crate::keybindings::kb("x", DismissResult, r),
+        crate::keybindings::kb("delete", DismissResult, r),
+        crate::keybindings::kb("backspace", DismissResult, r),
+        crate::keybindings::kb("r", ReplaceResult, r),
+        crate::keybindings::kb("h", CollapseFile, r),
+        crate::keybindings::kb("left", CollapseFile, r),
+        crate::keybindings::kb("l", ExpandFile, r),
+        crate::keybindings::kb("right", ExpandFile, r),
+        crate::keybindings::kb("i", FocusQuery, r),
     ]);
 }
 
