@@ -48,8 +48,8 @@ actions!(
 pub fn bind_keys() {
     crate::keybindings::collect([
         crate::keybindings::kb("cmd-p", FindFile, None),
-        crate::keybindings::kb("cmd-shift-p", CommandPalette, None),
         crate::keybindings::kb("cmd-;", CommandPalette, None),
+        crate::keybindings::kb("cmd-shift-p", CommandPalette, None),
         crate::keybindings::kb("cmd-f", FindInFile, None),
         crate::keybindings::kb("cmd-g", FindNext, None),
         crate::keybindings::kb("cmd-shift-g", FindPrev, None),
@@ -3242,11 +3242,14 @@ impl Workspace {
                 .when_some(self.message.clone(), |d, (msg, err)| d.text_color(if err { theme::git_deleted() } else { theme::fg() }).child(msg)),
         )
         .when(self.message.is_none(), |d| {
-            d.child(hint("⌘P", "file"))
-                .child(hint("⌘D", "split"))
-                .child(hint("⌘T", "term"))
-                .child(hint(":", "cmd"))
-                .when(pane_count > 1, |d| d.child(hint("⌘⌥ jkl;", "split")))
+            // Hints show the shortcuts as currently configured (they're editable).
+            let k = |name: &str, fallback: &str| crate::keybindings::shortcut_label(name).unwrap_or_else(|| fallback.to_string());
+            let dirs = crate::keybindings::direction_letters();
+            d.child(hint(&k("FindFile", "⌘P"), "file"))
+                .child(hint(&k("SplitRight", "⌘D"), "split"))
+                .child(hint(&k("NewTerminal", "⌘T"), "term"))
+                .child(hint(&k("CommandPalette", "⌘;"), "cmd"))
+                .when(pane_count > 1, |d| d.child(hint(&format!("⌘⌥ {dirs}"), "move")))
         })
         .child({
             let (e, w) = self.problem_counts();

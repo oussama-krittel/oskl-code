@@ -228,9 +228,34 @@ impl Config {
     }
 }
 
+thread_local! {
+    static CURRENT: RefCell<Config> = RefCell::new(Config::default());
+    static LABELS: RefCell<BTreeMap<String, String>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Label of the first shortcut of a global action, as currently configured (e.g. "⌘;").
+pub fn shortcut_label(action: &str) -> Option<String> {
+    LABELS.with(|l| l.borrow().get(action).cloned())
+}
+
+/// The direction letters as typed, e.g. "jkl;".
+pub fn direction_letters() -> String {
+    CURRENT.with(|c| c.borrow().dirs.concat())
+}
+
 /// Rebinds everything from defaults + the user's config.
 pub fn apply(cx: &mut App) {
     let cfg = Config::load();
+    // Cache labels for UI hints (status bar) so rendering never touches disk.
+    let mut labels = BTreeMap::new();
+    for e in entries().iter().filter(|e| e.ctx.is_none()) {
+        let short = e.id.rsplit("::").next().unwrap_or(&e.id).to_string();
+        if let Some(first) = cfg.effective(e).first() {
+            labels.insert(short, label(first));
+        }
+    }
+    LABELS.with(|l| *l.borrow_mut() = labels);
+    CURRENT.with(|c| *c.borrow_mut() = cfg.clone());
     cx.clear_key_bindings();
     let mapper = cx.keyboard_mapper().clone();
     let mut bindings = Vec::new();
