@@ -10,20 +10,37 @@ static SHELL_PATH: OnceLock<Option<String>> = OnceLock::new();
 /// Apps launched from Finder get a minimal PATH. Ask the user's login shell
 /// for the real one once, like VS Code does.
 pub fn init_shell_path() {
-    SHELL_PATH.get_or_init(|| {
-        if std::env::var_os("TERM").is_some() {
-            return None;
-        }
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        let out = Command::new(shell).args(["-lic", "printf '%s' \"$PATH\""]).stdin(Stdio::null()).output().ok()?;
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!path.is_empty()).then_some(path)
-    });
+    shell_path();
+}
+
+/// The user's login-shell PATH (resolved once). Every tool launch waits for it, so the
+/// first lint/type-check after starting from Finder doesn't run without `node` on PATH.
+fn shell_path() -> Option<&'static String> {
+    SHELL_PATH
+        .get_or_init(|| {
+            if std::env::var_os("TERM").is_some() {
+                return None;
+            }
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+            // Markers around PATH so shell startup chatter can't corrupt it.
+            let out = Command::new(shell)
+                .args(["-lic", "printf '__KITE_PATH__%s__KITE_END__' \"$PATH\""])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            let start = text.find("__KITE_PATH__")? + "__KITE_PATH__".len();
+            let end = text[start..].find("__KITE_END__")? + start;
+            let path = text[start..end].trim().to_string();
+            (!path.is_empty()).then_some(path)
+        })
+        .as_ref()
 }
 
 fn command(program: &Path) -> Command {
     let mut cmd = Command::new(program);
-    if let Some(Some(path)) = SHELL_PATH.get() {
+    if let Some(path) = shell_path() {
         cmd.env("PATH", path);
     }
     cmd.env("NO_COLOR", "1").env("FORCE_COLOR", "0");
@@ -31,9 +48,9 @@ fn command(program: &Path) -> Command {
 }
 
 fn search_path() -> Vec<PathBuf> {
-    let path = match SHELL_PATH.get() {
-        Some(Some(p)) => p.clone(),
-        _ => std::env::var("PATH").unwrap_or_default(),
+    let path = match shell_path() {
+        Some(p) => p.clone(),
+        None => std::env::var("PATH").unwrap_or_default(),
     };
     std::env::split_paths(&path).collect()
 }
@@ -247,9 +264,10 @@ pub fn find_eslint(dir: &Path, root: &Path) -> Option<PathBuf> {
     find_tool("eslint", dir, root).filter(|_| has_config(dir, root, ESLINT_CONFIG))
 }
 
-/// Runs a tool and returns its stdout (diagnostic formats are printed there).
-pub fn run_tool(bin: &Path, args: &[&str], cwd: &Path) -> String {
+/// Runs a tool: (exited successfully, stdout, stderr). Diagnostic formats are printed on stdout.
+pub fn run_tool(bin: &Path, args: &[&str], cwd: &Path) -> (bool, String, String) {
     let mut c = command(bin);
     c.args(args);
-    run(c, String::new(), None, cwd).stdout
+    let out = run(c, String::new(), None, cwd);
+    (out.ok, out.stdout, out.stderr)
 }

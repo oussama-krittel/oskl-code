@@ -19,27 +19,47 @@ pub fn is_typescript(path: &Path) -> bool {
     matches!(path.extension().and_then(|e| e.to_str()).unwrap_or(""), "ts" | "tsx" | "mts" | "cts")
 }
 
-/// Lints one file. Returns its diagnostics (possibly empty) or None when no linter applies.
-pub fn lint_file(root: &Path, file: &Path) -> Option<(String, Vec<Diag>)> {
+/// Short reason a tool failed, from its stderr (first meaningful line).
+fn failure(tool: &str, stderr: &str, stdout: &str) -> String {
+    let text = if stderr.trim().is_empty() { stdout } else { stderr };
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("exited with an error");
+    format!("{tool} failed: {line}")
+}
+
+/// Lints one file. Returns its diagnostics (possibly empty), Err when the linter itself
+/// failed (so it isn't mistaken for "no problems"), or None when no linter applies.
+pub fn lint_file(root: &Path, file: &Path) -> Option<Result<(String, Vec<Diag>), String>> {
     if !is_web(file) {
         return None;
     }
     let dir = file.parent().unwrap_or(root);
     if let Some(eslint) = tools::find_eslint(dir, root) {
-        let out = tools::run_tool(&eslint, &["-f", "json", &file.to_string_lossy()], root);
-        let diags = parse_eslint(&out).remove(file).unwrap_or_default();
-        return Some(("eslint".into(), diags));
+        let (ok, out, err) = tools::run_tool(&eslint, &["-f", "json", &file.to_string_lossy()], root);
+        // ESLint exits 1 when it found problems; anything without JSON output is a real failure.
+        if !out.trim_start().starts_with('[') {
+            return Some(Err(failure("eslint", &err, &out)));
+        }
+        let _ = ok;
+        let key = file.canonicalize().unwrap_or(file.to_path_buf());
+        let mut map = parse_eslint(&out);
+        let diags = map.remove(file).or_else(|| map.remove(&key)).unwrap_or_default();
+        return Some(Ok(("eslint".into(), diags)));
     }
     if let Some(biome) = tools::find_named("biome", dir, root) {
-        let out = tools::run_tool(&biome, &["lint", "--reporter=github", "--colors=off", &file.to_string_lossy()], root);
-        let diags = parse_github(&out, root).remove(file).unwrap_or_default();
-        return Some(("biome".into(), diags));
+        let (ok, out, err) = tools::run_tool(&biome, &["lint", "--reporter=github", "--colors=off", &file.to_string_lossy()], root);
+        let mut map = parse_github(&out, root);
+        if !ok && map.is_empty() && !err.contains("Found") {
+            return Some(Err(failure("biome", &err, &out)));
+        }
+        let key = file.canonicalize().unwrap_or(file.to_path_buf());
+        let diags = map.remove(file).or_else(|| map.remove(&key)).unwrap_or_default();
+        return Some(Ok(("biome".into(), diags)));
     }
     None
 }
 
 /// Type-checks the TypeScript project that contains `file`.
-pub fn typecheck(root: &Path, file: &Path) -> Option<FileDiags> {
+pub fn typecheck(root: &Path, file: &Path) -> Option<Result<FileDiags, String>> {
     let mut dir = file.parent();
     let project = loop {
         let d = dir?;
@@ -54,12 +74,17 @@ pub fn typecheck(root: &Path, file: &Path) -> Option<FileDiags> {
     let tsc = tools::find_named("tsc", &project, root)?;
     // Incremental info lives in the temp dir so repeated checks are fast.
     let info = std::env::temp_dir().join(format!("kite-{:x}.tsbuildinfo", hash(&project.to_string_lossy())));
-    let out = tools::run_tool(
+    let (ok, out, err) = tools::run_tool(
         &tsc,
         &["--noEmit", "--pretty", "false", "--incremental", "--tsBuildInfoFile", &info.to_string_lossy(), "-p", &project.to_string_lossy()],
         &project,
     );
-    Some(parse_tsc(&out, &project))
+    let map = parse_tsc(&out, &project);
+    // tsc exits non-zero when it finds errors; no parsed errors + failure means tsc itself broke.
+    if !ok && map.is_empty() {
+        return Some(Err(failure("tsc", &err, &out)));
+    }
+    Some(Ok(map))
 }
 
 fn hash(s: &str) -> u64 {
@@ -204,11 +229,11 @@ mod live {
         let Ok(dir) = std::env::var("KITE_TS_PROJECT") else { return };
         let root = std::path::PathBuf::from(dir).canonicalize().unwrap();
         let file = root.join("src/app.ts");
-        let ts = super::typecheck(&root, &file).expect("tsc ran");
+        let ts = super::typecheck(&root, &file).expect("tsc ran").expect("tsc succeeded");
         let diags = &ts[&file];
         println!("tsc: {diags:#?}");
         assert!(diags.len() >= 2);
-        let (tool, lint) = super::lint_file(&root, &file).expect("a linter ran");
+        let (tool, lint) = super::lint_file(&root, &file).expect("a linter ran").expect("linter succeeded");
         println!("{tool}: {lint:#?}");
         assert!(!lint.is_empty());
     }

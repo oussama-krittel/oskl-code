@@ -1488,6 +1488,9 @@ impl Workspace {
 
     /// Lints a saved/opened file, and type-checks its TypeScript project.
     fn check_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if std::env::var_os("KITE_DEBUG").is_some() {
+            eprintln!("[kite] check_file {} (checks on: {})", path.display(), self.settings.checks);
+        }
         if !self.settings.checks {
             return;
         }
@@ -1499,12 +1502,19 @@ impl Workspace {
             key.clone(),
             cx.spawn(async move |this, cx| {
                 let result = task.await;
+                if std::env::var_os("KITE_DEBUG").is_some() {
+                    eprintln!("[kite] lint {}: {:?}", key.display(), result.as_ref().map(|r| r.as_ref().map(|(t, d)| (t.clone(), d.len()))));
+                }
                 this.update(cx, |ws, cx| {
                     ws.lint_tasks.remove(&key);
-                    if let Some((_, diags)) = result {
-                        let key = key.canonicalize().unwrap_or(key.clone());
-                        ws.lint_diags.insert(key, diags);
-                        ws.push_diagnostics(cx);
+                    match result {
+                        Some(Ok((_, diags))) => {
+                            let key = key.canonicalize().unwrap_or(key.clone());
+                            ws.lint_diags.insert(key, diags);
+                            ws.push_diagnostics(cx);
+                        }
+                        Some(Err(e)) => ws.flash(e, true, cx),
+                        None => {}
                     }
                 })
                 .ok();
@@ -1549,11 +1559,18 @@ impl Workspace {
         let task = cx.background_executor().spawn(async move { crate::diagnostics::typecheck(&root, &path) });
         self.tsc_task = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
+            if std::env::var_os("KITE_DEBUG").is_some() {
+                eprintln!("[kite] tsc: {:?}", result.as_ref().map(|r| r.as_ref().map(|m| m.iter().map(|(p, d)| (p.display().to_string(), d.len())).collect::<Vec<_>>())));
+            }
             this.update(cx, |ws, cx| {
                 ws.tsc_running = false;
-                if let Some(map) = result {
-                    ws.ts_diags = map;
-                    ws.push_diagnostics(cx);
+                match result {
+                    Some(Ok(map)) => {
+                        ws.ts_diags = map;
+                        ws.push_diagnostics(cx);
+                    }
+                    Some(Err(e)) => ws.flash(e, true, cx),
+                    None => {}
                 }
                 if let Some(next) = ws.tsc_again.take() {
                     ws.typecheck(next, cx);
