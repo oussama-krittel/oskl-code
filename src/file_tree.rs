@@ -14,13 +14,13 @@ actions!(file_tree, [Down, Up, Expand, Collapse, Open, Top, Bottom, NewFile, New
 pub fn bind_keys() {
     let c = Some("FileTree");
     crate::keybindings::collect([
-        crate::keybindings::kb("j", Down, c),
+        crate::keybindings::kb("{down}", Down, c),
         crate::keybindings::kb("down", Down, c),
-        crate::keybindings::kb("k", Up, c),
+        crate::keybindings::kb("{up}", Up, c),
         crate::keybindings::kb("up", Up, c),
-        crate::keybindings::kb("l", Expand, c),
+        crate::keybindings::kb("{right}", Expand, c),
         crate::keybindings::kb("right", Expand, c),
-        crate::keybindings::kb("h", Collapse, c),
+        crate::keybindings::kb("{left}", Collapse, c),
         crate::keybindings::kb("left", Collapse, c),
         crate::keybindings::kb("enter", Open, c),
         crate::keybindings::kb("o", Open, c),

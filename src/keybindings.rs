@@ -136,8 +136,8 @@ fn describe(name: &str, ctx: Option<&str>) -> String {
         "KillLine" => "Delete to end of line (copies it)",
         "DeleteToLineStart" => "Delete to line start",
         "Submit" => if ctx == Some("Editor") { "New line below / submit" } else { "Submit" },
-        "ScrollLineUp" => "Scroll view up (cursor stays)",
-        "ScrollLineDown" => "Scroll view down (cursor stays)",
+        "ScrollLineUp" => "Scroll view up (cursor stays) · previous option in lists",
+        "ScrollLineDown" => "Scroll view down (cursor stays) · next option in lists",
         "ShowCharacterPalette" => "Emoji & symbols",
         _ => "",
     };
@@ -171,7 +171,8 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { dirs: ["j".into(), "k".into(), "l".into(), ";".into()], overrides: BTreeMap::new() }
+        // ← ↓ ↑ →
+        Self { dirs: ["j".into(), "k".into(), "i".into(), "l".into()], overrides: BTreeMap::new() }
     }
 }
 
@@ -183,9 +184,12 @@ impl Config {
     pub fn load() -> Self {
         let mut cfg = Self::default();
         let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) else { return cfg };
+        let mut version = 1;
         for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
             let Some((k, v)) = line.split_once(" = ") else { continue };
-            if k == "directions" {
+            if k == "version" {
+                version = v.parse().unwrap_or(1);
+            } else if k == "directions" {
                 let letters: Vec<String> = v.split_whitespace().map(String::from).collect();
                 if let Ok(arr) = <[String; 4]>::try_from(letters) {
                     cfg.dirs = arr;
@@ -194,6 +198,10 @@ impl Config {
                 let keys = v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
                 cfg.overrides.insert(k.to_string(), keys);
             }
+        }
+        // v1's default letters (j k l ;) became j k i l: move people still on the old default.
+        if version < 2 && cfg.dirs.join(" ") == "j k l ;" {
+            cfg.dirs = Self::default().dirs;
         }
         cfg
     }
@@ -204,6 +212,7 @@ impl Config {
             std::fs::create_dir_all(dir).ok();
         }
         let mut out = String::from("# OSKL Code shortcuts — edit them in the Shortcuts tab (⌘K ⌘S).\n");
+        out.push_str("version = 2\n");
         out.push_str(&format!("directions = {}\n", self.dirs.join(" ")));
         for (id, keys) in &self.overrides {
             out.push_str(&format!("{id} = {}\n", keys.join(", ")));
@@ -413,6 +422,7 @@ mod tests {
     fn directions_resolve() {
         let mut cfg = Config::default();
         assert_eq!(cfg.resolve("cmd-alt-{left}"), "cmd-alt-j");
+        assert_eq!(cfg.resolve("cmd-alt-{up}"), "cmd-alt-i");
         cfg.dirs = ["h".into(), "j".into(), "k".into(), "l".into()];
         assert_eq!(cfg.resolve("cmd-alt-shift-{right}"), "cmd-alt-shift-l");
     }

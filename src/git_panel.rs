@@ -17,9 +17,9 @@ actions!(git_panel, [Down, Up, Open, ToggleStage, Discard, OpenFile, FocusCommit
 pub fn bind_keys() {
     let c = Some("GitPanel");
     crate::keybindings::collect([
-        crate::keybindings::kb("j", Down, c),
+        crate::keybindings::kb("{down}", Down, c),
         crate::keybindings::kb("down", Down, c),
-        crate::keybindings::kb("k", Up, c),
+        crate::keybindings::kb("{up}", Up, c),
         crate::keybindings::kb("up", Up, c),
         crate::keybindings::kb("enter", Open, c),
         crate::keybindings::kb("space", ToggleStage, c),

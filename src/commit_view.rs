@@ -12,9 +12,9 @@ actions!(commit_view, [Next, Prev, OpenSelected, CopySha]);
 pub fn bind_keys() {
     let c = Some("CommitView");
     crate::keybindings::collect([
-        crate::keybindings::kb("j", Next, c),
+        crate::keybindings::kb("{down}", Next, c),
         crate::keybindings::kb("down", Next, c),
-        crate::keybindings::kb("k", Prev, c),
+        crate::keybindings::kb("{up}", Prev, c),
         crate::keybindings::kb("up", Prev, c),
         crate::keybindings::kb("enter", OpenSelected, c),
         crate::keybindings::kb("o", OpenSelected, c),
@@ -259,7 +259,11 @@ impl Render for CommitView {
                         .border_t_1()
                         .border_color(theme::border())
                         .child(div().font_weight(FontWeight::BOLD).child(format!("{} files changed", d.files.len())))
-                        .child(div().text_color(theme::fg_muted()).text_size(px(11.)).child("j/k to move · enter for diff · y copies hash")),
+                        .child(div().text_color(theme::fg_muted()).text_size(px(11.)).child({
+                            let d: Vec<char> = crate::keybindings::direction_letters().chars().collect();
+                            let (down, up) = (d.get(1).copied().unwrap_or('k'), d.get(2).copied().unwrap_or('i'));
+                            format!("{down}/{up} or ↓/↑ to move · enter for diff · y copies hash")
+                        })),
                 )
                 .child(div().flex().flex_col().children(files)),
         )

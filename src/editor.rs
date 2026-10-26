@@ -696,10 +696,17 @@ impl Editor {
     }
     /// ⌃⌥↑ / ⌃⌥↓: scroll the view a line, leaving the cursor where it is.
     fn scroll_line_up(&mut self, _: &ScrollLineUp, _: &mut Window, cx: &mut Context<Self>) {
+        // In one-line inputs (finder, command line, search) this moves through the options.
+        if self.mode == EditorMode::SingleLine {
+            return cx.emit(EditorEvent::Up);
+        }
         self.scroll_y = (self.scroll_y - self.line_height()).max(0.);
         cx.notify();
     }
     fn scroll_line_down(&mut self, _: &ScrollLineDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == EditorMode::SingleLine {
+            return cx.emit(EditorEvent::Down);
+        }
         self.scroll_y += self.line_height();
         cx.notify();
     }

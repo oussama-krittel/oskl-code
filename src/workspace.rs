@@ -120,9 +120,9 @@ pub fn bind_keys() {
     ]);
     let o = Some("Output");
     crate::keybindings::collect([
-        crate::keybindings::kb("j", OutputDown, o),
+        crate::keybindings::kb("{down}", OutputDown, o),
         crate::keybindings::kb("down", OutputDown, o),
-        crate::keybindings::kb("k", OutputUp, o),
+        crate::keybindings::kb("{up}", OutputUp, o),
         crate::keybindings::kb("up", OutputUp, o),
         crate::keybindings::kb("space", OutputPageDown, o),
         crate::keybindings::kb("pagedown", OutputPageDown, o),
@@ -3274,6 +3274,19 @@ impl Workspace {
                         .child("Blame")
                         .on_click(cx.listener(|ws, _, w, cx| ws.toggle_blame(&ToggleBlame, w, cx))),
                 )
+        })
+        .child({
+            let on = self.settings.format_on_save;
+            item("status-format")
+                .tooltip(ui::tooltip("Format on ⌘S with your project's formatter (click to toggle, :formatonsave on|off)"))
+                .child(ui::small_icon(if on { "check" } else { "close" }, if on { theme::git_added() } else { theme::fg_muted() }))
+                .child("Format")
+                .on_click(cx.listener(|ws, _, _, cx| {
+                    ws.settings.format_on_save = !ws.settings.format_on_save;
+                    ws.settings.save();
+                    let on = ws.settings.format_on_save;
+                    ws.flash(format!("Format on save {}", if on { "on" } else { "off" }), false, cx);
+                }))
         })
         .child({
             let on = self.settings.autosave;

@@ -23,9 +23,9 @@ pub fn bind_keys() {
     ]);
     let r = Some("SearchResults");
     crate::keybindings::collect([
-        crate::keybindings::kb("j", ResultDown, r),
+        crate::keybindings::kb("{down}", ResultDown, r),
         crate::keybindings::kb("down", ResultDown, r),
-        crate::keybindings::kb("k", ResultUp, r),
+        crate::keybindings::kb("{up}", ResultUp, r),
         crate::keybindings::kb("up", ResultUp, r),
         crate::keybindings::kb("enter", OpenResult, r),
         crate::keybindings::kb("o", OpenResult, r),
@@ -33,11 +33,11 @@ pub fn bind_keys() {
         crate::keybindings::kb("delete", DismissResult, r),
         crate::keybindings::kb("backspace", DismissResult, r),
         crate::keybindings::kb("r", ReplaceResult, r),
-        crate::keybindings::kb("h", CollapseFile, r),
+        crate::keybindings::kb("{left}", CollapseFile, r),
         crate::keybindings::kb("left", CollapseFile, r),
-        crate::keybindings::kb("l", ExpandFile, r),
+        crate::keybindings::kb("{right}", ExpandFile, r),
         crate::keybindings::kb("right", ExpandFile, r),
-        crate::keybindings::kb("i", FocusQuery, r),
+        crate::keybindings::kb("/", FocusQuery, r),
     ]);
 }
 

@@ -16,9 +16,9 @@ actions!(diff_view, [NextRow, PrevRow, NextHunk, PrevHunk, ToggleBlame, ToggleIn
 pub fn bind_keys() {
     let c = Some("DiffView");
     crate::keybindings::collect([
-        crate::keybindings::kb("j", NextRow, c),
+        crate::keybindings::kb("{down}", NextRow, c),
         crate::keybindings::kb("down", NextRow, c),
-        crate::keybindings::kb("k", PrevRow, c),
+        crate::keybindings::kb("{up}", PrevRow, c),
         crate::keybindings::kb("up", PrevRow, c),
         crate::keybindings::kb("n", NextHunk, c),
         crate::keybindings::kb("alt-down", NextHunk, c),
@@ -28,7 +28,7 @@ pub fn bind_keys() {
         crate::keybindings::kb("alt-up", PrevHunk, c),
         crate::keybindings::kb("shift-f7", PrevHunk, c),
         crate::keybindings::kb("b", ToggleBlame, c),
-        crate::keybindings::kb("i", ToggleInline, c),
+        crate::keybindings::kb("v", ToggleInline, c),
         crate::keybindings::kb("enter", OpenFile, c),
         crate::keybindings::kb("o", OpenFile, c),
         crate::keybindings::kb("cmd-c", CopyRow, c),
