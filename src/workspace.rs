@@ -64,7 +64,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-7", Buffer7, None),
         KeyBinding::new("cmd-8", Buffer8, None),
         KeyBinding::new("cmd-9", Buffer9, None),
-        KeyBinding::new("cmd-shift-enter", ZoomPane, None),
+        KeyBinding::new("cmd-alt-enter", ZoomPane, None),
         KeyBinding::new("cmd-0", FocusSidebar, None),
         KeyBinding::new("ctrl-alt-h", FocusLeft, None),
         KeyBinding::new("ctrl-alt-l", FocusRight, None),
@@ -322,7 +322,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("term", "Terminal in this pane (⌘T); term <cmd> runs a command", true),
     ("close", "Close this pane (⌘⇧W)", false),
     ("only", "Close all other panes", false),
-    ("max", "Maximize / restore this pane (⌘⇧Enter)", false),
+    ("max", "Maximize / restore this pane (⌘⌥Enter)", false),
     ("buffers", "Files open in this pane (⌘E)", false),
     ("git", "Run any git command: git <args>", true),
     ("!", "Run a shell command: !<command>", true),
@@ -2724,7 +2724,7 @@ impl Workspace {
                 ws.open_terminal_view(None, w, cx);
             })))
             .when(self.panes.len() > 1, |d| {
-                d.child(glyph("max", "maximize", "Maximize / restore (⌘⇧Enter · double-click title)").on_click(cx.listener(move |ws, _, _, cx| {
+                d.child(glyph("max", "maximize", "Maximize / restore (⌘⌥Enter · double-click title)").on_click(cx.listener(move |ws, _, _, cx| {
                     ws.set_focused_pane(id);
                     ws.zoomed = !ws.zoomed;
                     cx.notify();

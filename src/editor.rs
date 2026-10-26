@@ -84,7 +84,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", Newline, c),
         KeyBinding::new("shift-enter", Newline, c),
         KeyBinding::new("cmd-enter", Submit, c),
-        KeyBinding::new("cmd-alt-enter", NewlineAbove, c),
+        KeyBinding::new("cmd-shift-enter", NewlineAbove, c),
         KeyBinding::new("tab", Indent, c),
         KeyBinding::new("shift-tab", Outdent, c),
         KeyBinding::new("cmd-]", Indent, c),
