@@ -56,7 +56,8 @@ impl AssetSource for Assets {
             .strip_prefix("icons/")
             .and_then(|p| p.strip_suffix(".svg"))
             .unwrap_or(path);
-        Ok(icon_body(name).map(|body| Cow::Owned(format!("{HEAD}{body}</svg>").into_bytes())))
+        let body = icon_body(name).map(String::from).or_else(|| crate::icons::svg(name));
+        Ok(body.map(|body| Cow::Owned(format!("{HEAD}{body}</svg>").into_bytes())))
     }
 
     fn list(&self, _path: &str) -> Result<Vec<SharedString>> {

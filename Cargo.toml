@@ -39,3 +39,6 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[dev-dependencies]
+usvg = "0.45.1"

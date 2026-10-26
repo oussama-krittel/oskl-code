@@ -10,6 +10,7 @@ mod git;
 mod git_panel;
 mod graph;
 mod highlight;
+mod icons;
 mod keymap;
 mod repo;
 mod request;

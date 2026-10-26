@@ -292,7 +292,7 @@ impl FileTree {
                 ui::small_icon("dot", transparent_black())
             })
             .child(if row.entry.is_dir {
-                ui::icon(if row.expanded { "folder-open" } else { "folder" }, theme::c(0xc09553))
+                ui::folder_icon(&row.entry.name, row.expanded)
             } else {
                 ui::file_icon(&row.entry.name)
             })

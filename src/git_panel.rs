@@ -605,7 +605,7 @@ impl GitPanel {
                     .gap(px(4.))
                     .hover(|s| s.bg(theme::hover()))
                     .child(ui::small_icon("chevron-down", theme::fg()))
-                    .child(ui::icon("folder", theme::c(0xa074c4)))
+                    .child(ui::folder_icon(dir.rsplit('/').next().unwrap_or(dir), true))
                     .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_color(theme::fg()).child(dir.replace('/', " / ")))
                     .child(
                         div().invisible().group_hover("folder", |s| s.visible()).child(

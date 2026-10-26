@@ -39,29 +39,18 @@ pub fn status_color(s: FileStatus) -> Hsla {
 }
 
 pub fn file_color(name: &str) -> Hsla {
-    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-    theme::c(match ext.as_str() {
-        "ts" | "mts" | "cts" => 0x519aba,
-        "tsx" | "jsx" => 0x4fc1e9,
-        "js" | "mjs" | "cjs" => 0xcbcb41,
-        "json" | "jsonc" => 0xcbcb41,
-        "md" | "mdx" => 0x519aba,
-        "css" | "scss" | "less" => 0x519aba,
-        "html" | "vue" | "svelte" => 0xe37933,
-        "rs" => 0xdea584,
-        "py" => 0x3c78aa,
-        "go" => 0x519aba,
-        "swift" => 0xe37933,
-        "yml" | "yaml" | "toml" => 0xa074c4,
-        "sh" | "zsh" | "bash" => 0x8dc149,
-        "lock" => 0x8c8c8c,
-        "svg" | "png" | "jpg" | "gif" | "webp" => 0xa074c4,
-        _ => 0x8c8c8c,
-    })
+    theme::c(crate::icons::file_icon(name).1)
 }
 
+/// Material-style icon for a file name.
 pub fn file_icon(name: &str) -> Svg {
-    icon("file", file_color(name))
+    let (key, color) = crate::icons::file_icon(name);
+    icon(&key, theme::c(color))
+}
+
+/// Material-style folder icon, colored by folder name.
+pub fn folder_icon(name: &str, open: bool) -> Svg {
+    icon(if open { "fd-open" } else { "fd-closed" }, theme::c(crate::icons::folder_color(name)))
 }
 
 pub fn badge(text: impl Into<SharedString>, bg: Hsla) -> Div {
