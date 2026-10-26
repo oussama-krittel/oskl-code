@@ -105,6 +105,10 @@ pub fn bind_keys() {
         crate::keybindings::kb("escape", Escape, c),
         crate::keybindings::kb("ctrl-alt-up", ScrollLineUp, c),
         crate::keybindings::kb("ctrl-alt-down", ScrollLineDown, c),
+        crate::keybindings::kb("ctrl-cmd-up", ScrollLineUp, c),
+        crate::keybindings::kb("ctrl-cmd-down", ScrollLineDown, c),
+        crate::keybindings::kb("ctrl-cmd-{up}", ScrollLineUp, c),
+        crate::keybindings::kb("ctrl-cmd-{down}", ScrollLineDown, c),
         crate::keybindings::kb("ctrl-cmd-space", ShowCharacterPalette, c),
     ]);
 }
@@ -362,6 +366,11 @@ impl Editor {
     pub fn set_diagnostics(&mut self, diags: Vec<Diag>, cx: &mut Context<Self>) {
         self.diagnostics = diags;
         cx.notify();
+    }
+
+    /// How far the view is scrolled down, in pixels.
+    pub fn scroll_top(&self) -> f32 {
+        self.scroll_y
     }
 
     pub fn is_focused(&self, window: &Window) -> bool {

@@ -3775,5 +3775,26 @@ mod ui_tests {
         cx.simulate_keystrokes("ctrl-alt-l");
         assert_eq!(pos(cx), 3, "search: ⌃⌥L should act as →");
     }
+
+    #[gpui::test]
+    fn ctrl_cmd_letters_scroll_without_moving_cursor(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("long.txt");
+        std::fs::write(&file, (0..300).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file, None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).expect("editor open");
+        let head = |cx: &mut VisualTestContext| ed.read_with(cx, |e, _| e.buf.sel.head);
+        let start = head(cx);
+        let top = |cx: &mut VisualTestContext| ed.read_with(cx, |e, _| e.scroll_top());
+        cx.simulate_keystrokes("ctrl-cmd-k ctrl-cmd-k ctrl-cmd-k");
+        assert!(top(cx) > 0., "⌃⌘K scrolls the view down");
+        let scrolled = top(cx);
+        cx.simulate_keystrokes("ctrl-cmd-i");
+        assert!(top(cx) < scrolled, "⌃⌘I scrolls back up");
+        assert_eq!(head(cx), start, "⌃⌘K/I leave the cursor where it is");
+        cx.simulate_keystrokes("ctrl-alt-k");
+        assert_ne!(head(cx), start, "⌃⌥K is ↓ and moves the cursor");
+    }
 }
 
