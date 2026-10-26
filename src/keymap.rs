@@ -22,7 +22,7 @@ pub const KEYS: &[(&str, &str, &str)] = &[
     ("General", "⌘J", "Toggle output panel (lint/format/git output)"),
         ("General", "⌘0", "Focus sidebar"),
     ("General", "Status bar ✓ Auto Save", "Auto save 1s after typing (on by default) · :autosave on|off"),
-    ("General", "⌘S", "Save"),
+    ("General", "⌘S", "Save — formats first with your project's formatter (:formatonsave off to disable)"),
     ("Panes & splits", "⌘D  ·  ⌘⇧D", "Split right / down (then pick a file, or ⌘T for a terminal)"),
     ("Panes & splits", "Split limit", "A split can be halved until it is 1/8 of the window (max 8 splits)"),
     ("Panes & splits", "⌘⌥←→↑↓  ·  ⌃⌥H J K L", "Move between panes (wraps around at the edges)"),

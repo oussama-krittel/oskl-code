@@ -41,7 +41,7 @@ pub fn open_window_with(root: PathBuf, file: Option<PathBuf>, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
-            title: Some("kite".into()),
+            title: Some("OSKL Code".into()),
             appears_transparent: true,
             traffic_light_position: Some(point(px(12.), px(11.))),
         }),
@@ -72,8 +72,9 @@ fn main() {
         [a, f, ..] if a.is_dir() => (a.clone(), Some(a.join(f)).filter(|p| p.is_file()).or(Some(f.clone()).filter(|p| p.is_file()))),
         [a] if a.is_dir() => (a.clone(), None),
         _ => {
-            let cwd = std::env::current_dir().ok().filter(|p| p != &PathBuf::from("/"));
-            (cwd.or_else(|| std::env::var("HOME").ok().map(PathBuf::from)).unwrap_or_else(|| PathBuf::from(".")), None)
+            // From a terminal: open the current folder. From the Dock/Finder (cwd is "/"): start screen.
+            let cwd = std::env::current_dir().ok().filter(|p| p != &PathBuf::from("/") && std::env::var_os("TERM").is_some());
+            (cwd.unwrap_or_else(workspace::no_project_dir), None)
         }
     };
     let root = root.canonicalize().unwrap_or(root);
@@ -92,7 +93,7 @@ fn main() {
         search::bind_keys(cx);
         diff_edit::bind_keys(cx);
         cx.on_action(|_: &QuitApp, cx| cx.quit());
-        cx.set_menus(vec![Menu { name: "kite".into(), items: vec![MenuItem::action("Quit kite", QuitApp)] }]);
+        cx.set_menus(vec![Menu { name: "OSKL Code".into(), items: vec![MenuItem::action("Quit OSKL Code", QuitApp)] }]);
         open_window_with(root.clone(), file.clone(), cx);
         cx.activate(true);
     });

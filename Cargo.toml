@@ -42,4 +42,5 @@ opt-level = 1
 opt-level = 3
 
 [dev-dependencies]
+resvg = "0.45.1"
 usvg = "0.45.1"

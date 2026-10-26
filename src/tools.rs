@@ -318,3 +318,17 @@ mod tests {
         assert_eq!(st("README.md"), Block("<!--", "-->"));
     }
 }
+
+#[cfg(test)]
+mod live_format {
+    /// Formats a messy TS snippet with the project's formatter (KITE_TS_PROJECT, skipped otherwise).
+    #[test]
+    fn formats_with_project_tool() {
+        let Ok(dir) = std::env::var("KITE_TS_PROJECT") else { return };
+        let root = std::path::PathBuf::from(dir);
+        let file = root.join("src/app.ts");
+        let (out, tool) = super::format(&root, &file, "const   x={a:1,b:2}\nexport   function f( ){return x}\n").expect("formats");
+        println!("{tool}:\n{out}");
+        assert!(out.contains("const x = { a: 1, b: 2 };"));
+    }
+}

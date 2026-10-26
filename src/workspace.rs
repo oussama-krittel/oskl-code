@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 actions!(
@@ -288,7 +289,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("w", "Save the current file", false),
     ("q", "Close the current tab (q! discards changes)", false),
     ("wq", "Save and close", false),
-    ("qa", "Quit kite (qa! discards changes)", false),
+    ("qa", "Quit OSKL Code (qa! discards changes)", false),
     ("e", "Open a file: e <path>[:line]", true),
     ("new", "Create a file: new <path>", true),
     ("mkdir", "Create a folder: mkdir <path>", true),
@@ -315,6 +316,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("search", "Search in all files: search <text> (⇧⌘F)", true),
     ("sidebar", "Sidebar side: sidebar left | right", true),
     ("autosave", "Auto save: autosave on | off (default on)", true),
+    ("formatonsave", "Format on ⌘S: formatonsave on | off (default on)", true),
     ("problems", "List lint and TypeScript problems (click to jump)", false),
     ("check", "Lint/type-check on save: check on | off | now", true),
     ("vsplit", "Split right (⌘D), optionally opening a file: vsplit <path>", true),
@@ -371,6 +373,7 @@ pub struct Workspace {
     blame_default: bool,
     window_bounds: Rc<Cell<Bounds<Pixels>>>,
     tool_task: Option<Task<()>>,
+    format_save_task: Option<Task<()>>,
     watch_task: Option<Task<()>>,
     _watcher: Option<notify::RecommendedWatcher>,
     _subs: Vec<Subscription>,
@@ -384,6 +387,8 @@ pub struct Workspace {
     tsc_task: Option<Task<()>>,
     tsc_running: bool,
     tsc_again: Option<PathBuf>,
+    /// False when the app was opened without a folder (start screen with Open Folder / Recent).
+    has_project: bool,
     panes: Vec<Pane>,
     layout: Layout,
     focused_pane: usize,
@@ -405,9 +410,12 @@ impl Workspace {
         let cmd = cx.new(|cx| Editor::new(EditorMode::SingleLine, cx));
         let search = cx.new(|cx| SearchPanel::new(repo.clone(), window, cx));
         let keys = cx.new(|cx| KeysPanel::new(window, cx));
+        let has_project = root_is_project(&repo.read(cx).root);
         let mut settings = Settings::load();
-        settings.add_recent(repo.read(cx).root.clone());
-        settings.save();
+        if has_project {
+            settings.add_recent(repo.read(cx).root.clone());
+            settings.save();
+        }
         let subs = vec![
             cx.subscribe_in(&search, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&search, window, |ws, _, ev: &SearchEvent, window, cx| match ev {
@@ -436,7 +444,7 @@ impl Workspace {
             }),
         ];
         let project = repo.read(cx).root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        window.set_window_title(&format!("{project} — kite"));
+        window.set_window_title(&if root_is_project(&repo.read(cx).root) { format!("{project} — OSKL Code") } else { "OSKL Code".into() });
         let mut ws = Self {
             focus: cx.focus_handle(),
             repo,
@@ -447,7 +455,7 @@ impl Workspace {
             tabs: Vec::new(),
             active: None,
             side: Side::Files,
-            side_visible: true,
+            side_visible: has_project,
             side_w: 300.,
             resizing_side: false,
             output: Vec::new(),
@@ -475,6 +483,7 @@ impl Workspace {
             settings,
             window_bounds: Rc::new(Cell::new(Bounds::default())),
             tool_task: None,
+            format_save_task: None,
             watch_task: None,
             _watcher: None,
             _subs: subs,
@@ -488,6 +497,7 @@ impl Workspace {
             tsc_task: None,
             tsc_running: false,
             tsc_again: None,
+            has_project,
             panes: vec![Pane { id: 0, items: Vec::new(), active: None }],
             layout: Layout::Pane(0),
             focused_pane: 0,
@@ -1171,7 +1181,38 @@ impl Workspace {
     // ------------------------------------------------------------ actions
 
     fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
+        let format = self.settings.format_on_save;
+        self.save_active(format, cx);
+    }
+
+    /// ⌘S: format with the project's formatter (when there is one), then save.
+    /// Autosave never formats, so text doesn't jump around while typing.
+    fn save_active(&mut self, format: bool, cx: &mut Context<Self>) {
         let Some(ed) = self.active_editor() else { return };
+        let path = ed.read(cx).path.clone();
+        let (Some(path), true) = (path, format) else { return self.finish_save(ed, cx) };
+        let root = self.root(cx);
+        let text = ed.read(cx).text();
+        let version = ed.read(cx).buf.version();
+        let input = text.clone();
+        let task = cx.background_executor().spawn(async move { tools::format(&root, &path, &input) });
+        self.format_save_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |ws, cx| {
+                // Only apply if nothing was typed meanwhile; formatting is one undo step.
+                if let Ok((formatted, _)) = result
+                    && formatted != text
+                    && ed.read(cx).buf.version() == version
+                {
+                    ed.update(cx, |e, cx| e.apply_format(&formatted, cx));
+                }
+                ws.finish_save(ed, cx);
+            })
+            .ok();
+        }));
+    }
+
+    fn finish_save(&mut self, ed: Entity<Editor>, cx: &mut Context<Self>) {
         match ed.update(cx, |ed, cx| ed.save(cx)) {
             Ok(()) => {
                 let name = ed.read(cx).path.as_ref().map(|p| self.rel(p, cx)).unwrap_or_default();
@@ -1982,9 +2023,9 @@ impl Workspace {
                 })
                 .take(12)
                 .collect(),
-            "autosave" => ["on", "off"]
+            "autosave" | "formatonsave" | "fos" => ["on", "off"]
                 .iter()
-                .map(|s| CmdItem { label: s.to_string(), detail: String::new(), value: format!("autosave {s}"), positions: vec![], exec: true })
+                .map(|s| CmdItem { label: s.to_string(), detail: String::new(), value: format!("{head} {s}"), positions: vec![], exec: true })
                 .collect(),
             "sidebar" => ["left", "right"]
                 .iter()
@@ -2082,7 +2123,7 @@ impl Workspace {
         match cmd {
             "w" | "write" => self.save(&Save, window, cx),
             "wq" | "x" => {
-                self.save(&Save, window, cx);
+                self.save_active(false, cx);
                 self.close_active(&CloseTab, window, cx);
             }
             "q" => self.close_active(&CloseTab, window, cx),
@@ -2208,6 +2249,16 @@ impl Workspace {
                     self.flash("Checking…".into(), false, cx);
                 }
             },
+            "formatonsave" | "fos" => {
+                self.settings.format_on_save = match rest {
+                    "on" => true,
+                    "off" => false,
+                    _ => !self.settings.format_on_save,
+                };
+                self.settings.save();
+                let on = self.settings.format_on_save;
+                self.flash(format!("Format on save {}", if on { "on (⌘S formats, autosave doesn't)" } else { "off" }), false, cx);
+            }
             "autosave" => {
                 let on = match rest {
                     "on" => true,
@@ -2830,63 +2881,82 @@ impl Workspace {
     }
 
     fn render_welcome(&self, cx: &mut Context<Self>) -> AnyElement {
-        match None::<()> {
-            Some(_) => div().into_any_element(),
-            None => {
-                let row = |label: &str, keys: &str| {
+        static LOGO: std::sync::OnceLock<Arc<gpui::Image>> = std::sync::OnceLock::new();
+        let logo = LOGO.get_or_init(|| Arc::new(gpui::Image::from_bytes(ImageFormat::Png, include_bytes!("../packaging/logo-256.png").to_vec()))).clone();
+        let row = |label: &str, keys: &str| {
+            div()
+                .flex()
+                .gap(px(16.))
+                .child(div().w(px(160.)).flex().justify_end().child(label.to_string()))
+                .child(div().w(px(130.)).text_color(theme::fg()).child(keys.to_string()))
+        };
+        // "OSKL code" wordmark, each letter in its color from the app icon.
+        let letter = |l: &'static str, color: u32| div().text_color(theme::c(color)).child(l);
+        let wordmark = div()
+            .flex()
+            .items_end()
+            .gap(px(2.))
+            .text_size(px(30.))
+            .font_weight(FontWeight::BOLD)
+            .child(letter("O", 0x61afef))
+            .child(letter("S", 0xc678dd))
+            .child(letter("K", 0xe5c07b))
+            .child(letter("L", 0x98c379))
+            .child(div().ml(px(10.)).text_size(px(22.)).font_weight(FontWeight::NORMAL).text_color(theme::fg_dim()).child("code"));
+        let mut screen = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(9.))
+            .bg(theme::bg_editor())
+            .text_color(theme::fg_muted())
+            .child(img(logo).size(px(112.)))
+            .child(wordmark)
+            .child(div().mb(px(18.)).text_size(px(11.)).text_color(theme::fg_muted()).child("git-first · terminal-fast · light"))
+            .child(row("Find File", "⌘ P"))
+            .child(row("Command Line", "⌘ ⇧ P  or  :"))
+            .child(row("Source Control", "⌃ ⇧ G"))
+            .child(row("Search in Files", "⌘ ⇧ F"))
+            .child(row("Terminal", "⌘ T  ·  ⌃ `"))
+            .child(row("Split Right / Down", "⌘ D  ·  ⌘ ⇧ D"))
+            .child(row("Toggle Blame", "⌥ ⌘ B"))
+            .child(row("All Shortcuts", "⌘K ⌘S"));
+        // Open Folder and Recent only when no project is open yet.
+        if !self.has_project {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let recent: Vec<PathBuf> = self.settings.recent_folders.iter().filter(|f| f.is_dir() && !f.starts_with(std::env::temp_dir())).take(8).cloned().collect();
+            screen = screen
+                .child(row("Open Folder", "⌘ O"))
+                .child(
                     div()
-                        .flex()
-                        .gap(px(16.))
-                        .child(div().w(px(160.)).flex().justify_end().child(label.to_string()))
-                        .child(div().w(px(120.)).text_color(theme::fg()).child(keys.to_string()))
-                };
-                div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(10.))
-                    .bg(theme::bg_editor())
-                    .text_color(theme::fg_muted())
-                    .child(div().text_size(px(12.)).text_color(theme::frame_focused()).mb(px(18.)).child("┌─ kite ─────────────────────┐"))
-                    .child(row("Find File", "⌘ P"))
-                    .child(row("Command Line", "⌘ ⇧ P  or  :"))
-                    .child(row("Source Control", "⌃ ⇧ G"))
-                    .child(row("Toggle Blame", "⌥ ⌘ B"))
-                    .child(row("Format File", "⇧ ⌥ F"))
-                    .child(row("Terminal", "⌘ T  ·  ⌃ `"))
-                    .child(row("Split Right / Down", "⌘ D  ·  ⌘ ⇧ D"))
-                    .child(row("All Shortcuts", "⌘K ⌘S"))
-                    .child(row("Open Folder", "⌘ O"))
-                    .child(
-                        div()
-                            .id("welcome-open")
-                            .mt(px(16.))
-                            .px(px(14.))
-                            .py(px(6.))
-                            .rounded(px(4.))
-                            .bg(theme::accent())
-                            .text_color(theme::c(0xffffff))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme::accent_hover()))
-                            .on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx)))
-                            .child("Open Folder…"),
-                    )
-                    .child(div().mt(px(14.)).text_size(px(10.5)).child("RECENT"))
-                    .children(self.settings.recent_folders.iter().skip(1).take(6).enumerate().map(|(i, f)| {
-                        let dir = f.clone();
-                        div()
-                            .id(("recent", i))
-                            .text_color(theme::accent())
-                            .cursor_pointer()
-                            .hover(|s| s.underline())
-                            .on_click(cx.listener(move |ws, _, w, cx| ws.switch_project(dir.clone(), w, cx)))
-                            .child(f.to_string_lossy().replace(&std::env::var("HOME").unwrap_or_default(), "~"))
-                    }))
-                    .into_any_element()
-            }
+                        .id("welcome-open")
+                        .mt(px(16.))
+                        .px(px(14.))
+                        .py(px(6.))
+                        .rounded(px(4.))
+                        .bg(theme::frame_focused())
+                        .text_color(theme::bg_app())
+                        .font_weight(FontWeight::BOLD)
+                        .cursor_pointer()
+                        .hover(|s| s.opacity(0.85))
+                        .on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx)))
+                        .child("Open Folder…"),
+                )
+                .when(!recent.is_empty(), |d| d.child(div().mt(px(14.)).text_size(px(10.5)).child("RECENT")))
+                .children(recent.into_iter().enumerate().map(|(i, f)| {
+                    let label = f.to_string_lossy().replacen(&home, "~", 1);
+                    div()
+                        .id(("recent", i))
+                        .text_color(theme::accent())
+                        .cursor_pointer()
+                        .hover(|s| s.underline())
+                        .on_click(cx.listener(move |ws, _, w, cx| ws.switch_project(f.clone(), w, cx)))
+                        .child(label)
+                }));
         }
+        screen.into_any_element()
     }
 
     fn render_output(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3027,7 +3097,7 @@ impl Workspace {
                 .child(div().text_color(theme::fg_muted()).child(label.to_string()))
         };
         let pane_count = self.panes.len();
-        base.child(chip(if self.zoomed { " kite · MAX ".into() } else { " kite ".into() }, theme::frame_focused()))
+        base.child(chip(if self.zoomed { " oskl · MAX ".into() } else { " oskl ".into() }, theme::frame_focused()))
         .child(
             item("status-branch")
                 .when(!branch.is_empty(), |d| d.child(ui::small_icon("git", theme::fg())).child(branch.clone()))
@@ -3472,4 +3542,15 @@ mod tests {
         assert!(l.remove_pane(1));
         assert!(matches!(l, Layout::Pane(0)));
     }
+}
+
+/// An empty placeholder folder used when the app starts without a project.
+pub fn no_project_dir() -> PathBuf {
+    let dir = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(".config/kite/no-project");
+    std::fs::create_dir_all(&dir).ok();
+    dir.canonicalize().unwrap_or(dir)
+}
+
+fn root_is_project(root: &Path) -> bool {
+    root != no_project_dir()
 }

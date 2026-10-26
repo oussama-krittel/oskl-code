@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#262b35"/>
+      <stop offset="1" stop-color="#0b0d11"/>
+    </linearGradient>
+    <linearGradient id="front" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#454c5a"/>
+      <stop offset="1" stop-color="#22262e"/>
+    </linearGradient>
+    <linearGradient id="inside" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#05070a"/>
+      <stop offset="1" stop-color="#14171d"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="1" r="0.75">
+      <stop offset="0" stop-color="#98c379" stop-opacity="0.30"/>
+      <stop offset="0.6" stop-color="#61afef" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#61afef" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="16" flood-color="#000" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+
+  <!-- macOS-style rounded square -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="183.5" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+
+  <!-- soft light rising from the open drawer -->
+  <ellipse cx="512" cy="560" rx="340" ry="255" fill="url(#glow)"/>
+
+  <!-- drawer opening (the dark inside) -->
+  <path d="M236 548 L788 548 L760 610 L264 610 Z" fill="url(#inside)"/>
+
+  <!-- the letters O S K L, popping out of the drawer -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="50" filter="url(#shadow)">
+    <!-- O sits low and leans left, S jumps highest, K and L bob in between -->
+    <circle cx="325" cy="512" r="66" stroke="#61afef" transform="rotate(-14 325 512)"/>
+    <path d="M500 392 C478 366 418 368 418 412 C418 456 506 448 506 494 C506 540 440 548 410 518" stroke="#c678dd" transform="rotate(9 460 456)"/>
+    <path d="M582 420 V586 M656 420 L588 504 L662 586" stroke="#e5c07b" transform="rotate(-8 622 503)"/>
+    <path d="M728 404 V574 H780" stroke="#98c379" transform="rotate(12 754 489)"/>
+  </g>
+
+  <!-- drawer front, covering the letters' feet -->
+  <g filter="url(#shadow)">
+    <rect x="210" y="586" width="604" height="248" rx="40" fill="url(#front)"/>
+  </g>
+  <rect x="212" y="588" width="600" height="6" rx="3" fill="#ffffff" fill-opacity="0.16"/>
+  <!-- label slot + handle -->
+  <rect x="452" y="636" width="120" height="44" rx="8" fill="none" stroke="#0b0d11" stroke-opacity="0.55" stroke-width="6"/>
+  <rect x="412" y="724" width="200" height="40" rx="20" fill="#98c379"/>
+  <rect x="412" y="724" width="200" height="14" rx="7" fill="#ffffff" fill-opacity="0.25"/>
+</svg>
