@@ -286,6 +286,10 @@ impl FileTree {
                 window.focus(&tree.focus);
                 tree.activate(ix, ev.click_count() < 2, cx);
             }))
+            .when(!row.entry.is_dir, |d| {
+                let drag = ui::DraggedFile { path: row.entry.path.clone(), label: row.entry.name.clone() };
+                d.on_drag(drag, |f: &ui::DraggedFile, _, _, cx| cx.new(|_| ui::DragChip(f.label.clone())))
+            })
             .child(if row.entry.is_dir {
                 ui::small_icon(if row.expanded { "chevron-down" } else { "chevron-right" }, theme::fg())
             } else {

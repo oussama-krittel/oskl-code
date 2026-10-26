@@ -115,3 +115,36 @@ impl Render for TextTooltip {
 pub fn tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     move |_, cx| cx.new(|_| TextTooltip(text.into())).into()
 }
+
+/// A pane item (file, diff, terminal…) being dragged by its title-bar chip.
+#[derive(Clone)]
+pub struct DraggedItem {
+    pub tab_id: usize,
+    pub label: String,
+}
+
+/// A file being dragged from the explorer.
+#[derive(Clone)]
+pub struct DraggedFile {
+    pub path: std::path::PathBuf,
+    pub label: String,
+}
+
+/// What follows the cursor while dragging.
+pub struct DragChip(pub String);
+
+impl Render for DragChip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(4.))
+            .bg(theme::bg_popup())
+            .border_1()
+            .border_color(theme::frame_focused())
+            .text_size(px(11.5))
+            .font_family(theme::MONO_FONT)
+            .text_color(theme::fg_bright())
+            .child(self.0.clone())
+    }
+}

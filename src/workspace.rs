@@ -37,6 +37,7 @@ actions!(
         OpenFolder, SearchAll, ShowKeysPanel, ToggleSidebarSide,
         SplitRight, SplitDown, ClosePane, ZoomPane, FocusLeft, FocusRight, FocusUp, FocusDown,
         NewTerminal, ToggleTerminal, PaneBuffers,
+        MoveItemLeft, MoveItemRight, MoveItemUp, MoveItemDown,
         Buffer1, Buffer2, Buffer3, Buffer4, Buffer5, Buffer6, Buffer7, Buffer8, Buffer9,
     ]
 );
@@ -69,6 +70,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-l", FocusRight, None),
         KeyBinding::new("ctrl-alt-k", FocusUp, None),
         KeyBinding::new("ctrl-alt-j", FocusDown, None),
+        KeyBinding::new("cmd-alt-shift-left", MoveItemLeft, None),
+        KeyBinding::new("cmd-alt-shift-right", MoveItemRight, None),
+        KeyBinding::new("cmd-alt-shift-up", MoveItemUp, None),
+        KeyBinding::new("cmd-alt-shift-down", MoveItemDown, None),
+        KeyBinding::new("ctrl-alt-shift-h", MoveItemLeft, None),
+        KeyBinding::new("ctrl-alt-shift-l", MoveItemRight, None),
+        KeyBinding::new("ctrl-alt-shift-k", MoveItemUp, None),
+        KeyBinding::new("ctrl-alt-shift-j", MoveItemDown, None),
         KeyBinding::new("cmd-alt-up", FocusUp, None),
         KeyBinding::new("cmd-alt-down", FocusDown, None),
         KeyBinding::new("cmd-d", SplitRight, None),
@@ -201,6 +210,40 @@ impl Layout {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DropZone {
+    Center,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl DropZone {
+    /// Which part of a pane the cursor is over: the outer quarter on each side splits.
+    fn at(bounds: Bounds<Pixels>, p: Point<Pixels>) -> Self {
+        let x = (p.x - bounds.left()) / bounds.size.width;
+        let y = (p.y - bounds.top()) / bounds.size.height;
+        let edge = 0.25;
+        let candidates = [(x, DropZone::Left), (1. - x, DropZone::Right), (y, DropZone::Top), (1. - y, DropZone::Bottom)];
+        candidates
+            .into_iter()
+            .filter(|(d, _)| *d < edge)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, z)| z)
+            .unwrap_or(DropZone::Center)
+    }
+
+    fn from_dir(dx: i32, dy: i32) -> Self {
+        match (dx.signum(), dy.signum()) {
+            (-1, _) => DropZone::Left,
+            (1, _) => DropZone::Right,
+            (_, -1) => DropZone::Top,
+            _ => DropZone::Bottom,
+        }
+    }
+}
+
 struct Pane {
     id: usize,
     /// Tab ids open in this pane (its "buffers").
@@ -327,6 +370,7 @@ pub struct Workspace {
     pane_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
     split_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     dragging_split: Option<String>,
+    drop_hint: Option<(usize, DropZone)>,
     extra_subs: Vec<Subscription>,
 }
 
@@ -428,6 +472,7 @@ impl Workspace {
             pane_bounds: Default::default(),
             split_bounds: Default::default(),
             dragging_split: None,
+            drop_hint: None,
             extra_subs: Vec::new(),
         };
         ws.start_watcher(cx);
@@ -668,10 +713,10 @@ impl Workspace {
         }
     }
 
-    /// Moves focus to the nearest pane in a direction (dx, dy), or to the sidebar at the edge.
-    fn focus_dir(&mut self, dx: i32, dy: i32, window: &mut Window, cx: &mut Context<Self>) {
+    /// The nearest pane in a direction from the focused one.
+    fn neighbor(&self, dx: i32, dy: i32) -> Option<usize> {
         let bounds = self.pane_bounds.borrow().clone();
-        let Some(cur) = bounds.get(&self.focused_pane) else { return };
+        let cur = bounds.get(&self.focused_pane)?;
         let c = cur.center();
         let mut best: Option<(f32, usize)> = None;
         for (id, b) in &bounds {
@@ -691,8 +736,14 @@ impl Workspace {
                 best = Some((score, *id));
             }
         }
+        best.map(|(_, id)| id)
+    }
+
+    /// Moves focus to the nearest pane in a direction (wraps around at the edges).
+    fn focus_dir(&mut self, dx: i32, dy: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let best = self.neighbor(dx, dy).map(|id| ((), id));
         match best {
-            Some((_, id)) => {
+            Some(((), id)) => {
                 self.set_focused_pane(id);
                 self.focus_active(window, cx);
             }
@@ -715,6 +766,96 @@ impl Workspace {
     /// ⌘T: a terminal in the focused pane.
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_terminal_view(None, window, cx);
+    }
+
+    /// ⌘⌥⇧ + arrow: move the shown item to the pane that way, or split off a new pane there.
+    fn move_item_dir(&mut self, dx: i32, dy: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tid) = self.pane(self.focused_pane).and_then(|p| p.active) else {
+            return self.flash("Nothing to move in this pane".into(), true, cx);
+        };
+        match self.neighbor(dx, dy) {
+            Some(target) => self.move_tab(tid, target, DropZone::Center, window, cx),
+            None => self.move_tab(tid, self.focused_pane, DropZone::from_dir(dx, dy), window, cx),
+        }
+    }
+
+    /// Moves an item into `target` (Center) or into a new split on one side of it.
+    fn move_tab(&mut self, tid: usize, target: usize, zone: DropZone, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(src) = self.pane_of_tab(tid) else { return };
+        if self.pane(target).is_none() {
+            return;
+        }
+        let src_len = self.pane(src).map(|p| p.items.len()).unwrap_or(0);
+        let dest = if zone == DropZone::Center {
+            if src == target {
+                return;
+            }
+            target
+        } else {
+            if src == target && src_len <= 1 {
+                return self.flash("It's the only item in this pane — open another file first, or move it onto another pane".into(), true, cx);
+            }
+            let new = self.next_id;
+            self.next_id += 1;
+            self.panes.push(Pane { id: new, items: Vec::new(), active: None });
+            let vertical = matches!(zone, DropZone::Left | DropZone::Right);
+            let before = matches!(zone, DropZone::Left | DropZone::Top);
+            let (a, b) = if before { (Layout::Pane(new), Layout::Pane(target)) } else { (Layout::Pane(target), Layout::Pane(new)) };
+            self.layout.replace_pane(target, Layout::Split { vertical, ratio: 0.5, a: Box::new(a), b: Box::new(b) });
+            new
+        };
+        if let Some(p) = self.pane_mut(src)
+            && let Some(pos) = p.items.iter().position(|x| *x == tid)
+        {
+            p.items.remove(pos);
+            if p.active == Some(tid) {
+                p.active = p.items.get(pos.min(p.items.len().saturating_sub(1))).copied();
+            }
+        }
+        if let Some(p) = self.pane_mut(dest) {
+            p.items.push(tid);
+            p.active = Some(tid);
+        }
+        if self.pane(src).is_some_and(|p| p.items.is_empty()) && self.panes.len() > 1 {
+            self.layout.remove_pane(src);
+            self.panes.retain(|p| p.id != src);
+        }
+        self.zoomed = false;
+        self.drop_hint = None;
+        self.set_focused_pane(dest);
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// A file dropped from the explorer onto a pane.
+    fn drop_file(&mut self, path: PathBuf, pane: usize, zone: DropZone, window: &mut Window, cx: &mut Context<Self>) {
+        self.drop_hint = None;
+        let existing = self.tabs.iter().find(|t| matches!(&t.kind, TabKind::Editor(e) if e.read(cx).path.as_ref() == Some(&path))).map(|t| t.id);
+        if let Some(tid) = existing {
+            // Already open somewhere: move it there instead of opening it twice.
+            if self.pane_of_tab(tid) == Some(pane) && zone == DropZone::Center {
+                if let Some(ix) = self.tab_ix(tid) {
+                    self.activate(ix, window, cx);
+                }
+                return;
+            }
+            return self.move_tab(tid, pane, zone, window, cx);
+        }
+        let dest = if zone == DropZone::Center {
+            pane
+        } else {
+            let new = self.next_id;
+            self.next_id += 1;
+            self.panes.push(Pane { id: new, items: Vec::new(), active: None });
+            let vertical = matches!(zone, DropZone::Left | DropZone::Right);
+            let before = matches!(zone, DropZone::Left | DropZone::Top);
+            let (a, b) = if before { (Layout::Pane(new), Layout::Pane(pane)) } else { (Layout::Pane(pane), Layout::Pane(new)) };
+            self.layout.replace_pane(pane, Layout::Split { vertical, ratio: 0.5, a: Box::new(a), b: Box::new(b) });
+            new
+        };
+        self.zoomed = false;
+        self.set_focused_pane(dest);
+        self.open_file(path, None, false, window, cx);
     }
 
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2404,8 +2545,33 @@ impl Workspace {
                             }))
                             .child(div().text_color(if active { theme::frame_focused() } else { theme::fg_muted() }).child(if i < 9 { format!("{}", i + 1) } else { "·".into() }))
                             .child(if term { ui::small_icon("terminal", theme::frame_focused()).size(px(12.)) } else { ui::file_icon(&icon_name).size(px(12.)) })
-                            .child(div().max_w(px(180.)).overflow_hidden().whitespace_nowrap().when(preview, |d| d.italic()).child(title))
-                            .when(dirty, |d| d.child(div().text_color(theme::git_modified()).child("●"))),
+                            .child(div().max_w(px(180.)).overflow_hidden().whitespace_nowrap().when(preview, |d| d.italic()).child(title.clone()))
+                            .when(dirty, |d| d.child(div().text_color(theme::git_modified()).child("●")))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("chip-x-{id}-{tid}")))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(14.))
+                                    .rounded(px(3.))
+                                    .when(!active, |d| d.invisible().group_hover(SharedString::from(format!("chip-{id}-{tid}")), |s| s.visible()))
+                                    .hover(|s| s.bg(theme::ca(0xffffff1f)))
+                                    .tooltip(ui::tooltip("Close (⌘W · middle-click)"))
+                                    .on_click(cx.listener({
+                                        let tid = *tid;
+                                        move |ws, _, w, cx| {
+                                            cx.stop_propagation();
+                                            if let Some(ix) = ws.tab_ix(tid) {
+                                                ws.close_tab(ix, false, w, cx);
+                                            }
+                                        }
+                                    }))
+                                    .child(ui::small_icon("close", theme::fg_dim()).size(px(10.))),
+                            )
+                            .group(SharedString::from(format!("chip-{id}-{tid}")))
+                            .cursor_grab()
+                            .on_drag(ui::DraggedItem { tab_id: *tid, label: title }, |d: &ui::DraggedItem, _, _, cx| cx.new(|_| ui::DragChip(d.label.clone()))),
                     )
                 })),
             )
@@ -2471,10 +2637,47 @@ impl Workspace {
                         }
                     }))
                     .child(canvas(move |b, _, _| { cell.borrow_mut().insert(id, b); }, |_, _, _, _| {}).absolute().size_full())
+                    .on_drag_move(cx.listener(move |ws, ev: &DragMoveEvent<ui::DraggedItem>, _, cx| ws.update_drop_hint(id, ev.bounds, ev.event.position, cx)))
+                    .on_drag_move(cx.listener(move |ws, ev: &DragMoveEvent<ui::DraggedFile>, _, cx| ws.update_drop_hint(id, ev.bounds, ev.event.position, cx)))
+                    .on_drop(cx.listener(move |ws, d: &ui::DraggedItem, w, cx| {
+                        let zone = ws.drop_hint.filter(|(p, _)| *p == id).map(|(_, z)| z).unwrap_or(DropZone::Center);
+                        ws.move_tab(d.tab_id, id, zone, w, cx);
+                    }))
+                    .on_drop(cx.listener(move |ws, d: &ui::DraggedFile, w, cx| {
+                        let zone = ws.drop_hint.filter(|(p, _)| *p == id).map(|(_, z)| z).unwrap_or(DropZone::Center);
+                        ws.drop_file(d.path.clone(), id, zone, w, cx);
+                    }))
                     .child(header)
-                    .child(div().flex_1().min_h_0().child(content)),
+                    .child(div().flex_1().min_h_0().child(content))
+                    .when_some(self.drop_hint.filter(|(p, _)| *p == id).map(|(_, z)| z), |d, zone| {
+                        // Shows where the drop lands: the whole pane, or the half that becomes a new split.
+                        let overlay = div().absolute().bg(theme::frame_focused().opacity(0.16)).border_2().border_color(theme::frame_focused()).rounded(px(4.));
+                        let overlay = match zone {
+                            DropZone::Center => overlay.inset_0(),
+                            DropZone::Left => overlay.top_0().bottom_0().left_0().w(relative(0.5)),
+                            DropZone::Right => overlay.top_0().bottom_0().right_0().w(relative(0.5)),
+                            DropZone::Top => overlay.left_0().right_0().top_0().h(relative(0.5)),
+                            DropZone::Bottom => overlay.left_0().right_0().bottom_0().h(relative(0.5)),
+                        };
+                        d.child(overlay)
+                    }),
             )
             .into_any_element()
+    }
+
+    fn update_drop_hint(&mut self, id: usize, bounds: Bounds<Pixels>, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        if !bounds.contains(&pos) {
+            if self.drop_hint.is_some_and(|(p, _)| p == id) {
+                self.drop_hint = None;
+                cx.notify();
+            }
+            return;
+        }
+        let hint = Some((id, DropZone::at(bounds, pos)));
+        if self.drop_hint != hint {
+            self.drop_hint = hint;
+            cx.notify();
+        }
     }
 
     fn render_empty_pane(&self) -> AnyElement {
@@ -3001,6 +3204,10 @@ impl Render for Workspace {
                 ws.zoomed = !ws.zoomed;
                 cx.notify();
             }))
+            .on_action(cx.listener(|ws, _: &MoveItemLeft, w, cx| ws.move_item_dir(-1, 0, w, cx)))
+            .on_action(cx.listener(|ws, _: &MoveItemRight, w, cx| ws.move_item_dir(1, 0, w, cx)))
+            .on_action(cx.listener(|ws, _: &MoveItemUp, w, cx| ws.move_item_dir(0, -1, w, cx)))
+            .on_action(cx.listener(|ws, _: &MoveItemDown, w, cx| ws.move_item_dir(0, 1, w, cx)))
             .on_action(cx.listener(|ws, _: &FocusLeft, w, cx| ws.focus_dir(-1, 0, w, cx)))
             .on_action(cx.listener(|ws, _: &FocusRight, w, cx| ws.focus_dir(1, 0, w, cx)))
             .on_action(cx.listener(|ws, _: &FocusUp, w, cx| ws.focus_dir(0, -1, w, cx)))
@@ -3072,6 +3279,7 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|ws, _, _, _| {
+                ws.drop_hint = None;
                 ws.dragging_split = None;
                 ws.resizing_side = false;
                 ws.resizing_output = false;
@@ -3093,5 +3301,32 @@ impl Render for Workspace {
             })
             .child(self.render_status(window, cx))
             .children(self.render_cmd_popup(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DropZone, Layout};
+    use gpui::{Bounds, point, px, size};
+
+    #[test]
+    fn drop_zones_follow_the_cursor() {
+        let b = Bounds::new(point(px(0.), px(0.)), size(px(400.), px(200.)));
+        assert_eq!(DropZone::at(b, point(px(200.), px(100.))), DropZone::Center);
+        assert_eq!(DropZone::at(b, point(px(20.), px(100.))), DropZone::Left);
+        assert_eq!(DropZone::at(b, point(px(390.), px(100.))), DropZone::Right);
+        assert_eq!(DropZone::at(b, point(px(200.), px(10.))), DropZone::Top);
+        assert_eq!(DropZone::at(b, point(px(200.), px(190.))), DropZone::Bottom);
+    }
+
+    #[test]
+    fn layout_split_and_remove() {
+        let mut l = Layout::Pane(0);
+        l.replace_pane(0, Layout::Split { vertical: true, ratio: 0.5, a: Box::new(Layout::Pane(1)), b: Box::new(Layout::Pane(0)) });
+        let mut ids = Vec::new();
+        l.panes(&mut ids);
+        assert_eq!(ids, vec![1, 0]);
+        assert!(l.remove_pane(1));
+        assert!(matches!(l, Layout::Pane(0)));
     }
 }
