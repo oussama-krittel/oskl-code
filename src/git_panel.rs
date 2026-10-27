@@ -202,6 +202,11 @@ impl GitPanel {
         }
     }
 
+    #[cfg(test)]
+    pub fn changes_scroll_max(&self) -> f32 {
+        self.changes_scroll.max_offset().height / px(1.)
+    }
+
     pub fn focus(&self, window: &mut Window) {
         window.focus(&self.focus);
     }
@@ -1027,6 +1032,9 @@ impl GitPanel {
             .id("changes-scroll")
             .flex()
             .flex_col()
+            // Fill the space it's given and scroll inside it (otherwise it just grows).
+            .flex_1()
+            .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.changes_scroll)
             .child(
@@ -1389,7 +1397,7 @@ impl Render for GitPanel {
                     .when(self.changes_open && !self.graph_open, |d| d.flex_1())
                     .when(!self.changes_open, |d| d.flex_none())
                     .child(changes_header)
-                    .when(self.changes_open, |d| d.child(div().flex_1().min_h_0().child(self.render_changes(focused, window, cx)))),
+                    .when(self.changes_open, |d| d.child(div().flex().flex_col().flex_1().min_h_0().child(self.render_changes(focused, window, cx)))),
             )
             .when(both_open, |d| {
                 d.child(

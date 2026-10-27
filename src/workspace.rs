@@ -4191,6 +4191,24 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn long_changes_list_scrolls(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && mkdir -p src/a && for i in $(seq 1 120); do echo $i > src/a/f$i.txt; done");
+        });
+        ws.update(cx, |ws, cx| {
+            ws.side = super::Side::Git;
+            ws.side_visible = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let max = ws.read_with(cx, |ws, cx| ws.git_panel.read(cx).changes_scroll_max());
+        assert!(max > 100., "the changes list overflows and can scroll (max offset {max})");
+    }
+
+    #[gpui::test]
     fn merge_editor_checkboxes_and_accept(cx: &mut TestAppContext) {
         let (ws, cx) = setup_with(cx, merge_in_conflict);
         cx.run_until_parked();
