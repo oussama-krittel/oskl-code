@@ -300,8 +300,15 @@ struct Pane {
     items: Vec<usize>,
     active: Option<usize>,
     /// What was shown before / after (⌃- and ⌃⇧-), newest last.
-    back: Vec<usize>,
-    fwd: Vec<usize>,
+    back: Vec<Nav>,
+    fwd: Vec<Nav>,
+}
+
+/// A place to go back to: a tab, and where its cursor was (editors only).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Nav {
+    tab: usize,
+    pos: Option<usize>,
 }
 
 struct Tab {
@@ -732,12 +739,13 @@ impl Workspace {
         } else {
             None
         };
-        self.tabs.push(Tab { id, kind, preview, _sub: sub });
         let fp = self.focused_pane;
+        let prev_nav = self.pane(fp).and_then(|p| p.active).map(|t| self.nav_of(t, cx));
+        self.tabs.push(Tab { id, kind, preview, _sub: sub });
         if let Some(pane) = self.pane_mut(fp) {
             let pos = pane.active.and_then(|a| pane.items.iter().position(|x| *x == a)).map(|p| p + 1).unwrap_or(pane.items.len());
             pane.items.insert(pos, id);
-            if let Some(prev) = pane.active {
+            if let Some(prev) = prev_nav {
                 pane.back.push(prev);
                 pane.fwd.clear();
             }
@@ -755,8 +763,8 @@ impl Workspace {
     /// Removes a tab everywhere (no dirty check).
     fn drop_tab(&mut self, id: usize) {
         for pane in &mut self.panes {
-            pane.back.retain(|t| *t != id);
-            pane.fwd.retain(|t| *t != id);
+            pane.back.retain(|n| n.tab != id);
+            pane.fwd.retain(|n| n.tab != id);
             if let Some(pos) = pane.items.iter().position(|x| *x == id) {
                 pane.items.remove(pos);
                 if pane.active == Some(id) {
@@ -782,8 +790,9 @@ impl Workspace {
             Some(p) => {
                 self.set_focused_pane(p);
                 let navigating = self.navigating;
+                let prev_nav = self.pane(p).and_then(|p| p.active).filter(|prev| *prev != id && !navigating).map(|t| self.nav_of(t, cx));
                 if let Some(pane) = self.pane_mut(p) {
-                    if let Some(prev) = pane.active.filter(|prev| *prev != id && !navigating) {
+                    if let Some(prev) = prev_nav {
                         pane.back.push(prev);
                         pane.fwd.clear();
                     }
@@ -1381,6 +1390,18 @@ impl Workspace {
 
     /// Go to definition in another file: open it and put the cursor on the name.
     fn open_definition(&mut self, t: crate::definition::Target, window: &mut Window, cx: &mut Context<Self>) {
+        // Within the file: remember where the cursor was (a new tab is remembered by open_file).
+        let fp = self.focused_pane;
+        if let Some(cur) = self.pane(fp).and_then(|p| p.active)
+            && let Some(ix) = self.tab_ix(cur)
+            && matches!(&self.tabs[ix].kind, TabKind::Editor(e) if e.read(cx).path.as_ref() == Some(&t.path))
+        {
+            let nav = self.nav_of(cur, cx);
+            if let Some(pane) = self.pane_mut(fp) {
+                pane.back.push(nav);
+                pane.fwd.clear();
+            }
+        }
         self.open_file(t.path, None, false, window, cx);
         if let Some(ed) = self.active_editor() {
             ed.update(cx, |ed, cx| ed.go_to(t.row, t.col, cx));
@@ -1660,18 +1681,34 @@ impl Workspace {
     /// ⌃- / ⌃⇧-: back / forward through what this split showed.
     fn navigate(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
         let fp = self.focused_pane;
+        let current = self.pane(fp).and_then(|p| p.active).map(|t| self.nav_of(t, cx));
         let Some(pane) = self.pane_mut(fp) else { return };
         let (from, to) = if back { (&mut pane.back, &mut pane.fwd) } else { (&mut pane.fwd, &mut pane.back) };
         let Some(target) = from.pop() else {
             return self.flash(if back { "Nothing to go back to".into() } else { "Nothing to go forward to".into() }, false, cx);
         };
-        if let Some(cur) = pane.active {
+        if let Some(cur) = current {
             to.push(cur);
         }
-        let Some(ix) = self.tab_ix(target) else { return };
+        let Some(ix) = self.tab_ix(target.tab) else { return };
         self.navigating = true;
         self.activate(ix, window, cx);
         self.navigating = false;
+        if let (Some(pos), TabKind::Editor(e)) = (target.pos, &self.tabs[ix].kind) {
+            e.update(cx, |e, cx| {
+                let (row, col) = e.buf.pos_to_rc(pos.min(e.buf.len()));
+                e.go_to(row, col, cx);
+            });
+        }
+    }
+
+    /// Where a tab is now, for the back/forward history.
+    fn nav_of(&self, tab: usize, cx: &App) -> Nav {
+        let pos = self.tab_ix(tab).and_then(|ix| match &self.tabs[ix].kind {
+            TabKind::Editor(e) => Some(e.read(cx).buf.sel.head),
+            _ => None,
+        });
+        Nav { tab, pos }
     }
 
     /// ⌘1…⌘9: show the Nth item of the focused pane (⌘9 = last, like browsers).
@@ -3182,6 +3219,7 @@ impl Workspace {
             None if self.panes.len() == 1 => self.render_welcome(cx),
             None => self.render_empty_pane(),
         };
+        let (can_back, can_fwd) = self.pane(id).map(|p| (!p.back.is_empty(), !p.fwd.is_empty())).unwrap_or_default();
         let glyph = |gid: &'static str, icon: &'static str, tip: &'static str| {
             div()
                 .id(SharedString::from(format!("{gid}-{id}")))
@@ -3294,6 +3332,25 @@ impl Workspace {
                     ws.set_focused_pane(id);
                     ws.cycle_buffer(1, w, cx);
                 })))
+            })
+            .when(can_back || can_fwd, |d| {
+                // Back / forward through where you've been in this split (⌃- / ⌃⇧-).
+                d.child(
+                    glyph("nav-back", "arrow-left", "Go back (⌃-)")
+                        .when(!can_back, |g| g.opacity(0.35))
+                        .on_click(cx.listener(move |ws, _, window, cx| {
+                            ws.set_focused_pane(id);
+                            ws.navigate(true, window, cx);
+                        })),
+                )
+                .child(
+                    glyph("nav-fwd", "arrow-right", "Go forward (⌃⇧-)")
+                        .when(!can_fwd, |g| g.opacity(0.35))
+                        .on_click(cx.listener(move |ws, _, window, cx| {
+                            ws.set_focused_pane(id);
+                            ws.navigate(false, window, cx);
+                        })),
+                )
             })
             .when(is_editor, |d| {
                 // Word wrap toggle (same as ⌥Z / the status bar): lit while wrapping.
@@ -4505,6 +4562,14 @@ mod ui_tests {
         cx.simulate_keystrokes("f12");
         cx.run_until_parked();
         assert_eq!(at(cx), ("Button.tsx".into(), (2, 16)), "imported component");
+        cx.simulate_keystrokes("ctrl--");
+        assert_eq!(at(cx), ("app.tsx".into(), (3, 3)), "back to where the jump started");
+        cx.simulate_keystrokes("ctrl--");
+        assert_eq!(at(cx), ("app.tsx".into(), (2, 2)), "back past a jump within the file");
+        cx.simulate_keystrokes("ctrl-shift--");
+        assert_eq!(at(cx), ("app.tsx".into(), (3, 3)));
+        cx.simulate_keystrokes("ctrl-shift--");
+        assert_eq!(at(cx), ("Button.tsx".into(), (2, 16)), "forward again");
 
         ws.update_in(cx, |ws, window, cx| ws.open_file(file.clone(), None, false, window, cx));
         put(cx, 4, 3);

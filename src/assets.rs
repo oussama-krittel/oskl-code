@@ -29,6 +29,8 @@ fn icon_body(name: &str) -> Option<&'static str> {
         "target" => r#"<circle cx="8" cy="8" r="5.5"/><circle cx="8" cy="8" r="2" fill="black"/>"#,
         "tag" => r#"<path d="M1.5 1.5h6l7 7-6 6-7-7z"/><circle cx="5" cy="5" r="1"/>"#,
         "sync" => r#"<path d="M5 13.5v-11M2.5 5L5 2.5 7.5 5"/><path d="M11 2.5v11M8.5 11l2.5 2.5 2.5-2.5"/>"#,
+        "arrow-left" => r#"<path d="M13.5 8h-11M6.5 4l-4 4 4 4"/>"#,
+        "arrow-right" => r#"<path d="M2.5 8h11M9.5 4l4 4-4 4"/>"#,
         "arrow-up" => r#"<path d="M8 13.5v-11M4 6.5l4-4 4 4"/>"#,
         "arrow-down" => r#"<path d="M8 2.5v11M4 9.5l4 4 4-4"/>"#,
         "fetch" => r#"<path d="M4.5 12.5h7a2.8 2.8 0 0 0 .3-5.6 4 4 0 0 0-7.7-.9A3.3 3.3 0 0 0 4.5 12.5z"/><path d="M8 7v4M6.5 9.5L8 11l1.5-1.5"/>"#,

@@ -1018,11 +1018,12 @@ impl Editor {
     pub fn go_to_definition(&mut self, pos: usize, cx: &mut Context<Self>) {
         use crate::definition::{Found, Target};
         self.completion = None;
+        // Through the workspace even within this file, so ⌃- can come back.
         let land = |ed: &mut Self, t: Target, cx: &mut Context<Self>| {
-            if ed.path.as_ref() == Some(&t.path) {
-                ed.go_to(t.row, t.col, cx);
-            } else {
+            if ed.path.is_some() {
                 cx.emit(EditorEvent::OpenAt(t));
+            } else {
+                ed.go_to(t.row, t.col, cx);
             }
         };
         match crate::definition::find(&self.buf, pos, self.path.as_deref(), self.root.as_deref()) {
