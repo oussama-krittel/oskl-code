@@ -254,6 +254,9 @@ impl FileTree {
                 self.expanded.insert(row.entry.path.clone());
             }
             self.rebuild();
+        } else if preview {
+            // Single click: show it, but keep the keyboard here (⌘C, ⌘⌫… act on the file).
+            cx.emit(Request::ShowFile(row.entry.path.clone()));
         } else {
             cx.emit(Request::OpenFile { path: row.entry.path.clone(), line: None, preview });
         }
@@ -367,6 +370,13 @@ impl FileTree {
             self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
         }
         input.read(cx).focus(window);
+        // And again once the box is on screen: focus given to something not yet drawn can be lost.
+        let again = input.clone();
+        cx.on_next_frame(window, move |tree, window, cx| {
+            if tree.editing.as_ref().is_some_and(|e| e.input == again) {
+                again.read(cx).focus(window);
+            }
+        });
         cx.notify();
     }
 
@@ -698,8 +708,10 @@ impl FileTree {
         let selected = !row.pending && self.selected.as_ref() == Some(&row.entry.path);
         let input = self.editing.as_ref().filter(|e| row.pending || e.kind == EditKind::Rename(row.entry.path.clone())).map(|e| e.input.clone());
         let path = row.entry.path.clone();
+        let selector = format!("tree-row-{}", row.entry.name);
         div()
             .id(("tree-row", ix))
+            .debug_selector(move || selector)
             .flex()
             .items_center()
             .h(theme::row_h())
@@ -846,8 +858,8 @@ impl Render for FileTree {
                     .gap(px(1.))
                     .text_size(px(10.5))
                     .child(div().flex_1().child("EXPLORER"))
-                    .child(head_button("tree-new-file", "new-file", "New File… (A)").on_click(cx.listener(|t, _, w, cx| t.new_file(&NewFile, w, cx))))
-                    .child(head_button("tree-new-folder", "new-folder", "New Folder… (⇧A)").on_click(cx.listener(|t, _, w, cx| t.new_folder(&NewFolder, w, cx))))
+                    .child(head_button("tree-new-file", "new-file", "New File… (A)").debug_selector(|| "tree-new-file".into()).on_click(cx.listener(|t, _, w, cx| t.new_file(&NewFile, w, cx))))
+                    .child(head_button("tree-new-folder", "new-folder", "New Folder… (⇧A)").debug_selector(|| "tree-new-folder".into()).on_click(cx.listener(|t, _, w, cx| t.new_folder(&NewFolder, w, cx))))
                     .child(head_button("tree-refresh", "refresh", "Refresh").on_click(cx.listener(|t, _, _, cx| {
                         t.children.clear();
                         t.rebuild();
@@ -863,6 +875,15 @@ impl Render for FileTree {
                     .flex()
                     .flex_col()
                     // Empty space below the files: the project root (paste / new file there).
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|tree, _, window, cx| {
+                            tree.menu = None;
+                            tree.selected = Some(tree.root.clone());
+                            window.focus(&tree.focus);
+                            cx.notify();
+                        }),
+                    )
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|tree, ev: &MouseDownEvent, window, cx| {

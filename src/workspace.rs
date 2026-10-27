@@ -449,6 +449,8 @@ pub struct Workspace {
     split_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     dragging_split: Option<String>,
     navigating: bool,
+    /// Showing a tab without moving the keyboard to it (explorer single click).
+    keep_focus: bool,
     session_saved: String,
     _session_tasks: Vec<Task<()>>,
     _quit_sub: Option<Subscription>,
@@ -579,6 +581,7 @@ impl Workspace {
             split_bounds: Default::default(),
             dragging_split: None,
             navigating: false,
+            keep_focus: false,
             session_saved: String::new(),
             _session_tasks: Vec::new(),
             _quit_sub: None,
@@ -676,6 +679,11 @@ impl Workspace {
                 self.open_compare(base, other.clone(), window, cx);
             }
             Request::OpenFile { path, line, preview } => self.open_file(path.clone(), *line, *preview, window, cx),
+            Request::ShowFile(path) => {
+                self.keep_focus = true;
+                self.open_file(path.clone(), None, true, window, cx);
+                self.keep_focus = false;
+            }
             Request::OpenAt { path, line, cols } => {
                 self.open_file(path.clone(), None, true, window, cx);
                 if let Some(ed) = self.active_editor() {
@@ -838,7 +846,9 @@ impl Workspace {
             }
         }
         self.sync_active();
-        self.focus_active(window, cx);
+        if !self.keep_focus {
+            self.focus_active(window, cx);
+        }
         if let TabKind::Editor(e) = &self.tabs[ix].kind
             && let Some(path) = e.read(cx).path.clone()
         {
@@ -4770,6 +4780,69 @@ mod ui_tests {
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
         assert!(root.join("b.ts").is_file());
+    }
+
+    #[gpui::test]
+    fn explorer_keeps_the_keyboard_after_real_clicks(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("a.ts"), "const a = 1;\n").unwrap();
+        std::fs::write(root.join("b.ts"), "b\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| {
+            ws.side = super::Side::Files;
+            ws.side_visible = true;
+            ws.tree.update(cx, |t, cx| t.invalidate(&std::collections::HashSet::from([root.clone()]), cx));
+            cx.notify();
+            let _ = window;
+        });
+        cx.run_until_parked();
+        let click = |cx: &mut gpui::VisualTestContext, sel: &'static str, count: usize| {
+            cx.run_until_parked();
+            let at = cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} is on screen")).center();
+            for n in 1..=count {
+                cx.simulate_event(gpui::MouseDownEvent { position: at, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: n, first_mouse: false });
+                cx.simulate_event(gpui::MouseUpEvent { position: at, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: n });
+            }
+            cx.run_until_parked();
+        };
+        let tree_focused = |cx: &mut gpui::VisualTestContext| ws.update_in(cx, |ws, window, cx| gpui::Focusable::focus_handle(&ws.tree, cx).is_focused(window));
+        let active = |cx: &mut gpui::VisualTestContext| ws.read_with(cx, |ws, cx| ws.active_editor().and_then(|e| e.read(cx).path.clone()));
+
+        // One click: the file shows, the keyboard stays in the explorer.
+        click(cx, "tree-row-a.ts", 1);
+        assert_eq!(active(cx), Some(root.join("a.ts")), "previewed");
+        assert!(tree_focused(cx), "single click keeps the keyboard in the explorer");
+        cx.simulate_keystrokes("cmd-c");
+        click(cx, "tree-row-src", 1);
+        cx.simulate_keystrokes("cmd-v");
+        assert!(root.join("src/a.ts").is_file(), "⌘C ⌘V copied the file, not text");
+        assert_eq!(std::fs::read_to_string(root.join("a.ts")).unwrap(), "const a = 1;\n");
+
+        // The + button: the name box gets the typing.
+        click(cx, "tree-row-a.ts", 1);
+        click(cx, "tree-new-file", 1);
+        cx.simulate_input("fresh.ts");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(root.join("fresh.ts").is_file(), "typed into the name box");
+        click(cx, "tree-new-folder", 1);
+        cx.simulate_input("lib");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(root.join("lib").is_dir());
+
+        // Delete from a clicked row asks, and never touches the open file's text.
+        click(cx, "tree-row-b.ts", 1);
+        cx.simulate_keystrokes("cmd-backspace");
+        assert!(cx.has_pending_prompt(), "⌘⌫ asks to move b.ts to the Trash");
+        cx.simulate_prompt_answer("Cancel");
+
+        // Double click: the cursor goes into the file.
+        click(cx, "tree-row-b.ts", 2);
+        assert_eq!(active(cx), Some(root.join("b.ts")));
+        assert!(!tree_focused(cx));
+        assert!(ws.update_in(cx, |ws, window, cx| gpui::Focusable::focus_handle(&ws.active_editor().unwrap(), cx).is_focused(window)), "double click puts the cursor in the file");
     }
 
     #[gpui::test]

@@ -21,6 +21,8 @@ impl DiffSpec {
 
 pub enum Request {
     OpenFile { path: PathBuf, line: Option<usize>, preview: bool },
+    /// Show a file as a preview but leave the keyboard where it is (explorer single click).
+    ShowFile(PathBuf),
     /// Open a file and select char columns `cols` on `line` (0-based).
     OpenAt { path: PathBuf, line: usize, cols: std::ops::Range<usize> },
     OpenDiff { spec: DiffSpec, preview: bool },
