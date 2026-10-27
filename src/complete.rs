@@ -625,27 +625,41 @@ fn attr_suffix(name: &str, fl: Flavor) -> (&'static str, usize) {
 
 /// Folders and files for an import path being typed.
 fn paths(typed: &str, file: Option<&Path>, root: Option<&Path>) -> Vec<Item> {
+    let aliases = file.map(|f| aliases(f, root)).unwrap_or_default();
+    let alias_items = |typed: &str| -> Vec<Item> {
+        let mut seen = HashSet::new();
+        aliases.iter().filter(|(p, _)| p.starts_with(typed) && seen.insert(p.clone())).map(|(p, _)| Item::new(p.clone(), Kind::Folder)).collect()
+    };
     if typed.is_empty() {
         // Just opened the quotes: where paths start (packages show once a letter is typed).
-        return ["./", "../", "@/"].iter().map(|s| Item::new(*s, Kind::Folder)).collect();
+        let mut out: Vec<Item> = ["./", "../"].iter().map(|s| Item::new(*s, Kind::Folder)).collect();
+        out.extend(alias_items(""));
+        return out;
     }
     let (dir_part, _) = typed.rsplit_once('/').map(|(d, f)| (format!("{d}/"), f)).unwrap_or((String::new(), typed));
-    let base: Option<PathBuf> = if typed.starts_with('.') {
-        file.and_then(|f| f.parent()).map(|d| d.join(&dir_part))
-    } else if let Some(rest) = dir_part.strip_prefix("@/").or_else(|| dir_part.strip_prefix("~/")) {
-        root.map(|r| if r.join("src").is_dir() { r.join("src") } else { r.to_path_buf() }).map(|r| r.join(rest))
-    } else if typed == "@" || typed == "~" {
-        return vec![Item { label: format!("{typed}/"), kind: Kind::Folder, suffix: "", back: 0 }];
-    } else {
-        root.map(|r| r.join("node_modules").join(&dir_part))
-    };
     if dir_part.is_empty() && typed.starts_with('.') {
         // `.` or `..` alone: offer the two starting points.
         return ["./", "../"].iter().map(|s| Item::new(*s, Kind::Folder)).collect();
     }
-    let Some(base) = base else { return Vec::new() };
-    let Ok(rd) = std::fs::read_dir(&base) else { return Vec::new() };
-    let in_modules = !typed.starts_with('.') && !typed.starts_with('@') && !typed.starts_with('~') || typed.starts_with("@") && !typed.starts_with("@/");
+    let alias = aliases.iter().find(|(p, _)| typed.starts_with(p.as_str()));
+    let mut in_modules = false;
+    let mut out = Vec::new();
+    let base: Option<PathBuf> = if typed.starts_with('.') {
+        file.and_then(|f| f.parent()).map(|d| d.join(&dir_part))
+    } else if let Some((p, target)) = alias {
+        Some(target.join(dir_part.strip_prefix(p.as_str()).unwrap_or("")))
+    } else if let Some(rest) = dir_part.strip_prefix("@/").or_else(|| dir_part.strip_prefix("~/")).filter(|_| aliases.is_empty()) {
+        // No tsconfig/jsconfig paths: the usual `@/` → `src/`.
+        root.map(|r| if r.join("src").is_dir() { r.join("src") } else { r.to_path_buf() }).map(|r| r.join(rest))
+    } else {
+        if dir_part.is_empty() {
+            out = alias_items(typed);
+        }
+        in_modules = true;
+        root.map(|r| r.join("node_modules").join(&dir_part))
+    };
+    let Some(base) = base else { return out };
+    let Ok(rd) = std::fs::read_dir(&base) else { return out };
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     for e in rd.flatten().take(2_000) {
@@ -664,7 +678,97 @@ fn paths(typed: &str, file: Option<&Path>, root: Option<&Path>) -> Vec<Item> {
     files.sort_by(|a, b| a.label.cmp(&b.label));
     files.dedup_by(|a, b| a.label == b.label);
     dirs.extend(files);
-    dirs
+    out.extend(dirs);
+    out
+}
+
+/// Import aliases from the nearest tsconfig.json / jsconfig.json (`compilerOptions.paths`), as
+/// (prefix, folder) pairs, longest prefix first: `"@/*": ["./src/*"]` → ("@/", <dir>/src/).
+fn aliases(file: &Path, root: Option<&Path>) -> Vec<(String, PathBuf)> {
+    let mut dir = file.parent();
+    for _ in 0..8 {
+        let Some(d) = dir else { break };
+        for name in ["tsconfig.json", "jsconfig.json"] {
+            let cfg = d.join(name);
+            if cfg.is_file() {
+                let mut out = Vec::new();
+                read_aliases(&cfg, &mut out, 0);
+                out.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+                return out;
+            }
+        }
+        if Some(d) == root {
+            break;
+        }
+        dir = d.parent();
+    }
+    Vec::new()
+}
+
+fn read_aliases(cfg: &Path, out: &mut Vec<(String, PathBuf)>, depth: u32) {
+    let Some(v) = std::fs::read_to_string(cfg).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&t)).ok()) else { return };
+    let dir = cfg.parent().unwrap_or(Path::new("."));
+    let co = &v["compilerOptions"];
+    let base = dir.join(co["baseUrl"].as_str().unwrap_or("."));
+    if let Some(paths) = co["paths"].as_object() {
+        for (pattern, targets) in paths {
+            let Some(target) = targets.as_array().and_then(|a| a.first()).and_then(|t| t.as_str()) else { continue };
+            if let (Some(prefix), Some(folder)) = (pattern.strip_suffix('*'), target.strip_suffix('*')) {
+                if !prefix.is_empty() {
+                    out.push((prefix.to_string(), base.join(folder.trim_start_matches("./"))));
+                }
+            }
+        }
+    }
+    // `"extends": "./tsconfig.base.json"`: its paths count too (package presets are skipped).
+    if let Some(ext) = v["extends"].as_str().filter(|e| e.starts_with('.') && depth < 3) {
+        let mut p = dir.join(ext);
+        if p.extension().is_none() {
+            p.set_extension("json");
+        }
+        read_aliases(&p, out, depth + 1);
+    }
+}
+
+/// JSON with comments and trailing commas (tsconfig's flavour) → plain JSON.
+fn strip_jsonc(text: &str) -> String {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut in_str = false;
+    while i < c.len() {
+        let ch = c[i];
+        if in_str {
+            out.push(ch);
+            if ch == '\\' && i + 1 < c.len() {
+                out.push(c[i + 1]);
+                i += 1;
+            } else if ch == '"' {
+                in_str = false;
+            }
+        } else if ch == '"' {
+            in_str = true;
+            out.push(ch);
+        } else if ch == '/' && c.get(i + 1) == Some(&'/') {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        } else if ch == '/' && c.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < c.len() && !(c[i] == '*' && c[i + 1] == '/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        } else if ch == ',' && c[i + 1..].iter().find(|x| !x.is_whitespace()).is_some_and(|x| matches!(x, '}' | ']')) {
+            // A trailing comma: dropped.
+        } else {
+            out.push(ch);
+        }
+        i += 1;
+    }
+    out
 }
 
 fn strip_code_ext(name: &str) -> &str {
@@ -864,7 +968,18 @@ mod tests {
         let items = paths("./components/Ca", Some(&file), Some(&dir));
         assert_eq!(items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), vec!["Card"]);
         let items = paths("@/components/", Some(&file), Some(&dir));
-        assert_eq!(items.len(), 1, "@/ maps to src/");
+        assert_eq!(items.len(), 1, "no tsconfig: @/ maps to src/");
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            "{\n  // aliases\n  \"compilerOptions\": {\n    \"baseUrl\": \".\",\n    /* ui */ \"paths\": { \"~ui/*\": [\"src/components/*\"], \"@/*\": [\"./src/*\"], },\n  },\n}\n",
+        )
+        .unwrap();
+        let items = paths("~ui/C", Some(&file), Some(&dir));
+        assert_eq!(items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), vec!["Card"], "alias from tsconfig paths");
+        let items = paths("", Some(&file), Some(&dir));
+        assert!(items.iter().any(|i| i.label == "~ui/"), "aliases are offered when the quotes open");
+        let items = paths("~", Some(&file), Some(&dir));
+        assert_eq!(items.first().map(|i| i.label.as_str()), Some("~ui/"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
