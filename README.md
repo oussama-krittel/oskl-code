@@ -159,3 +159,7 @@ GPUI compiles its Metal shaders when the app starts (the `runtime_shaders` featu
 ## Status
 
 OSKL Code is young and used daily by its author. It runs on macOS only. There's no extension system or language server support yet: suggestions and go to definition are built in and focus on JavaScript / TypeScript / JSX. Issues and pull requests are welcome.
+
+## License
+
+[MIT](LICENSE) © 2026 Oussama Krittel
