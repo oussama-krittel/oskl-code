@@ -3026,6 +3026,7 @@ dependencies = [
  "regex",
  "resvg",
  "ropey",
+ "serde",
  "serde_json",
  "similar",
  "tree-sitter",

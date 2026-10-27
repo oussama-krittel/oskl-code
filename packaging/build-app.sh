@@ -51,6 +51,21 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Folder</string>
+      <key>CFBundleTypeRole</key><string>Editor</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key><array><string>public.folder</string><string>public.directory</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Source file</string>
+      <key>CFBundleTypeRole</key><string>Editor</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key><array><string>public.source-code</string><string>public.plain-text</string><string>public.json</string><string>public.data</string></array>
+    </dict>
+  </array>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
 </dict>
 </plist>

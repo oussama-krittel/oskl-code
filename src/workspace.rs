@@ -430,6 +430,9 @@ pub struct Workspace {
     split_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     dragging_split: Option<String>,
     navigating: bool,
+    session_saved: String,
+    _session_tasks: Vec<Task<()>>,
+    _quit_sub: Option<Subscription>,
     drop_hint: Option<(usize, DropZone)>,
     extra_subs: Vec<Subscription>,
 }
@@ -542,10 +545,30 @@ impl Workspace {
             split_bounds: Default::default(),
             dragging_split: None,
             navigating: false,
+            session_saved: String::new(),
+            _session_tasks: Vec::new(),
+            _quit_sub: None,
             drop_hint: None,
             extra_subs: Vec::new(),
         };
         ws.start_watcher(cx);
+        if ws.has_project {
+            cx.add_recent_document(&ws.repo.read(cx).root.clone());
+            // Save the layout every few seconds when it changed, and on quit.
+            ws._session_tasks.push(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(3)).await;
+                    if this.update(cx, |ws, cx| ws.save_session(cx)).is_err() {
+                        break;
+                    }
+                }
+            }));
+            ws._quit_sub = Some(cx.on_app_quit(|ws, cx| {
+                ws.save_session(cx);
+                async {}
+            }));
+        }
+        register_workspace(cx.entity().downgrade());
         ws.tree.read(cx).focus(window);
         ws
     }
@@ -741,6 +764,151 @@ impl Workspace {
         {
             self.tree.update(cx, |t, cx| t.reveal(&path, cx));
         }
+        cx.notify();
+    }
+
+    // ------------------------------------------------------------ session
+
+    pub fn has_project(&self) -> bool {
+        self.has_project
+    }
+
+    fn snapshot(&self, cx: &App) -> crate::session::Session {
+        use crate::session::{ItemState, LayoutState, PaneState, Session};
+        let mut order = Vec::new();
+        self.layout.panes(&mut order);
+        let pane_states: Vec<PaneState> = order
+            .iter()
+            .map(|pid| {
+                let Some(pane) = self.pane(*pid) else { return PaneState::default() };
+                let mut items = Vec::new();
+                let mut active = None;
+                for tid in &pane.items {
+                    let Some(ix) = self.tab_ix(*tid) else { continue };
+                    let item = match &self.tabs[ix].kind {
+                        TabKind::Editor(e) => {
+                            let e = e.read(cx);
+                            let (row, col) = e.cursor_rc();
+                            e.path.clone().map(|path| ItemState::File { path, row, col })
+                        }
+                        TabKind::Terminal(t) => Some(ItemState::Terminal { cwd: t.read(cx).cwd.clone() }),
+                        _ => None,
+                    };
+                    if let Some(item) = item {
+                        if pane.active == Some(*tid) {
+                            active = Some(items.len());
+                        }
+                        items.push(item);
+                    }
+                }
+                PaneState { items, active }
+            })
+            .collect();
+        fn convert(l: &Layout, order: &[usize]) -> LayoutState {
+            match l {
+                Layout::Pane(id) => LayoutState::Pane(order.iter().position(|p| p == id).unwrap_or(0)),
+                Layout::Split { vertical, ratio, a, b } => LayoutState::Split { vertical: *vertical, ratio: *ratio, a: Box::new(convert(a, order)), b: Box::new(convert(b, order)) },
+            }
+        }
+        Session {
+            layout: convert(&self.layout, &order),
+            panes: pane_states,
+            focused: order.iter().position(|p| *p == self.focused_pane).unwrap_or(0),
+            side: match self.side {
+                Side::Files => "files",
+                Side::Search => "search",
+                Side::Git => "git",
+                Side::Keys => "keys",
+            }
+            .into(),
+            side_visible: self.side_visible,
+            side_w: self.side_w,
+        }
+    }
+
+    pub fn save_session(&mut self, cx: &mut Context<Self>) {
+        if !self.has_project {
+            return;
+        }
+        let snap = self.snapshot(cx);
+        let text = serde_json::to_string(&snap).unwrap_or_default();
+        if text != self.session_saved {
+            crate::session::save(&self.root(cx), &snap);
+            self.session_saved = text;
+        }
+    }
+
+    /// Rebuilds the saved layout: splits, files (cursor positions) and terminals.
+    pub fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::session::{ItemState, LayoutState};
+        if !self.has_project {
+            return;
+        }
+        let Some(saved) = crate::session::load(&self.root(cx)) else { return };
+        if saved.panes.is_empty() {
+            return;
+        }
+        // Fresh pane ids for every saved pane (the first reuses the existing one).
+        let first = self.panes[0].id;
+        let mut ids = vec![first];
+        for _ in 1..saved.panes.len() {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.panes.push(Pane { id, items: Vec::new(), active: None, back: Vec::new(), fwd: Vec::new() });
+            ids.push(id);
+        }
+        fn convert(l: &LayoutState, ids: &[usize]) -> Layout {
+            match l {
+                LayoutState::Pane(i) => Layout::Pane(ids.get(*i).copied().unwrap_or(ids[0])),
+                LayoutState::Split { vertical, ratio, a, b } => Layout::Split { vertical: *vertical, ratio: *ratio, a: Box::new(convert(a, ids)), b: Box::new(convert(b, ids)) },
+            }
+        }
+        self.layout = convert(&saved.layout, &ids);
+        let mut shown = Vec::new();
+        for (pi, pane) in saved.panes.iter().enumerate() {
+            self.focused_pane = ids[pi];
+            let mut opened = Vec::new();
+            for item in &pane.items {
+                match item {
+                    ItemState::File { path, row, col } if path.is_file() => {
+                        self.open_file(path.clone(), None, false, window, cx);
+                        if let Some(ed) = self.active_editor() {
+                            let (row, col) = (*row, *col);
+                            ed.update(cx, |ed, cx| ed.go_to(row, col, cx));
+                        }
+                        opened.push(self.active.map(|a| self.tabs[a].id));
+                    }
+                    ItemState::Terminal { cwd } => {
+                        let cwd = if cwd.is_dir() { cwd.clone() } else { self.root(cx) };
+                        self.open_terminal_in(cwd, None, window, cx);
+                        opened.push(self.active.map(|a| self.tabs[a].id));
+                    }
+                    _ => opened.push(None),
+                }
+            }
+            shown.push(pane.active.and_then(|a| opened.get(a).copied().flatten()));
+        }
+        // Show the item each split had in front, then focus the split you were in.
+        for (pi, tid) in shown.into_iter().enumerate() {
+            if let Some(tid) = tid
+                && let Some(pane) = self.pane_mut(ids[pi])
+            {
+                pane.active = Some(tid);
+                pane.back.clear();
+            }
+        }
+        self.focused_pane = ids.get(saved.focused).copied().unwrap_or(first);
+        self.side = match saved.side.as_str() {
+            "search" => Side::Search,
+            "git" => Side::Git,
+            "keys" => Side::Keys,
+            _ => Side::Files,
+        };
+        self.side_visible = saved.side_visible;
+        self.side_w = saved.side_w;
+        self.sync_active();
+        self.focus_active(window, cx);
+        self.session_saved = serde_json::to_string(&self.snapshot(cx)).unwrap_or_default();
         cx.notify();
     }
 
@@ -998,6 +1166,10 @@ impl Workspace {
 
     fn open_terminal_view(&mut self, command: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let root = self.root(cx);
+        self.open_terminal_in(root, command, window, cx);
+    }
+
+    fn open_terminal_in(&mut self, root: PathBuf, command: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let started = match crate::terminal::start(&root) {
             Ok(s) => s,
             Err(e) => return self.flash(format!("Could not start terminal: {e}"), true, cx),
@@ -3808,5 +3980,61 @@ mod ui_tests {
         cx.simulate_keystrokes("cmd-shift-\\ escape");
         assert_eq!(panes(&ws, cx), 3, "⌘⇧\\ splits down");
     }
+
+    #[gpui::test]
+    fn session_restores_splits_and_files(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(root.join("b.txt"), "bee\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("a.txt"), Some(3), false, window, cx));
+        cx.simulate_keystrokes("cmd-\\ escape");
+        ws.update_in(cx, |ws, window, cx| {
+            ws.open_file(root.join("b.txt"), None, false, window, cx);
+            ws.save_session(cx);
+        });
+        // A brand-new window for the same project comes back the same.
+        let (ws2, cx2) = cx.add_window_view(|window, cx| Workspace::new(root.clone(), window, cx));
+        ws2.update_in(cx2, |ws, window, cx| ws.restore_session(window, cx));
+        cx2.run_until_parked();
+        ws2.read_with(cx2, |ws, cx| {
+            assert_eq!(ws.panes.len(), 2, "both splits restored");
+            let files: Vec<String> = ws
+                .tabs
+                .iter()
+                .filter_map(|t| match &t.kind {
+                    super::TabKind::Editor(e) => e.read(cx).path.as_ref().map(|p| p.file_name().unwrap().to_string_lossy().to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(files.len(), 2);
+            assert!(files.contains(&"a.txt".into()) && files.contains(&"b.txt".into()));
+            let a = ws.tabs.iter().find_map(|t| match &t.kind {
+                super::TabKind::Editor(e) if e.read(cx).path.as_ref().is_some_and(|p| p.ends_with("a.txt")) => Some(e.read(cx).cursor_rc()),
+                _ => None,
+            });
+            assert_eq!(a, Some((2, 0)), "cursor line restored");
+        });
+    }
 }
 
+thread_local! {
+    static WORKSPACES: std::cell::RefCell<Vec<WeakEntity<Workspace>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn register_workspace(ws: WeakEntity<Workspace>) {
+    WORKSPACES.with(|w| w.borrow_mut().push(ws));
+}
+
+/// Roots of the project windows currently open (for reopening them next launch).
+pub fn open_project_roots(cx: &App) -> Vec<PathBuf> {
+    WORKSPACES.with(|w| {
+        w.borrow()
+            .iter()
+            .filter_map(|ws| ws.upgrade())
+            .map(|ws| ws.read(cx))
+            .filter(|ws| ws.has_project())
+            .map(|ws| ws.repo.read(cx).root.clone())
+            .collect()
+    })
+}

@@ -12,6 +12,7 @@ gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 notify = "6"
 regex = "1"
 ropey = "1.6"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 similar = "2"
 tree-sitter = "0.27"
