@@ -690,9 +690,39 @@ impl Workspace {
             Request::OpenDiff { spec, preview } => self.open_diff(spec.clone(), *preview, window, cx),
             Request::OpenCommit(sha) => self.open_commit(sha.clone(), window, cx),
             Request::CommandLine(text) => self.open_cmd(CmdMode::Command, text, window, cx),
+            Request::Moved { from, to } => self.path_moved(from, to, cx),
+            Request::Deleted(paths) => self.paths_deleted(paths, window, cx),
+            Request::OpenTerminal(dir) => self.open_terminal_in(dir.clone(), None, window, cx),
             Request::Message(m) => self.flash(m.clone(), false, cx),
             Request::Error(e) => self.flash(e.clone(), true, cx),
         }
+    }
+
+    /// Open editors of a renamed/moved file (or anything inside a moved folder) follow it.
+    fn path_moved(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            if let TabKind::Editor(e) = &tab.kind
+                && let Some(rest) = e.read(cx).path.as_ref().and_then(|p| p.strip_prefix(from).ok()).map(Path::to_path_buf)
+            {
+                let new = if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) };
+                e.update(cx, |e, cx| {
+                    e.path = Some(new);
+                    cx.notify();
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Tabs of trashed files (or files in trashed folders) close.
+    fn paths_deleted(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        loop {
+            let gone = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Editor(e) if e.read(cx).path.as_ref().is_some_and(|p| paths.iter().any(|d| p.starts_with(d)))));
+            let Some(ix) = gone else { break };
+            self.close_tab(ix, true, window, cx);
+        }
+        let names: Vec<String> = paths.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).collect();
+        self.flash(format!("Moved {} to the Trash", names.join(", ")), false, cx);
     }
 
     // ------------------------------------------------------------ tabs
@@ -2704,19 +2734,35 @@ impl Workspace {
                 }
                 match std::fs::rename(&from, &to) {
                     Ok(()) => {
-                        for tab in &self.tabs {
-                            if let TabKind::Editor(e) = &tab.kind
-                                && e.read(cx).path.as_ref() == Some(&from)
-                            {
-                                e.update(cx, |e, cx| {
-                                    e.path = Some(to.clone());
-                                    cx.notify();
-                                });
-                            }
-                        }
+                        self.path_moved(&from, &to, cx);
                         self.flash(format!("Renamed to {}", parts[1]), false, cx);
                     }
                     Err(e) => self.flash(format!("mv failed: {e}"), true, cx),
+                }
+            }
+            "rm" | "trash" => {
+                let path = resolve(&root, rest);
+                if rest.is_empty() || !path.exists() || path == root {
+                    return self.flash("Usage: rm <path> (moves it to the Trash)".into(), true, cx);
+                }
+                match trash::delete(&path) {
+                    Ok(()) => self.paths_deleted(&[path], window, cx),
+                    Err(e) => self.flash(format!("rm failed: {e}"), true, cx),
+                }
+            }
+            "cp" => {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() != 2 {
+                    return self.flash("Usage: cp <from> <to>".into(), true, cx);
+                }
+                let (from, mut to) = (resolve(&root, parts[0]), resolve(&root, parts[1]));
+                if to.is_dir() && let Some(name) = from.file_name() {
+                    to = to.join(name);
+                }
+                let to = crate::file_tree::unique_path(&to);
+                match crate::file_tree::copy_recursive(&from, &to) {
+                    Ok(()) => self.flash(format!("Copied to {}", to.strip_prefix(&root).unwrap_or(&to).display()), false, cx),
+                    Err(e) => self.flash(format!("cp failed: {e}"), true, cx),
                 }
             }
             "cd" => self.flash(format!("Not a folder: {rest}"), true, cx),
@@ -4612,6 +4658,73 @@ mod ui_tests {
         assert_eq!(color, crate::highlight::color(ed.read_with(cx, |e, _| e.capture_at(4, 9)).unwrap()), "underline in the text's own colour");
         assert!(link(cx, "missing", 0).is_none(), "nothing to go to");
         assert!(link(cx, "missing", 0).is_none(), "still nothing after the background search");
+    }
+
+    #[gpui::test]
+    fn explorer_creates_renames_copies_moves_and_asks_before_deleting(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("a.ts"), "a").unwrap();
+        std::fs::write(root.join("b.ts"), "b").unwrap();
+        let tree = ws.read_with(cx, |ws, _| ws.tree.clone());
+        tree.update(cx, |t, cx| {
+            t.invalidate(&std::collections::HashSet::from([root.clone()]), cx);
+            t.reveal(&root.join("a.ts"), cx);
+        });
+        let rows = tree.read_with(cx, |t, _| t.row_names());
+        let project = root.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(rows.first(), Some(&(0, project)), "the project folder is its own row");
+        assert!(rows.contains(&(1, "src".to_string())), "files sit under it");
+        ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
+        let select = |cx: &mut gpui::VisualTestContext, p: std::path::PathBuf| tree.update(cx, |t, _| t.select(p));
+
+        // New file at the root (root row selected), typed into the name box.
+        select(cx, root.clone());
+        cx.simulate_keystrokes("a");
+        cx.simulate_input("new.ts");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(root.join("new.ts").is_file(), "created");
+        assert_eq!(ws.read_with(cx, |ws, cx| ws.active_editor().and_then(|e| e.read(cx).path.clone())), Some(root.join("new.ts")), "and opened");
+
+        // Rename: the name box selects the name without the extension.
+        ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
+        select(cx, root.join("new.ts"));
+        cx.simulate_keystrokes("f2");
+        cx.simulate_input("renamed");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(root.join("renamed.ts").is_file() && !root.join("new.ts").exists());
+        assert_eq!(ws.read_with(cx, |ws, cx| ws.active_editor().and_then(|e| e.read(cx).path.clone())), Some(root.join("renamed.ts")), "the open tab follows");
+
+        // Copy a.ts into src, then again (gets a Finder-style name).
+        select(cx, root.join("a.ts"));
+        cx.simulate_keystrokes("cmd-c");
+        select(cx, root.join("src"));
+        cx.simulate_keystrokes("cmd-v");
+        select(cx, root.join("src"));
+        cx.simulate_keystrokes("cmd-v");
+        assert_eq!(std::fs::read_to_string(root.join("src/a.ts")).unwrap(), "a");
+        assert!(root.join("src/a copy.ts").is_file() && root.join("a.ts").is_file());
+
+        // Cut renamed.ts into src: moved, and its tab follows.
+        select(cx, root.join("renamed.ts"));
+        cx.simulate_keystrokes("cmd-x");
+        select(cx, root.join("src"));
+        cx.simulate_keystrokes("cmd-v");
+        cx.run_until_parked();
+        assert!(root.join("src/renamed.ts").is_file() && !root.join("renamed.ts").exists());
+        assert_eq!(ws.read_with(cx, |ws, cx| ws.active_editor().and_then(|e| e.read(cx).path.clone())), Some(root.join("src/renamed.ts")));
+
+        // Delete asks first; Cancel leaves the file alone.
+        ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
+        select(cx, root.join("b.ts"));
+        cx.simulate_keystrokes("cmd-backspace");
+        assert!(cx.has_pending_prompt(), "asks before moving to the Trash");
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(root.join("b.ts").is_file());
     }
 
     #[gpui::test]

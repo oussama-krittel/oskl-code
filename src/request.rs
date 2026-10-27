@@ -31,6 +31,12 @@ pub enum Request {
     MarkResolved(String),
     /// Opens the command line pre-filled with this text.
     CommandLine(String),
+    /// A file or folder was renamed/moved: open tabs follow it.
+    Moved { from: PathBuf, to: PathBuf },
+    /// Files or folders were moved to the Trash: their tabs close.
+    Deleted(Vec<PathBuf>),
+    /// A terminal in this folder.
+    OpenTerminal(PathBuf),
     Message(String),
     Error(String),
 }
