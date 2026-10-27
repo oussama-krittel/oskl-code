@@ -316,7 +316,14 @@ pub struct Editor {
     /// The suggestion list under the cursor (tags, attributes, words, import paths).
     pub completion: Option<Completion>,
     /// The name or import path under the mouse while ⌘ is held (underlined, ⌘-click follows it).
-    link: Option<Range<usize>>,
+    link: Option<(Range<usize>, Hsla)>,
+    /// Whether the last name hovered with ⌘ leads anywhere: (its range, buffer version, answer).
+    link_memo: Option<(Range<usize>, u64, bool)>,
+    cmd_held: bool,
+    /// Project-wide lookups of names not found in the file, kept briefly so hover and click
+    /// don't search twice.
+    def_cache: std::collections::HashMap<String, (std::time::Instant, Option<crate::definition::Target>)>,
+    def_pending: std::collections::HashSet<String>,
     layout: Option<Layout>,
     drag: Option<DragMode>,
     scroll_drag: Option<f32>,
@@ -380,6 +387,10 @@ impl Editor {
             occurrence_origin: None,
             completion: None,
             link: None,
+            link_memo: None,
+            cmd_held: false,
+            def_cache: Default::default(),
+            def_pending: Default::default(),
             layout: None,
             drag: None,
             scroll_drag: None,
@@ -991,21 +1002,119 @@ impl Editor {
 
     // ------------------------------------------------------------ go to definition
 
-    fn link_at(&self, p: Point<Pixels>) -> Option<Range<usize>> {
+    /// The syntax capture at a column (None for plain text).
+    pub(crate) fn capture_at(&self, row: usize, col: usize) -> Option<u8> {
+        let spans = self.spans.as_ref()?.get(row)?;
+        spans.iter().rev().find(|(r, _)| r.start <= col && col < r.end).map(|(_, h)| *h)
+    }
+
+    /// With ⌘ held over `p`: the range to underline and its text colour, only when a click there
+    /// would go somewhere (its own declaration counts).
+    fn link_at(&mut self, p: Point<Pixels>, cx: &mut Context<Self>) -> Option<(Range<usize>, Hsla)> {
+        use crate::definition::{Found, Hit};
         let l = self.layout.as_ref()?;
         if p.x / px(1.) < l.text_left {
             return None;
         }
-        match crate::definition::hit_at(&self.buf, self.pos_for_point(p))? {
-            crate::definition::Hit::Module(_, r) | crate::definition::Hit::Name(_, r) => Some(r),
+        let pos = self.pos_for_point(p);
+        self.link_for_pos(pos, cx)
+    }
+
+    pub(crate) fn link_for_pos(&mut self, pos: usize, cx: &mut Context<Self>) -> Option<(Range<usize>, Hsla)> {
+        use crate::definition::{Found, Hit};
+        let hit = crate::definition::hit_at(&self.buf, pos)?;
+        let (range, module) = match &hit {
+            Hit::Module(_, r) => (r.clone(), true),
+            Hit::Name(_, r) => (r.clone(), false),
+        };
+        let (row, col) = self.buf.pos_to_rc(range.start);
+        let cap = self.capture_at(row, col);
+        let kind = cap.map(highlight::name).unwrap_or("");
+        const INERT: &[&str] = &["comment", "string", "number", "keyword", "boolean", "punctuation", "operator", "escape", "character", "constant.builtin", "type.builtin", "variable.builtin", "text."];
+        if !module && INERT.iter().any(|k| kind.starts_with(k)) {
+            return None;
+        }
+        let version = self.buf.version();
+        let ok = match &self.link_memo {
+            Some((r, v, ok)) if *r == range && *v == version => *ok,
+            _ => {
+                let ok = match crate::definition::find(&self.buf, range.start, self.path.as_deref(), self.root.as_deref()) {
+                    Found::At(_) => true,
+                    Found::Nothing => false,
+                    Found::Search(name) => match self.cached_definition(&name) {
+                        Some(t) => t.is_some(),
+                        None => {
+                            // Unknown yet: look it up in the background and underline when found.
+                            self.search_definition(name, false, cx);
+                            return None;
+                        }
+                    },
+                };
+                self.link_memo = Some((range.clone(), version, ok));
+                ok
+            }
+        };
+        ok.then(|| (range, cap.map(highlight::color).unwrap_or_else(theme::fg)))
+    }
+
+    fn update_link(&mut self, cx: &mut Context<Self>) {
+        let link = (self.cmd_held && self.mode == EditorMode::Full).then(|| self.link_at(self.last_mouse, cx)).flatten();
+        if link != self.link {
+            self.link = link;
+            cx.notify();
         }
     }
 
     fn modifiers_changed(&mut self, ev: &ModifiersChangedEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let link = (ev.modifiers.platform && self.mode == EditorMode::Full).then(|| self.link_at(self.last_mouse)).flatten();
-        if link != self.link {
-            self.link = link;
-            cx.notify();
+        self.cmd_held = ev.modifiers.platform;
+        self.update_link(cx);
+    }
+
+    fn cached_definition(&self, name: &str) -> Option<Option<crate::definition::Target>> {
+        self.def_cache.get(name).filter(|(at, _)| at.elapsed() < Duration::from_secs(30)).map(|(_, t)| t.clone())
+    }
+
+    /// Looks `name` up across the project off the UI thread; `go` jumps there once found.
+    fn search_definition(&mut self, name: String, go: bool, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        if !go && !self.def_pending.insert(name.clone()) {
+            return;
+        }
+        let skip = self.path.clone();
+        // In JS/TS a name that isn't imported or declared here can only come from an export
+        // elsewhere (anything else is a parameter or a local we couldn't place).
+        let exported_only = complete::flavor(self.lang.or_else(|| self.path.as_deref().and_then(highlight::detect))).is_some();
+        if go {
+            cx.emit(EditorEvent::Notice(format!("Looking for {name}…")));
+        }
+        cx.spawn(async move |this, cx| {
+            let n = name.clone();
+            let found = cx.background_spawn(async move { crate::definition::search_project(&root, &n, skip.as_deref(), exported_only) }).await;
+            this.update(cx, |ed, cx| {
+                ed.def_pending.remove(&name);
+                ed.def_cache.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(30));
+                ed.def_cache.insert(name.clone(), (std::time::Instant::now(), found.clone()));
+                if go {
+                    match found {
+                        Some(t) => ed.land(t, cx),
+                        None => cx.emit(EditorEvent::Notice(format!("No definition found for {name}"))),
+                    }
+                } else {
+                    ed.link_memo = None;
+                    ed.update_link(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Through the workspace even within this file, so ⌃- can come back.
+    fn land(&mut self, t: crate::definition::Target, cx: &mut Context<Self>) {
+        if self.path.is_some() {
+            cx.emit(EditorEvent::OpenAt(t));
+        } else {
+            self.go_to(t.row, t.col, cx);
         }
     }
 
@@ -1016,34 +1125,16 @@ impl Editor {
     /// Jumps to what's at `pos`: in this file directly, in another through the workspace, or
     /// after a project-wide search in the background.
     pub fn go_to_definition(&mut self, pos: usize, cx: &mut Context<Self>) {
-        use crate::definition::{Found, Target};
+        use crate::definition::Found;
         self.completion = None;
-        // Through the workspace even within this file, so ⌃- can come back.
-        let land = |ed: &mut Self, t: Target, cx: &mut Context<Self>| {
-            if ed.path.is_some() {
-                cx.emit(EditorEvent::OpenAt(t));
-            } else {
-                ed.go_to(t.row, t.col, cx);
-            }
-        };
         match crate::definition::find(&self.buf, pos, self.path.as_deref(), self.root.as_deref()) {
-            Found::At(t) => land(self, t, cx),
+            Found::At(t) => self.land(t, cx),
             Found::Nothing => {}
-            Found::Search(name) => {
-                let Some(root) = self.root.clone() else { return };
-                let skip = self.path.clone();
-                cx.emit(EditorEvent::Notice(format!("Looking for {name}…")));
-                cx.spawn(async move |this, cx| {
-                    let n = name.clone();
-                    let found = cx.background_spawn(async move { crate::definition::search_project(&root, &n, skip.as_deref()) }).await;
-                    this.update(cx, |ed, cx| match found {
-                        Some(t) => land(ed, t, cx),
-                        None => cx.emit(EditorEvent::Notice(format!("No definition found for {name}"))),
-                    })
-                    .ok();
-                })
-                .detach();
-            }
+            Found::Search(name) => match self.cached_definition(&name) {
+                Some(Some(t)) => self.land(t, cx),
+                Some(None) => cx.emit(EditorEvent::Notice(format!("No definition found for {name}"))),
+                None => self.search_definition(name, true, cx),
+            },
         }
     }
 
@@ -1711,11 +1802,8 @@ impl Editor {
 
     fn mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.last_mouse = ev.position;
-        let link = (ev.modifiers.platform && !ev.dragging() && self.mode == EditorMode::Full).then(|| self.link_at(ev.position)).flatten();
-        if link != self.link {
-            self.link = link;
-            cx.notify();
-        }
+        self.cmd_held = ev.modifiers.platform && !ev.dragging();
+        self.update_link(cx);
         if !ev.dragging() {
             self.drag = None;
             self.scroll_drag = None;
@@ -2088,12 +2176,12 @@ impl Editor {
         }
 
         // ⌘-hover: the name or path a click would follow.
-        if let Some(link) = self.link.clone() {
+        if let Some((link, color)) = self.link.clone() {
             let (row, c0) = self.buf.pos_to_rc(link.start);
             let c1 = c0 + (link.end - link.start);
             if let Some((_, shaped, map)) = lines.iter().find(|(r, _, _)| *r == row) {
                 for (x0, x1, y) in spans(row, shaped, map, c0, c1) {
-                    p.quads_under.push(fill(Bounds::new(point(px(x0), px(y + line_h - 2.)), size(px(x1 - x0), px(1.))), theme::accent()));
+                    p.quads_under.push(fill(Bounds::new(point(px(x0), px(y + line_h - 2.)), size(px(x1 - x0), px(1.))), color));
                 }
             }
         }

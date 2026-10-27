@@ -4585,6 +4585,36 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn cmd_hover_underlines_only_what_leads_somewhere(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::write(root.join("money.ts"), "export const formatMoney = (n: number) => n;\n").unwrap();
+        let file = root.join("app.ts");
+        let src = "import { formatMoney } from './money';\n// formatMoney here\nconst label = 'formatMoney';\nfunction show(value: number) {\n  return formatMoney(value) + missing;\n}\n";
+        std::fs::write(&file, src).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file, None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).expect("editor open");
+        let link = |cx: &mut gpui::VisualTestContext, needle: &str, nth: usize| {
+            let byte = src.match_indices(needle).nth(nth).unwrap().0;
+            let pos = src[..byte].chars().count() + 1;
+            let r = ed.update(cx, |e, cx| e.link_for_pos(pos, cx));
+            cx.run_until_parked();
+            r.map(|(r, c)| (src.chars().skip(r.start).take(r.end - r.start).collect::<String>(), c))
+        };
+        assert_eq!(link(cx, "./money", 0).map(|l| l.0).as_deref(), Some("./money"), "an import path that exists");
+        assert_eq!(link(cx, "formatMoney", 0).map(|l| l.0).as_deref(), Some("formatMoney"));
+        assert!(link(cx, "formatMoney", 1).is_none(), "not in a comment");
+        assert!(link(cx, "formatMoney", 2).is_none(), "not in a string");
+        assert!(link(cx, "function", 0).is_none(), "not a keyword");
+        assert!(link(cx, "show", 0).is_some(), "a declaration leads to itself");
+        let (_, color) = link(cx, "formatMoney", 3).expect("a call of an import");
+        assert_eq!(color, crate::highlight::color(ed.read_with(cx, |e, _| e.capture_at(4, 9)).unwrap()), "underline in the text's own colour");
+        assert!(link(cx, "missing", 0).is_none(), "nothing to go to");
+        assert!(link(cx, "missing", 0).is_none(), "still nothing after the background search");
+    }
+
+    #[gpui::test]
     fn folding_skips_hidden_lines_and_brackets_autoclose(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("fold.rs");

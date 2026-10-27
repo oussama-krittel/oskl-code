@@ -323,18 +323,22 @@ pub fn find(buf: &Buffer, pos: usize, file: Option<&Path>, root: Option<&Path>) 
             {
                 return Found::At(Target { path: here, row, col });
             }
-            // Clicked on the declaration itself, or a member/global: look across the project.
-            if declaration(&text, &name, None).is_some() && qualifier.is_none() {
-                return Found::Nothing;
+            // The declaration itself: it "goes" to itself, like VS Code.
+            if qualifier.is_none()
+                && let Some((row, col)) = declaration(&text, &name, None)
+            {
+                return Found::At(Target { path: here, row, col });
             }
+            // A member or a global: look across the project.
             Found::Search(name)
         }
     }
 }
 
-/// Project-wide: the first declaration of `name` in the project's code files (exports first).
-/// Runs off the UI thread; skips node_modules, build output and hidden folders.
-pub fn search_project(root: &Path, name: &str, skip: Option<&Path>) -> Option<Target> {
+/// Project-wide: the first declaration of `name` in the project's code files (exports first;
+/// only exports when `exported_only`). Runs off the UI thread; skips node_modules, build output
+/// and hidden folders.
+pub fn search_project(root: &Path, name: &str, skip: Option<&Path>, exported_only: bool) -> Option<Target> {
     const MAX_FILES: usize = 20_000;
     const MAX_SIZE: u64 = 1_000_000;
     let mut stack = vec![root.to_path_buf()];
@@ -375,6 +379,7 @@ pub fn search_project(root: &Path, name: &str, skip: Option<&Path>) -> Option<Ta
                 return Some(Target { path: p, row, col });
             }
             if fallback.is_none()
+                && !exported_only
                 && let Some((row, col)) = declaration(&text, name, None)
             {
                 fallback = Some(Target { path: p.clone(), row, col });
@@ -446,8 +451,11 @@ mod tests {
         std::fs::create_dir_all(d.join("node_modules/x")).unwrap();
         std::fs::write(d.join("node_modules/x/index.ts"), "export function formatMoney() {}").unwrap();
         std::fs::write(d.join("src/lib/money.ts"), "// money\nexport const formatMoney = (n: number) => n;\n").unwrap();
-        let t = search_project(&d, "formatMoney", None).expect("found");
+        let t = search_project(&d, "formatMoney", None, true).expect("found");
         assert_eq!((t.path.ends_with("src/lib/money.ts"), t.row, t.col), (true, 1, 13));
+        std::fs::write(d.join("src/lib/util.ts"), "const helper = 1;\n").unwrap();
+        assert_eq!(search_project(&d, "helper", None, true), None, "a local in another file isn't a target");
+        assert!(search_project(&d, "helper", None, false).is_some());
         std::fs::remove_dir_all(&d).ok();
     }
 }

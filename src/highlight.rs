@@ -17,6 +17,11 @@ const NAMES: &[&str] = &[
     "character", "namespace", "field", "method", "text.title", "text.uri", "text.literal",
 ];
 
+/// The capture name of a span's index (`comment`, `string`, `function.method`…).
+pub fn name(ix: u8) -> &'static str {
+    NAMES.get(ix as usize).copied().unwrap_or("")
+}
+
 pub fn color(ix: u8) -> Hsla {
     let name = NAMES.get(ix as usize).copied().unwrap_or("");
     let base = name.split('.').next().unwrap_or("");
