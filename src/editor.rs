@@ -296,6 +296,9 @@ pub struct Editor {
     scroll_x: f32,
     scroll_y: f32,
     autoscroll: Option<bool>,
+    /// Where a ⌘D run started (the first selection and the scroll), to come back to once
+    /// every occurrence is selected.
+    occurrence_origin: Option<(Range<usize>, f32)>,
     layout: Option<Layout>,
     drag: Option<DragMode>,
     scroll_drag: Option<f32>,
@@ -356,6 +359,7 @@ impl Editor {
             scroll_x: 0.,
             scroll_y: 0.,
             autoscroll: None,
+            occurrence_origin: None,
             layout: None,
             drag: None,
             scroll_drag: None,
@@ -1076,8 +1080,24 @@ impl Editor {
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) { self.buf.single_cursor(); self.buf.select_all(); cx.notify() }
     fn select_line(&mut self, _: &SelectLine, _: &mut Window, cx: &mut Context<Self>) { self.motion(cx, |b| b.select_line()) }
     fn select_next_occurrence(&mut self, _: &SelectNextOccurrence, _: &mut Window, cx: &mut Context<Self>) {
-        if self.buf.select_next_occurrence() {
+        let start = self.buf.extra.is_empty().then_some(self.scroll_y);
+        let added = self.buf.select_next_occurrence();
+        if let Some(y) = start {
+            let first = self.buf.extra.first().unwrap_or(&self.buf.sel).range();
+            self.occurrence_origin = Some((first, y));
+        }
+        if added {
             self.after_move(cx);
+        }
+        // ⌘D again once every occurrence is selected: go back to the one the run started on, at
+        // the scroll it started at, ready to type.
+        if !added && !self.buf.extra.is_empty() {
+            if let Some((first, y)) = self.occurrence_origin.clone() {
+                self.buf.make_primary(first);
+                self.scroll_y = y;
+                self.autoscroll = None;
+                cx.notify();
+            }
         }
     }
     fn select_all_occurrences(&mut self, _: &SelectAllOccurrences, _: &mut Window, cx: &mut Context<Self>) {

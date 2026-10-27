@@ -4418,9 +4418,11 @@ mod ui_tests {
         cx.simulate_keystrokes("cmd-d");
         assert_eq!(sels(cx), (0..3, 2), "then wraps to the first");
         cx.simulate_keystrokes("cmd-d");
-        assert_eq!(sels(cx), (4..7, 3));
-        cx.simulate_keystrokes("cmd-d cmd-d");
-        assert_eq!(sels(cx), (4..7, 3), "back at the start: nothing more to add");
+        assert_eq!(sels(cx), (4..7, 3), "all four picked, view stays on the last one added");
+        cx.simulate_keystrokes("cmd-d");
+        assert_eq!(sels(cx), (8..11, 3), "the next ⌘D goes back to the one the run started on");
+        cx.simulate_keystrokes("cmd-d");
+        assert_eq!(sels(cx), (8..11, 3), "and stays there");
     }
 
     #[gpui::test]

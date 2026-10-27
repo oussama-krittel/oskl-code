@@ -509,16 +509,31 @@ impl Buffer {
         if self.extra.is_empty() && !self.occurrence_word_matches() {
             self.occurrence_word = false;
         }
+        let Some(r) = self.next_free_occurrence() else { return false };
+        self.extra.push(self.sel);
+        self.sel = Sel { anchor: r.start, head: r.end };
+        true
+    }
+
+    /// The occurrence ⌘D would add next: the first unselected one after the main selection,
+    /// wrapping to the top. None once every occurrence is selected.
+    pub fn next_free_occurrence(&self) -> Option<Range<usize>> {
+        if self.sel.is_empty() {
+            return None;
+        }
         let needle = self.slice(self.sel.range());
         let found = self.occurrences(&needle, self.occurrence_word);
         let taken = self.all_sels();
         let after = self.sel.range().end;
         let free = |r: &Range<usize>| !taken.iter().any(|s| s.range() == *r);
-        let next = found.iter().find(|r| r.start >= after && free(r)).or_else(|| found.iter().find(|r| free(r)));
-        let Some(r) = next.cloned() else { return false };
-        self.extra.push(self.sel);
-        self.sel = Sel { anchor: r.start, head: r.end };
-        true
+        found.iter().find(|r| r.start >= after && free(r)).or_else(|| found.iter().find(|r| free(r))).cloned()
+    }
+
+    /// Makes the selection covering `range` the main one (the one the view follows).
+    pub fn make_primary(&mut self, range: Range<usize>) {
+        if let Some(ix) = self.extra.iter().position(|s| s.range() == range) {
+            std::mem::swap(&mut self.extra[ix], &mut self.sel);
+        }
     }
 
     /// The single selection is exactly a whole word (so ⌘D keeps matching whole words).
