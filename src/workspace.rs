@@ -1012,6 +1012,42 @@ impl Workspace {
         best.map(|(_, id)| id)
     }
 
+    /// The split directly on one side of the focused one: it starts at that edge and overlaps it
+    /// across (so a split that's only diagonal, like bottom-left of a full-height right split, isn't).
+    fn adjacent(&self, dx: i32, dy: i32) -> Option<usize> {
+        let bounds = self.pane_bounds.borrow().clone();
+        let cur = *bounds.get(&self.focused_pane)?;
+        let f = |p: Pixels| p / px(1.);
+        let mut best: Option<(f32, usize)> = None;
+        for (id, b) in &bounds {
+            if *id == self.focused_pane || self.pane(*id).is_none() {
+                continue;
+            }
+            // Gap between the two edges (splits have a few pixels of padding/divider between them).
+            let gap = match (dx, dy) {
+                (1, _) => f(b.left()) - f(cur.right()),
+                (-1, _) => f(cur.left()) - f(b.right()),
+                (_, 1) => f(b.top()) - f(cur.bottom()),
+                _ => f(cur.top()) - f(b.bottom()),
+            };
+            if !(-2. ..=12.).contains(&gap) {
+                continue;
+            }
+            let overlap = if dx != 0 {
+                f(cur.bottom()).min(f(b.bottom())) - f(cur.top()).max(f(b.top()))
+            } else {
+                f(cur.right()).min(f(b.right())) - f(cur.left()).max(f(b.left()))
+            };
+            if overlap <= 8. {
+                continue;
+            }
+            if best.is_none_or(|(o, _)| overlap > o) {
+                best = Some((overlap, *id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
     /// Moves focus to the nearest pane in a direction (wraps around at the edges).
     fn focus_dir(&mut self, dx: i32, dy: i32, window: &mut Window, cx: &mut Context<Self>) {
         let best = self.neighbor(dx, dy).map(|id| ((), id));
@@ -1046,7 +1082,7 @@ impl Workspace {
         let Some(tid) = self.pane(self.focused_pane).and_then(|p| p.active) else {
             return self.flash("Nothing to move in this pane".into(), true, cx);
         };
-        match self.neighbor(dx, dy) {
+        match self.adjacent(dx, dy) {
             Some(target) => self.move_tab(tid, target, DropZone::Center, window, cx),
             None => self.move_tab(tid, self.focused_pane, DropZone::from_dir(dx, dy), window, cx),
         }
@@ -4098,6 +4134,38 @@ mod ui_tests {
         assert_eq!(panes(&ws, cx), 2, "⌘\\ splits right");
         cx.simulate_keystrokes("cmd-shift-\\ escape");
         assert_eq!(panes(&ws, cx), 3, "⌘⇧\\ splits down");
+    }
+
+    #[gpui::test]
+    fn moving_a_file_only_goes_to_a_split_really_on_that_side(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        // Left split cut in two (top / bottom), right split full height — like the screenshot.
+        cx.simulate_keystrokes("cmd-\\ escape");
+        let right = ws.read_with(cx, |ws, _| ws.focused_pane);
+        let left = ws.read_with(cx, |ws, _| ws.panes.iter().map(|p| p.id).find(|id| *id != right).unwrap());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.set_focused_pane(left);
+            ws.split(false, window, cx);
+            ws.set_focused_pane(right);
+            ws.open_file(root.join("a.txt"), None, false, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-alt-shift-down");
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(ws.panes.len(), 4, "nothing below the right split: it splits down");
+            let holder = ws.panes.iter().find(|p| !p.items.is_empty()).unwrap().id;
+            assert!(holder != left && holder != right, "file went to the new split, not bottom-left");
+        });
+        // Now there's a split right below: moving up goes back into it, no new split.
+        cx.simulate_keystrokes("cmd-alt-shift-up");
+        cx.run_until_parked();
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(ws.panes.len(), 4);
+            assert_eq!(ws.pane(right).unwrap().items.len(), 1, "back in the right split");
+        });
     }
 
     #[gpui::test]
