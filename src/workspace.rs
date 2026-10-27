@@ -3157,6 +3157,7 @@ impl Workspace {
         let pos = pane.active.and_then(|a| pane.items.iter().position(|x| *x == a)).map(|p| p + 1).unwrap_or(0);
         let (title, icon_name, dirty) = active_ix.map(|ix| self.tab_title(&self.tabs[ix], cx)).unwrap_or_else(|| ("empty".into(), String::new(), false));
         let is_term = active_ix.is_some_and(|ix| matches!(self.tabs[ix].kind, TabKind::Terminal(_)));
+        let is_editor = active_ix.is_some_and(|ix| matches!(self.tabs[ix].kind, TabKind::Editor(_) | TabKind::Merge(_)));
         let frame = if focused { theme::frame_focused() } else { theme::frame() };
         let cell = self.pane_bounds.clone();
         let content: AnyElement = match active_ix.map(|ix| &self.tabs[ix].kind) {
@@ -3281,6 +3282,18 @@ impl Workspace {
                     ws.set_focused_pane(id);
                     ws.cycle_buffer(1, w, cx);
                 })))
+            })
+            .when(is_editor, |d| {
+                // Word wrap toggle (same as ⌥Z / the status bar): lit while wrapping.
+                let on = crate::editor::word_wrap();
+                d.child(
+                    glyph("wrap", "wrap", if on { "Word wrap is on — click to turn off (⌥Z)" } else { "Word wrap: continue long lines on the next row (⌥Z)" })
+                        .when(on, |g| g.bg(theme::frame_focused().opacity(0.18)))
+                        .on_click(cx.listener(|ws, _, _, cx| {
+                            let on = !crate::editor::word_wrap();
+                            ws.set_word_wrap(on, cx);
+                        })),
+                )
             })
             .child(glyph("split-r", "split", "Split right (⌘\\)").on_click(cx.listener(move |ws, _, w, cx| {
                 ws.set_focused_pane(id);

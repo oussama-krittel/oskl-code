@@ -37,6 +37,7 @@ fn icon_body(name: &str) -> Option<&'static str> {
         "dot" => r#"<circle cx="8" cy="8" r="3.5" fill="black"/>"#,
         "search" => r#"<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/>"#,
         "blame" => r#"<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/>"#,
+        "wrap" => r#"<path d="M2.5 4h11"/><path d="M2.5 8h9a2 2 0 0 1 0 4H8"/><path d="M9.5 10.5L8 12l1.5 1.5"/><path d="M2.5 12h3"/>"#,
         "terminal" => r#"<path d="M2.5 4l4 4-4 4"/><path d="M8 12h5.5"/>"#,
         "split" => r#"<rect x="1.5" y="2.5" width="13" height="11" rx="1"/><path d="M8 2.5v11"/>"#,
         "inline" => r#"<rect x="1.5" y="2.5" width="13" height="11" rx="1"/><path d="M1.5 8h13"/>"#,
