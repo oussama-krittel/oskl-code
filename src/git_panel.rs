@@ -426,24 +426,20 @@ impl GitPanel {
         let is_untracked = |p: &String| st.unstaged.iter().any(|c| &c.path == p && c.status == FileStatus::Untracked);
         let (untracked, tracked): (Vec<String>, Vec<String>) = paths.into_iter().partition(is_untracked);
         let Some(ask) = discard_prompt(&tracked, &untracked) else { return };
-        let answers: Vec<PromptButton> = ask
-            .buttons
-            .iter()
-            .map(|(label, _)| PromptButton::new(label.clone()))
-            .chain(std::iter::once(PromptButton::Cancel("Cancel".into())))
-            .collect();
-        let choice = window.prompt(PromptLevel::Warning, &ask.message, Some(&ask.detail), &answers, cx);
-        let buttons = ask.buttons;
-        cx.spawn(async move |this, cx| {
-            let Ok(ix) = choice.await else { return };
-            let Some((_, what)) = buttons.get(ix).cloned() else { return };
-            this.update(cx, |panel, cx| {
-                let untracked = if what == DiscardWhat::TrackedOnly { Vec::new() } else { untracked };
-                panel.run_discard(tracked, untracked, cx);
-            })
-            .ok();
-        })
-        .detach();
+        let _ = window;
+        let panel = cx.entity().downgrade();
+        let choices = ask.buttons.clone();
+        cx.emit(Request::Ask(crate::dialog::Ask {
+            title: ask.message,
+            detail: ask.detail,
+            buttons: ask.buttons.into_iter().map(|(label, _)| label).collect(),
+            danger: true,
+            on_answer: std::rc::Rc::new(move |ix, _, cx| {
+                let Some((_, what)) = choices.get(ix).cloned() else { return };
+                let (tracked, untracked) = (tracked.clone(), if what == DiscardWhat::TrackedOnly { Vec::new() } else { untracked.clone() });
+                panel.update(cx, |panel, cx| panel.run_discard(tracked, untracked, cx)).ok();
+            }),
+        }));
     }
 
     fn run_discard(&mut self, tracked: Vec<String>, untracked: Vec<String>, cx: &mut Context<Self>) {

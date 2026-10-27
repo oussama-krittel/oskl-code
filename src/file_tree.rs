@@ -466,20 +466,18 @@ impl FileTree {
         let Some(path) = self.target() else { return };
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let what = if path.is_dir() { format!("the folder '{name}' and its contents") } else { format!("'{name}'") };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &format!("Are you sure you want to delete {what}?"),
-            Some("You can restore it from the Trash."),
-            &[PromptButton::new("Move to Trash"), PromptButton::Cancel("Cancel".into())],
-            cx,
-        );
-        cx.spawn(async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
-            this.update(cx, |tree, cx| tree.trash(path, cx)).ok();
-        })
-        .detach();
+        let _ = window;
+        let tree = cx.entity().downgrade();
+        cx.emit(Request::Ask(crate::dialog::Ask {
+            title: format!("Are you sure you want to delete {what}?"),
+            detail: "You can restore it from the Trash.".into(),
+            buttons: vec!["Move to Trash".into()],
+            danger: true,
+            on_answer: std::rc::Rc::new(move |_, _, cx| {
+                let path = path.clone();
+                tree.update(cx, |tree, cx| tree.trash(path, cx)).ok();
+            }),
+        }));
     }
 
     pub(crate) fn trash(&mut self, path: PathBuf, cx: &mut Context<Self>) {

@@ -37,6 +37,8 @@ pub enum Request {
     Moved { from: PathBuf, to: PathBuf },
     /// Files or folders were moved to the Trash: their tabs close.
     Deleted(Vec<PathBuf>),
+    /// Ask in the in-app dialog (themed, not the macOS alert).
+    Ask(crate::dialog::Ask),
     /// A terminal in this folder.
     OpenTerminal(PathBuf),
     Message(String),

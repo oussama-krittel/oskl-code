@@ -1011,7 +1011,6 @@ impl Editor {
     /// With ⌘ held over `p`: the range to underline and its text colour, only when a click there
     /// would go somewhere (its own declaration counts).
     fn link_at(&mut self, p: Point<Pixels>, cx: &mut Context<Self>) -> Option<(Range<usize>, Hsla)> {
-        use crate::definition::{Found, Hit};
         let l = self.layout.as_ref()?;
         if p.x / px(1.) < l.text_left {
             return None;

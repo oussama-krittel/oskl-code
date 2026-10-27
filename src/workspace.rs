@@ -451,6 +451,8 @@ pub struct Workspace {
     navigating: bool,
     /// Showing a tab without moving the keyboard to it (explorer single click).
     keep_focus: bool,
+    /// The open confirmation dialog.
+    ask: Option<AskState>,
     session_saved: String,
     _session_tasks: Vec<Task<()>>,
     _quit_sub: Option<Subscription>,
@@ -582,6 +584,7 @@ impl Workspace {
             dragging_split: None,
             navigating: false,
             keep_focus: false,
+            ask: None,
             session_saved: String::new(),
             _session_tasks: Vec::new(),
             _quit_sub: None,
@@ -700,10 +703,126 @@ impl Workspace {
             Request::CommandLine(text) => self.open_cmd(CmdMode::Command, text, window, cx),
             Request::Moved { from, to } => self.path_moved(from, to, cx),
             Request::Deleted(paths) => self.paths_deleted(paths, window, cx),
+            Request::Ask(ask) => self.open_ask(ask.clone(), window, cx),
             Request::OpenTerminal(dir) => self.open_terminal_in(dir.clone(), None, window, cx),
             Request::Message(m) => self.flash(m.clone(), false, cx),
             Request::Error(e) => self.flash(e.clone(), true, cx),
         }
+    }
+
+    fn open_ask(&mut self, ask: crate::dialog::Ask, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = cx.focus_handle();
+        let restore = window.focused(cx);
+        window.focus(&focus);
+        self.ask = Some(AskState { ask, sel: 0, focus, restore });
+        cx.notify();
+    }
+
+    /// Closes the dialog: `Some(i)` runs button i, `None` is Cancel. The keyboard goes back
+    /// to where it was.
+    pub(crate) fn answer_ask(&mut self, choice: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(st) = self.ask.take() else { return };
+        match &st.restore {
+            Some(f) => window.focus(f),
+            None => self.focus_active(window, cx),
+        }
+        cx.notify();
+        if let Some(ix) = choice.filter(|ix| *ix < st.ask.buttons.len()) {
+            (st.ask.on_answer)(ix, window, cx);
+        }
+    }
+
+    /// Buttons left to right: Cancel, then the actions with the main one last.
+    fn ask_order(n: usize) -> Vec<usize> {
+        std::iter::once(n).chain((0..n).rev()).collect()
+    }
+
+    fn ask_step(&mut self, by: isize, cx: &mut Context<Self>) {
+        let Some(st) = &mut self.ask else { return };
+        let order = Self::ask_order(st.ask.buttons.len());
+        let pos = order.iter().position(|i| *i == st.sel).unwrap_or(0) as isize;
+        let next = (pos + by).rem_euclid(order.len() as isize) as usize;
+        st.sel = order[next];
+        cx.notify();
+    }
+
+    fn render_ask(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::dialog::{DialogCancel, DialogConfirm, DialogNext, DialogPrev};
+        let st = self.ask.as_ref()?;
+        let n = st.ask.buttons.len();
+        let danger = theme::c(0xc74e39);
+        let buttons = Self::ask_order(n).into_iter().map(|ix| {
+            let main = ix == 0;
+            let label = if ix == n { "Cancel".to_string() } else { st.ask.buttons[ix].clone() };
+            let selected = ix == st.sel;
+            let selector = format!("dialog-button-{label}");
+            div()
+                .id(("dialog-button", ix))
+                .debug_selector(move || selector)
+                .flex()
+                .items_center()
+                .h(px(26.))
+                .px(px(14.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_size(px(12.))
+                .border_1()
+                .when(main, |d| {
+                    let bg = if st.ask.danger { danger } else { theme::accent() };
+                    d.bg(bg).border_color(bg).text_color(theme::c(0xffffff)).hover(|s| s.opacity(0.9))
+                })
+                .when(!main, |d| d.border_color(theme::border_input()).text_color(theme::fg()).hover(|s| s.bg(theme::hover())))
+                .when(selected, |d| d.border_color(theme::focus_border()))
+                .on_click(cx.listener(move |ws, _, window, cx| ws.answer_ask(Some(ix).filter(|i| *i < n), window, cx)))
+                .child(label)
+        });
+        let detail = st.ask.detail.lines().map(|l| if l.is_empty() { div().h(px(8.)) } else { div().child(l.to_string()) });
+        let icon_color = if st.ask.danger { danger } else { theme::c(0xe5c07b) };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .bg(theme::ca(0x00000073))
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(110.))
+                .child(
+                    div()
+                        .id("dialog")
+                        .track_focus(&st.focus)
+                        .key_context("Dialog")
+                        .on_action(cx.listener(|ws, _: &DialogConfirm, window, cx| {
+                            let sel = ws.ask.as_ref().map(|s| s.sel);
+                            ws.answer_ask(sel, window, cx);
+                        }))
+                        .on_action(cx.listener(|ws, _: &DialogCancel, window, cx| ws.answer_ask(None, window, cx)))
+                        .on_action(cx.listener(|ws, _: &DialogNext, _, cx| ws.ask_step(1, cx)))
+                        .on_action(cx.listener(|ws, _: &DialogPrev, _, cx| ws.ask_step(-1, cx)))
+                        .w(px(460.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.))
+                        .p(px(18.))
+                        .bg(theme::bg_popup())
+                        .border_1()
+                        .border_color(theme::border_input())
+                        .rounded(px(8.))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .flex()
+                                .items_start()
+                                .gap(px(10.))
+                                .child(ui::small_icon("warning", icon_color).size(px(18.)))
+                                .child(div().flex_1().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(st.ask.title.clone())),
+                        )
+                        .child(div().pl(px(28.)).flex().flex_col().text_size(px(12.)).text_color(theme::fg_dim()).children(detail))
+                        .child(div().flex().justify_end().gap(px(8.)).pt(px(4.)).children(buttons)),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Open editors of a renamed/moved file (or anything inside a moved folder) follow it.
@@ -4276,7 +4395,16 @@ impl Render for Workspace {
             })
             .child(self.render_status(window, cx))
             .children(self.render_cmd_popup(cx))
+            .children(self.render_ask(cx))
     }
+}
+
+struct AskState {
+    ask: crate::dialog::Ask,
+    /// The highlighted button (`buttons.len()` is Cancel).
+    sel: usize,
+    focus: FocusHandle,
+    restore: Option<FocusHandle>,
 }
 
 #[cfg(test)]
@@ -4361,6 +4489,7 @@ mod ui_tests {
             crate::search::bind_keys();
             crate::findbar::bind_keys();
             crate::diff_edit::bind_keys();
+            crate::dialog::bind_keys();
             crate::keybindings::apply(cx);
         });
         prepare(&project);
@@ -4442,8 +4571,9 @@ mod ui_tests {
         let all: Vec<String> = ws.read_with(cx, |ws, cx| ws.repo.read(cx).status.unstaged.iter().map(|c| c.path.clone()).collect());
         assert_eq!(all.len(), 3);
         ws.update_in(cx, |ws, window, cx| ws.git_panel.update(cx, |p, cx| p.ask_discard(all, window, cx)));
-        assert!(cx.has_pending_prompt(), "asks first");
-        cx.simulate_prompt_answer("Discard 1 Tracked File");
+        assert!(ws.read_with(cx, |ws, _| ws.ask.is_some()), "asks first, in the app's own dialog");
+        let at = cx.debug_bounds("dialog-button-Discard 1 Tracked File").expect("button on screen").center();
+        cx.simulate_click(at, gpui::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(std::fs::read_to_string(root.join("notes.md")).unwrap(), "one\n", "tracked change discarded");
         assert!(root.join("a.txt").exists() && root.join("b.txt").exists(), "untracked files kept");
@@ -4776,8 +4906,9 @@ mod ui_tests {
         ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
         select(cx, root.join("b.ts"));
         cx.simulate_keystrokes("cmd-backspace");
-        assert!(cx.has_pending_prompt(), "asks before moving to the Trash");
-        cx.simulate_prompt_answer("Cancel");
+        assert!(ws.read_with(cx, |ws, _| ws.ask.is_some()), "asks before moving to the Trash");
+        cx.simulate_keystrokes("escape");
+        assert!(ws.read_with(cx, |ws, _| ws.ask.is_none()), "Esc cancels");
         cx.run_until_parked();
         assert!(root.join("b.ts").is_file());
     }
@@ -4835,8 +4966,11 @@ mod ui_tests {
         // Delete from a clicked row asks, and never touches the open file's text.
         click(cx, "tree-row-b.ts", 1);
         cx.simulate_keystrokes("cmd-backspace");
-        assert!(cx.has_pending_prompt(), "⌘⌫ asks to move b.ts to the Trash");
-        cx.simulate_prompt_answer("Cancel");
+        assert!(ws.read_with(cx, |ws, _| ws.ask.is_some()), "⌘⌫ asks to move b.ts to the Trash");
+        let at = cx.debug_bounds("dialog-button-Cancel").expect("Cancel on screen").center();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(tree_focused(cx), "the keyboard goes back to the explorer");
 
         // Double click: the cursor goes into the file.
         click(cx, "tree-row-b.ts", 2);

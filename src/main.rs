@@ -4,6 +4,7 @@ mod commit_view;
 mod complete;
 mod datafiles;
 mod definition;
+mod dialog;
 mod diagnostics;
 mod diff_edit;
 mod diff_view;
@@ -114,6 +115,7 @@ fn main() {
         search::bind_keys();
         findbar::bind_keys();
         diff_edit::bind_keys();
+        dialog::bind_keys();
         keybindings::apply(cx);
         cx.on_action(|_: &QuitApp, cx| cx.quit());
         cx.on_action(|_: &NewWindow, cx| open_window(workspace::no_project_dir(), cx));
