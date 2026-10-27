@@ -182,6 +182,7 @@ enum TabKind {
     DiffEdit(Entity<DiffEditView>),
     Commit(Entity<CommitView>),
     Terminal(Entity<TerminalView>),
+    Merge(Entity<crate::merge_view::MergeView>),
 }
 
 /// Tiling layout of panes, like zellij / tmux / iTerm splits.
@@ -338,6 +339,9 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("fetch", "git fetch --all --prune", false),
     ("pull", "git pull", false),
     ("push", "git push", false),
+    ("sync", "Pull then push: sync (rebase) | sync merge", true),
+    ("compare", "Compare the current branch with another: compare <branch>", true),
+    ("abort", "Abort the merge / rebase / cherry-pick in progress", false),
     ("stash", "git stash (stash pop to restore)", false),
     ("graph", "Graph scope: graph all | graph auto", true),
     ("open", "Open a folder in this window: open <dir> (⌘O for a picker)", true),
@@ -413,6 +417,8 @@ pub struct Workspace {
     _watcher: Option<notify::RecommendedWatcher>,
     _subs: Vec<Subscription>,
     diff_rights: Vec<(Entity<DiffEditView>, Entity<Editor>)>,
+    /// Result editor of each merge editor tab.
+    merge_results: Vec<(Entity<crate::merge_view::MergeView>, Entity<Editor>)>,
     autosave_tasks: std::collections::HashMap<EntityId, Task<()>>,
     lint_diags: FileDiags,
     ts_diags: FileDiags,
@@ -468,7 +474,12 @@ impl Workspace {
             }),
             cx.subscribe_in(&tree, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&git_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
-            cx.subscribe_in(&repo, window, |ws, _, ev: &RepoEvent, _, cx| match ev {
+            cx.subscribe_in(&repo, window, |ws, _, ev: &RepoEvent, window, cx| match ev {
+                RepoEvent::PushRejected => {
+                    // The remote moved on: Enter pulls (rebase) then pushes; "sync merge" merges instead.
+                    ws.open_cmd(CmdMode::Command, "sync", window, cx);
+                    ws.flash("Push rejected: the remote has new commits. Enter = pull --rebase then push · sync merge = merge instead".into(), true, cx);
+                }
                 RepoEvent::Message(m) => ws.flash(m.clone(), false, cx),
                 RepoEvent::Error(e) => ws.flash(e.clone(), true, cx),
                 RepoEvent::Output { title, text, ok } => {
@@ -537,6 +548,7 @@ impl Workspace {
             _watcher: None,
             _subs: subs,
             diff_rights: Vec::new(),
+            merge_results: Vec::new(),
             autosave_tasks: Default::default(),
             lint_diags: Default::default(),
             ts_diags: Default::default(),
@@ -642,6 +654,17 @@ impl Workspace {
 
     fn handle_request(&mut self, req: &Request, window: &mut Window, cx: &mut Context<Self>) {
         match req {
+            Request::MarkResolved(rel) => {
+                let rel = rel.clone();
+                if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Merge(m) if m.read(cx).rel == rel)) {
+                    self.close_tab(ix, true, window, cx);
+                }
+                self.stage_resolved(rel, cx);
+            }
+            Request::Compare(other) => {
+                let base = self.repo.read(cx).branch_label();
+                self.open_compare(base, other.clone(), window, cx);
+            }
             Request::OpenFile { path, line, preview } => self.open_file(path.clone(), *line, *preview, window, cx),
             Request::OpenAt { path, line, cols } => {
                 self.open_file(path.clone(), None, true, window, cx);
@@ -742,6 +765,9 @@ impl Workspace {
             let removed = self.tabs.remove(ix);
             if let TabKind::DiffEdit(d) = &removed.kind {
                 self.diff_rights.retain(|(v, _)| v != d);
+            }
+            if let TabKind::Merge(m) = &removed.kind {
+                self.merge_results.retain(|(v, _)| v != m);
             }
         }
         self.sync_active();
@@ -982,6 +1008,7 @@ impl Workspace {
         match &self.tabs[ix].kind {
             TabKind::Editor(e) => e.read(cx).buf.is_dirty(),
             TabKind::DiffEdit(d) => d.read(cx).right.read(cx).buf.is_dirty(),
+            TabKind::Merge(m) => m.read(cx).result.read(cx).buf.is_dirty(),
             _ => false,
         }
     }
@@ -1262,6 +1289,7 @@ impl Workspace {
             TabKind::DiffEdit(d) => d.read(cx).focus(window, cx),
             TabKind::Commit(c) => c.read(cx).focus(window),
             TabKind::Terminal(t) => t.read(cx).focus(window),
+            TabKind::Merge(m) => m.read(cx).focus(window, cx),
         }
     }
 
@@ -1269,6 +1297,7 @@ impl Workspace {
         match &self.tabs.get(self.active?)?.kind {
             TabKind::Editor(e) => Some(e.clone()),
             TabKind::DiffEdit(_) => self.diff_edit_right(self.active?),
+            TabKind::Merge(m) => self.merge_results.iter().find(|(v, _)| v == m).map(|(_, e)| e.clone()),
             _ => None,
         }
     }
@@ -1321,6 +1350,17 @@ impl Workspace {
                     if let Some(p) = editor.read(cx).path.clone() {
                         ws.check_file(p, cx);
                     }
+                    ws.after_save(editor, cx);
+                }
+                EditorEvent::CompareConflict => {
+                    if let Some(p) = editor.read(cx).path.clone() {
+                        ws.compare_conflict(p, window, cx);
+                    }
+                }
+                EditorEvent::OpenMergeEditor => {
+                    if let Some(p) = editor.read(cx).path.clone() {
+                        ws.open_merge_editor(p, window, cx);
+                    }
                 }
                 _ => {}
             });
@@ -1363,6 +1403,17 @@ impl Workspace {
                 EditorEvent::Saved => {
                     if let Some(p) = editor.read(cx).path.clone() {
                         ws.check_file(p, cx);
+                    }
+                    ws.after_save(editor, cx);
+                }
+                EditorEvent::CompareConflict => {
+                    if let Some(p) = editor.read(cx).path.clone() {
+                        ws.compare_conflict(p, window, cx);
+                    }
+                }
+                EditorEvent::OpenMergeEditor => {
+                    if let Some(p) = editor.read(cx).path.clone() {
+                        ws.open_merge_editor(p, window, cx);
                     }
                 }
                 _ => {}
@@ -1407,6 +1458,75 @@ impl Workspace {
         self.add_tab(TabKind::Commit(view), sub, true, window, cx);
     }
 
+    /// "Resolve in Merge Editor" for a conflicted file.
+    fn open_merge_editor(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.root(cx);
+        let Ok(rel) = path.strip_prefix(&root).map(|r| r.to_string_lossy().to_string()) else { return };
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Merge(m) if m.read(cx).rel == rel)) {
+            return self.activate(ix, window, cx);
+        }
+        // Save the plain editor first so the merge editor starts from what's on disk.
+        if let Some(ed) = self.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Editor(e) if e.read(cx).path.as_ref() == Some(&path) => Some(e.clone()),
+            _ => None,
+        }) && ed.read(cx).buf.is_dirty()
+        {
+            ed.update(cx, |e, cx| e.save(cx)).ok();
+        }
+        let font = self.font_size;
+        let view = cx.new(|cx| crate::merge_view::MergeView::new(path, rel, root, font, cx));
+        let result = view.read(cx).result.clone();
+        self.merge_results.push((view.clone(), result));
+        let sub = cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx));
+        self.add_tab(TabKind::Merge(view), sub, false, window, cx);
+    }
+
+    /// Compare on a conflict: current (ours) vs incoming (theirs) for the whole file.
+    fn compare_conflict(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.root(cx);
+        let Ok(rel) = path.strip_prefix(&root).map(|r| r.to_string_lossy().to_string()) else { return };
+        let spec = DiffSpec { path: rel, old_path: None, left: Rev::Stage(2), right: Rev::Stage(3), from_commit: None };
+        self.open_diff(spec, false, window, cx);
+    }
+
+    /// Stages a file whose conflicts are gone (VS Code marks it resolved on save).
+    fn stage_resolved(&mut self, rel: String, cx: &mut Context<Self>) {
+        let msg = format!("Marked {} as resolved", ui::file_name(&rel));
+        self.repo.update(cx, |r, cx| r.run_op("Mark resolved", cx, move |root| git::stage(root, &[rel]).map(|_| msg)));
+    }
+
+    /// After saving: a conflicted file with no markers left gets staged.
+    fn after_save(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        let Some(path) = editor.read(cx).path.clone() else { return };
+        let root = self.root(cx);
+        let Ok(rel) = path.strip_prefix(&root).map(|r| r.to_string_lossy().to_string()) else { return };
+        let conflicted = self.repo.read(cx).status.conflicts.iter().any(|c| c.path == rel);
+        if conflicted && editor.update(cx, |e, _| {
+            e.refresh_conflicts();
+            e.conflicts.is_empty()
+        }) {
+            self.stage_resolved(rel, cx);
+        }
+    }
+
+    fn open_compare(&mut self, base: String, other: String, window: &mut Window, cx: &mut Context<Self>) {
+        let key = format!("{base}...{other}");
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Commit(c) if c.read(cx).sha == key)) {
+            return self.activate(ix, window, cx);
+        }
+        let root = self.root(cx);
+        let view = cx.new(|cx| CommitView::new_compare(root, base, other, cx));
+        let sub = cx.subscribe_in(&view, window, |ws, view, req: &Request, window, cx| {
+            if let Request::OpenDiff { .. } = req
+                && let Some(tab) = ws.tabs.iter_mut().find(|t| matches!(&t.kind, TabKind::Commit(c) if c == view))
+            {
+                tab.preview = false;
+            }
+            ws.handle_request(req, window, cx)
+        });
+        self.add_tab(TabKind::Commit(view), sub, false, window, cx);
+    }
+
     fn close_tab(&mut self, ix: usize, force: bool, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.tabs.len() {
             return;
@@ -1447,6 +1567,10 @@ impl Workspace {
                 (d.title(), d.spec.path.clone(), d.right.read(cx).buf.is_dirty())
             }
             TabKind::Commit(c) => (c.read(cx).title(), String::new(), false),
+            TabKind::Merge(m) => {
+                let m = m.read(cx);
+                (m.title(), m.rel.clone(), m.result.read(cx).buf.is_dirty())
+            }
             TabKind::Terminal(t) => {
                 let t = t.read(cx);
                 (format!("$ {}", t.title), String::new(), false)
@@ -1653,7 +1777,7 @@ impl Workspace {
                 d.update(cx, |d, cx| d.set_blame(on, cx));
                 self.blame_default = on;
             }
-            TabKind::Commit(_) | TabKind::Terminal(_) => {}
+            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) => {}
         }
         self.settings.blame_default = self.blame_default;
         self.settings.save();
@@ -2228,7 +2352,7 @@ impl Workspace {
                     self.cmd.update(cx, |c, cx| c.set_text(&value, cx));
                 }
             }
-            EditorEvent::OpenCommit(_) | EditorEvent::Saved => {}
+            EditorEvent::OpenCommit(_) | EditorEvent::Saved | EditorEvent::CompareConflict | EditorEvent::OpenMergeEditor => {}
         }
     }
 
@@ -2694,6 +2818,21 @@ impl Workspace {
                 self.repo.update(cx, |r, cx| r.run_git(vec!["switch".into(), "-c".into(), rest.to_string()], cx));
             }
             "fetch" => self.repo.update(cx, |r, cx| r.run_git(vec!["fetch".into(), "--all".into(), "--prune".into()], cx)),
+            "sync" => {
+                let rebase = rest != "merge";
+                self.repo.update(cx, |r, cx| r.run_op(if rebase { "Pull (rebase) & push" } else { "Pull (merge) & push" }, cx, move |root| git::sync(root, rebase)));
+            }
+            "compare" => {
+                if rest.is_empty() {
+                    return self.flash("compare <branch>: which branch?".into(), true, cx);
+                }
+                let base = self.repo.read(cx).branch_label();
+                self.open_compare(base, rest.to_string(), window, cx);
+            }
+            "abort" => match self.repo.read(cx).status.op.clone() {
+                Some(op) => self.repo.update(cx, |r, cx| r.run_op("Abort", cx, move |root| git::abort_op(root, op.kind))),
+                None => self.flash("Nothing in progress to abort".into(), true, cx),
+            },
             "pull" | "push" | "stash" | "merge" | "rebase" => {
                 let mut args = vec![cmd.to_string()];
                 args.extend(rest.split_whitespace().map(String::from));
@@ -2833,7 +2972,7 @@ impl Workspace {
                         d.update(cx, |d, cx| d.refresh(cx));
                     }
                 }
-                TabKind::Commit(_) | TabKind::Terminal(_) => {}
+                TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) => {}
             }
         }
         self.repo.update(cx, |r, cx| {
@@ -3001,6 +3140,7 @@ impl Workspace {
             Some(TabKind::DiffEdit(d)) => d.clone().into_any_element(),
             Some(TabKind::Commit(c)) => c.clone().into_any_element(),
             Some(TabKind::Terminal(t)) => t.clone().into_any_element(),
+            Some(TabKind::Merge(m)) => m.clone().into_any_element(),
             None if self.panes.len() == 1 => self.render_welcome(cx),
             None => self.render_empty_pane(),
         };
@@ -3979,6 +4119,11 @@ mod ui_tests {
     use gpui::{TestAppContext, VisualTestContext};
 
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
+        setup_with(cx, |_| {})
+    }
+
+    /// Like `setup`, letting the test fill the project folder before the window opens.
+    fn setup_with(cx: &mut TestAppContext, prepare: impl FnOnce(&std::path::Path)) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
         let home = std::env::temp_dir().join(format!("kite-ui-test-{}", std::process::id()));
         // Each test gets its own project so saved sessions don't clash between parallel tests.
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -3998,7 +4143,72 @@ mod ui_tests {
             crate::diff_edit::bind_keys();
             crate::keybindings::apply(cx);
         });
+        prepare(&project);
         cx.add_window_view(|window, cx| Workspace::new(project, window, cx))
+    }
+
+    /// `main` and `feature` both changed line 1 of a.txt, and `git merge feature` stopped on it.
+    fn merge_in_conflict(dir: &std::path::Path) {
+        let sh = |cmd: &str| {
+            std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).env("GIT_EDITOR", "true").output().unwrap();
+        };
+        sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+        sh("printf 'base\\nkeep\\n' > a.txt && git add . && git commit -qm base");
+        sh("git switch -qc feature && printf 'theirs\\nkeep\\n' > a.txt && git commit -qam feat");
+        sh("git switch -q main && printf 'ours\\nkeep\\n' > a.txt && git commit -qam mine");
+        sh("git merge feature");
+    }
+
+    fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+        String::from_utf8_lossy(&std::process::Command::new("git").args(args).current_dir(dir).output().unwrap().stdout).trim().to_string()
+    }
+
+    #[gpui::test]
+    fn conflict_accept_both_save_stages_then_commit_merge(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, merge_in_conflict);
+        cx.run_until_parked();
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let op = ws.read_with(cx, |ws, cx| ws.repo.read(cx).status.op.clone()).expect("merge detected");
+        assert_eq!(op.label, "Merging feature");
+        let msg = ws.read_with(cx, |ws, cx| ws.git_panel.read(cx).commit_input.read(cx).text());
+        assert!(msg.starts_with("Merge branch 'feature'"), "message prefilled: {msg}");
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("a.txt"), None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).unwrap();
+        ed.update(cx, |e, cx| {
+            e.refresh_conflicts();
+            assert_eq!(e.conflicts.len(), 1);
+            e.resolve_conflict(0, crate::editor::ConflictAction::Both, cx);
+        });
+        assert_eq!(ed.read_with(cx, |e, _| e.text()), "ours\ntheirs\nkeep\n");
+        cx.simulate_keystrokes("cmd-s");
+        cx.run_until_parked();
+        assert!(ws.read_with(cx, |ws, cx| ws.repo.read(cx).status.conflicts.is_empty()), "saved without markers → staged");
+        ws.update_in(cx, |ws, window, cx| ws.git_panel.update(cx, |p, cx| p.commit(None, false, false, window, cx)));
+        cx.run_until_parked();
+        assert!(ws.read_with(cx, |ws, cx| ws.repo.read(cx).status.op.is_none()), "merge finished");
+        assert_eq!(git_out(&root, &["log", "-1", "--format=%P"]).split_whitespace().count(), 2, "merge commit");
+    }
+
+    #[gpui::test]
+    fn merge_editor_checkboxes_and_accept(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, merge_in_conflict);
+        cx.run_until_parked();
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_merge_editor(root.join("a.txt"), window, cx));
+        cx.run_until_parked();
+        let view = ws.read_with(cx, |ws, _| ws.merge_results.first().map(|(v, _)| v.clone())).expect("merge tab");
+        view.update(cx, |v, cx| {
+            v.toggle(0, true, cx);
+            v.toggle(0, false, cx);
+        });
+        let result = view.read_with(cx, |v, _| v.result.clone());
+        assert_eq!(result.read_with(cx, |e, _| e.text()), "theirs\nours\nkeep\n", "incoming ticked first goes first");
+        view.update(cx, |v, cx| v.accept(cx));
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "theirs\nours\nkeep\n");
+        assert!(ws.read_with(cx, |ws, cx| ws.repo.read(cx).status.conflicts.is_empty()), "accepted → staged");
+        assert!(ws.read_with(cx, |ws, _| ws.merge_results.is_empty()), "merge tab closed");
     }
 
     fn cursor(ws: &gpui::Entity<Workspace>, cx: &mut VisualTestContext) -> usize {

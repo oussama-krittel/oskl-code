@@ -358,7 +358,7 @@ impl DiffView {
 
 fn blame_side(root: &std::path::Path, rev: &Rev, path: &str) -> Option<BlameLines> {
     let blame = match rev {
-        Rev::Empty => return None,
+        Rev::Empty | Rev::Stage(_) => return None,
         Rev::Commit(sha) => git::blame(root, path, Some(sha), None),
         Rev::Working => git::blame(root, path, None, None),
         Rev::Index => {

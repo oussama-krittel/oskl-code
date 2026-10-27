@@ -31,6 +31,8 @@ pub struct CommitView {
     error: Option<String>,
     selected: usize,
     scroll: ScrollHandle,
+    /// Comparing two branches (base, other) instead of showing one commit.
+    pub compare: Option<(String, String)>,
     _task: Task<()>,
 }
 
@@ -51,10 +53,32 @@ impl CommitView {
             })
             .ok();
         });
-        Self { focus: cx.focus_handle(), root, sha, details: None, error: None, selected: 0, scroll: ScrollHandle::new(), _task: task }
+        Self { focus: cx.focus_handle(), root, sha, details: None, error: None, selected: 0, scroll: ScrollHandle::new(), compare: None, _task: task }
+    }
+
+    /// What `other` changed since it split from `base` (like comparing branches on GitHub).
+    pub fn new_compare(root: PathBuf, base: String, other: String, cx: &mut Context<Self>) -> Self {
+        let (r, b, o) = (root.clone(), base.clone(), other.clone());
+        let load = cx.background_executor().spawn(async move { git::compare(&r, &b, &o) });
+        let task = cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |view, cx| {
+                match result {
+                    Ok(d) => view.details = Some(d),
+                    Err(e) => view.error = Some(e.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        let sha = format!("{base}...{other}");
+        Self { focus: cx.focus_handle(), root, sha, details: None, error: None, selected: 0, scroll: ScrollHandle::new(), compare: Some((base, other)), _task: task }
     }
 
     pub fn title(&self) -> String {
+        if let Some((a, b)) = &self.compare {
+            return format!("{a} ↔ {b}");
+        }
         match &self.details {
             Some(d) => format!("{} {}", &d.sha[..7], d.subject()),
             None => self.sha[..self.sha.len().min(7)].to_string(),
@@ -74,7 +98,7 @@ impl CommitView {
         };
         let right = if file.status == FileStatus::Deleted { Rev::Empty } else { Rev::Commit(d.sha.clone()) };
         cx.emit(Request::OpenDiff {
-            spec: DiffSpec { path: file.path.clone(), old_path: file.orig_path.clone(), left, right, from_commit: Some(d.sha.clone()) },
+            spec: DiffSpec { path: file.path.clone(), old_path: file.orig_path.clone(), left, right, from_commit: self.compare.is_none().then(|| d.sha.clone()) },
             preview,
         });
     }
@@ -213,7 +237,18 @@ impl Render for CommitView {
                 .gap(px(14.))
                 .child(div().text_size(px(20.)).text_color(theme::fg_bright()).child(d.subject().to_string()))
                 .child(refs)
-                .child(
+                .when_some(self.compare.clone(), |el, (a, b)| {
+                    let short = |s: &str| s[..s.len().min(7)].to_string();
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(meta_row("Base", div().font_family(theme::MONO_FONT).child(format!("{a}  (split at {})", d.parents.first().map(|p| short(p)).unwrap_or_default()))))
+                            .child(meta_row("Compared", div().font_family(theme::MONO_FONT).child(format!("{b}  ({})", short(&d.sha))))),
+                    )
+                })
+                .when(self.compare.is_none(), |el| el.child(
                     div()
                         .flex()
                         .flex_col()
@@ -238,7 +273,7 @@ impl Render for CommitView {
                         .child(meta_row("Date", div().child(format!("{}  ({})", d.date, util::relative_time(d.time)))))
                         .when(d.committer != d.author, |el| el.child(meta_row("Committer", div().child(d.committer.clone()))))
                         .when(!d.parents.is_empty(), |el| el.child(meta_row("Parents", parents))),
-                )
+                ))
                 .when(!d.body().is_empty(), |el| {
                     el.child(
                         div()

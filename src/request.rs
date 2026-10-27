@@ -25,6 +25,10 @@ pub enum Request {
     OpenAt { path: PathBuf, line: usize, cols: std::ops::Range<usize> },
     OpenDiff { spec: DiffSpec, preview: bool },
     OpenCommit(String),
+    /// Compare the current branch with this one.
+    Compare(String),
+    /// A conflicted file (repo-relative) was resolved in the merge editor: stage it.
+    MarkResolved(String),
     /// Opens the command line pre-filled with this text.
     CommandLine(String),
     Message(String),

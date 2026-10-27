@@ -15,6 +15,7 @@ mod highlight;
 mod icons;
 mod keybindings;
 mod keymap;
+mod merge_view;
 mod repo;
 mod request;
 mod search;

@@ -130,6 +130,172 @@ pub struct Status {
     pub unstaged: Vec<Change>,
     pub conflicts: Vec<Change>,
     pub ignored: Vec<String>,
+    /// A merge / rebase / cherry-pick / revert waiting to be finished.
+    pub op: Option<OpState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpKind {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpState {
+    pub kind: OpKind,
+    /// "Merging feature", "Rebasing main (2/5)"…
+    pub label: String,
+    /// The commit message git prepared (MERGE_MSG, or the rebased commit's message).
+    pub message: String,
+}
+
+impl OpKind {
+    pub fn continue_label(self) -> &'static str {
+        match self {
+            OpKind::Merge => "Commit Merge",
+            OpKind::Rebase => "Continue Rebase",
+            OpKind::CherryPick => "Continue Cherry-pick",
+            OpKind::Revert => "Continue Revert",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            OpKind::Merge => "merge",
+            OpKind::Rebase => "rebase",
+            OpKind::CherryPick => "cherry-pick",
+            OpKind::Revert => "revert",
+        }
+    }
+
+    pub fn can_skip(self) -> bool {
+        matches!(self, OpKind::Rebase | OpKind::CherryPick | OpKind::Revert)
+    }
+}
+
+/// The repository's .git directory (follows `.git` files of worktrees and submodules).
+pub fn git_dir(root: &Path) -> Option<PathBuf> {
+    let dot = root.join(".git");
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    let text = std::fs::read_to_string(&dot).ok()?;
+    let p = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+    Some(if p.is_absolute() { p } else { root.join(p) })
+}
+
+fn read_trim(p: &Path) -> Option<String> {
+    std::fs::read_to_string(p).ok().map(|s| s.trim().to_string())
+}
+
+/// Message file contents without git's "#" comment lines.
+fn clean_message(text: &str) -> String {
+    text.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n").trim().to_string()
+}
+
+pub fn op_state(root: &Path) -> Option<OpState> {
+    let dir = git_dir(root)?;
+    let short = |r: String| r.trim_start_matches("refs/heads/").to_string();
+    for sub in ["rebase-merge", "rebase-apply"] {
+        let d = dir.join(sub);
+        if d.is_dir() {
+            let (n, total) = if sub == "rebase-merge" { ("msgnum", "end") } else { ("next", "last") };
+            let step = match (read_trim(&d.join(n)), read_trim(&d.join(total))) {
+                (Some(a), Some(b)) => format!(" ({a}/{b})"),
+                _ => String::new(),
+            };
+            let onto = read_trim(&d.join("onto")).map(|o| o[..o.len().min(7)].to_string());
+            let branch = read_trim(&d.join("head-name")).map(short).unwrap_or_else(|| "HEAD".into());
+            let message = read_trim(&d.join("message")).or_else(|| read_trim(&dir.join("MERGE_MSG"))).map(|m| clean_message(&m)).unwrap_or_default();
+            let label = match onto {
+                Some(o) => format!("Rebasing {branch} onto {o}{step}"),
+                None => format!("Rebasing {branch}{step}"),
+            };
+            return Some(OpState { kind: OpKind::Rebase, label, message });
+        }
+    }
+    let msg = || read_trim(&dir.join("MERGE_MSG")).map(|m| clean_message(&m)).unwrap_or_default();
+    if dir.join("MERGE_HEAD").exists() {
+        // "Merge branch 'feature' into main" → feature
+        let m = msg();
+        let what = m.split('\'').nth(1).map(String::from).unwrap_or_else(|| read_trim(&dir.join("MERGE_HEAD")).map(|s| s[..s.len().min(7)].to_string()).unwrap_or_default());
+        return Some(OpState { kind: OpKind::Merge, label: format!("Merging {what}"), message: m });
+    }
+    for (file, kind, verb) in [("CHERRY_PICK_HEAD", OpKind::CherryPick, "Cherry-picking"), ("REVERT_HEAD", OpKind::Revert, "Reverting")] {
+        if let Some(sha) = read_trim(&dir.join(file)) {
+            return Some(OpState { kind, label: format!("{verb} {}", &sha[..sha.len().min(7)]), message: msg() });
+        }
+    }
+    None
+}
+
+/// Finishes the operation with `message` (no editor pops up).
+pub fn continue_op(root: &Path, kind: OpKind, message: &str) -> Result<String> {
+    let dir = git_dir(root).ok_or_else(|| anyhow!("no .git directory"))?;
+    match kind {
+        OpKind::Merge => return run_with_stdin(root, &["commit", "-F", "-"], message),
+        OpKind::Rebase => {
+            if !message.is_empty() {
+                let f = dir.join("rebase-merge/message");
+                if f.exists() {
+                    std::fs::write(f, format!("{message}\n"))?;
+                }
+            }
+        }
+        _ => {
+            if !message.is_empty() {
+                std::fs::write(dir.join("MERGE_MSG"), format!("{message}\n"))?;
+            }
+        }
+    }
+    let out = git(root).env("GIT_EDITOR", "true").args([kind.verb(), "--continue"]).output()?;
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
+        bail!("{}", text.trim());
+    }
+    Ok(text)
+}
+
+pub fn abort_op(root: &Path, kind: OpKind) -> Result<String> {
+    run(root, &[kind.verb(), "--abort"])
+}
+
+pub fn skip_op(root: &Path, kind: OpKind) -> Result<String> {
+    let out = git(root).env("GIT_EDITOR", "true").args([kind.verb(), "--skip"]).output()?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Pulls (rebase or merge), then pushes: what to do after a push was rejected.
+pub fn sync(root: &Path, rebase: bool) -> Result<String> {
+    run(root, &["pull", if rebase { "--rebase" } else { "--no-rebase" }, "--no-edit"])?;
+    run(root, &["push"])
+}
+
+/// What `other` has that `base` doesn't: files changed since their merge base, as a
+/// commit-like summary (the "parent" is the merge base).
+pub fn compare(root: &Path, base: &str, other: &str) -> Result<CommitDetails> {
+    let mb = run(root, &["merge-base", base, other])?.trim().to_string();
+    let tip = run(root, &["rev-parse", other])?.trim().to_string();
+    let files = run(root, &["diff", "-z", "-M", "--name-status", &mb, &tip])?;
+    let count = run(root, &["rev-list", "--count", &format!("{mb}..{tip}")]).map(|s| s.trim().to_string()).unwrap_or_default();
+    let behind = run(root, &["rev-list", "--count", &format!("{tip}..{base}")]).map(|s| s.trim().to_string()).unwrap_or_default();
+    Ok(CommitDetails {
+        sha: tip,
+        parents: vec![mb],
+        author: String::new(),
+        email: String::new(),
+        date: String::new(),
+        time: 0,
+        committer: String::new(),
+        refs: Vec::new(),
+        message: format!("Compare {base} … {other}\n\n{other} has {count} commit(s) not in {base}; {base} has {behind} not in {other}.\nFiles below: what {other} changed since they split."),
+        files: parse_name_status(&files),
+    })
 }
 
 impl Status {
@@ -154,7 +320,9 @@ pub fn status(root: &Path) -> Result<Status> {
             "--ignored=matching",
         ],
     )?;
-    Ok(parse_status(&out))
+    let mut st = parse_status(&out);
+    st.op = op_state(root);
+    Ok(st)
 }
 
 fn parse_status(out: &str) -> Status {
@@ -444,6 +612,8 @@ pub enum Rev {
     Index,
     Working,
     Empty,
+    /// A merge stage: 2 = current (ours), 3 = incoming (theirs).
+    Stage(u8),
 }
 
 impl Rev {
@@ -453,6 +623,9 @@ impl Rev {
             Rev::Index => "Index".into(),
             Rev::Working => "Working Tree".into(),
             Rev::Empty => "Empty".into(),
+            Rev::Stage(2) => "Current (ours)".into(),
+            Rev::Stage(3) => "Incoming (theirs)".into(),
+            Rev::Stage(n) => format!("Stage {n}"),
         }
     }
 }
@@ -462,6 +635,7 @@ pub fn read_rev(root: &Path, rev: &Rev, path: &str) -> Option<String> {
         Rev::Empty => return Some(String::new()),
         Rev::Working => std::fs::read(root.join(path)).ok()?,
         Rev::Index => git(root).args(["show", &format!(":{path}")]).output().ok().filter(|o| o.status.success())?.stdout,
+        Rev::Stage(n) => git(root).args(["show", &format!(":{n}:{path}")]).output().ok().filter(|o| o.status.success())?.stdout,
         Rev::Commit(sha) => git(root).args(["show", &format!("{sha}:{path}")]).output().ok().filter(|o| o.status.success())?.stdout,
     };
     if bytes.iter().take(8000).any(|b| *b == 0) {
@@ -675,5 +849,73 @@ mod live {
         let all = super::log(&root, 800, true, &[]).expect("log all");
         println!("log all: {}", all.len());
         assert!(!log.unwrap().is_empty());
+    }
+
+    use crate::git::{OpKind, abort_op, compare, continue_op, run, stage, status};
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    /// A repo where `main` and `feature` both changed line 1 of a.txt.
+    fn conflicting_repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kite-git-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = |cmd: &str| {
+            let out = Command::new("sh").arg("-c").arg(cmd).current_dir(&dir).env("GIT_EDITOR", "true").output().unwrap();
+            String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)
+        };
+        sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+        sh("printf 'base\\nkeep\\n' > a.txt && git add . && git commit -qm base");
+        sh("git switch -qc feature && printf 'theirs\\nkeep\\n' > a.txt && git commit -qam feat");
+        sh("git switch -q main && printf 'ours\\nkeep\\n' > a.txt && git commit -qam mine");
+        dir
+    }
+
+    #[test]
+    fn merge_conflict_state_and_continue() {
+        let dir = conflicting_repo("merge");
+        assert!(run(&dir, &["merge", "feature"]).is_err(), "conflicts");
+        let st = status(&dir).unwrap();
+        assert_eq!(st.conflicts.len(), 1);
+        let op = st.op.expect("merge in progress");
+        assert_eq!(op.kind, OpKind::Merge);
+        assert_eq!(op.label, "Merging feature");
+        assert!(op.message.starts_with("Merge branch 'feature'"), "{}", op.message);
+        std::fs::write(dir.join("a.txt"), "ours\ntheirs\nkeep\n").unwrap();
+        stage(&dir, &["a.txt".into()]).unwrap();
+        continue_op(&dir, OpKind::Merge, &op.message).unwrap();
+        let st = status(&dir).unwrap();
+        assert!(st.op.is_none() && st.conflicts.is_empty());
+        assert!(run(&dir, &["log", "-1", "--format=%P"]).unwrap().split_whitespace().count() == 2, "merge commit");
+    }
+
+    #[test]
+    fn rebase_conflict_continue_and_abort() {
+        let dir = conflicting_repo("rebase");
+        assert!(run(&dir, &["rebase", "feature"]).is_err());
+        let op = status(&dir).unwrap().op.expect("rebase in progress");
+        assert_eq!(op.kind, OpKind::Rebase);
+        assert!(op.label.starts_with("Rebasing main"), "{}", op.label);
+        assert_eq!(op.message, "mine");
+        std::fs::write(dir.join("a.txt"), "both\nkeep\n").unwrap();
+        stage(&dir, &["a.txt".into()]).unwrap();
+        continue_op(&dir, OpKind::Rebase, "mine, merged").unwrap();
+        assert!(status(&dir).unwrap().op.is_none());
+        assert_eq!(run(&dir, &["log", "-1", "--format=%s"]).unwrap().trim(), "mine, merged");
+        // Abort leaves things as they were.
+        let dir = conflicting_repo("abort");
+        assert!(run(&dir, &["merge", "feature"]).is_err());
+        abort_op(&dir, OpKind::Merge).unwrap();
+        let st = status(&dir).unwrap();
+        assert!(st.op.is_none() && st.conflicts.is_empty());
+    }
+
+    #[test]
+    fn compare_branches_lists_their_changes() {
+        let dir = conflicting_repo("compare");
+        let d = compare(&dir, "main", "feature").unwrap();
+        assert_eq!(d.files.len(), 1);
+        assert_eq!(d.files[0].path, "a.txt");
+        assert!(d.message.contains("feature has 1 commit(s) not in main"), "{}", d.message);
     }
 }

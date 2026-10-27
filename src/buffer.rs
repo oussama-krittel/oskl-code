@@ -25,6 +25,15 @@ impl Sel {
     }
 }
 
+/// A merge conflict block, by rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conflict {
+    pub start: usize,
+    pub base: Option<usize>,
+    pub mid: usize,
+    pub end: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EditKind {
     Insert,
@@ -840,6 +849,63 @@ impl Buffer {
         end.map(|e| (row, e))
     }
 
+    /// Merge conflict blocks (`<<<<<<<` … `=======` … `>>>>>>>`, optionally with a `|||||||` base).
+    pub fn conflicts(&self) -> Vec<Conflict> {
+        let mut out = Vec::new();
+        let mut open: Option<Conflict> = None;
+        for (row, line) in self.rope.lines().enumerate() {
+            let starts = |p: &str| line.len_chars() >= 7 && line.slice(..7).chars().eq(p.chars());
+            if starts("<<<<<<<") {
+                open = Some(Conflict { start: row, base: None, mid: 0, end: 0 });
+            } else if let Some(c) = open.as_mut() {
+                if starts("|||||||") && c.mid == 0 {
+                    c.base = Some(row);
+                } else if starts("=======") && c.mid == 0 {
+                    c.mid = row;
+                } else if starts(">>>>>>>") && c.mid != 0 {
+                    c.end = row;
+                    out.push(open.take().unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    /// Text of rows `a..b` (b exclusive), each with its newline.
+    fn rows_text(&self, a: usize, b: usize) -> String {
+        if a >= b {
+            return String::new();
+        }
+        let mut t = self.slice(self.rows_range(a, b - 1));
+        if !t.ends_with('\n') {
+            t.push('\n');
+        }
+        t
+    }
+
+    /// The current (ours) and incoming (theirs) sides of a conflict.
+    pub fn conflict_sides(&self, c: &Conflict) -> (String, String) {
+        (self.rows_text(c.start + 1, c.base.unwrap_or(c.mid)), self.rows_text(c.mid + 1, c.end))
+    }
+
+    /// Replaces a conflict block with the chosen side(s).
+    pub fn resolve_conflict(&mut self, c: &Conflict, current: bool, incoming: bool) {
+        let (ours, theirs) = self.conflict_sides(c);
+        let mut text = String::new();
+        if current {
+            text.push_str(&ours);
+        }
+        if incoming {
+            text.push_str(&theirs);
+        }
+        let range = self.rows_range(c.start, c.end);
+        if !self.slice(range.clone()).ends_with('\n') && text.ends_with('\n') {
+            text.pop();
+        }
+        let at = range.start;
+        self.replace(range, &text, Some(Sel::at(at)), EditKind::Other);
+    }
+
     pub fn newline(&mut self) {
         let r = self.sel.range();
         let (row, col) = self.pos_to_rc(r.start);
@@ -1400,5 +1466,22 @@ mod tests {
         assert_eq!(b.fold_range(0), Some((0, 3)));
         assert_eq!(b.fold_range(1), Some((1, 2)));
         assert_eq!(b.fold_range(2), None);
+    }
+
+    #[test]
+    fn finds_and_resolves_conflicts() {
+        let text = "a\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nz\n";
+        let mut b = Buffer::new(text);
+        let c = b.conflicts();
+        assert_eq!(c, vec![Conflict { start: 1, base: None, mid: 3, end: 5 }]);
+        assert_eq!(b.conflict_sides(&c[0]), ("ours\n".into(), "theirs\n".into()));
+        b.resolve_conflict(&c[0], true, true);
+        assert_eq!(b.text(), "a\nours\ntheirs\nz\n");
+        b.undo();
+        b.resolve_conflict(&c[0], false, true);
+        assert_eq!(b.text(), "a\ntheirs\nz\n");
+        let diff3 = Buffer::new("<<<<<<< HEAD\nx\n||||||| base\nb\n=======\ny\n>>>>>>> o");
+        let c = diff3.conflicts();
+        assert_eq!(diff3.conflict_sides(&c[0]), ("x\n".into(), "y\n".into()));
     }
 }

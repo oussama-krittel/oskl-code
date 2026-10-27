@@ -71,6 +71,8 @@ pub struct GitPanel {
     scope_open: bool,
     scope_branches: Vec<String>,
     scope_remotes: Vec<String>,
+    /// Last operation seen, to prefill the message once when one starts.
+    last_op: Option<git::OpState>,
     _subs: Vec<Subscription>,
 }
 
@@ -85,6 +87,17 @@ impl GitPanel {
         });
         let subs = vec![
             cx.observe(&repo, |panel, repo, cx| {
+                let op = repo.read(cx).status.op.clone();
+                if op.as_ref().map(|o| (o.kind, &o.message)) != panel.last_op.as_ref().map(|o| (o.kind, &o.message)) {
+                    // A merge/rebase step started: put git's prepared message in the box.
+                    let msg = op.as_ref().map(|o| o.message.clone()).unwrap_or_default();
+                    let current = panel.commit_input.read(cx).text();
+                    let was_prefilled = panel.last_op.as_ref().is_some_and(|o| o.message == current);
+                    if current.trim().is_empty() || was_prefilled {
+                        panel.commit_input.update(cx, |ed, cx| ed.set_text(&msg, cx));
+                    }
+                    panel.last_op = op;
+                }
                 let branch = repo.read(cx).branch_label();
                 panel.commit_input.update(cx, |ed, cx| {
                     ed.placeholder = format!("Message (⌘Enter to commit on \"{branch}\")").into();
@@ -120,6 +133,7 @@ impl GitPanel {
             scope_open: false,
             scope_branches: Vec::new(),
             scope_remotes: Vec::new(),
+            last_op: None,
             _subs: subs,
         }
     }
@@ -137,6 +151,9 @@ impl GitPanel {
     pub fn commit(&mut self, message: Option<String>, all: bool, amend: bool, window: &mut Window, cx: &mut Context<Self>) {
         let message = message.unwrap_or_else(|| self.commit_input.read(cx).text()).trim().to_string();
         let repo = self.repo.read(cx);
+        if let Some(op) = repo.status.op.clone() {
+            return self.continue_op(op, message, window, cx);
+        }
         if message.is_empty() && !amend {
             self.focus_commit_input(window, cx);
             return cx.emit(Request::Error("Write a commit message first".into()));
@@ -179,6 +196,81 @@ impl GitPanel {
         }));
     }
 
+    /// Commit Merge / Continue Rebase / Continue Cherry-pick, without an editor popping up.
+    fn continue_op(&mut self, op: git::OpState, message: String, window: &mut Window, cx: &mut Context<Self>) {
+        let st = self.repo.read(cx).status.clone();
+        if !st.conflicts.is_empty() {
+            let n = st.conflicts.len();
+            return cx.emit(Request::Error(format!("Resolve {n} conflicted file{} first (Merge Changes)", if n == 1 { "" } else { "s" })));
+        }
+        if op.kind == git::OpKind::Merge && message.is_empty() {
+            self.focus_commit_input(window, cx);
+            return cx.emit(Request::Error("Write a commit message first".into()));
+        }
+        if !st.unstaged.iter().all(|c| c.status == FileStatus::Untracked) && op.kind != git::OpKind::Merge {
+            // Rebase/cherry-pick need resolved files staged; stage the tracked changes like VS Code.
+            let paths: Vec<String> = st.unstaged.iter().filter(|c| c.status != FileStatus::Untracked).map(|c| c.path.clone()).collect();
+            let root = self.repo.read(cx).root.clone();
+            git::stage(&root, &paths).ok();
+        }
+        let kind = op.kind;
+        self.commit_input.update(cx, |ed, cx| ed.set_text("", cx));
+        self.last_op = None;
+        self.repo.update(cx, |r, cx| r.run_op(kind.continue_label(), cx, move |root| git::continue_op(root, kind, &message)));
+    }
+
+    fn abort_op(&mut self, cx: &mut Context<Self>) {
+        let Some(op) = self.repo.read(cx).status.op.clone() else { return };
+        self.commit_input.update(cx, |ed, cx| ed.set_text("", cx));
+        self.repo.update(cx, |r, cx| r.run_op("Abort", cx, move |root| git::abort_op(root, op.kind)));
+    }
+
+    fn skip_op(&mut self, cx: &mut Context<Self>) {
+        let Some(op) = self.repo.read(cx).status.op.clone() else { return };
+        self.repo.update(cx, |r, cx| r.run_op("Skip", cx, move |root| git::skip_op(root, op.kind)));
+    }
+
+    fn render_op_banner(&self, op: &git::OpState, conflicts: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px(px(8.))
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .rounded(px(3.))
+                .border_1()
+                .border_color(theme::border_input())
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover()))
+                .child(label)
+        };
+        let detail = if conflicts > 0 {
+            format!("{conflicts} conflicted file{} — open to resolve, save to mark resolved", if conflicts == 1 { "" } else { "s" })
+        } else {
+            format!("All conflicts resolved — {}", op.kind.continue_label())
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .p(px(8.))
+            .rounded(px(3.))
+            .bg(theme::ca(0xe5c07b1a))
+            .border_1()
+            .border_color(theme::ca(0xe5c07b66))
+            .child(div().flex().items_center().gap(px(6.)).child(ui::small_icon("warning", theme::c(0xe5c07b))).child(div().text_color(theme::fg_bright()).child(op.label.clone())))
+            .child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(detail))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(6.))
+                    .text_size(px(11.))
+                    .child(button("op-abort", "Abort").on_click(cx.listener(|p, _, _, cx| p.abort_op(cx))))
+                    .when(op.kind.can_skip(), |d| d.child(button("op-skip", "Skip this commit").on_click(cx.listener(|p, _, _, cx| p.skip_op(cx))))),
+            )
+    }
+
     pub fn stage(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
         self.repo.update(cx, |repo, cx| repo.run_op("Stage", cx, move |root| git::stage(root, &paths).map(|_| String::new())));
     }
@@ -195,7 +287,7 @@ impl GitPanel {
 
     fn open_change(&self, staged: bool, change: &Change, preview: bool, cx: &mut Context<Self>) {
         let root = self.repo.read(cx).root.clone();
-        if change.status == FileStatus::Untracked {
+        if matches!(change.status, FileStatus::Untracked | FileStatus::Conflicted) {
             return cx.emit(Request::OpenFile { path: root.join(&change.path), line: None, preview });
         }
         let (left, right) = if staged {
@@ -590,6 +682,19 @@ impl GitPanel {
                     .child(item("bm-delete", format!("Delete tag {name}"), true).text_color(theme::git_deleted()).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["tag".into(), "-d".into(), n2.clone()], cx))));
             }
         }
+        if !r.is_head {
+            let current = self.repo.read(cx).branch_label();
+            let (n1, n2, n3) = (name.clone(), name.clone(), name.clone());
+            menu = menu
+                .child(div().my(px(4.)).h(px(1.)).bg(theme::border()))
+                .child(item("bm-compare", format!("Compare with {current}"), true).on_click(cx.listener(move |p, _, _, cx| {
+                    p.branch_menu = None;
+                    cx.emit(Request::Compare(n1.clone()));
+                    cx.notify();
+                })))
+                .child(item("bm-merge", format!("Merge into {current}"), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["merge".into(), "--no-edit".into(), n2.clone()], cx))))
+                .child(item("bm-rebase", format!("Rebase {current} onto this"), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["rebase".into(), n3.clone()], cx))));
+        }
         menu
     }
 
@@ -850,7 +955,13 @@ impl GitPanel {
         let branch = repo.branch_label();
         let busy = repo.busy.clone();
         let input_focused = self.commit_input.read(cx).is_focused(window);
-        let commit_label = if self.amend { "Commit (Amend)" } else { "Commit" };
+        let op = repo.status.op.clone();
+        let conflicts = repo.status.conflicts.len();
+        let commit_label = match &op {
+            Some(op) => op.kind.continue_label(),
+            None if self.amend => "Commit (Amend)",
+            None => "Commit",
+        };
         let rows = self.list_rows(cx);
         div()
             .id("changes-scroll")
@@ -866,6 +977,7 @@ impl GitPanel {
                     .flex()
                     .flex_col()
                     .gap(px(6.))
+                    .when_some(op.as_ref(), |d, op| d.child(self.render_op_banner(op, conflicts, cx)))
                     .child(
                         div()
                             .p(px(4.))

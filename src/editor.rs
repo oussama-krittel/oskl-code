@@ -28,7 +28,7 @@ actions!(
         SelectAll, SelectLine, Copy, Cut, Paste, Undo, Redo,
         MoveLineUp, MoveLineDown, DuplicateLineDown, DuplicateLineUp, DeleteLine, ToggleComment,
         Escape, Submit, ShowCharacterPalette, ScrollLineUp, ScrollLineDown, SelectNextOccurrence,
-        SelectAllOccurrences, Fold, Unfold, FoldAll, UnfoldAll,
+        SelectAllOccurrences, Fold, Unfold, FoldAll, UnfoldAll, NextConflict, PrevConflict,
     ]
 );
 
@@ -98,6 +98,8 @@ pub fn bind_keys() {
         crate::keybindings::kb("alt-cmd-]", Unfold, c),
         crate::keybindings::kb("cmd-k cmd-0", FoldAll, c),
         crate::keybindings::kb("cmd-k cmd-j", UnfoldAll, c),
+        crate::keybindings::kb("f7", NextConflict, c),
+        crate::keybindings::kb("shift-f7", PrevConflict, c),
         crate::keybindings::kb("cmd-c", Copy, c),
         crate::keybindings::kb("cmd-x", Cut, c),
         crate::keybindings::kb("cmd-v", Paste, c),
@@ -165,9 +167,22 @@ pub enum EditorEvent {
     Tab,
     OpenCommit(String),
     Saved,
+    /// "Compare" on a conflict: current vs incoming of this file.
+    CompareConflict,
+    /// "Resolve in Merge Editor".
+    OpenMergeEditor,
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictAction {
+    Current,
+    Incoming,
+    Both,
+    Compare,
+    MergeEditor,
+}
 
 /// How a buffer line is tinted in a diff.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -272,6 +287,10 @@ pub struct Editor {
     /// Folded regions: (first row, last hidden row); rows after the first are hidden.
     folds: Vec<(usize, usize)>,
     fold_decor: Option<Arc<DiffDecor>>,
+    pub conflicts: Vec<crate::buffer::Conflict>,
+    conflicts_ver: Option<u64>,
+    /// Clickable conflict actions from the last layout: (bounds, conflict, action).
+    conflict_hits: Vec<(Bounds<Pixels>, usize, ConflictAction)>,
     find_current: Option<usize>,
     pub user_email: Option<String>,
     pub font_size: f32,
@@ -326,6 +345,9 @@ impl Editor {
             find_matches: Arc::default(),
             folds: Vec::new(),
             fold_decor: None,
+            conflicts: Vec::new(),
+            conflicts_ver: None,
+            conflict_hits: Vec::new(),
             find_current: None,
             user_email: None,
             font_size: 12.,
@@ -591,6 +613,48 @@ impl Editor {
             cx.notify();
         }
     }
+
+    // ------------------------------------------------------------ merge conflicts
+
+    /// Re-reads conflict blocks when the text changed (cheap check: only files with markers).
+    pub fn refresh_conflicts(&mut self) {
+        if self.conflicts_ver == Some(self.buf.version()) {
+            return;
+        }
+        self.conflicts_ver = Some(self.buf.version());
+        self.conflicts = if self.mode == EditorMode::Full && self.buf.len() < 4_000_000 { self.buf.conflicts() } else { Vec::new() };
+    }
+
+    pub fn resolve_conflict(&mut self, ix: usize, action: ConflictAction, cx: &mut Context<Self>) {
+        self.refresh_conflicts();
+        let Some(c) = self.conflicts.get(ix).copied() else { return };
+        match action {
+            ConflictAction::Compare => return cx.emit(EditorEvent::CompareConflict),
+            ConflictAction::MergeEditor => return cx.emit(EditorEvent::OpenMergeEditor),
+            _ if self.read_only => return,
+            ConflictAction::Current => self.buf.resolve_conflict(&c, true, false),
+            ConflictAction::Incoming => self.buf.resolve_conflict(&c, false, true),
+            ConflictAction::Both => self.buf.resolve_conflict(&c, true, true),
+        }
+        self.buf.single_cursor();
+        self.after_edit(cx);
+    }
+
+    fn jump_conflict(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.refresh_conflicts();
+        let (row, _) = self.cursor_rc();
+        let target = if forward {
+            self.conflicts.iter().find(|c| c.start > row).or(self.conflicts.first())
+        } else {
+            self.conflicts.iter().rev().find(|c| c.start < row).or(self.conflicts.last())
+        };
+        if let Some(c) = target.copied() {
+            self.go_to(c.start, 0, cx);
+        }
+    }
+
+    fn next_conflict(&mut self, _: &NextConflict, _: &mut Window, cx: &mut Context<Self>) { self.jump_conflict(true, cx) }
+    fn prev_conflict(&mut self, _: &PrevConflict, _: &mut Window, cx: &mut Context<Self>) { self.jump_conflict(false, cx) }
 
     // ------------------------------------------------------------ folding
 
@@ -1118,6 +1182,9 @@ impl Editor {
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
+        if let Some((_, ix, action)) = self.conflict_hits.iter().find(|(b, _, _)| b.contains(&ev.position)).cloned() {
+            return self.resolve_conflict(ix, action, cx);
+        }
         let Some(l) = &self.layout else { return };
         let x = ev.position.x / px(1.);
         if let Some(sb) = &l.scrollbar
@@ -1592,6 +1659,66 @@ impl Editor {
                         Bounds::new(point(px(text_x + x0), px(y_for(*row))), size(px(x1 - x0), px(line_h))),
                         color,
                     ));
+                }
+            }
+        }
+
+        // Merge conflicts: current (green) and incoming (blue) blocks, actions on the <<<<<<< line.
+        self.conflict_hits.clear();
+        if full {
+            self.refresh_conflicts();
+        }
+        if full && !self.conflicts.is_empty() {
+            let width_all = px(width);
+            let (cur_head, cur_body) = (theme::ca(0x2ea0436e), theme::ca(0x2ea04326));
+            let (inc_head, inc_body) = (theme::ca(0x3794ff6e), theme::ca(0x3794ff26));
+            let base_tint = theme::ca(0x8b919c22);
+            let first_row = lines.first().map(|l| l.0).unwrap_or(0);
+            let last_row = lines.last().map(|l| l.0).unwrap_or(0);
+            for (ix, c) in self.conflicts.clone().iter().enumerate() {
+                if c.end < first_row || c.start > last_row {
+                    continue;
+                }
+                for (row, shaped, _) in &lines {
+                    let tint = if *row == c.start {
+                        cur_head
+                    } else if *row < c.base.unwrap_or(c.mid) && *row > c.start {
+                        cur_body
+                    } else if c.base.is_some_and(|b| *row >= b) && *row < c.mid {
+                        base_tint
+                    } else if *row == c.mid {
+                        theme::ca(0x00000000)
+                    } else if *row > c.mid && *row < c.end {
+                        inc_body
+                    } else if *row == c.end {
+                        inc_head
+                    } else {
+                        continue;
+                    };
+                    p.quads_under.push(fill(Bounds::new(point(bounds.left(), px(y_for(*row))), size(width_all, px(line_h))), tint));
+                    if *row == c.start {
+                        let mut x = text_x + shaped.width / px(1.) + char_w * 3.;
+                        let actions = [
+                            ("Accept Current", ConflictAction::Current),
+                            ("Accept Incoming", ConflictAction::Incoming),
+                            ("Accept Both", ConflictAction::Both),
+                            ("Compare", ConflictAction::Compare),
+                            ("Merge Editor", ConflictAction::MergeEditor),
+                        ];
+                        for (i, (label, action)) in actions.into_iter().enumerate() {
+                            if i > 0 {
+                                let sep = self.shape(window, "|".into(), theme::fg_muted());
+                                p.overlay_text.push((point(px(x), px(y_for(*row))), sep.clone()));
+                                x += sep.width / px(1.) + char_w;
+                            }
+                            let shaped = self.shape(window, label.into(), theme::c(0xd7dae0));
+                            let w = shaped.width / px(1.);
+                            let hit = Bounds::new(point(px(x), px(y_for(*row))), size(px(w), px(line_h)));
+                            p.overlay_text.push((point(px(x), px(y_for(*row))), shaped));
+                            self.conflict_hits.push((hit, ix, action));
+                            x += w + char_w;
+                        }
+                    }
                 }
             }
         }
@@ -2242,6 +2369,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::unfold))
             .on_action(cx.listener(Self::fold_all))
             .on_action(cx.listener(Self::unfold_all))
+            .on_action(cx.listener(Self::next_conflict))
+            .on_action(cx.listener(Self::prev_conflict))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))

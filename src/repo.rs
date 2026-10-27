@@ -14,6 +14,8 @@ pub enum RepoEvent {
     Message(String),
     Error(String),
     Output { title: String, text: String, ok: bool },
+    /// The remote has commits we don't: offer pull-then-push.
+    PushRejected,
 }
 
 impl EventEmitter<RepoEvent> for Repo {}
@@ -270,7 +272,11 @@ impl Repo {
             let (ok, text) = task.await;
             this.update(cx, |repo, cx| {
                 repo.busy = None;
+                let rejected = !ok && title.starts_with("git push") && (text.contains("rejected") || text.contains("fetch first") || text.contains("non-fast-forward"));
                 cx.emit(RepoEvent::Output { title, text, ok });
+                if rejected {
+                    cx.emit(RepoEvent::PushRejected);
+                }
                 repo.refresh_status(cx);
                 repo.refresh_log(cx);
             })
