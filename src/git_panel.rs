@@ -42,11 +42,72 @@ enum Item {
 #[derive(Clone)]
 enum ListRow {
     Section { staged: bool, conflicts: bool, count: usize },
-    Folder { staged: bool, dir: String, paths: Vec<String> },
-    File { staged: bool, change: Change, nested: bool },
+    /// `label` is the folder name, or a compacted chain like "src / lib" (VS Code style).
+    Folder { staged: bool, key: String, label: String, depth: usize, open: bool, paths: Vec<String> },
+    File { staged: bool, change: Change, depth: usize },
+}
+
+/// Folder of the changes tree.
+#[derive(Default)]
+struct Node {
+    dirs: std::collections::BTreeMap<String, Node>,
+    files: Vec<Change>,
+}
+
+impl Node {
+    fn all_paths(&self, out: &mut Vec<String>) {
+        for d in self.dirs.values() {
+            d.all_paths(out);
+        }
+        out.extend(self.files.iter().map(|c| c.path.clone()));
+    }
+}
+
+/// Changes as a tree like the explorer: folders first (single-folder chains compacted into
+/// one row), then files; a collapsed folder hides what's inside it.
+fn tree_rows(changes: &[Change], staged: bool, section: &str, collapsed: &std::collections::HashSet<String>) -> Vec<ListRow> {
+    let mut root = Node::default();
+    for c in changes {
+        let mut node = &mut root;
+        let dir = ui::file_dir(&c.path);
+        for part in dir.split('/').filter(|p| !p.is_empty()) {
+            node = node.dirs.entry(part.to_string()).or_default();
+        }
+        node.files.push(c.clone());
+    }
+    fn emit(node: &Node, prefix: &str, depth: usize, staged: bool, section: &str, collapsed: &std::collections::HashSet<String>, rows: &mut Vec<ListRow>) {
+        for (name, child) in &node.dirs {
+            let (mut label, mut full, mut child) = (name.clone(), if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") }, child);
+            while child.files.is_empty() && child.dirs.len() == 1 {
+                let (n, c) = child.dirs.iter().next().unwrap();
+                label = format!("{label} / {n}");
+                full = format!("{full}/{n}");
+                child = c;
+            }
+            let key = format!("{section}:{full}");
+            let open = !collapsed.contains(&key);
+            let mut paths = Vec::new();
+            child.all_paths(&mut paths);
+            rows.push(ListRow::Folder { staged, key, label, depth, open, paths });
+            if open {
+                emit(child, &full, depth + 1, staged, section, collapsed, rows);
+            }
+        }
+        let mut files: Vec<&Change> = node.files.iter().collect();
+        files.sort_by(|a, b| ui::file_name(&a.path).cmp(ui::file_name(&b.path)));
+        for c in files {
+            rows.push(ListRow::File { staged, change: c.clone(), depth });
+        }
+    }
+    let mut rows = Vec::new();
+    emit(&root, "", 0, staged, section, collapsed, &mut rows);
+    rows
 }
 
 const LANE_W: f32 = 11.;
+/// Changes tree: where depth 0 starts, and the step per level (same as the explorer).
+const TREE_LEFT: f32 = 16.;
+const TREE_INDENT: f32 = 12.;
 const GRAPH_ROW_H: f32 = 20.;
 
 pub struct GitPanel {
@@ -73,6 +134,8 @@ pub struct GitPanel {
     scope_remotes: Vec<String>,
     /// Last operation seen, to prefill the message once when one starts.
     last_op: Option<git::OpState>,
+    /// Collapsed folders in the changes tree ("section:dir").
+    collapsed: std::collections::HashSet<String>,
     _subs: Vec<Subscription>,
 }
 
@@ -134,6 +197,7 @@ impl GitPanel {
             scope_branches: Vec::new(),
             scope_remotes: Vec::new(),
             last_op: None,
+            collapsed: Default::default(),
             _subs: subs,
         }
     }
@@ -310,36 +374,21 @@ impl GitPanel {
         let repo = self.repo.read(cx);
         let st = &repo.status;
         let mut rows = Vec::new();
-        let mut group = |rows: &mut Vec<ListRow>, staged: bool, changes: &[Change]| {
-            let mut i = 0;
-            while i < changes.len() {
-                let dir = ui::file_dir(&changes[i].path).to_string();
-                let mut j = i;
-                while j < changes.len() && ui::file_dir(&changes[j].path) == dir {
-                    j += 1;
-                }
-                if !dir.is_empty() {
-                    rows.push(ListRow::Folder { staged, dir: dir.clone(), paths: changes[i..j].iter().map(|c| c.path.clone()).collect() });
-                }
-                for c in &changes[i..j] {
-                    rows.push(ListRow::File { staged, change: c.clone(), nested: !dir.is_empty() });
-                }
-                i = j;
-            }
-        };
+        let collapsed = &self.collapsed;
+        let group = |rows: &mut Vec<ListRow>, staged: bool, section: &str, changes: &[Change]| rows.extend(tree_rows(changes, staged, section, collapsed));
         if !st.conflicts.is_empty() {
             rows.push(ListRow::Section { staged: false, conflicts: true, count: st.conflicts.len() });
-            group(&mut rows, false, &st.conflicts);
+            group(&mut rows, false, "merge", &st.conflicts);
         }
         if !st.staged.is_empty() {
             rows.push(ListRow::Section { staged: true, conflicts: false, count: st.staged.len() });
             if self.staged_open {
-                group(&mut rows, true, &st.staged);
+                group(&mut rows, true, "staged", &st.staged);
             }
         }
         rows.push(ListRow::Section { staged: false, conflicts: false, count: st.unstaged.len() });
         if self.unstaged_open {
-            group(&mut rows, false, &st.unstaged);
+            group(&mut rows, false, "changes", &st.unstaged);
         }
         rows
     }
@@ -849,24 +898,33 @@ impl GitPanel {
                     .child(ui::badge(count.to_string(), theme::accent()))
                     .into_any_element()
             }
-            ListRow::Folder { staged, dir, paths } => {
-                let (staged, paths) = (*staged, paths.clone());
+            ListRow::Folder { staged, key, label, depth, open, paths } => {
+                let (staged, paths, open, key) = (*staged, paths.clone(), *open, key.clone());
+                let name = label.rsplit(" / ").next().unwrap_or(label).to_string();
                 div()
                     .id(("folder", ix))
                     .group("folder")
                     .flex()
                     .items_center()
                     .h(theme::row_h())
-                    .pl(px(22.))
+                    .pl(px(TREE_LEFT + *depth as f32 * TREE_INDENT))
                     .pr(px(8.))
                     .gap(px(4.))
+                    .cursor_pointer()
                     .hover(|s| s.bg(theme::hover()))
-                    .child(ui::small_icon("chevron-down", theme::fg()))
-                    .child(ui::folder_icon(dir.rsplit('/').next().unwrap_or(dir), true))
-                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_color(theme::fg()).child(dir.replace('/', " / ")))
+                    .on_click(cx.listener(move |panel, _, _, cx| {
+                        if !panel.collapsed.remove(&key) {
+                            panel.collapsed.insert(key.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .child(ui::small_icon(if open { "chevron-down" } else { "chevron-right" }, theme::fg()))
+                    .child(ui::folder_icon(&name, open))
+                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_color(theme::fg()).child(label.clone()))
                     .child(
                         div().invisible().group_hover("folder", |s| s.visible()).child(
                             ui::icon_button(("folder-stage", ix), if staged { "minus" } else { "plus" }).on_click(cx.listener(move |panel, _, _, cx| {
+                                cx.stop_propagation();
                                 if staged { panel.unstage(paths.clone(), cx) } else { panel.stage(paths.clone(), cx) }
                             })),
                         ),
@@ -874,7 +932,7 @@ impl GitPanel {
                     .child(ui::small_icon("dot", theme::git_modified()).size(px(8.)))
                     .into_any_element()
             }
-            ListRow::File { staged, change, nested } => {
+            ListRow::File { staged, change, depth } => {
                 let staged = *staged;
                 let name = ui::file_name(&change.path).to_string();
                 let dir = ui::file_dir(&change.path).to_string();
@@ -891,9 +949,9 @@ impl GitPanel {
                     .flex()
                     .items_center()
                     .h(theme::row_h())
-                    .pl(px(if *nested { 40. } else { 26. }))
+                    .pl(px(TREE_LEFT + *depth as f32 * TREE_INDENT))
                     .pr(px(8.))
-                    .gap(px(5.))
+                    .gap(px(4.))
                     .cursor_pointer()
                     .when(selected, |d| {
                         d.bg(if focused { theme::selected_focused() } else { theme::selected() })
@@ -906,6 +964,8 @@ impl GitPanel {
                         panel.open_change(staged, &c1, ev.click_count() < 2, cx);
                         cx.notify();
                     }))
+                    // Lines up with the folder icons, like the explorer.
+                    .child(div().w(px(14.)).flex_none())
                     .child(ui::file_icon(&name))
                     .child(
                         div()
@@ -921,7 +981,7 @@ impl GitPanel {
                                     .when(change.status == FileStatus::Deleted, |d| d.line_through())
                                     .child(name),
                             )
-                            .when(!*nested && !dir.is_empty(), |d| d.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(dir))),
+                            .when(*depth == 0 && !dir.is_empty(), |d| d.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(dir))),
                     )
                     .child(
                         div()
@@ -1373,3 +1433,32 @@ impl Render for GitPanel {
     }
 }
 
+#[cfg(test)]
+mod tree_tests {
+    use super::{ListRow, tree_rows};
+    use crate::git::{Change, FileStatus};
+
+    fn change(p: &str) -> Change {
+        Change { path: p.into(), orig_path: None, status: FileStatus::Modified }
+    }
+
+    fn outline(rows: &[ListRow]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                ListRow::Folder { label, depth, .. } => format!("{}{label}/", "  ".repeat(*depth)),
+                ListRow::File { change, depth, .. } => format!("{}{}", "  ".repeat(*depth), crate::ui::file_name(&change.path)),
+                ListRow::Section { .. } => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nested_and_compacted_like_vscode() {
+        let changes = [change("src/lib/api.test.ts"), change("src/lib/auth/auth.types.ts"), change("README.md")];
+        let rows = tree_rows(&changes, false, "changes", &Default::default());
+        assert_eq!(outline(&rows), vec!["src / lib/", "  auth/", "    auth.types.ts", "  api.test.ts", "README.md"]);
+        let collapsed = ["changes:src/lib/auth".to_string()].into_iter().collect();
+        let rows = tree_rows(&changes, false, "changes", &collapsed);
+        assert_eq!(outline(&rows), vec!["src / lib/", "  auth/", "  api.test.ts", "README.md"]);
+    }
+}
