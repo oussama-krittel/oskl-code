@@ -151,7 +151,10 @@ pub fn bind_keys() {
 
 const ACTIVITY_W: f32 = 40.;
 const STATUS_H: f32 = 22.;
-const TITLE_H: f32 = 30.;
+/// Height kept clear for the macOS window buttons (close / minimize / zoom) at the top-left.
+const LIGHTS_H: f32 = 30.;
+/// Width the window buttons take from the left edge.
+const LIGHTS_W: f32 = 76.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
@@ -445,6 +448,8 @@ pub struct Workspace {
     prev_pane: usize,
     next_id: usize,
     zoomed: bool,
+    /// Extra left padding for the top-left pane's header so the window buttons don't cover it.
+    lights_pad: f32,
     pane_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
     split_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     dragging_split: Option<String>,
@@ -579,6 +584,7 @@ impl Workspace {
             prev_pane: 0,
             next_id: 1,
             zoomed: false,
+            lights_pad: 0.,
             pane_bounds: Default::default(),
             split_bounds: Default::default(),
             dragging_split: None,
@@ -3285,62 +3291,22 @@ impl Workspace {
 
     // ------------------------------------------------------------ rendering
 
-    fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let repo = self.repo.read(cx);
-        let project = repo.root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        div()
-            .id("titlebar")
-            .relative()
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .h(px(TITLE_H))
-            .bg(theme::bg_side())
-            .border_b_1()
-            .border_color(theme::border())
-            .on_click(|ev, window, _| {
-                if ev.click_count() == 2 {
-                    window.titlebar_double_click();
-                }
-            })
-            .child(
-                div()
-                    .id("command-center")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(6.))
-                    .w(px(380.))
-                    .h(px(22.))
-                    .rounded(px(6.))
-                    .bg(theme::ca(0xffffff0d))
-                    .border_1()
-                    .border_color(theme::border_input())
-                    .text_color(theme::fg_dim())
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::ca(0xffffff17)))
-                    .on_click(cx.listener(|ws, _, window, cx| ws.find_file(&FindFile, window, cx)))
-                    .child(ui::small_icon("search", theme::fg_dim()))
-                    .child(project),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .right(px(10.))
-                    .top(px(4.))
-                    .flex()
-                    .gap(px(2.))
-                    .child(ui::icon_button("tb-open", "folder").tooltip(ui::tooltip("Open Folder here (⌘O)")).on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))))
-                    .child(ui::icon_button("tb-open-new", "plus").tooltip(ui::tooltip("Open another project in a new window (⌘⇧N) · ⌘` switches")).on_click(cx.listener(|ws, _, w, cx| ws.pick_folder(true, w, cx))))
-                    .child(ui::icon_button("tb-side", "split").tooltip(ui::tooltip("Move sidebar left/right (⌘K ⌘B)")).on_click(cx.listener(|ws, _, w, cx| ws.toggle_sidebar_side(&ToggleSidebarSide, w, cx))))
-                    .child(ui::icon_button("tb-panel", "inline").tooltip(ui::tooltip("Toggle output panel (⌘J)")).on_click(cx.listener(|ws, _, w, cx| ws.toggle_output(&ToggleOutput, w, cx)))),
-            )
-    }
-
-    fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_activity_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let changes = self.repo.read(cx).status.change_count();
         let right = self.settings.sidebar_right;
+        // A plain button in the activity bar (no selected state).
+        let tool = |id: &'static str, icon: &'static str, tip: &'static str, size: f32| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(ACTIVITY_W))
+                .h(px(size + 18.))
+                .cursor_pointer()
+                .tooltip(ui::tooltip(tip))
+                .child(ui::icon(icon, theme::fg_muted()).size(px(size)))
+        };
         let item = |id: &'static str, icon: &'static str, side: Side, tip: &'static str, ws: &Self, cx: &mut Context<Self>| {
             let active = ws.side_visible && ws.side == side;
             div()
@@ -3368,13 +3334,35 @@ impl Workspace {
             .when(!right, |d| d.border_r_1())
             .when(right, |d| d.border_l_1())
             .border_color(theme::border())
+            .when(!right && !window.is_fullscreen(), |d| d.pt(px(LIGHTS_H)))
+            .child(tool("act-go-to-file", "go-to-file", "Go to File (⌘P)", 19.).on_click(cx.listener(|ws, _, w, cx| ws.find_file(&FindFile, w, cx))))
+            .child(div().mx(px(10.)).my(px(2.)).h(px(1.)).bg(theme::border()))
             .child(item("act-files", "files", Side::Files, "Explorer (⇧⌘E)", self, cx))
             .child(item("act-search", "search", Side::Search, "Search (⇧⌘F)", self, cx))
             .child(item("act-git", "git", Side::Git, "Source Control (⌃⇧G)", self, cx).when(changes > 0, |d| {
                 d.child(div().absolute().bottom(px(8.)).right(px(6.)).child(ui::badge(changes.to_string(), theme::accent()).text_size(px(10.)).h(px(16.)).min_w(px(16.))))
             }))
             .child(div().flex_1())
+            .child(tool("tb-open", "folder", "Open Folder here (⌘O)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))))
+            .child(tool("tb-open-new", "plus", "Open another project in a new window (⌘⇧N) · ⌘` switches", 16.).on_click(cx.listener(|ws, _, w, cx| ws.pick_folder(true, w, cx))))
+            .child(tool("tb-side", "split", "Move sidebar left/right (⌘K ⌘B)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.toggle_sidebar_side(&ToggleSidebarSide, w, cx))))
+            .child(tool("tb-panel", "inline", "Toggle output panel (⌘J)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.toggle_output(&ToggleOutput, w, cx))))
+            .child(div().mx(px(10.)).my(px(2.)).h(px(1.)).bg(theme::border()))
             .child(item("act-keys", "keyboard", Side::Keys, "Shortcuts (⌘K ⌘S)", self, cx))
+    }
+
+    /// The pane drawn in the main area's top-left corner (the first child all the way down).
+    fn top_left_pane(&self) -> usize {
+        if self.zoomed {
+            return self.focused_pane;
+        }
+        let mut node = &self.layout;
+        loop {
+            match node {
+                Layout::Pane(id) => return *id,
+                Layout::Split { a, .. } => node = a,
+            }
+        }
     }
 
     fn render_layout(&self, node: &Layout, path: String, focused_area: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -3467,7 +3455,7 @@ impl Workspace {
             .flex_none()
             .items_center()
             .h(px(24.))
-            .pl(px(8.))
+            .pl(px(8. + if id == self.top_left_pane() { self.lights_pad } else { 0. }))
             .pr(px(4.))
             .gap(px(6.))
             .text_size(px(11.))
@@ -4202,6 +4190,13 @@ impl Render for Workspace {
             Side::Keys => self.keys.clone().into_any_element(),
         };
         let right = self.settings.sidebar_right;
+        // The window buttons sit over the top-left corner: whatever is there makes room for them.
+        let lights = !window.is_fullscreen();
+        self.lights_pad = match (lights, right, self.side_visible) {
+            (false, _, _) | (true, false, true) => 0.,
+            (true, false, false) => LIGHTS_W - ACTIVITY_W,
+            (true, true, _) => LIGHTS_W - 8.,
+        };
         let side_block = self.side_visible.then(|| {
             let handle = div()
                 .id("side-resize")
@@ -4217,7 +4212,7 @@ impl Render for Workspace {
                     ws.resizing_side = true;
                     cx.stop_propagation();
                 }));
-            let panel = div().flex_none().w(px(self.side_w)).h_full().min_w_0().overflow_hidden().px(px(5.)).text_size(px(11.)).bg(theme::bg_side()).child(sidebar);
+            let panel = div().flex_none().w(px(self.side_w)).h_full().min_w_0().overflow_hidden().px(px(5.)).when(!right && lights, |d| d.pt(px(LIGHTS_H))).text_size(px(11.)).bg(theme::bg_side()).child(sidebar);
             if right { div().flex().h_full().child(handle).child(panel) } else { div().flex().h_full().child(panel).child(handle) }
         });
         let main = div()
@@ -4234,7 +4229,7 @@ impl Render for Workspace {
             }))
             .when(self.output_visible, |d| d.child(self.render_output(cx)))
             .into_any_element();
-        let activity = self.render_activity_bar(cx).into_any_element();
+        let activity = self.render_activity_bar(window, cx).into_any_element();
         div()
             .key_context("Workspace")
             .track_focus(&self.focus)
@@ -4387,7 +4382,6 @@ impl Render for Workspace {
             .font_family(theme::UI_FONT)
             .text_size(theme::ui_text())
             .child(canvas(move |b, _, _| bounds_cell.set(b), |_, _, _, _| {}).absolute().size_full())
-            .child(self.render_titlebar(cx))
             .child(if right {
                 div().flex().flex_1().min_h_0().child(main).children(side_block).child(activity)
             } else {
