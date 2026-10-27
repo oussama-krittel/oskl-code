@@ -88,8 +88,9 @@ pub fn bind_keys() {
         crate::keybindings::kb("ctrl-cmd-{right}", NextTab, None),
         crate::keybindings::kb("cmd-alt-up", FocusUp, None),
         crate::keybindings::kb("cmd-alt-down", FocusDown, None),
-        crate::keybindings::kb("cmd-d", SplitRight, None),
-        crate::keybindings::kb("cmd-shift-d", SplitDown, None),
+        crate::keybindings::kb("cmd-\\", SplitRight, None),
+        crate::keybindings::kb("cmd-shift-\\", SplitDown, None),
+        crate::keybindings::kb("cmd-|", SplitDown, None),
         crate::keybindings::kb("cmd-shift-w", ClosePane, None),
         crate::keybindings::kb("cmd-t", NewTerminal, None),
         crate::keybindings::kb("cmd-e", PaneBuffers, None),
@@ -347,8 +348,8 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("formatonsave", "Format on ⌘S: formatonsave on | off (default on)", true),
     ("problems", "List lint and TypeScript problems (click to jump)", false),
     ("check", "Lint/type-check on save: check on | off | now", true),
-    ("vsplit", "Split right (⌘D), optionally opening a file: vsplit <path>", true),
-    ("split", "Split down (⌘⇧D), optionally opening a file: split <path>", true),
+    ("vsplit", "Split right (⌘\\), optionally opening a file: vsplit <path>", true),
+    ("split", "Split down (⌘⇧\\), optionally opening a file: split <path>", true),
     ("term", "Terminal in this pane (⌘T); term <cmd> runs a command", true),
     ("close", "Close this pane (⌘⇧W)", false),
     ("only", "Close all other panes", false),
@@ -2867,11 +2868,11 @@ impl Workspace {
                     ws.cycle_buffer(1, w, cx);
                 })))
             })
-            .child(glyph("split-r", "split", "Split right (⌘D)").on_click(cx.listener(move |ws, _, w, cx| {
+            .child(glyph("split-r", "split", "Split right (⌘\\)").on_click(cx.listener(move |ws, _, w, cx| {
                 ws.set_focused_pane(id);
                 ws.split(true, w, cx);
             })))
-            .child(glyph("split-d", "inline", "Split down (⌘⇧D)").on_click(cx.listener(move |ws, _, w, cx| {
+            .child(glyph("split-d", "inline", "Split down (⌘⇧\\)").on_click(cx.listener(move |ws, _, w, cx| {
                 ws.set_focused_pane(id);
                 ws.split(false, w, cx);
             })))
@@ -2979,7 +2980,7 @@ impl Workspace {
             .text_color(theme::fg_muted())
             .child(row("⌘P", "open a file here"))
             .child(row("⌘T", "terminal here"))
-            .child(row("⌘D ⌘⇧D", "split again"))
+            .child(row("⌘\\ ⌘⇧\\", "split again"))
             .child(row(":e", "open by path"))
             .child(row("⌘⇧W", "close this pane"))
             .into_any_element()
@@ -3011,7 +3012,7 @@ impl Workspace {
                 .child(row("Source Control", "⌃ ⇧ G"))
                 .child(row("Search in Files", "⌘ ⇧ F"))
                 .child(row("Terminal", "⌘ T  ·  ⌃ `"))
-                .child(row("Split Right / Down", "⌘ D  ·  ⌘ ⇧ D"))
+                .child(row("Split Right / Down", "⌘ \\  ·  ⌘ ⇧ \\"))
                 .child(row("Toggle Blame", "⌥ ⌘ B"))
                 .child(row("All Shortcuts", "⌘K ⌘S"))
                 .into_any_element();
@@ -3246,7 +3247,7 @@ impl Workspace {
             let k = |name: &str, fallback: &str| crate::keybindings::shortcut_label(name).unwrap_or_else(|| fallback.to_string());
             let dirs = crate::keybindings::direction_letters();
             d.child(hint(&k("FindFile", "⌘P"), "file"))
-                .child(hint(&k("SplitRight", "⌘D"), "split"))
+                .child(hint(&k("SplitRight", "⌘\\"), "split"))
                 .child(hint(&k("NewTerminal", "⌘T"), "term"))
                 .child(hint(&k("CommandPalette", "⌘;"), "cmd"))
                 .when(pane_count > 1, |d| d.child(hint(&format!("⌘⌥ {dirs}"), "move")))
@@ -3795,6 +3796,17 @@ mod ui_tests {
         assert_eq!(head(cx), start, "⌃⌘K/I leave the cursor where it is");
         cx.simulate_keystrokes("ctrl-alt-k");
         assert_ne!(head(cx), start, "⌃⌥K is ↓ and moves the cursor");
+    }
+
+    #[gpui::test]
+    fn cmd_backslash_splits(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let panes = |ws: &gpui::Entity<Workspace>, cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.panes.len());
+        assert_eq!(panes(&ws, cx), 1);
+        cx.simulate_keystrokes("cmd-\\ escape");
+        assert_eq!(panes(&ws, cx), 2, "⌘\\ splits right");
+        cx.simulate_keystrokes("cmd-shift-\\ escape");
+        assert_eq!(panes(&ws, cx), 3, "⌘⇧\\ splits down");
     }
 }
 

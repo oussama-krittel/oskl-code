@@ -251,7 +251,7 @@ impl TerminalView {
                     self.write(&b"\x0c"[..]);
                     cx.stop_propagation();
                 }
-                _ => {} // let app shortcuts (⌘P, ⌘D, ⌘W …) through
+                _ => {} // let app shortcuts (⌘P, ⌘\\, ⌘W …) through
             }
             return;
         }

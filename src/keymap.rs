@@ -35,7 +35,7 @@ pub const KEYS: &[(&str, &str, &str)] = &[
         ("General", "⌘0", "Focus sidebar"),
     ("General", "Status bar ✓ Auto Save", "Auto save 1s after typing (on by default) · :autosave on|off"),
     ("General", "⌘S", "Save — formats first with your project's formatter (:formatonsave off to disable)"),
-    ("Panes & splits", "⌘D  ·  ⌘⇧D", "Split right / down (then pick a file, or ⌘T for a terminal)"),
+    ("Panes & splits", "⌘\\  ·  ⌘⇧\\", "Split right / down (then pick a file, or ⌘T for a terminal)"),
     ("Panes & splits", "Split limit", "A split can be halved until it is 1/8 of the window (max 8 splits)"),
     ("Panes & splits", "⌘⌥ ←↓↑→  ·  ⌘⌥ J K L ;", "Move between splits (j ← · k ↓ · l ↑ · ; →; wraps at the edges)"),
     ("Panes & splits", "Click a pane", "Focus it (green frame = focused pane)"),
@@ -222,7 +222,7 @@ impl KeysPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| {
             let mut ed = Editor::new(EditorMode::SingleLine, cx);
-            ed.placeholder = "Filter (e.g. split, blame, ⌘D)".into();
+            ed.placeholder = "Filter (e.g. split, blame, ⌘\\)".into();
             ed
         });
         let sub = cx.subscribe_in(&filter, window, |_, _, ev: &EditorEvent, _, cx| {
