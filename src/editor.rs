@@ -200,6 +200,32 @@ pub enum DRow {
     Filler,
     /// A deleted line shown read-only (inline diff), index into `phantom`.
     Phantom(usize),
+    /// Continuation of a soft-wrapped line: (buffer row, segment ≥ 1).
+    Cont(usize, usize),
+}
+
+thread_local! {
+    /// Word wrap: on for every code editor when the user turns it on (⌥Z). Per UI thread
+    /// (there's one in the app; tests each get their own).
+    static WORD_WRAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn word_wrap() -> bool {
+    WORD_WRAP.with(|w| w.get())
+}
+
+pub fn set_word_wrap(on: bool) {
+    WORD_WRAP.with(|w| w.set(on));
+}
+
+/// Where each line is soft-wrapped, for the current text, width and folds.
+pub struct WrapData {
+    key: (u64, usize, Vec<(usize, usize)>),
+    /// Char columns where each row's segments start (always begins with 0).
+    starts: Vec<Vec<usize>>,
+    /// Display columns continuation segments are indented by (the line's own indent).
+    indent: Vec<usize>,
+    decor: Arc<DiffDecor>,
 }
 
 #[derive(Debug, Default)]
@@ -287,6 +313,7 @@ pub struct Editor {
     /// Folded regions: (first row, last hidden row); rows after the first are hidden.
     folds: Vec<(usize, usize)>,
     fold_decor: Option<Arc<DiffDecor>>,
+    wrap_data: Option<Arc<WrapData>>,
     pub conflicts: Vec<crate::buffer::Conflict>,
     conflicts_ver: Option<u64>,
     /// Clickable conflict actions from the last layout: (bounds, conflict, action).
@@ -345,6 +372,7 @@ impl Editor {
             find_matches: Arc::default(),
             folds: Vec::new(),
             fold_decor: None,
+            wrap_data: None,
             conflicts: Vec::new(),
             conflicts_ver: None,
             conflict_hits: Vec::new(),
@@ -789,9 +817,84 @@ impl Editor {
         cx.notify();
     }
 
+    // ------------------------------------------------------------ word wrap
+
+    fn wrap_active(&self) -> bool {
+        word_wrap() && self.mode == EditorMode::Full && self.decor.is_none()
+    }
+
+    /// Recomputes wrap points when the text, the width (in columns) or the folds changed.
+    fn ensure_wrap(&mut self, cols: usize) {
+        let key = (self.buf.version(), cols, self.folds.clone());
+        if self.wrap_data.as_ref().is_some_and(|w| w.key == key) {
+            return;
+        }
+        let n = self.buf.line_count();
+        let mut starts = Vec::with_capacity(n);
+        let mut indent = Vec::with_capacity(n);
+        let mut rows = Vec::with_capacity(n);
+        let mut disp_of_line = Vec::with_capacity(n);
+        for r in 0..n {
+            let (st, ind) = wrap_points(&self.buf, r, cols);
+            if self.row_hidden(r) {
+                disp_of_line.push(rows.len().saturating_sub(1));
+            } else {
+                disp_of_line.push(rows.len());
+                rows.push(DRow::Line(r));
+                rows.extend((1..st.len()).map(|k| DRow::Cont(r, k)));
+            }
+            starts.push(st);
+            indent.push(ind);
+        }
+        let decor = Arc::new(DiffDecor { rows, disp_of_line, ..Default::default() });
+        self.wrap_data = Some(Arc::new(WrapData { key, starts, indent, decor }));
+    }
+
+    /// Segment starts of a row (just `[0]` without wrap).
+    pub(crate) fn seg_starts(&self, row: usize) -> &[usize] {
+        match self.wrap_data.as_ref().filter(|_| self.wrap_active()) {
+            Some(w) => w.starts.get(row).map(|v| v.as_slice()).unwrap_or(&[0]),
+            None => &[0],
+        }
+    }
+
+    /// Up/down by screen row when lines are wrapped (keeps the column inside the segment).
+    fn wrapped_vertical(&mut self, delta: isize, extend: bool) -> bool {
+        let Some(w) = self.wrap_data.clone().filter(|_| self.wrap_active() && self.buf.extra.is_empty()) else { return false };
+        let (r, c) = self.buf.pos_to_rc(self.buf.sel.head);
+        let st = &w.starts[r.min(w.starts.len() - 1)];
+        let k = seg_index(st, c);
+        let goal = self.buf.goal_col.unwrap_or_else(|| self.buf.display_col(r, c) - self.buf.display_col(r, st[k]));
+        let disp = disp_of(&w.decor, r) + k;
+        let last = w.decor.rows.len().saturating_sub(1) as isize;
+        let target = disp as isize + delta;
+        let pos = if target < 0 {
+            0
+        } else if target > last {
+            self.buf.len()
+        } else {
+            let (tr, tk) = match w.decor.rows[target as usize] {
+                DRow::Cont(tr, tk) => (tr, tk),
+                DRow::Line(tr) => (tr, 0),
+                _ => return false,
+            };
+            let ts = &w.starts[tr];
+            let base = self.buf.display_col(tr, ts[tk]);
+            let end = ts.get(tk + 1).map(|e| e - 1).unwrap_or(self.buf.line_len(tr));
+            let col = self.buf.col_for_display(tr, base + goal).clamp(ts[tk], end.max(ts[tk]));
+            self.buf.rc_to_pos(tr, col)
+        };
+        if !extend && !self.buf.sel.is_empty() {
+            self.buf.sel = Sel::at(self.buf.sel.head);
+        }
+        self.buf.move_to(pos, extend);
+        self.buf.goal_col = Some(goal);
+        true
+    }
+
     /// Display rows: the diff layout, or the folds of a plain file.
     fn view_decor(&self) -> Option<&Arc<DiffDecor>> {
-        self.decor.as_ref().or(self.fold_decor.as_ref())
+        self.decor.as_ref().or(self.wrap_data.as_ref().map(|w| &w.decor)).or(self.fold_decor.as_ref())
     }
 
     fn disp_count(&self) -> usize {
@@ -812,8 +915,11 @@ impl Editor {
         let last = self.buf.line_count().saturating_sub(1);
         let Some(d) = self.view_decor() else { return disp.min(last) };
         let disp = disp.min(d.rows.len().saturating_sub(1));
-        let found = d.rows[disp..].iter().find_map(|r| if let DRow::Line(l) = r { Some(*l) } else { None })
-            .or_else(|| d.rows[..disp].iter().rev().find_map(|r| if let DRow::Line(l) = r { Some(*l) } else { None }));
+        let line = |r: &DRow| match r {
+            DRow::Line(l) | DRow::Cont(l, _) => Some(*l),
+            _ => None,
+        };
+        let found = d.rows[disp..].iter().find_map(line).or_else(|| d.rows[..disp].iter().rev().find_map(line));
         found.unwrap_or(0).min(last)
     }
 
@@ -892,6 +998,11 @@ impl Editor {
 
     /// Up/down over folded regions: hidden rows are skipped, not opened.
     fn vertical(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+        if self.wrapped_vertical(delta, extend) {
+            let (row, _) = self.cursor_rc();
+            self.reveal_row(row);
+            return self.after_move(cx);
+        }
         if self.folds.is_empty() || self.mode != EditorMode::Full {
             return self.motion(cx, |b| b.move_vertical(delta, extend));
         }
@@ -1151,20 +1262,45 @@ impl Editor {
 
     // ------------------------------------------------------------ mouse
 
-    fn row_for_y(&self, y: Pixels) -> usize {
+    fn disp_for_y(&self, y: Pixels) -> usize {
         let Some(l) = &self.layout else { return 0 };
         let rel = (y - l.bounds.top()) / px(1.) - l.pad_top + self.scroll_y;
-        let disp = if rel < 0. {
+        if rel < 0. {
             // Above the top edge: one row above the first visible row.
             ((self.scroll_y / l.line_h) as usize).saturating_sub(1)
         } else {
             (rel / l.line_h) as usize
-        };
-        self.line_at_disp(disp)
+        }
+    }
+
+    fn row_for_y(&self, y: Pixels) -> usize {
+        self.line_at_disp(self.disp_for_y(y))
     }
 
     fn pos_for_point(&self, p: Point<Pixels>) -> usize {
         let Some(l) = &self.layout else { return self.buf.sel.head };
+        if let Some(w) = self.wrap_data.as_ref().filter(|_| self.wrap_active()) {
+            // Wrapped: find the segment under the pointer, then the column inside it.
+            let disp = self.disp_for_y(p.y).min(w.decor.rows.len().saturating_sub(1));
+            let (row, k) = match w.decor.rows.get(disp) {
+                Some(DRow::Cont(r, k)) => (*r, *k),
+                Some(DRow::Line(r)) => (*r, 0),
+                _ => return self.buf.len(),
+            };
+            let st = &w.starts[row];
+            let indent = if k == 0 { 0. } else { w.indent[row] as f32 * l.char_w };
+            let x = p.x / px(1.) - l.text_left - indent;
+            let col = match l.lines.iter().find(|(r, _, _)| *r == row) {
+                Some((_, shaped, map)) => {
+                    let x0 = shaped.x_for_index(map[st[k].min(map.len() - 1)]) / px(1.);
+                    let byte = shaped.closest_index_for_x(px((x + x0).max(x0)));
+                    map.iter().position(|b| *b >= byte).unwrap_or(map.len() - 1)
+                }
+                None => st[k],
+            };
+            let end = st.get(k + 1).map(|e| e - 1).unwrap_or(self.buf.line_len(row));
+            return self.buf.rc_to_pos(row, col.clamp(st[k], end.max(st[k])));
+        }
         let row = self.row_for_y(p.y);
         let x = p.x / px(1.) - l.text_left + self.scroll_x;
         if x <= 0. {
@@ -1447,12 +1583,21 @@ impl Editor {
         let text_w = (width - blame_w - numbers_w - text_pad - 10.).max(10.);
         let pad_top = if self.mode == EditorMode::SingleLine { ((height - line_h) / 2.).max(0.) } else { 0. };
 
+        // Word wrap at the editor's width (monospace: a column count).
+        let wrap_on = self.wrap_active();
+        if wrap_on {
+            self.ensure_wrap(((text_w - 6.) / char_w).floor().max(20.) as usize);
+            self.scroll_x = 0.;
+        } else {
+            self.wrap_data = None;
+        }
+
         // Scrolling.
         let disp_count = self.disp_count();
         let content_h = if full { (disp_count.saturating_sub(1)) as f32 * line_h + height } else { line_count as f32 * line_h };
         let max_scroll = (content_h - height).max(0.);
         let (row, col) = self.buf.pos_to_rc(self.buf.sel.head);
-        let cursor_disp = self.disp_of(row);
+        let cursor_disp = self.disp_of(row) + seg_index(self.seg_starts(row), col);
         if let Some(link) = &self.scroll_link {
             let (v, g) = link.get();
             if g != self.link_gen {
@@ -1474,10 +1619,10 @@ impl Editor {
                 self.scroll_y = y + line_h - height + margin;
             }
             let x = self.buf.display_col(row, col) as f32 * char_w;
-            if x < self.scroll_x {
+            if !wrap_on && x < self.scroll_x {
                 self.scroll_x = (x - char_w * 8.).max(0.);
             }
-            if x > self.scroll_x + text_w - char_w * 2. {
+            if !wrap_on && x > self.scroll_x + text_w - char_w * 2. {
                 self.scroll_x = x - text_w + char_w * 8.;
             }
         }
@@ -1513,6 +1658,14 @@ impl Editor {
                     }
                     r
                 }
+                Some(DRow::Cont(r, _)) if r < line_count => {
+                    // A wrapped line's next segment: its line is shaped once (maybe here, if its
+                    // first segment is scrolled off the top).
+                    if lines.last().map(|l: &(usize, ShapedLine, Vec<usize>)| l.0) == Some(r) {
+                        continue;
+                    }
+                    r
+                }
                 Some(DRow::Phantom(i)) => {
                     let text = decor.as_ref().and_then(|dec| dec.phantom.get(i).cloned()).unwrap_or_default().replace('\t', "    ");
                     phantoms.push((y_disp(d), i, self.shape(window, text, theme::fg_dim())));
@@ -1538,7 +1691,7 @@ impl Editor {
             max_line_w = max_line_w.max(shaped.width / px(1.));
             lines.push((row, shaped, map));
         }
-        let max_scroll_x = (max_line_w - text_w + char_w * 8.).max(0.);
+        let max_scroll_x = if wrap_on { 0. } else { (max_line_w - text_w + char_w * 8.).max(0.) };
         self.scroll_x = self.scroll_x.clamp(0., max_scroll_x.max(self.scroll_x.min(max_scroll_x + 1.)));
         if self.scroll_x > max_scroll_x && self.drag.is_none() {
             self.scroll_x = max_scroll_x;
@@ -1548,6 +1701,31 @@ impl Editor {
         let x_for = |shaped: &ShapedLine, map: &Vec<usize>, col: usize| -> f32 {
             shaped.x_for_index(map[col.min(map.len() - 1)]) / px(1.)
         };
+        // Wrap-aware geometry: a column's (x, y), and a column range split into on-screen pieces.
+        // Without wrap every row is one segment and these are the plain x_for / y_for.
+        let wd = self.wrap_data.clone().filter(|_| wrap_on);
+        let starts = |r: usize| -> Vec<usize> { wd.as_ref().and_then(|w| w.starts.get(r).cloned()).unwrap_or_else(|| vec![0]) };
+        let ind = |r: usize, k: usize| if k == 0 { 0. } else { wd.as_ref().and_then(|w| w.indent.get(r)).copied().unwrap_or(0) as f32 * char_w };
+        let at = |r: usize, shaped: &ShapedLine, map: &Vec<usize>, col: usize| -> (f32, f32) {
+            let st = starts(r);
+            let k = seg_index(&st, col);
+            (text_x + ind(r, k) + x_for(shaped, map, col) - x_for(shaped, map, st[k]), y_for(r) + k as f32 * line_h)
+        };
+        let spans = |r: usize, shaped: &ShapedLine, map: &Vec<usize>, c0: usize, c1: usize| -> Vec<(f32, f32, f32)> {
+            let st = starts(r);
+            let mut out = Vec::new();
+            for k in 0..st.len() {
+                let (s, e) = (st[k], st.get(k + 1).copied().unwrap_or(usize::MAX));
+                let (a, b) = (c0.max(s), c1.min(e));
+                if a > b || (a == b && c0 != c1) {
+                    continue;
+                }
+                let base = text_x + ind(r, k) - x_for(shaped, map, s);
+                out.push((base + x_for(shaped, map, a), base + x_for(shaped, map, b), y_for(r) + k as f32 * line_h));
+            }
+            out
+        };
+        let nsegs = |r: usize| starts(r).len();
 
         let mut p = EditorPaint::default();
         p.bounds = bounds;
@@ -1593,7 +1771,7 @@ impl Editor {
         // Current line highlight.
         if full && self.buf.sel.is_empty() && lines.iter().any(|(r, _, _)| *r == row) {
             p.quads_under.push(fill(
-                Bounds::new(point(px(left + blame_w), px(y_for(row))), size(px(width - blame_w), px(line_h))),
+                Bounds::new(point(px(left + blame_w), px(y_for(row))), size(px(width - blame_w), px(line_h * nsegs(row) as f32))),
                 theme::line_highlight(),
             ));
         }
@@ -1610,15 +1788,15 @@ impl Editor {
                     }
                     let c0 = m.start.max(rs) - rs;
                     let c1 = m.end.min(re) - rs;
-                    let x0 = x_for(shaped, map, c0);
-                    let x1 = x_for(shaped, map, c1).max(x0 + 2.);
                     let current = self.find_current == Some(i);
-                    let b = Bounds::new(point(px(text_x + x0), px(y_for(*row))), size(px(x1 - x0), px(line_h)));
-                    p.quads_under.push(if current {
-                        fill(b, theme::ca(0xff9d0066)).border_widths(px(1.)).border_color(theme::c(0xffb340))
-                    } else {
-                        fill(b, theme::find_match())
-                    });
+                    for (x0, x1, y) in spans(*row, shaped, map, c0, c1) {
+                        let b = Bounds::new(point(px(x0), px(y)), size(px((x1 - x0).max(2.)), px(line_h)));
+                        p.quads_under.push(if current {
+                            fill(b, theme::ca(0xff9d0066)).border_widths(px(1.)).border_color(theme::c(0xffb340))
+                        } else {
+                            fill(b, theme::find_match())
+                        });
+                    }
                 }
             }
         }
@@ -1628,12 +1806,9 @@ impl Editor {
             let hi = lines.last().map(|l| l.0 + 1).unwrap_or(0);
             for (row, cols) in self.buf.find_all(q, lo..hi) {
                 if let Some((_, shaped, map)) = lines.iter().find(|(r, _, _)| *r == row) {
-                    let x0 = x_for(shaped, map, cols.start);
-                    let x1 = x_for(shaped, map, cols.end);
-                    p.quads_under.push(fill(
-                        Bounds::new(point(px(text_x + x0), px(y_for(row))), size(px((x1 - x0).max(2.)), px(line_h))),
-                        theme::find_match(),
-                    ));
+                    for (x0, x1, y) in spans(row, shaped, map, cols.start, cols.end) {
+                        p.quads_under.push(fill(Bounds::new(point(px(x0), px(y)), size(px((x1 - x0).max(2.)), px(line_h))), theme::find_match()));
+                    }
                 }
             }
         }
@@ -1649,14 +1824,17 @@ impl Editor {
                 }
                 let s = sel.start.max(rs) - rs;
                 let e = sel.end.min(re) - rs;
-                let x0 = x_for(shaped, map, s);
-                let mut x1 = x_for(shaped, map, e);
-                if sel.end > re {
-                    x1 += char_w * 0.6;
-                }
-                if x1 > x0 {
+                let pieces = spans(*row, shaped, map, s, e);
+                let n = pieces.len();
+                for (i, (x0, mut x1, y)) in pieces.into_iter().enumerate() {
+                    if sel.end > re && i + 1 == n {
+                        x1 += char_w * 0.6;
+                    }
+                    if x1 <= x0 {
+                        continue;
+                    }
                     p.quads_under.push(fill(
-                        Bounds::new(point(px(text_x + x0), px(y_for(*row))), size(px(x1 - x0), px(line_h))),
+                        Bounds::new(point(px(x0), px(y)), size(px(x1 - x0), px(line_h))),
                         color,
                     ));
                 }
@@ -1679,7 +1857,7 @@ impl Editor {
                 if c.end < first_row || c.start > last_row {
                     continue;
                 }
-                for (row, shaped, _) in &lines {
+                for (row, shaped, map) in &lines {
                     let tint = if *row == c.start {
                         cur_head
                     } else if *row < c.base.unwrap_or(c.mid) && *row > c.start {
@@ -1695,9 +1873,11 @@ impl Editor {
                     } else {
                         continue;
                     };
-                    p.quads_under.push(fill(Bounds::new(point(bounds.left(), px(y_for(*row))), size(width_all, px(line_h))), tint));
+                    p.quads_under.push(fill(Bounds::new(point(bounds.left(), px(y_for(*row))), size(width_all, px(line_h * nsegs(*row) as f32))), tint));
                     if *row == c.start {
-                        let mut x = text_x + shaped.width / px(1.) + char_w * 3.;
+                        let (end_x, end_y) = at(*row, shaped, map, self.buf.line_len(*row));
+                        let mut x = end_x + char_w * 3.;
+                        let y_row = end_y;
                         let actions = [
                             ("Accept Current", ConflictAction::Current),
                             ("Accept Incoming", ConflictAction::Incoming),
@@ -1708,13 +1888,13 @@ impl Editor {
                         for (i, (label, action)) in actions.into_iter().enumerate() {
                             if i > 0 {
                                 let sep = self.shape(window, "|".into(), theme::fg_muted());
-                                p.overlay_text.push((point(px(x), px(y_for(*row))), sep.clone()));
+                                p.overlay_text.push((point(px(x), px(y_row)), sep.clone()));
                                 x += sep.width / px(1.) + char_w;
                             }
                             let shaped = self.shape(window, label.into(), theme::c(0xd7dae0));
                             let w = shaped.width / px(1.);
-                            let hit = Bounds::new(point(px(x), px(y_for(*row))), size(px(w), px(line_h)));
-                            p.overlay_text.push((point(px(x), px(y_for(*row))), shaped));
+                            let hit = Bounds::new(point(px(x), px(y_row)), size(px(w), px(line_h)));
+                            p.overlay_text.push((point(px(x), px(y_row)), shaped));
                             self.conflict_hits.push((hit, ix, action));
                             x += w + char_w;
                         }
@@ -1731,7 +1911,7 @@ impl Editor {
                 for k in 0..w / unit {
                     let x = text_x + (k * unit) as f32 * char_w;
                     if x >= text_left - 1. {
-                        p.quads_under.push(fill(Bounds::new(point(px(x.round()), px(y_for(*row))), size(px(1.), px(line_h))), theme::indent_guide()));
+                        p.quads_under.push(fill(Bounds::new(point(px(x.round()), px(y_for(*row))), size(px(1.), px(line_h * nsegs(*row) as f32))), theme::indent_guide()));
                     }
                 }
             }
@@ -1743,25 +1923,40 @@ impl Editor {
                 for pos in [a, b] {
                     let (r, c) = self.buf.pos_to_rc(pos);
                     if let Some((_, shaped, map)) = lines.iter().find(|(lr, _, _)| *lr == r) {
-                        let (x0, x1) = (x_for(shaped, map, c), x_for(shaped, map, c + 1));
-                        let bb = Bounds::new(point(px(text_x + x0), px(y_for(r))), size(px((x1 - x0).max(2.)), px(line_h)));
+                        let (x0, y0) = at(r, shaped, map, c);
+                        let w = x_for(shaped, map, c + 1) - x_for(shaped, map, c);
+                        let bb = Bounds::new(point(px(x0), px(y0)), size(px(w.max(2.)), px(line_h)));
                         p.quads_under.push(fill(bb, theme::bracket_match()).border_widths(px(1.)).border_color(theme::bracket_match_border()));
                     }
                 }
             }
             // "⋯" after a folded line.
-            for (row, shaped, _) in lines.iter().filter(|(r, _, _)| self.is_folded(*r)) {
-                let x = text_x + shaped.width / px(1.) + char_w;
+            for (row, shaped, map) in lines.iter().filter(|(r, _, _)| self.is_folded(*r)) {
+                let (ex, ey) = at(*row, shaped, map, self.buf.line_len(*row));
+                let x = ex + char_w;
                 let label = self.shape(window, " ⋯ ".into(), theme::fg_dim());
-                let bb = Bounds::new(point(px(x), px(y_for(*row) + 2.)), size(label.width, px(line_h - 4.)));
+                let bb = Bounds::new(point(px(x), px(ey + 2.)), size(label.width, px(line_h - 4.)));
                 p.quads_under.push(fill(bb, theme::hover()).corner_radii(px(3.)));
-                p.text.push((point(px(x), px(y_for(*row))), label));
+                p.text.push((point(px(x), px(ey)), label));
             }
         }
 
         // Text.
-        for (row, shaped, _) in &lines {
-            p.text.push((point(px(text_x), px(y_for(*row))), shaped.clone()));
+        for (row, shaped, map) in &lines {
+            let st = starts(*row);
+            if st.len() == 1 {
+                p.text.push((point(px(text_x), px(y_for(*row))), shaped.clone()));
+                continue;
+            }
+            // Each segment paints the whole line shifted left, clipped to that segment's text.
+            for k in 0..st.len() {
+                let x0 = x_for(shaped, map, st[k]);
+                let x1 = st.get(k + 1).map(|e| x_for(shaped, map, *e)).unwrap_or(shaped.width / px(1.));
+                let y = y_for(*row) + k as f32 * line_h;
+                let left_x = text_x + ind(*row, k);
+                let clip = Bounds::new(point(px(left_x), px(y)), size(px(x1 - x0 + 1.), px(line_h)));
+                p.text_clipped.push((point(px(left_x - x0), px(y)), shaped.clone(), clip));
+            }
         }
         if self.buf.len() == 0 && !self.placeholder.is_empty() {
             let ph = self.shape(window, self.placeholder.to_string(), theme::fg_muted());
@@ -1773,8 +1968,8 @@ impl Editor {
             for s in &self.buf.extra {
                 let (r, c) = self.buf.pos_to_rc(s.head);
                 if let Some((_, shaped, map)) = lines.iter().find(|(lr, _, _)| *lr == r) {
-                    let x = text_x + x_for(shaped, map, c);
-                    p.quads_over.push(fill(Bounds::new(point(px(x), px(y_for(r))), size(px(2.), px(line_h))), theme::cursor()));
+                    let (x, y) = at(r, shaped, map, c);
+                    p.quads_over.push(fill(Bounds::new(point(px(x), px(y)), size(px(2.), px(line_h))), theme::cursor()));
                 }
             }
         }
@@ -1783,8 +1978,8 @@ impl Editor {
         if focused
             && let Some((_, shaped, map)) = lines.iter().find(|(r, _, _)| *r == row)
         {
-            let x = text_x + x_for(shaped, map, col);
-            p.cursor = Some(fill(Bounds::new(point(px(x), px(y_for(row))), size(px(2.), px(line_h))), theme::cursor()));
+            let (x, y) = at(row, shaped, map, col);
+            p.cursor = Some(fill(Bounds::new(point(px(x), px(y)), size(px(2.), px(line_h))), theme::cursor()));
         } else if focused && self.buf.len() == 0 {
             p.cursor = Some(fill(Bounds::new(point(px(text_left), px(top + pad_top)), size(px(2.), px(line_h))), theme::cursor()));
         }
@@ -1879,29 +2074,30 @@ impl Editor {
                         let ls = self.buf.line_start(*r);
                         c1 = if w.end > pos { w.end - ls } else { c0 + 1 };
                     }
-                    let x0 = text_x + x_for(shaped, map, c0);
-                    let x1 = (text_x + x_for(shaped, map, c1)).max(x0 + char_w);
                     let color = d.severity.color();
-                    let mut pb = PathBuilder::stroke(px(1.));
-                    let base = y + line_h - 2.5;
-                    pb.move_to(point(px(x0), px(base)));
-                    let mut x = x0;
-                    let mut up = true;
-                    while x < x1 {
-                        x = (x + 2.).min(x1);
-                        pb.line_to(point(px(x), px(if up { base - 2. } else { base })));
-                        up = !up;
-                    }
-                    if let Ok(path) = pb.build() {
-                        p.paths.push((path, color));
+                    for (x0, x1, sy) in spans(*r, shaped, map, c0, c1) {
+                        let x1 = x1.max(x0 + char_w);
+                        let mut pb = PathBuilder::stroke(px(1.));
+                        let base = sy + line_h - 2.5;
+                        pb.move_to(point(px(x0), px(base)));
+                        let mut x = x0;
+                        let mut up = true;
+                        while x < x1 {
+                            x = (x + 2.).min(x1);
+                            pb.line_to(point(px(x), px(if up { base - 2. } else { base })));
+                            up = !up;
+                        }
+                        if let Ok(path) = pb.build() {
+                            p.paths.push((path, color));
+                        }
                     }
                     if *r == d.row && diag_rows.insert(*r) {
-                        p.quads_under.push(fill(Bounds::new(point(px(left + blame_w), px(y)), size(px(width - blame_w), px(line_h))), color.opacity(0.07)));
+                        p.quads_under.push(fill(Bounds::new(point(px(left + blame_w), px(y)), size(px(width - blame_w), px(line_h * nsegs(*r) as f32))), color.opacity(0.07)));
                         let more = self.diagnostics.iter().filter(|o| o.row == *r).count();
                         let label = if more > 1 { format!("● {}  (+{})", d.message.lines().next().unwrap_or(""), more - 1) } else { format!("● {}", d.message.lines().next().unwrap_or("")) };
                         let shaped_label = self.shape(window, label, color.opacity(0.85));
-                        let lx = text_x + shaped.width / px(1.) + char_w * 3.;
-                        p.text.push((point(px(lx), px(y)), shaped_label));
+                        let (ex, ey) = at(*r, shaped, map, len);
+                        p.text.push((point(px(ex + char_w * 3.), px(ey)), shaped_label));
                     }
                 }
             }
@@ -1910,7 +2106,7 @@ impl Editor {
             } else if focused
                 && self.buf.sel.is_empty()
                 && let Some(c) = self.blame.as_ref().and_then(|b| b.get(row)).and_then(|c| c.clone())
-                && let Some((_, shaped, _)) = lines.iter().find(|(r, _, _)| *r == row)
+                && let Some((_, shaped, map)) = lines.iter().find(|(r, _, _)| *r == row)
             {
                 // Inline blame for the current line, GitLens-style.
                 let who = blame_author(&c, self.user_email.as_deref());
@@ -1920,8 +2116,8 @@ impl Editor {
                     format!("{who}, {} • {}", util::relative_time(c.time), c.summary)
                 };
                 let shaped_label = self.shape(window, label, theme::fg_muted());
-                let x = text_x + shaped.width / px(1.) + char_w * 4.;
-                p.text.push((point(px(x), px(y_for(row))), shaped_label));
+                let (ex, ey) = at(row, shaped, map, self.buf.line_len(row));
+                p.text.push((point(px(ex + char_w * 4.), px(ey)), shaped_label));
             }
 
             // Scrollbar.
@@ -1976,6 +2172,47 @@ fn blame_label(c: &BlameCommit, user_email: Option<&str>, width: usize) -> Strin
         who
     };
     format!("{who:<room$} {when}")
+}
+
+/// Which segment of a wrapped line a column is in.
+fn seg_index(starts: &[usize], col: usize) -> usize {
+    starts.partition_point(|s| *s <= col).saturating_sub(1)
+}
+
+/// Where a line wraps at `cols` columns: after the last space that fits (else mid-word), with
+/// continuation rows indented like the line itself (unless that leaves too little room).
+fn wrap_points(buf: &Buffer, row: usize, cols: usize) -> (Vec<usize>, usize) {
+    let line = buf.line(row);
+    let chars: Vec<char> = line.chars().collect();
+    let mut dcols = Vec::with_capacity(chars.len() + 1);
+    let mut d = 0;
+    for ch in &chars {
+        dcols.push(d);
+        d = if *ch == '\t' { (d / buf.tab_width + 1) * buf.tab_width } else { d + 1 };
+    }
+    dcols.push(d);
+    let mut starts = vec![0];
+    if d <= cols {
+        return (starts, 0);
+    }
+    let lead = chars.iter().take_while(|c| **c == ' ' || **c == '\t').count();
+    let indent = if dcols[lead] * 2 < cols { dcols[lead] } else { 0 };
+    let mut seg_start = 0;
+    let mut room = cols;
+    let mut last_break: Option<usize> = None;
+    for i in 0..chars.len() {
+        if dcols[i + 1] - dcols[seg_start] > room && i > seg_start {
+            let b = last_break.filter(|b| *b > seg_start && *b <= i).unwrap_or(i);
+            starts.push(b);
+            seg_start = b;
+            room = cols - indent;
+            last_break = None;
+        }
+        if chars[i] == ' ' && i >= lead {
+            last_break = Some(i + 1);
+        }
+    }
+    (starts, indent)
 }
 
 fn disp_of(d: &DiffDecor, row: usize) -> usize {
@@ -2229,6 +2466,8 @@ pub struct EditorPaint {
     background: Option<Hsla>,
     quads_under: Vec<PaintQuad>,
     text: Vec<(Point<Pixels>, ShapedLine)>,
+    /// Segments of wrapped lines: the line, where to paint it, and the part to show.
+    text_clipped: Vec<(Point<Pixels>, ShapedLine, Bounds<Pixels>)>,
     gutter_bg: Option<PaintQuad>,
     overlay_text: Vec<(Point<Pixels>, ShapedLine)>,
     quads_over: Vec<PaintQuad>,
@@ -2292,6 +2531,11 @@ impl Element for EditorElement {
             window.with_content_mask(Some(ContentMask { bounds: p.text_clip }), |window| {
                 for (origin, line) in &p.text {
                     line.paint(*origin, p.line_h, window, cx).ok();
+                }
+                for (origin, line, clip) in &p.text_clipped {
+                    window.with_content_mask(Some(ContentMask { bounds: *clip }), |window| {
+                        line.paint(*origin, p.line_h, window, cx).ok();
+                    });
                 }
                 for (path, color) in p.paths.drain(..) {
                     window.paint_path(path, color);
@@ -2418,5 +2662,18 @@ mod tests {
         let d = compute_decors(Arc::new("hello".into()), "hello in oskl code");
         assert_eq!(d.right.words.get(&0).unwrap(), &vec![5..18]);
         assert!(d.left.words.get(&0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn wraps_after_spaces_and_indents_continuations() {
+        let b = crate::buffer::Buffer::new("aaaa bbbb cccc\n    xxxxxxxx yyyyyyyy\nshort");
+        assert_eq!(super::wrap_points(&b, 0, 10), (vec![0, 10], 0));
+        assert_eq!(super::wrap_points(&b, 0, 7), (vec![0, 5, 10], 0));
+        let (st, ind) = super::wrap_points(&b, 1, 14);
+        assert_eq!(ind, 4, "continuation rows line up with the line's indent");
+        assert_eq!(st, vec![0, 13]);
+        assert_eq!(super::wrap_points(&b, 2, 10), (vec![0], 0));
+        let b = crate::buffer::Buffer::new("abcdefghijklmnop");
+        assert_eq!(super::wrap_points(&b, 0, 6).0, vec![0, 6, 12], "no space: cut mid-word");
     }
 }

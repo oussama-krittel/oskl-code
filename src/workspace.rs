@@ -32,7 +32,7 @@ use std::time::Duration;
 actions!(
     workspace,
     [
-        FindFile, CommandPalette, FindInFile, FindReplaceInFile, FindNext, FindPrev, ShowFiles, ShowGit, ToggleSidebar,
+        FindFile, CommandPalette, FindInFile, FindReplaceInFile, ToggleWordWrap, FindNext, FindPrev, ShowFiles, ShowGit, ToggleSidebar,
         ToggleOutput, FocusEditor, FocusSidebar, Save, CloseTab, NextTab, PrevTab, FormatFile,
         ToggleBlame, ZoomIn, ZoomOut, Quit, GoToLine, RunShell, FocusCommit, ShowKeys, Lint,
         OutputDown, OutputUp, OutputPageDown, OutputPageUp, OutputTop, OutputBottom, OutputOpen, OutputLeave,
@@ -52,6 +52,7 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-shift-p", CommandPalette, None),
         crate::keybindings::kb("cmd-f", FindInFile, None),
         crate::keybindings::kb("alt-cmd-f", FindReplaceInFile, None),
+        crate::keybindings::kb("alt-z", ToggleWordWrap, None),
         crate::keybindings::kb("cmd-g", FindNext, None),
         crate::keybindings::kb("cmd-shift-g", FindPrev, None),
         crate::keybindings::kb("cmd-shift-e", ShowFiles, None),
@@ -350,6 +351,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("search", "Search in all files: search <text> (⇧⌘F)", true),
     ("sidebar", "Sidebar side: sidebar left | right", true),
     ("autosave", "Auto save: autosave on | off (default on)", true),
+    ("wrap", "Word wrap: wrap on | off (⌥Z)", true),
     ("formatonsave", "Format on ⌘S: formatonsave on | off (default on)", true),
     ("problems", "List lint and TypeScript problems (click to jump)", false),
     ("check", "Lint/type-check on save: check on | off | now", true),
@@ -463,6 +465,7 @@ impl Workspace {
         .detach();
         let has_project = root_is_project(&repo.read(cx).root);
         let mut settings = Settings::load();
+        crate::editor::set_word_wrap(settings.word_wrap);
         if has_project {
             settings.add_recent(repo.read(cx).root.clone());
             settings.save();
@@ -2031,6 +2034,20 @@ impl Workspace {
         self.autosave_tasks.insert(id, task);
     }
 
+    /// Word wrap for every code editor (all windows).
+    fn set_word_wrap(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.word_wrap = on;
+        self.settings.save();
+        crate::editor::set_word_wrap(on);
+        self.flash(format!("Word wrap {}", if on { "on — long lines continue on the next row" } else { "off" }), false, cx);
+        cx.refresh_windows();
+    }
+
+    fn toggle_word_wrap(&mut self, _: &ToggleWordWrap, _: &mut Window, cx: &mut Context<Self>) {
+        let on = !crate::editor::word_wrap();
+        self.set_word_wrap(on, cx);
+    }
+
     fn set_autosave(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.autosave = on;
         self.settings.save();
@@ -2717,6 +2734,14 @@ impl Workspace {
                     self.flash("Checking…".into(), false, cx);
                 }
             },
+            "wrap" => {
+                let on = match rest {
+                    "on" => true,
+                    "off" => false,
+                    _ => !crate::editor::word_wrap(),
+                };
+                self.set_word_wrap(on, cx);
+            }
             "formatonsave" | "fos" => {
                 self.settings.format_on_save = match rest {
                     "on" => true,
@@ -3688,6 +3713,17 @@ impl Workspace {
                 }))
         })
         .child({
+            let on = crate::editor::word_wrap();
+            item("status-wrap")
+                .tooltip(ui::tooltip("Word wrap: long lines continue on the next row (⌥Z, :wrap on|off)"))
+                .child(ui::small_icon(if on { "check" } else { "close" }, if on { theme::git_added() } else { theme::fg_muted() }))
+                .child("Wrap")
+                .on_click(cx.listener(|ws, _, _, cx| {
+                    let on = !crate::editor::word_wrap();
+                    ws.set_word_wrap(on, cx);
+                }))
+        })
+        .child({
             let on = self.settings.autosave;
             item("status-autosave")
                 .tooltip(ui::tooltip("Auto save after 1s (click to toggle, :autosave on|off)"))
@@ -3940,6 +3976,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::find_replace_in_file))
+            .on_action(cx.listener(Self::toggle_word_wrap))
             .on_action(cx.listener(|ws, _: &FindNext, _, cx| ws.find_step(true, cx)))
             .on_action(cx.listener(|ws, _: &FindPrev, _, cx| ws.find_step(false, cx)))
             .on_action(cx.listener(Self::show_files))
@@ -4374,6 +4411,34 @@ mod ui_tests {
         cx.simulate_keystrokes("down cmd-right");
         cx.simulate_input("(");
         assert!(ed.read_with(cx, |e, _| e.buf.line(1)).ends_with("one();()"), "( auto-closes");
+    }
+
+    #[gpui::test]
+    fn word_wrap_moves_by_screen_rows_and_toggles(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("long.txt");
+        let long = (0..400).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        std::fs::write(&file, format!("{long}\nnext\n")).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file, None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).unwrap();
+        let rc = |cx: &mut VisualTestContext| ed.read_with(cx, |e, _| e.cursor_rc());
+        ed.update(cx, |e, _| e.buf.sel = crate::buffer::Sel::at(0));
+        cx.simulate_keystrokes("down");
+        assert_eq!(rc(cx).0, 1, "no wrap: ↓ goes to the next line");
+        cx.simulate_keystrokes("up alt-z");
+        cx.run_until_parked();
+        assert!(crate::editor::word_wrap());
+        let segs = ed.read_with(cx, |e, _| e.seg_starts(0).len());
+        assert!(segs > 2, "the long line wraps into several rows ({segs})");
+        cx.simulate_keystrokes("down");
+        let (row, col) = rc(cx);
+        assert_eq!(row, 0, "wrapped: ↓ stays in the same line, one screen row down");
+        assert!(col > 0);
+        cx.simulate_keystrokes("alt-z");
+        cx.run_until_parked();
+        assert!(!crate::editor::word_wrap());
+        assert_eq!(ed.read_with(cx, |e, _| e.seg_starts(0).len()), 1);
     }
 
     #[gpui::test]

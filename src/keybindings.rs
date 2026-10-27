@@ -98,6 +98,7 @@ fn describe(name: &str, ctx: Option<&str>) -> String {
         "CommandPalette" => "Command line",
         "FindInFile" => "Find in this file",
         "FindReplaceInFile" => "Find & replace in this file",
+        "ToggleWordWrap" => "Word wrap on/off (long lines continue on the next row)",
         "ReplaceAll" => "Replace all matches",
         "ToggleFindCase" => "Toggle match case",
         "ToggleFindWord" => "Toggle whole word",
