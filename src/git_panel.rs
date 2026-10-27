@@ -47,6 +47,21 @@ enum ListRow {
     File { staged: bool, change: Change, depth: usize },
 }
 
+/// Which loaded commits the checkout contains (HEAD and its ancestors), plus HEAD's row.
+fn in_checkout(commits: &[git::Commit], head: &str) -> (Vec<bool>, Option<usize>) {
+    let index: std::collections::HashMap<&str, usize> = commits.iter().enumerate().map(|(i, c)| (c.sha.as_str(), i)).collect();
+    let mut seen = vec![false; commits.len()];
+    let head_ix = index.get(head).copied();
+    let mut stack: Vec<usize> = head_ix.into_iter().collect();
+    while let Some(i) = stack.pop() {
+        if std::mem::replace(&mut seen[i], true) {
+            continue;
+        }
+        stack.extend(commits[i].parents.iter().filter_map(|p| index.get(p.as_str()).copied()));
+    }
+    (seen, head_ix)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiscardWhat {
     All,
@@ -155,6 +170,8 @@ fn tree_rows(changes: &[Change], staged: bool, section: &str, collapsed: &std::c
 }
 
 const LANE_W: f32 = 11.;
+/// Opacity of graph colors for commits the checkout doesn't contain.
+const MUTED: f32 = 0.38;
 /// Changes tree: where depth 0 starts, and the step per level (same as the explorer).
 const TREE_LEFT: f32 = 16.;
 const TREE_INDENT: f32 = 12.;
@@ -186,6 +203,8 @@ pub struct GitPanel {
     last_op: Option<git::OpState>,
     /// Collapsed folders in the changes tree ("section:dir").
     collapsed: std::collections::HashSet<String>,
+    /// `in_checkout` for the current log and HEAD, recomputed when either changes.
+    reach: std::cell::RefCell<Option<(String, usize, Rc<(Vec<bool>, Option<usize>)>)>>,
     _subs: Vec<Subscription>,
 }
 
@@ -248,6 +267,7 @@ impl GitPanel {
             scope_remotes: Vec::new(),
             last_op: None,
             collapsed: Default::default(),
+            reach: Default::default(),
             _subs: subs,
         }
     }
@@ -1187,11 +1207,32 @@ impl GitPanel {
             .children(rows.iter().enumerate().map(|(ix, row)| self.render_list_row(row, ix, focused, cx)))
     }
 
+    fn reachability(&self, cx: &App) -> Rc<(Vec<bool>, Option<usize>)> {
+        let repo = self.repo.read(cx);
+        let head = repo.status.head_oid.clone().unwrap_or_default();
+        let key = std::sync::Arc::as_ptr(&repo.commits) as usize;
+        let mut cache = self.reach.borrow_mut();
+        if let Some((h, k, r)) = cache.as_ref()
+            && *h == head
+            && *k == key
+        {
+            return r.clone();
+        }
+        let r = Rc::new(in_checkout(&repo.commits, &head));
+        *cache = Some((head, key, r.clone()));
+        r
+    }
+
     fn render_graph_row(&self, ix: usize, row: &GraphRow, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        let reach = self.reachability(cx);
         let repo = self.repo.read(cx);
         let Some(commit) = repo.commits.get(ix) else { return div().into_any_element() };
         let head_oid = repo.status.head_oid.clone().unwrap_or_default();
         let is_head = commit.sha == head_oid;
+        // Commits the checkout doesn't have (newer than HEAD, unmerged branches) are muted.
+        let contained = reach.0.get(ix).copied().unwrap_or(true) || reach.1.is_none();
+        let above_head = reach.1.is_some_and(|h| ix < h);
+        let detached = is_head && !commit.refs.iter().any(|r| r.is_head);
         let selected = self.selected == Some(Item::Commit(ix));
         let colors = theme::lane_colors();
         let row2 = row.clone();
@@ -1217,20 +1258,30 @@ impl GitPanel {
                         window.paint_path(path, color);
                     }
                 };
+                let line_color = |i: usize| {
+                    let c = colors[i % colors.len()];
+                    if above_head { c.opacity(MUTED) } else { c }
+                };
                 for s in &row2.top {
                     let (a, b) = (point(x(s.from), top), point(x(s.to), mid));
-                    stroke(a, b, (s.from != s.to).then(|| point(x(s.from), mid)), colors[s.color % colors.len()]);
+                    stroke(a, b, (s.from != s.to).then(|| point(x(s.from), mid)), line_color(s.color));
                 }
                 for s in &row2.bottom {
                     let (a, b) = (point(x(s.from), mid), point(x(s.to), bottom));
-                    stroke(a, b, (s.from != s.to).then(|| point(x(s.to), mid)), colors[s.color % colors.len()]);
+                    // Below HEAD's dot the line is the checkout's own history again.
+                    let c = if is_head { colors[s.color % colors.len()] } else { line_color(s.color) };
+                    stroke(a, b, (s.from != s.to).then(|| point(x(s.to), mid)), c);
                 }
-                let color = colors[row2.color % colors.len()];
+                let full = colors[row2.color % colors.len()];
+                let color = if contained { full } else { full.opacity(MUTED) };
                 let c = point(x(row2.lane), mid);
                 let circle = |r: f32, color: Hsla| fill(Bounds::new(point(c.x - px(r), c.y - px(r)), size(px(r * 2.), px(r * 2.))), color).corner_radii(px(r));
                 if is_head {
-                    window.paint_quad(circle(5.5, color));
-                    window.paint_quad(circle(3.3, bg));
+                    // Current commit: a glowing ring around a solid dot with a bright core.
+                    window.paint_quad(circle(9., full.opacity(0.16)));
+                    window.paint_quad(circle(7., full.opacity(0.35)));
+                    window.paint_quad(circle(5.5, full));
+                    window.paint_quad(circle(2.2, theme::c(0xffffff)));
                 } else if is_merge {
                     window.paint_quad(circle(5., color));
                     window.paint_quad(circle(3.2, bg));
@@ -1280,6 +1331,7 @@ impl GitPanel {
             )
         });
 
+        let lane_color = colors[row.color % colors.len()];
         let sha = commit.sha.clone();
         div()
             .id(("commit", ix))
@@ -1293,6 +1345,7 @@ impl GitPanel {
             .gap(px(4.))
             .cursor_pointer()
             .bg(bg)
+            .when(is_head && !selected, |d| d.bg(lane_color.opacity(0.12)))
             .when(selected && focused, |d| d.border_1().border_color(theme::focus_border()))
             .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
             .on_click(cx.listener(move |panel, _, window, cx| {
@@ -1317,9 +1370,31 @@ impl GitPanel {
                     .gap(px(6.))
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .child(div().text_color(theme::fg()).when(is_head, |d| d.font_weight(FontWeight::BOLD)).child(commit.subject.clone()))
-                    .child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(commit.author.clone())),
+                    .child(
+                        div()
+                            .text_color(if is_head { theme::fg_bright() } else if contained { theme::fg() } else { theme::fg_muted() })
+                            .when(is_head, |d| d.font_weight(FontWeight::BOLD))
+                            .child(commit.subject.clone()),
+                    )
+                    .child(div().text_size(px(11.)).text_color(theme::fg_muted()).when(!contained, |d| d.opacity(0.6)).child(commit.author.clone())),
             )
+            .when(detached, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .px(px(6.))
+                        .h(px(16.))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(lane_color)
+                        .text_color(lane_color)
+                        .text_size(px(10.))
+                        .font_weight(FontWeight::BOLD)
+                        .child("HEAD"),
+                )
+            })
             .child(div().flex().flex_none().gap(px(3.)).children(badges))
             .into_any_element()
     }
@@ -1560,6 +1635,24 @@ mod tree_tests {
         let only_t = discard_prompt(&t, &[]).unwrap();
         assert_eq!(only_t.buttons[0].0, "Discard File");
         assert!(discard_prompt(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn checkout_contains_head_and_ancestors_only() {
+        let c = |sha: &str, parents: &[&str]| crate::git::Commit {
+            sha: sha.into(),
+            parents: parents.iter().map(|p| p.to_string()).collect(),
+            author: String::new(),
+            email: String::new(),
+            time: 0,
+            refs: Vec::new(),
+            subject: String::new(),
+        };
+        // newer (not checked out) → head → merge of side into base
+        let commits = vec![c("new", &["head"]), c("other", &["base"]), c("head", &["base", "side"]), c("side", &["base"]), c("base", &[])];
+        let (seen, head) = super::in_checkout(&commits, "head");
+        assert_eq!(head, Some(2));
+        assert_eq!(seen, vec![false, false, true, true, true]);
     }
 
     #[test]
