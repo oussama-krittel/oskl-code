@@ -182,7 +182,7 @@ impl SearchPanel {
         self.query.update(cx, |q, cx| q.set_text(text, cx));
     }
 
-    fn matcher(query: &str, opts: Options) -> Result<Regex, String> {
+    pub fn matcher(query: &str, opts: Options) -> Result<Regex, String> {
         let mut pat = if opts.regex { query.to_string() } else { regex::escape(query) };
         if opts.word {
             pat = format!(r"\b(?:{pat})\b");

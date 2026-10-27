@@ -259,6 +259,8 @@ pub struct Editor {
     marks: Vec<u8>,
     marks_task: Option<Task<()>>,
     pub search: Option<String>,
+    find_matches: Arc<Vec<Range<usize>>>,
+    find_current: Option<usize>,
     pub user_email: Option<String>,
     pub font_size: f32,
     char_w: Option<(f32, f32)>,
@@ -309,6 +311,8 @@ impl Editor {
             marks: Vec::new(),
             marks_task: None,
             search: None,
+            find_matches: Arc::default(),
+            find_current: None,
             user_email: None,
             font_size: 12.,
             char_w: None,
@@ -364,6 +368,22 @@ impl Editor {
             })
             .ok();
         }));
+    }
+
+    /// Matches highlighted by the find bar (char ranges), with the current one emphasized.
+    pub fn set_find_matches(&mut self, matches: Arc<Vec<Range<usize>>>, current: Option<usize>, cx: &mut Context<Self>) {
+        self.find_matches = matches;
+        self.find_current = current;
+        cx.notify();
+    }
+
+    /// Replaces a range as one undo step (used by find & replace).
+    pub fn replace_range(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        self.buf.replace(range, text, None, crate::buffer::EditKind::Other);
+        self.after_edit(cx);
     }
 
     pub fn set_diagnostics(&mut self, diags: Vec<Diag>, cx: &mut Context<Self>) {
@@ -1248,8 +1268,32 @@ impl Editor {
             ));
         }
 
-        // Search matches.
-        if let Some(q) = self.search.as_ref().filter(|q| !q.is_empty()) {
+        // Find bar matches (the current one stronger).
+        if !self.find_matches.is_empty() {
+            for (row, shaped, map) in &lines {
+                let rs = self.buf.line_start(*row);
+                let re = rs + self.buf.line_len(*row);
+                let first = self.find_matches.partition_point(|m| m.end <= rs);
+                for (i, m) in self.find_matches.iter().enumerate().skip(first) {
+                    if m.start > re {
+                        break;
+                    }
+                    let c0 = m.start.max(rs) - rs;
+                    let c1 = m.end.min(re) - rs;
+                    let x0 = x_for(shaped, map, c0);
+                    let x1 = x_for(shaped, map, c1).max(x0 + 2.);
+                    let current = self.find_current == Some(i);
+                    let b = Bounds::new(point(px(text_x + x0), px(y_for(*row))), size(px(x1 - x0), px(line_h)));
+                    p.quads_under.push(if current {
+                        fill(b, theme::ca(0xff9d0066)).border_widths(px(1.)).border_color(theme::c(0xffb340))
+                    } else {
+                        fill(b, theme::find_match())
+                    });
+                }
+            }
+        }
+        // Old command-line search highlight.
+        if let Some(q) = self.search.as_ref().filter(|q| !q.is_empty() && self.find_matches.is_empty()) {
             let lo = lines.first().map(|l| l.0).unwrap_or(0);
             let hi = lines.last().map(|l| l.0 + 1).unwrap_or(0);
             for (row, cols) in self.buf.find_all(q, lo..hi) {

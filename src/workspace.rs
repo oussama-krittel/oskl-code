@@ -32,7 +32,7 @@ use std::time::Duration;
 actions!(
     workspace,
     [
-        FindFile, CommandPalette, FindInFile, FindNext, FindPrev, ShowFiles, ShowGit, ToggleSidebar,
+        FindFile, CommandPalette, FindInFile, FindReplaceInFile, FindNext, FindPrev, ShowFiles, ShowGit, ToggleSidebar,
         ToggleOutput, FocusEditor, FocusSidebar, Save, CloseTab, NextTab, PrevTab, FormatFile,
         ToggleBlame, ZoomIn, ZoomOut, Quit, GoToLine, RunShell, FocusCommit, ShowKeys, Lint,
         OutputDown, OutputUp, OutputPageDown, OutputPageUp, OutputTop, OutputBottom, OutputOpen, OutputLeave,
@@ -51,6 +51,7 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-;", CommandPalette, None),
         crate::keybindings::kb("cmd-shift-p", CommandPalette, None),
         crate::keybindings::kb("cmd-f", FindInFile, None),
+        crate::keybindings::kb("alt-cmd-f", FindReplaceInFile, None),
         crate::keybindings::kb("cmd-g", FindNext, None),
         crate::keybindings::kb("cmd-shift-g", FindPrev, None),
         crate::keybindings::kb("cmd-shift-e", ShowFiles, None),
@@ -397,6 +398,9 @@ pub struct Workspace {
     return_focus: Option<FocusHandle>,
     search_origin: Option<usize>,
     last_search: Option<String>,
+    find: Entity<crate::findbar::FindBar>,
+    /// Pane and editor the find bar is open on.
+    find_on: Option<(usize, WeakEntity<Editor>)>,
     message: Option<(String, bool)>,
     message_task: Option<Task<()>>,
     recent: Vec<PathBuf>,
@@ -445,6 +449,12 @@ impl Workspace {
         let cmd = cx.new(|cx| Editor::new(EditorMode::SingleLine, cx));
         let search = cx.new(|cx| SearchPanel::new(repo.clone(), window, cx));
         let keys = cx.new(|cx| KeysPanel::new(window, cx));
+        let find = cx.new(|cx| crate::findbar::FindBar::new(window, cx));
+        cx.subscribe_in(&find, window, |ws, _, ev: &crate::findbar::FindEvent, window, cx| match ev {
+            crate::findbar::FindEvent::Close => ws.close_find(window, cx),
+            crate::findbar::FindEvent::Message(m) => ws.flash(m.clone(), false, cx),
+        })
+        .detach();
         let has_project = root_is_project(&repo.read(cx).root);
         let mut settings = Settings::load();
         if has_project {
@@ -512,6 +522,8 @@ impl Workspace {
             return_focus: None,
             search_origin: None,
             last_search: None,
+            find,
+            find_on: None,
             message: None,
             message_task: None,
             recent: Vec::new(),
@@ -2046,23 +2058,52 @@ impl Workspace {
     }
 
     fn find_in_file(&mut self, _: &FindInFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_find(false, window, cx);
+    }
+
+    fn find_replace_in_file(&mut self, _: &FindReplaceInFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_find(true, window, cx);
+    }
+
+    fn open_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ed) = self.active_editor() else { return self.flash("Open a file to search in it".into(), true, cx) };
-        let (origin, selected) = {
-            let e = ed.read(cx);
-            let r = e.buf.sel.range();
-            let text = e.buf.slice(r.clone());
-            (r.start, if !text.is_empty() && !text.contains('\n') { Some(text) } else { None })
-        };
-        self.search_origin = Some(origin);
-        let initial = selected.or(self.last_search.clone()).unwrap_or_default();
-        self.open_cmd(CmdMode::Search, &initial, window, cx);
-        self.cmd.update(cx, |c, cx| {
-            c.buf.select_all();
-            cx.notify();
-        });
+        if self.cmd_mode.is_some() {
+            self.cancel_cmd(window, cx);
+        }
+        if let Some((_, old)) = &self.find_on
+            && old.upgrade().is_some_and(|o| o != ed)
+        {
+            self.find.update(cx, |f, cx| f.close(cx));
+        }
+        self.find_on = Some((self.focused_pane, ed.downgrade()));
+        self.find.update(cx, |f, cx| f.open(ed, replace, window, cx));
+        cx.notify();
+    }
+
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, ed)) = self.find_on.take() else { return };
+        self.find.update(cx, |f, cx| f.close(cx));
+        if let Some(ed) = ed.upgrade() {
+            ed.read(cx).focus(window);
+        }
+        cx.notify();
+    }
+
+    /// The editor the find bar is showing on, if it's still the visible item of its pane.
+    fn find_target(&self, _cx: &App) -> Option<(usize, Entity<Editor>)> {
+        let (pane, ed) = self.find_on.as_ref()?;
+        let ed = ed.upgrade()?;
+        let active = self.pane(*pane)?.active.and_then(|t| self.tab_ix(t))?;
+        match &self.tabs[active].kind {
+            TabKind::Editor(e) if *e == ed => Some((*pane, ed)),
+            _ => None,
+        }
     }
 
     fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.find_target(cx).is_some() && self.find.read(cx).has_query(cx) {
+            return self.find.update(cx, |f, cx| f.step(forward, cx));
+        }
         let Some(query) = self.last_search.clone() else { return };
         let Some(ed) = self.active_editor() else { return };
         ed.update(cx, |ed, cx| {
@@ -3102,7 +3143,16 @@ impl Workspace {
                         ws.drop_file(d.path.clone(), id, zone, w, cx);
                     }))
                     .child(header)
-                    .child(div().flex_1().min_h_0().child(content))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .child(content)
+                            .when(self.find_target(cx).is_some_and(|(p, _)| p == id), |d| {
+                                d.child(div().absolute().top(px(4.)).right(px(14.)).child(self.find.clone()))
+                            }),
+                    )
                     .when_some(self.drop_hint.filter(|(p, _)| *p == id).map(|(_, z)| z), |d, zone| {
                         // Shows where the drop lands: the whole pane, or the half that becomes a new split.
                         let overlay = div().absolute().bg(theme::frame_focused().opacity(0.16)).border_2().border_color(theme::frame_focused()).rounded(px(4.));
@@ -3680,6 +3730,11 @@ impl Render for Workspace {
                     cx.stop_propagation();
                     return;
                 }
+                if ev.keystroke.key == "escape" && ws.find_on.is_some() && !ev.keystroke.modifiers.modified() {
+                    ws.close_find(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 if std::env::var_os("KITE_DEBUG").is_some() {
                     eprintln!("[kite] key {}", ev.keystroke.unparse());
                 }
@@ -3708,6 +3763,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::find_file))
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::find_in_file))
+            .on_action(cx.listener(Self::find_replace_in_file))
             .on_action(cx.listener(|ws, _: &FindNext, _, cx| ws.find_step(true, cx)))
             .on_action(cx.listener(|ws, _: &FindPrev, _, cx| ws.find_step(false, cx)))
             .on_action(cx.listener(Self::show_files))
@@ -3888,7 +3944,9 @@ mod ui_tests {
 
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
         let home = std::env::temp_dir().join(format!("kite-ui-test-{}", std::process::id()));
-        let project = home.join("project");
+        // Each test gets its own project so saved sessions don't clash between parallel tests.
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let project = home.join(format!("project-{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         std::fs::create_dir_all(&project).unwrap();
         // Keep the test away from the real settings and shortcuts.
         unsafe { std::env::set_var("HOME", &home) };
@@ -3900,6 +3958,7 @@ mod ui_tests {
             crate::diff_view::bind_keys();
             crate::commit_view::bind_keys();
             crate::search::bind_keys();
+            crate::findbar::bind_keys();
             crate::diff_edit::bind_keys();
             crate::keybindings::apply(cx);
         });
@@ -3947,6 +4006,47 @@ mod ui_tests {
         assert_eq!(pos(cx), 2, "search: ⌃⌥J should act as ←");
         cx.simulate_keystrokes("ctrl-alt-l");
         assert_eq!(pos(cx), 3, "search: ⌃⌥L should act as →");
+    }
+
+    #[gpui::test]
+    fn find_bar_moves_between_matches_and_replaces(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("find.txt");
+        std::fs::write(&file, "foo one\nbar foo\nfoo end\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file, None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).expect("editor open");
+        let sel = |cx: &mut VisualTestContext| ed.read_with(cx, |e, _| e.buf.sel.range());
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        cx.simulate_input("foo");
+        cx.run_until_parked();
+        assert_eq!(sel(cx), 0..3, "typing jumps to the first match");
+        cx.simulate_keystrokes("down");
+        assert_eq!(sel(cx), 12..15, "↓ goes to the next match");
+        cx.simulate_keystrokes("ctrl-alt-k");
+        cx.run_until_parked();
+        assert_eq!(sel(cx), 16..19, "⌃⌥K (mapped ↓) goes to the next match");
+        cx.simulate_keystrokes("down");
+        assert_eq!(sel(cx), 0..3, "wraps around");
+        cx.simulate_keystrokes("up");
+        assert_eq!(sel(cx), 16..19, "↑ goes back, wrapping");
+        cx.simulate_keystrokes("ctrl-alt-i");
+        cx.run_until_parked();
+        assert_eq!(sel(cx), 12..15, "⌃⌥I (mapped ↑) goes back");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(sel(cx), 16..19, "Enter goes to the next match");
+        // Replace all, as one undo step.
+        cx.simulate_keystrokes("alt-cmd-f");
+        cx.run_until_parked();
+        cx.simulate_input("baz");
+        cx.simulate_keystrokes("alt-enter");
+        cx.run_until_parked();
+        assert_eq!(ed.read_with(cx, |e, _| e.buf.text()), "baz one\nbar baz\nbaz end\n");
+        cx.simulate_keystrokes("escape");
+        assert!(ws.read_with(cx, |ws, _| ws.find_on.is_none()), "Esc closes the bar");
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(ed.read_with(cx, |e, _| e.buf.text()), "foo one\nbar foo\nfoo end\n", "one undo restores all");
     }
 
     #[gpui::test]

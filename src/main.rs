@@ -7,6 +7,7 @@ mod diff_edit;
 mod diff_view;
 mod editor;
 mod file_tree;
+mod findbar;
 mod git;
 mod git_panel;
 mod graph;
@@ -108,6 +109,7 @@ fn main() {
         diff_view::bind_keys();
         commit_view::bind_keys();
         search::bind_keys();
+        findbar::bind_keys();
         diff_edit::bind_keys();
         keybindings::apply(cx);
         cx.on_action(|_: &QuitApp, cx| cx.quit());
