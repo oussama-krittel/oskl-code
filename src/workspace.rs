@@ -1055,7 +1055,7 @@ impl Workspace {
         }
     }
 
-    /// The nearest pane in a direction from the focused one.
+    /// The nearest pane in a direction from the focused one, among those lined up with it.
     fn neighbor(&self, dx: i32, dy: i32) -> Option<usize> {
         let bounds = self.pane_bounds.borrow().clone();
         let cur = bounds.get(&self.focused_pane)?;
@@ -1068,7 +1068,15 @@ impl Workspace {
             let o = b.center();
             let (ddx, ddy) = ((o.x - c.x) / px(1.), (o.y - c.y) / px(1.));
             let ok = (dx > 0 && ddx > 1.) || (dx < 0 && ddx < -1.) || (dy > 0 && ddy > 1.) || (dy < 0 && ddy < -1.);
-            if !ok {
+            // Only splits that line up with this one (share some height for ←→, width for ↑↓):
+            // a split that's only diagonal is reached by wrapping instead.
+            let f = |p: Pixels| p / px(1.);
+            let overlap = if dx != 0 {
+                f(cur.bottom()).min(f(b.bottom())) - f(cur.top()).max(f(b.top()))
+            } else {
+                f(cur.right()).min(f(b.right())) - f(cur.left()).max(f(b.left()))
+            };
+            if !ok || overlap <= 8. {
                 continue;
             }
             let along = if dx != 0 { ddx.abs() } else { ddy.abs() };
@@ -1117,6 +1125,48 @@ impl Workspace {
         best.map(|(_, id)| id)
     }
 
+    /// Past an edge, like reading text: → goes to the leftmost split of the next row, ← to the
+    /// rightmost of the row above, ↓ to the top of the next column, ↑ to the bottom of the one
+    /// before; past the last row/column it starts over. Rows and columns are found by probing just
+    /// past the focused split's edge, so splits of different sizes work the same way.
+    fn wrap_target(&self, dx: i32, dy: i32) -> Option<usize> {
+        let bounds = self.pane_bounds.borrow().clone();
+        let cur = *bounds.get(&self.focused_pane)?;
+        let f = |p: Pixels| p / px(1.);
+        let panes: Vec<(usize, Bounds<Pixels>)> = bounds.into_iter().filter(|(id, _)| self.pane(*id).is_some()).collect();
+        if panes.len() < 2 {
+            return None;
+        }
+        let (min_top, max_bottom) = panes.iter().fold((f32::MAX, f32::MIN), |(a, b), (_, r)| (a.min(f(r.top())), b.max(f(r.bottom()))));
+        let (min_left, max_right) = panes.iter().fold((f32::MAX, f32::MIN), |(a, b), (_, r)| (a.min(f(r.left())), b.max(f(r.right()))));
+        // The nearest edge of another split past the focused one's edge (gaps between splits
+        // are skipped this way).
+        let next_edge = |edge: f32, of: fn(&Bounds<Pixels>) -> Pixels, forward: bool| -> Option<f32> {
+            let es = panes.iter().map(|(_, r)| f(of(r)));
+            if forward { es.filter(|e| *e >= edge - 2.).reduce(f32::min) } else { es.filter(|e| *e <= edge + 2.).reduce(f32::max) }
+        };
+        // The panes covering a horizontal line at y (or a vertical line at x).
+        let at_y = |y: f32| panes.iter().filter(move |(_, r)| f(r.top()) <= y && y < f(r.bottom()));
+        let at_x = |x: f32| panes.iter().filter(move |(_, r)| f(r.left()) <= x && x < f(r.right()));
+        let pick = |dx: i32, dy: i32, probe: f32| -> Option<usize> {
+            let key = |r: &Bounds<Pixels>| match (dx, dy) {
+                (1, _) => f(r.left()),
+                (-1, _) => -f(r.right()),
+                (_, 1) => f(r.top()),
+                _ => -f(r.bottom()),
+            };
+            let row = if dx != 0 { at_y(probe).collect::<Vec<_>>() } else { at_x(probe).collect() };
+            row.into_iter().min_by(|a, b| key(&a.1).total_cmp(&key(&b.1))).map(|(id, _)| *id)
+        };
+        let (probe, restart) = match (dx, dy) {
+            (1, _) => (next_edge(f(cur.bottom()), |r| r.top(), true).map(|e| e + 1.), min_top + 1.),
+            (-1, _) => (next_edge(f(cur.top()), |r| r.bottom(), false).map(|e| e - 1.), max_bottom - 1.),
+            (_, 1) => (next_edge(f(cur.right()), |r| r.left(), true).map(|e| e + 1.), min_left + 1.),
+            _ => (next_edge(f(cur.left()), |r| r.right(), false).map(|e| e - 1.), max_right - 1.),
+        };
+        probe.and_then(|p| pick(dx, dy, p)).or_else(|| pick(dx, dy, restart)).filter(|id| *id != self.focused_pane)
+    }
+
     /// Moves focus to the nearest pane in a direction (wraps around at the edges).
     fn focus_dir(&mut self, dx: i32, dy: i32, window: &mut Window, cx: &mut Context<Self>) {
         let best = self.neighbor(dx, dy).map(|id| ((), id));
@@ -1126,14 +1176,9 @@ impl Workspace {
                 self.focus_active(window, cx);
             }
             None => {
-                // Nothing that way: cycle through panes in layout order (wraps around).
-                let mut ids = Vec::new();
-                self.layout.panes(&mut ids);
-                if ids.len() > 1 {
-                    let cur = ids.iter().position(|p| *p == self.focused_pane).unwrap_or(0);
-                    let forward = dx > 0 || dy > 0;
-                    let next = if forward { (cur + 1) % ids.len() } else { (cur + ids.len() - 1) % ids.len() };
-                    self.set_focused_pane(ids[next]);
+                // Nothing that way: wrap like reading text.
+                if let Some(id) = self.wrap_target(dx, dy) {
+                    self.set_focused_pane(id);
                     self.focus_active(window, cx);
                 }
             }
@@ -4808,6 +4853,53 @@ mod ui_tests {
         assert_eq!(panes(&ws, cx), 2, "⌘\\ splits right");
         cx.simulate_keystrokes("cmd-shift-\\ escape");
         assert_eq!(panes(&ws, cx), 3, "⌘⇧\\ splits down");
+    }
+
+    #[gpui::test]
+    fn focus_wraps_like_reading_past_the_edges(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        // A 2×2 grid: left | right, each cut top / bottom.
+        cx.simulate_keystrokes("cmd-\\ escape");
+        let tr = ws.read_with(cx, |ws, _| ws.focused_pane);
+        let tl = ws.read_with(cx, |ws, _| ws.panes.iter().map(|p| p.id).find(|id| *id != tr).unwrap());
+        ws.update_in(cx, |ws, window, cx| {
+            ws.set_focused_pane(tl);
+            ws.split(false, window, cx);
+        });
+        let bl = ws.read_with(cx, |ws, _| ws.focused_pane);
+        ws.update_in(cx, |ws, window, cx| {
+            ws.set_focused_pane(tr);
+            ws.split(false, window, cx);
+        });
+        let br = ws.read_with(cx, |ws, _| ws.focused_pane);
+        cx.run_until_parked();
+        let go = |cx: &mut gpui::VisualTestContext, from: usize, keys: &str| {
+            ws.update(cx, |ws, _| ws.set_focused_pane(from));
+            cx.run_until_parked();
+            cx.simulate_keystrokes(keys);
+            ws.read_with(cx, |ws, _| ws.focused_pane)
+        };
+        assert_eq!(go(cx, tr, "cmd-alt-right"), bl, "→ at the right edge: next row, leftmost");
+        assert_eq!(go(cx, br, "cmd-alt-right"), tl, "→ past the last row: back to the first");
+        assert_eq!(go(cx, bl, "cmd-alt-left"), tr, "← at the left edge: row above, rightmost");
+        assert_eq!(go(cx, tl, "cmd-alt-left"), br, "← past the first row: the last one");
+        assert_eq!(go(cx, bl, "cmd-alt-down"), tr, "↓ at the bottom: next column, top");
+        assert_eq!(go(cx, br, "cmd-alt-down"), tl, "↓ past the last column: the first");
+        assert_eq!(go(cx, tr, "cmd-alt-up"), bl, "↑ at the top: column before, bottom");
+        assert_eq!(go(cx, tl, "cmd-alt-up"), br);
+        assert_eq!(go(cx, tl, "cmd-alt-right"), tr, "inside the grid nothing changes");
+        assert_eq!(go(cx, tl, "cmd-alt-down"), bl);
+
+        // Uneven: the right column cut once more (three rows on the right, two on the left).
+        ws.update_in(cx, |ws, window, cx| {
+            ws.set_focused_pane(br);
+            ws.split(false, window, cx);
+        });
+        let br2 = ws.read_with(cx, |ws, _| ws.focused_pane);
+        cx.run_until_parked();
+        assert_eq!(go(cx, tr, "cmd-alt-right"), bl, "the split under the right edge's bottom is the next row");
+        assert_eq!(go(cx, br2, "cmd-alt-right"), tl);
+        assert_eq!(go(cx, bl, "cmd-alt-down"), tr);
     }
 
     #[gpui::test]
