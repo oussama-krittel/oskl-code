@@ -28,7 +28,7 @@ actions!(
         SelectAll, SelectLine, Copy, Cut, Paste, Undo, Redo,
         MoveLineUp, MoveLineDown, DuplicateLineDown, DuplicateLineUp, DeleteLine, ToggleComment,
         Escape, Submit, ShowCharacterPalette, ScrollLineUp, ScrollLineDown, SelectNextOccurrence,
-        SelectAllOccurrences,
+        SelectAllOccurrences, Fold, Unfold, FoldAll, UnfoldAll,
     ]
 );
 
@@ -94,6 +94,10 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-l", SelectLine, c),
         crate::keybindings::kb("cmd-d", SelectNextOccurrence, c),
         crate::keybindings::kb("cmd-shift-l", SelectAllOccurrences, c),
+        crate::keybindings::kb("alt-cmd-[", Fold, c),
+        crate::keybindings::kb("alt-cmd-]", Unfold, c),
+        crate::keybindings::kb("cmd-k cmd-0", FoldAll, c),
+        crate::keybindings::kb("cmd-k cmd-j", UnfoldAll, c),
         crate::keybindings::kb("cmd-c", Copy, c),
         crate::keybindings::kb("cmd-x", Cut, c),
         crate::keybindings::kb("cmd-v", Paste, c),
@@ -265,6 +269,9 @@ pub struct Editor {
     marks_task: Option<Task<()>>,
     pub search: Option<String>,
     find_matches: Arc<Vec<Range<usize>>>,
+    /// Folded regions: (first row, last hidden row); rows after the first are hidden.
+    folds: Vec<(usize, usize)>,
+    fold_decor: Option<Arc<DiffDecor>>,
     find_current: Option<usize>,
     pub user_email: Option<String>,
     pub font_size: f32,
@@ -317,6 +324,8 @@ impl Editor {
             marks_task: None,
             search: None,
             find_matches: Arc::default(),
+            folds: Vec::new(),
+            fold_decor: None,
             find_current: None,
             user_email: None,
             font_size: 12.,
@@ -439,6 +448,7 @@ impl Editor {
     pub fn go_to(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
         let pos = self.buf.rc_to_pos(row, col);
         self.buf.single_cursor();
+        self.reveal_row(row.min(self.buf.line_count().saturating_sub(1)));
         self.buf.sel = Sel::at(pos);
         self.autoscroll = Some(false);
         self.center_on_next_layout = true;
@@ -447,6 +457,8 @@ impl Editor {
 
     pub fn select_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
         self.buf.single_cursor();
+        let (row, _) = self.buf.pos_to_rc(range.start.min(self.buf.len()));
+        self.reveal_row(row);
         self.buf.sel = Sel { anchor: range.start, head: range.end };
         self.autoscroll = Some(false);
         self.center_on_next_layout = true;
@@ -580,15 +592,153 @@ impl Editor {
         }
     }
 
+    // ------------------------------------------------------------ folding
+
+    fn rebuild_folds(&mut self) {
+        self.folds.sort();
+        self.folds.dedup();
+        if self.folds.is_empty() || self.decor.is_some() {
+            self.fold_decor = None;
+            return;
+        }
+        let n = self.buf.line_count();
+        let mut rows = Vec::with_capacity(n);
+        let mut disp_of_line = Vec::with_capacity(n);
+        let mut hidden_until: Option<usize> = None;
+        for r in 0..n {
+            if hidden_until.is_some_and(|e| r <= e) {
+                disp_of_line.push(rows.len().saturating_sub(1));
+                continue;
+            }
+            disp_of_line.push(rows.len());
+            rows.push(DRow::Line(r));
+            if let Some((_, e)) = self.folds.iter().find(|(s, _)| *s == r) {
+                hidden_until = Some(hidden_until.map_or(*e, |h| h.max(*e)));
+            }
+        }
+        self.fold_decor = Some(Arc::new(DiffDecor { rows, disp_of_line, ..Default::default() }));
+    }
+
+    /// Cheap check for the gutter: the next line with text is indented deeper.
+    fn foldable_quick(&self, row: usize) -> bool {
+        let Some(base) = self.buf.indent_width(row) else { return false };
+        (row + 1..(row + 50).min(self.buf.line_count())).find_map(|r| self.buf.indent_width(r)).is_some_and(|w| w > base)
+    }
+
+    pub fn is_folded(&self, row: usize) -> bool {
+        self.folds.iter().any(|(s, _)| *s == row)
+    }
+
+    fn row_hidden(&self, row: usize) -> bool {
+        self.folds.iter().any(|(s, e)| row > *s && row <= *e)
+    }
+
+    /// Folds the region at `row` (or the innermost one containing it); unfolds it if already folded.
+    pub fn toggle_fold(&mut self, row: usize, cx: &mut Context<Self>) {
+        if let Some(i) = self.folds.iter().position(|(s, _)| *s == row) {
+            self.folds.remove(i);
+        } else if let Some(f) = self.buf.fold_range(row) {
+            self.folds.push(f);
+        }
+        self.rebuild_folds();
+        cx.notify();
+    }
+
+    /// Opens every fold hiding `row` (when the cursor or a search lands inside one).
+    fn reveal_row(&mut self, row: usize) {
+        let before = self.folds.len();
+        self.folds.retain(|(s, e)| !(row > *s && row <= *e));
+        if self.folds.len() != before {
+            self.rebuild_folds();
+        }
+    }
+
+    /// Keeps folds on the right rows after an edit; folds an edit touched are opened.
+    fn splice_folds(&mut self, changes: &[RowChange]) {
+        if self.folds.is_empty() {
+            return;
+        }
+        for ch in changes {
+            let delta = ch.new_end as isize - ch.old_end as isize;
+            self.folds.retain(|(s, e)| ch.old_end < *s || ch.start > *e);
+            for (s, e) in self.folds.iter_mut() {
+                if *s > ch.old_end {
+                    *s = (*s as isize + delta).max(0) as usize;
+                    *e = (*e as isize + delta).max(0) as usize;
+                }
+            }
+        }
+        self.rebuild_folds();
+    }
+
+    fn fold(&mut self, _: &Fold, _: &mut Window, cx: &mut Context<Self>) {
+        let (row, _) = self.cursor_rc();
+        // The innermost region containing the cursor.
+        let target = (0..=row).rev().filter_map(|r| self.buf.fold_range(r)).find(|(s, e)| *s == row || (row > *s && row <= *e));
+        if let Some(f) = target
+            && !self.folds.contains(&f)
+        {
+            self.folds.push(f);
+            self.buf.single_cursor();
+            if row != f.0 {
+                let col = self.buf.line_len(f.0);
+                self.buf.sel = Sel::at(self.buf.rc_to_pos(f.0, col));
+            }
+            self.rebuild_folds();
+            self.after_move(cx);
+        }
+    }
+
+    fn unfold(&mut self, _: &Unfold, _: &mut Window, cx: &mut Context<Self>) {
+        let (row, _) = self.cursor_rc();
+        self.folds.retain(|(s, e)| !(row >= *s && row <= *e));
+        self.rebuild_folds();
+        cx.notify();
+    }
+
+    fn fold_all(&mut self, _: &FoldAll, _: &mut Window, cx: &mut Context<Self>) {
+        // Top-level regions only (nested ones are inside anyway).
+        let mut r = 0;
+        self.folds.clear();
+        while r < self.buf.line_count() {
+            match self.buf.fold_range(r) {
+                Some(f) => {
+                    self.folds.push(f);
+                    r = f.1 + 1;
+                }
+                None => r += 1,
+            }
+        }
+        let (row, _) = self.cursor_rc();
+        if let Some((s, _)) = self.folds.iter().find(|(s, e)| row > *s && row <= *e) {
+            let s = *s;
+            self.buf.single_cursor();
+            self.buf.sel = Sel::at(self.buf.line_start(s));
+        }
+        self.rebuild_folds();
+        self.after_move(cx);
+    }
+
+    fn unfold_all(&mut self, _: &UnfoldAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.folds.clear();
+        self.rebuild_folds();
+        cx.notify();
+    }
+
+    /// Display rows: the diff layout, or the folds of a plain file.
+    fn view_decor(&self) -> Option<&Arc<DiffDecor>> {
+        self.decor.as_ref().or(self.fold_decor.as_ref())
+    }
+
     fn disp_count(&self) -> usize {
-        match &self.decor {
+        match self.view_decor() {
             Some(d) => d.rows.len().max(1),
             None => self.buf.line_count(),
         }
     }
 
     fn disp_of(&self, row: usize) -> usize {
-        match &self.decor {
+        match self.view_decor() {
             Some(d) => disp_of(d, row),
             None => row,
         }
@@ -596,7 +746,7 @@ impl Editor {
 
     fn line_at_disp(&self, disp: usize) -> usize {
         let last = self.buf.line_count().saturating_sub(1);
-        let Some(d) = &self.decor else { return disp.min(last) };
+        let Some(d) = self.view_decor() else { return disp.min(last) };
         let disp = disp.min(d.rows.len().saturating_sub(1));
         let found = d.rows[disp..].iter().find_map(|r| if let DRow::Line(l) = r { Some(*l) } else { None })
             .or_else(|| d.rows[..disp].iter().rev().find_map(|r| if let DRow::Line(l) = r { Some(*l) } else { None }));
@@ -655,6 +805,7 @@ impl Editor {
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
         let changes = self.buf.take_changes();
+        self.splice_folds(&changes);
         self.splice_blame(&changes);
         self.splice_decorations(&changes);
         self.schedule_highlight(Duration::from_millis(30), cx);
@@ -668,6 +819,38 @@ impl Editor {
     /// A cursor motion, applied to every cursor.
     fn motion(&mut self, cx: &mut Context<Self>, f: impl FnMut(&mut Buffer)) {
         self.buf.each_cursor(false, f);
+        if !self.folds.is_empty() {
+            let (row, _) = self.cursor_rc();
+            self.reveal_row(row);
+        }
+        self.after_move(cx);
+    }
+
+    /// Up/down over folded regions: hidden rows are skipped, not opened.
+    fn vertical(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+        if self.folds.is_empty() || self.mode != EditorMode::Full {
+            return self.motion(cx, |b| b.move_vertical(delta, extend));
+        }
+        let step = delta.signum();
+        let mut left = delta.abs();
+        let last = self.buf.line_count().saturating_sub(1);
+        let (mut row, _) = self.cursor_rc();
+        let mut moves = 0isize;
+        while left > 0 {
+            let mut next = row as isize + step;
+            while next >= 0 && (next as usize) <= last && self.row_hidden(next as usize) {
+                next += step;
+            }
+            if next < 0 || next as usize > last {
+                moves += next - row as isize - step;
+                break;
+            }
+            moves += next - row as isize;
+            row = next as usize;
+            left -= 1;
+        }
+        let moves = if moves == 0 { step } else { moves };
+        self.buf.each_cursor(false, |b| b.move_vertical(moves, extend));
         self.after_move(cx);
     }
 
@@ -731,16 +914,16 @@ impl Editor {
         if self.mode == EditorMode::SingleLine {
             return cx.emit(EditorEvent::Up);
         }
-        self.motion(cx, |b| b.move_vertical(-1, false))
+        self.vertical(-1, false, cx)
     }
     fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
         if self.mode == EditorMode::SingleLine {
             return cx.emit(EditorEvent::Down);
         }
-        self.motion(cx, |b| b.move_vertical(1, false))
+        self.vertical(1, false, cx)
     }
-    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) { self.motion(cx, |b| b.move_vertical(-1, true)) }
-    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) { self.motion(cx, |b| b.move_vertical(1, true)) }
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) { self.vertical(-1, true, cx) }
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) { self.vertical(1, true, cx) }
     fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
         let n = self.page_rows();
         self.scroll_y -= n as f32 * self.line_height();
@@ -958,6 +1141,13 @@ impl Editor {
                 cx.emit(EditorEvent::OpenCommit(commit.sha.clone()));
             }
             return;
+        }
+        if self.mode == EditorMode::Full && self.decor.is_none() && x >= l.text_left - 18. && x < l.text_left - 2. {
+            // Fold chevron.
+            let row = self.row_for_y(ev.position.y);
+            if self.is_folded(row) || self.foldable_quick(row) {
+                return self.toggle_fold(row, cx);
+            }
         }
         let in_numbers = self.mode == EditorMode::Full && x < l.text_left;
         let pos = self.pos_for_point(ev.position);
@@ -1184,7 +1374,8 @@ impl Editor {
         let blame_w = if full && self.blame_gutter { (char_w * 26.).round() } else { 0. };
         let digits = line_count.to_string().len().max(3) as f32;
         let numbers_w = if full { (digits * char_w + 26.).round() } else { 0. };
-        let text_pad = if full { 14. } else { 2. };
+        // Room between the numbers and the text for the fold chevrons.
+        let text_pad = if full { 18. } else { 2. };
         let text_left = left + blame_w + numbers_w + text_pad;
         let text_w = (width - blame_w - numbers_w - text_pad - 10.).max(10.);
         let pad_top = if self.mode == EditorMode::SingleLine { ((height - line_h) / 2.).max(0.) } else { 0. };
@@ -1233,7 +1424,7 @@ impl Editor {
             }
         }
 
-        let decor = self.decor.clone();
+        let decor = self.view_decor().cloned();
         let first = (self.scroll_y / line_h) as usize;
         let visible = ((height / line_h).ceil() as usize + 1).min(disp_count.saturating_sub(first));
         let scroll_y = self.scroll_y;
@@ -1405,6 +1596,42 @@ impl Editor {
             }
         }
 
+        if full {
+            // Indent guides (blank lines take the indent of the next line with text).
+            let unit = if self.buf.indent.starts_with('\t') { self.buf.tab_width } else { self.buf.indent.chars().count() }.max(1);
+            for (row, _, _) in &lines {
+                let w = self.buf.indent_width(*row).or_else(|| (row + 1..(row + 200).min(line_count)).find_map(|r| self.buf.indent_width(r))).unwrap_or(0);
+                for k in 0..w / unit {
+                    let x = text_x + (k * unit) as f32 * char_w;
+                    if x >= text_left - 1. {
+                        p.quads_under.push(fill(Bounds::new(point(px(x.round()), px(y_for(*row))), size(px(1.), px(line_h))), theme::indent_guide()));
+                    }
+                }
+            }
+            // Matching bracket.
+            if focused
+                && self.buf.extra.is_empty()
+                && let Some((a, b)) = self.buf.matching_bracket(self.buf.sel.head)
+            {
+                for pos in [a, b] {
+                    let (r, c) = self.buf.pos_to_rc(pos);
+                    if let Some((_, shaped, map)) = lines.iter().find(|(lr, _, _)| *lr == r) {
+                        let (x0, x1) = (x_for(shaped, map, c), x_for(shaped, map, c + 1));
+                        let bb = Bounds::new(point(px(text_x + x0), px(y_for(r))), size(px((x1 - x0).max(2.)), px(line_h)));
+                        p.quads_under.push(fill(bb, theme::bracket_match()).border_widths(px(1.)).border_color(theme::bracket_match_border()));
+                    }
+                }
+            }
+            // "⋯" after a folded line.
+            for (row, shaped, _) in lines.iter().filter(|(r, _, _)| self.is_folded(*r)) {
+                let x = text_x + shaped.width / px(1.) + char_w;
+                let label = self.shape(window, " ⋯ ".into(), theme::fg_dim());
+                let bb = Bounds::new(point(px(x), px(y_for(*row) + 2.)), size(label.width, px(line_h - 4.)));
+                p.quads_under.push(fill(bb, theme::hover()).corner_radii(px(3.)));
+                p.text.push((point(px(x), px(y_for(*row))), label));
+            }
+        }
+
         // Text.
         for (row, shaped, _) in &lines {
             p.text.push((point(px(text_x), px(y_for(*row))), shaped.clone()));
@@ -1446,6 +1673,18 @@ impl Editor {
                 let label = self.shape(window, (r + 1).to_string(), color);
                 let x = numbers_right - label.width / px(1.);
                 p.overlay_text.push((point(px(x), px(y_for(*r))), label));
+            }
+
+            // Fold chevrons: ▸ on folded lines, a faint ▾ where something is nested below.
+            let chevron_x = left + blame_w + numbers_w + 1.;
+            for (r, _, _) in lines.iter().filter(|_| self.decor.is_none()) {
+                let folded = self.is_folded(*r);
+                if !folded && !self.foldable_quick(*r) {
+                    continue;
+                }
+                let (glyph, color) = if folded { ("▸", theme::fg()) } else { ("▾", theme::line_number()) };
+                let label = self.shape(window, glyph.into(), color);
+                p.overlay_text.push((point(px(chevron_x), px(y_for(*r))), label));
             }
 
             // Git change markers.
@@ -1784,19 +2023,25 @@ impl EntityInputHandler for Editor {
         if self.read_only {
             return;
         }
-        let typed_at_cursors = range_utf16.is_none() && self.marked.is_none() && !self.buf.extra.is_empty();
+        let range_utf16_none = range_utf16.is_none() && self.marked.is_none();
+        let typed_at_cursors = range_utf16_none && !self.buf.extra.is_empty();
         let range = range_utf16
             .map(|r| self.chars_from_utf16(&r))
             .or(self.marked.clone())
             .unwrap_or(self.buf.sel.range());
         self.marked = None;
         let text = if self.mode == EditorMode::SingleLine { text.replace('\n', " ") } else { text.to_string() };
+        let code = self.mode == EditorMode::Full && range_utf16_none;
         if typed_at_cursors {
-            return self.edit(cx, |b| b.insert(&text));
+            return self.edit(cx, |b| if code { b.type_char(&text) } else { b.insert(&text) });
         }
         self.buf.single_cursor();
         self.buf.sel = Sel { anchor: range.start, head: range.end };
-        self.buf.insert(&text);
+        if code {
+            self.buf.type_char(&text);
+        } else {
+            self.buf.insert(&text);
+        }
         self.after_edit(cx);
     }
 
@@ -1993,6 +2238,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::select_line))
             .on_action(cx.listener(Self::select_next_occurrence))
             .on_action(cx.listener(Self::select_all_occurrences))
+            .on_action(cx.listener(Self::fold))
+            .on_action(cx.listener(Self::unfold))
+            .on_action(cx.listener(Self::fold_all))
+            .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))

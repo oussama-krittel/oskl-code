@@ -720,6 +720,126 @@ impl Buffer {
         self.replace(r, text, None, kind);
     }
 
+    /// Typing one character in a code editor: auto-closes brackets and quotes, types over a
+    /// closer that's already there, and wraps a selection in a pair.
+    pub fn type_char(&mut self, text: &str) {
+        let mut chars = text.chars();
+        let (Some(ch), None) = (chars.next(), chars.next()) else { return self.insert(text) };
+        let close = match ch {
+            '(' => Some(')'),
+            '[' => Some(']'),
+            '{' => Some('}'),
+            '"' | '\'' | '`' => Some(ch),
+            _ => None,
+        };
+        let r = self.sel.range();
+        if let Some(close) = close
+            && !r.is_empty()
+        {
+            // Wrap the selection, keeping it selected inside the pair.
+            let inner = self.slice(r.clone());
+            let n = inner.chars().count();
+            let after = if self.sel.anchor <= self.sel.head { Sel { anchor: r.start + 1, head: r.start + 1 + n } } else { Sel { anchor: r.start + 1 + n, head: r.start + 1 } };
+            return self.replace(r, &format!("{ch}{inner}{close}"), Some(after), EditKind::Other);
+        }
+        let pos = r.start;
+        let next = self.char_at(pos);
+        let prev = pos.checked_sub(1).and_then(|p| self.char_at(p));
+        let is_word = |c: Option<char>| c.is_some_and(|c| class(c) == CharClass::Word);
+        // Type over the closer (or closing quote) right after the cursor.
+        if matches!(ch, ')' | ']' | '}' | '"' | '\'' | '`') && next == Some(ch) {
+            self.sel = Sel::at(pos + 1);
+            self.goal_col = None;
+            return;
+        }
+        if let Some(close) = close {
+            let quote = close == ch;
+            let ok = if quote {
+                // Not inside a word (don't → don''t) and not right before one.
+                !is_word(prev) && !is_word(next) && prev != Some(ch)
+            } else {
+                next.is_none_or(|c| c.is_whitespace() || matches!(c, ')' | ']' | '}' | ',' | ';' | ':' | '.'))
+            };
+            if ok {
+                return self.replace(r, &format!("{ch}{close}"), Some(Sel::at(pos + 1)), EditKind::Insert);
+            }
+        }
+        self.insert(text)
+    }
+
+    /// Bracket under/before the cursor and its match (char positions), if any.
+    pub fn matching_bracket(&self, pos: usize) -> Option<(usize, usize)> {
+        let pair = |c: char| match c {
+            '(' => Some((')', true)),
+            '[' => Some((']', true)),
+            '{' => Some(('}', true)),
+            ')' => Some(('(', false)),
+            ']' => Some(('[', false)),
+            '}' => Some(('{', false)),
+            _ => None,
+        };
+        let at = [Some(pos), pos.checked_sub(1)].into_iter().flatten().find(|p| self.char_at(*p).and_then(pair).is_some())?;
+        let open = self.char_at(at)?;
+        let (other, forward) = pair(open)?;
+        let mut depth = 0usize;
+        let limit = 100_000;
+        if forward {
+            for (i, c) in self.rope.chars_at(at + 1).enumerate().take(limit) {
+                if c == open {
+                    depth += 1;
+                } else if c == other {
+                    if depth == 0 {
+                        return Some((at, at + 1 + i));
+                    }
+                    depth -= 1;
+                }
+            }
+        } else {
+            let mut it = self.rope.chars_at(at);
+            let mut p = at;
+            while let Some(c) = it.prev() {
+                p -= 1;
+                if at - p > limit {
+                    break;
+                }
+                if c == open {
+                    depth += 1;
+                } else if c == other {
+                    if depth == 0 {
+                        return Some((p, at));
+                    }
+                    depth -= 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Display width of a line's leading whitespace, or None for a blank line.
+    pub fn indent_width(&self, row: usize) -> Option<usize> {
+        let line = self.line(row);
+        if line.trim().is_empty() {
+            return None;
+        }
+        let n = line.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+        Some(self.display_col(row, n))
+    }
+
+    /// Rows a fold starting at `row` would hide (`row+1..=end`): the following lines indented
+    /// deeper than it (trailing blank lines stay visible). None when nothing is nested under it.
+    pub fn fold_range(&self, row: usize) -> Option<(usize, usize)> {
+        let base = self.indent_width(row)?;
+        let mut end = None;
+        for r in row + 1..self.line_count() {
+            match self.indent_width(r) {
+                None => continue,
+                Some(w) if w > base => end = Some(r),
+                Some(_) => break,
+            }
+        }
+        end.map(|e| (row, e))
+    }
+
     pub fn newline(&mut self) {
         let r = self.sel.range();
         let (row, col) = self.pos_to_rc(r.start);
@@ -1251,5 +1371,34 @@ mod tests {
         b.extra = vec![Sel::at(2), Sel::at(5)];
         b.each_cursor(true, |b| b.toggle_comment("//"));
         assert_eq!(b.text(), "// one\n// two");
+    }
+
+    #[test]
+    fn auto_closes_and_types_over() {
+        let mut b = Buffer::new("");
+        b.type_char("(");
+        assert_eq!((b.text().as_str(), b.sel.head), ("()", 1));
+        b.type_char("a");
+        b.type_char(")");
+        assert_eq!((b.text().as_str(), b.sel.head), ("(a)", 3), "typed over the closer");
+        let mut b = Buffer::new("dont");
+        b.sel = Sel::at(3);
+        b.type_char("'");
+        assert_eq!(b.text(), "don't", "no pair inside a word");
+        let mut b = Buffer::new("x");
+        b.select_all();
+        b.type_char("\"");
+        assert_eq!(b.text(), "\"x\"", "wraps the selection");
+        assert_eq!(b.sel.range(), 1..2);
+    }
+
+    #[test]
+    fn brackets_and_folds() {
+        let b = Buffer::new("fn a() {\n    if x {\n        y();\n    }\n\n}\nz");
+        assert_eq!(b.matching_bracket(7), Some((7, 40)));
+        assert_eq!(b.matching_bracket(41), Some((7, 40)), "cursor right after the closer");
+        assert_eq!(b.fold_range(0), Some((0, 3)));
+        assert_eq!(b.fold_range(1), Some((1, 2)));
+        assert_eq!(b.fold_range(2), None);
     }
 }

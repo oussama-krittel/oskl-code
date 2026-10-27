@@ -4105,6 +4105,29 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn folding_skips_hidden_lines_and_brackets_autoclose(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("fold.rs");
+        std::fs::write(&file, "fn a() {\n    one();\n    two();\n}\nfn b() {}\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file, None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).expect("editor open");
+        let row = |cx: &mut VisualTestContext| ed.read_with(cx, |e, _| e.cursor_rc().0);
+        ed.update(cx, |e, _| e.buf.sel = crate::buffer::Sel::at(0));
+        cx.simulate_keystrokes("alt-cmd-[");
+        assert!(ed.read_with(cx, |e, _| e.is_folded(0)));
+        cx.simulate_keystrokes("down");
+        assert_eq!(row(cx), 3, "↓ jumps over the folded body");
+        cx.simulate_keystrokes("up");
+        assert_eq!(row(cx), 0);
+        cx.simulate_keystrokes("alt-cmd-]");
+        assert!(!ed.read_with(cx, |e, _| e.is_folded(0)));
+        cx.simulate_keystrokes("down cmd-right");
+        cx.simulate_input("(");
+        assert!(ed.read_with(cx, |e, _| e.buf.line(1)).ends_with("one();()"), "( auto-closes");
+    }
+
+    #[gpui::test]
     fn ctrl_cmd_letters_scroll_without_moving_cursor(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("long.txt");

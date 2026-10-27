@@ -57,6 +57,9 @@ pub fn selection_inactive() -> Hsla { c(0x2a2f38) }
 pub fn line_highlight() -> Hsla { ca(0xffffff0a) }
 pub fn cursor() -> Hsla { c(0xaeafad) }
 pub fn line_number() -> Hsla { c(0x4b515c) }
+pub fn indent_guide() -> Hsla { c(0x262a32) }
+pub fn bracket_match() -> Hsla { ca(0x5c637033) }
+pub fn bracket_match_border() -> Hsla { c(0x6b7280) }
 pub fn line_number_active() -> Hsla { c(0xcccccc) }
 pub fn find_match() -> Hsla { ca(0xea5c0055) }
 pub fn scrollbar() -> Hsla { ca(0x79797966) }
