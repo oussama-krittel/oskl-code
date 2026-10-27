@@ -89,6 +89,11 @@ pub struct FileTree {
     focus: FocusHandle,
     root: PathBuf,
     repo: Entity<Repo>,
+    /// Folders added to the workspace: more roots under the project's.
+    extra: Vec<PathBuf>,
+    /// Every repository in the workspace (a file's git colors come from the innermost one).
+    repos: Vec<Entity<Repo>>,
+    _repo_subs: Vec<Subscription>,
     expanded: HashSet<PathBuf>,
     children: HashMap<PathBuf, Vec<Entry>>,
     rows: Vec<Row>,
@@ -111,7 +116,10 @@ impl FileTree {
         let mut tree = Self {
             focus: cx.focus_handle(),
             root: root.clone(),
+            repos: vec![repo.clone()],
             repo,
+            extra: Vec::new(),
+            _repo_subs: Vec::new(),
             expanded: HashSet::from([root]),
             children: HashMap::new(),
             rows: Vec::new(),
@@ -163,16 +171,41 @@ impl FileTree {
         &self.children[dir]
     }
 
-    fn project_name(&self) -> String {
-        self.root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.root.to_string_lossy().to_string())
+    /// The workspace's folders or repositories changed.
+    pub fn set_workspace(&mut self, extra: Vec<PathBuf>, repos: Vec<Entity<Repo>>, cx: &mut Context<Self>) {
+        for r in extra.iter().filter(|r| !self.extra.contains(r)) {
+            self.expanded.insert(r.clone());
+        }
+        self._repo_subs = repos.iter().filter(|r| **r != self.repo).map(|r| cx.observe(r, |_, _, cx| cx.notify())).collect();
+        self.repos = repos;
+        self.extra = extra;
+        self.rebuild();
+        cx.notify();
+    }
+
+    /// The project folder, then the added ones.
+    fn roots(&self) -> Vec<PathBuf> {
+        std::iter::once(self.root.clone()).chain(self.extra.iter().cloned()).collect()
+    }
+
+    fn is_root(&self, p: &Path) -> bool {
+        p == self.root || self.extra.iter().any(|r| r == p)
+    }
+
+    /// The root (project or added folder) a path is in.
+    fn root_of(&self, p: &Path) -> PathBuf {
+        self.roots().into_iter().filter(|r| p.starts_with(r)).max_by_key(|r| r.components().count()).unwrap_or_else(|| self.root.clone())
     }
 
     fn rebuild(&mut self) {
-        let root = self.root.clone();
-        let expanded = self.expanded.contains(&root);
-        let mut rows = vec![Row { entry: Entry { path: root.clone(), name: self.project_name(), is_dir: true }, depth: 0, expanded, pending: false }];
-        if expanded {
-            self.push_children(&root, 1, &mut rows);
+        let mut rows = Vec::new();
+        for root in self.roots() {
+            let expanded = self.expanded.contains(&root);
+            let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| root.to_string_lossy().to_string());
+            rows.push(Row { entry: Entry { path: root.clone(), name, is_dir: true }, depth: 0, expanded, pending: false });
+            if expanded {
+                self.push_children(&root, 1, &mut rows);
+            }
         }
         self.rows = rows;
     }
@@ -216,7 +249,7 @@ impl FileTree {
     pub fn reveal(&mut self, path: &Path, cx: &mut Context<Self>) {
         let mut p = path.parent();
         while let Some(dir) = p {
-            if !dir.starts_with(&self.root) {
+            if !self.roots().iter().any(|r| dir.starts_with(r)) {
                 break;
             }
             self.expanded.insert(dir.to_path_buf());
@@ -305,14 +338,15 @@ impl FileTree {
         }
     }
     fn collapse_all(&mut self, _: &CollapseAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.expanded.retain(|p| p == &self.root);
+        let roots = self.roots();
+        self.expanded.retain(|p| roots.contains(p));
         self.rebuild();
         cx.notify();
     }
 
     /// The selected entry, if it's a real file or folder (not the project root).
     fn target(&self) -> Option<PathBuf> {
-        self.selected.clone().filter(|p| p != &self.root && p.starts_with(&self.root) && p.exists())
+        self.selected.clone().filter(|p| !self.is_root(p) && self.roots().iter().any(|r| p.starts_with(r)) && p.exists())
     }
 
     /// Folder new files and pastes go into: the selected folder, or the selected file's folder.
@@ -325,7 +359,7 @@ impl FileTree {
     }
 
     fn rel(&self, p: &Path) -> String {
-        p.strip_prefix(&self.root).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| p.to_string_lossy().to_string())
+        p.strip_prefix(self.root_of(p)).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| p.to_string_lossy().to_string())
     }
 
     // ------------------------------------------------------------ name box (new / rename)
@@ -593,7 +627,7 @@ impl FileTree {
     fn copy_relative_path(&mut self, _: &CopyRelativePath, _: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
         let p = self.selected.clone().unwrap_or(self.root.clone());
-        let rel = if p == self.root { ".".to_string() } else { self.rel(&p) };
+        let rel = if self.is_root(&p) { ".".to_string() } else { self.rel(&p) };
         cx.write_to_clipboard(ClipboardItem::new_string(rel));
         cx.emit(Request::Message("Copied relative path".into()));
     }
@@ -627,7 +661,8 @@ impl FileTree {
 
     fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (at, path) = self.menu.clone()?;
-        let is_root = path == self.root;
+        let is_root = self.is_root(&path);
+        let added = self.extra.contains(&path);
         let can_paste = self.clip.is_some();
         type Act = fn(&mut FileTree, &mut Window, &mut Context<FileTree>);
         let mut items: Vec<Option<(&'static str, &'static str, bool, Act)>> = vec![
@@ -653,6 +688,20 @@ impl FileTree {
             items.push(None);
             items.push(Some(("Rename…", "F2", true, |t, w, cx| t.rename(&Rename, w, cx))));
             items.push(Some(("Delete", "⌘⌫", true, |t, w, cx| t.delete(&Delete, w, cx))));
+        }
+        items.push(None);
+        items.push(Some(("Add Folder to Workspace…", "", true, |t, _, cx| {
+            t.menu = None;
+            cx.emit(Request::AddFolder);
+            cx.notify();
+        })));
+        if added {
+            items.push(Some(("Remove Folder from Workspace", "", true, |t, _, cx| {
+                if let Some((_, p)) = t.menu.take() {
+                    cx.emit(Request::RemoveFolder(p));
+                }
+                cx.notify();
+            })));
         }
         let list = div()
             .id("tree-menu")
@@ -691,11 +740,17 @@ impl FileTree {
     fn render_row(&self, ix: usize, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         let row = &self.rows[ix];
         let is_root = row.depth == 0;
-        let repo = self.repo.read(cx);
-        let rel = row.entry.path.strip_prefix(&self.root).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-        let ignored = !is_root && repo.is_ignored(&rel);
+        let owner = self
+            .repos
+            .iter()
+            .filter(|r| row.entry.path.starts_with(&r.read(cx).root))
+            .max_by_key(|r| r.read(cx).root.components().count())
+            .unwrap_or(&self.repo);
+        let repo = owner.read(cx);
+        let rel = row.entry.path.strip_prefix(&repo.root).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let ignored = !is_root && !rel.is_empty() && repo.is_ignored(&rel);
         let status = if row.entry.is_dir || row.pending { None } else { repo.status_of(&rel) };
-        let dirty_dir = row.entry.is_dir && !is_root && repo.dir_is_dirty(&rel);
+        let dirty_dir = row.entry.is_dir && !is_root && !rel.is_empty() && repo.dir_is_dirty(&rel);
         let name_color = match (status, ignored) {
             (Some(s), _) => ui::status_color(s),
             (None, true) => theme::git_ignored(),

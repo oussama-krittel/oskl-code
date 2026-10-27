@@ -25,7 +25,7 @@ pub fn bind_keys() {
 }
 
 pub struct DiffEditView {
-    root: PathBuf,
+    pub root: PathBuf,
     pub spec: DiffSpec,
     pub left: Entity<Editor>,
     pub right: Entity<Editor>,

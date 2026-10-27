@@ -357,6 +357,8 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("graph", "Graph scope: graph all | graph auto", true),
     ("open", "Open a folder in this window: open <dir> (⌘O for a picker)", true),
     ("window", "Open a project in a new window: window [dir] (⌘⇧N)", true),
+    ("add-folder", "Add a folder to the workspace: add-folder [dir] (a picker without one)", true),
+    ("remove-folder", "Take an added folder out of the workspace: remove-folder <dir>", true),
     ("recent", "Open a recent folder", true),
     ("search", "Search in all files: search <text> (⇧⌘F)", true),
     ("sidebar", "Sidebar side: sidebar left | right", true),
@@ -384,6 +386,14 @@ const COMMANDS: &[(&str, &str, bool)] = &[
 pub struct Workspace {
     focus: FocusHandle,
     repo: Entity<Repo>,
+    /// Folders added to the workspace next to the project (more roots in the explorer).
+    folders: Vec<Entity<Repo>>,
+    /// Every git repository in the workspace: the project's, the added folders', and the
+    /// ones found inside them.
+    repos: Vec<Entity<Repo>>,
+    /// The repository Source Control shows (git commands, diffs and the status bar use it).
+    git: Entity<Repo>,
+    repo_subs: Vec<Subscription>,
     tree: Entity<FileTree>,
     git_panel: Entity<GitPanel>,
     search: Entity<SearchPanel>,
@@ -493,35 +503,16 @@ impl Workspace {
             }),
             cx.subscribe_in(&tree, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&git_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
-            cx.subscribe_in(&repo, window, |ws, _, ev: &RepoEvent, window, cx| match ev {
-                RepoEvent::PushRejected => {
-                    // The remote moved on: Enter pulls (rebase) then pushes; "sync merge" merges instead.
-                    ws.open_cmd(CmdMode::Command, "sync", window, cx);
-                    ws.flash("Push rejected: the remote has new commits. Enter = pull --rebase then push · sync merge = merge instead".into(), true, cx);
-                }
-                RepoEvent::Message(m) => ws.flash(m.clone(), false, cx),
-                RepoEvent::Error(e) => ws.flash(e.clone(), true, cx),
-                RepoEvent::Output { title, text, ok } => {
-                    ws.show_output(title.clone(), text, !*ok, cx);
-                    let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(if *ok { "done" } else { "failed" });
-                    ws.flash(format!("{title}: {last}"), !*ok, cx);
-                }
-            }),
             cx.subscribe_in(&cmd, window, |ws, _, ev: &EditorEvent, window, cx| ws.on_cmd_event(ev, window, cx)),
-            cx.observe(&repo, |ws, repo, cx| {
-                for tab in &ws.tabs {
-                    if let TabKind::Editor(e) = &tab.kind {
-                        let email = repo.read(cx).user_email.clone();
-                        e.update(cx, |e, _| e.user_email = email);
-                    }
-                }
-                cx.notify();
-            }),
         ];
         let project = repo.read(cx).root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         window.set_window_title(&if root_is_project(&repo.read(cx).root) { format!("{project} — OSKL Code") } else { "OSKL Code".into() });
         let mut ws = Self {
             focus: cx.focus_handle(),
+            git: repo.clone(),
+            folders: Vec::new(),
+            repos: Vec::new(),
+            repo_subs: Vec::new(),
             repo,
             tree,
             git_panel,
@@ -598,6 +589,7 @@ impl Workspace {
             extra_subs: Vec::new(),
         };
         ws.start_watcher(cx);
+        ws.refresh_repos(window, cx);
         if ws.has_project {
             cx.add_recent_document(&ws.repo.read(cx).root.clone());
             // Save the layout every few seconds when it changed, and on quit.
@@ -625,6 +617,147 @@ impl Workspace {
 
     fn rel(&self, path: &Path, cx: &App) -> String {
         path.strip_prefix(self.root(cx)).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| path.to_string_lossy().to_string())
+    }
+
+    fn git_root(&self, cx: &App) -> PathBuf {
+        self.git.read(cx).root.clone()
+    }
+
+    /// The project and the folders added to it.
+    fn roots(&self, cx: &App) -> Vec<PathBuf> {
+        std::iter::once(&self.repo).chain(&self.folders).map(|r| r.read(cx).root.clone()).collect()
+    }
+
+    /// The repository a file belongs to (the innermost one), else the folder it's in.
+    fn repo_for(&self, path: &Path, cx: &App) -> Entity<Repo> {
+        self.repos
+            .iter()
+            .chain(&self.folders)
+            .filter(|r| path.starts_with(&r.read(cx).root))
+            .max_by_key(|r| r.read(cx).root.components().count())
+            .cloned()
+            .unwrap_or_else(|| self.repo.clone())
+    }
+
+    /// Finds the git repositories of the project and the added folders (and those nested in
+    /// them), keeps the one shown if it's still there, and tells the panels.
+    fn refresh_repos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let folders: Vec<Entity<Repo>> = std::iter::once(self.repo.clone()).chain(self.folders.clone()).collect();
+        let mut list: Vec<Entity<Repo>> = Vec::new();
+        let has = |list: &Vec<Entity<Repo>>, root: &Path, cx: &App| list.iter().any(|r| r.read(cx).root == root);
+        for f in &folders {
+            let root = f.read(cx).root.clone();
+            if f.read(cx).is_git && !has(&list, &root, cx) {
+                list.push(f.clone());
+            }
+            for p in crate::repo::find_repos(&root, 3) {
+                if has(&list, &p, cx) {
+                    continue;
+                }
+                let known = self.repos.iter().chain(&self.folders).find(|r| r.read(cx).root == p).cloned();
+                list.push(known.unwrap_or_else(|| cx.new(|cx| Repo::at(p, cx))));
+            }
+        }
+        if !list.contains(&self.git) {
+            self.git = list.first().cloned().unwrap_or_else(|| self.repo.clone());
+        }
+        let mut watched = list.clone();
+        if !watched.contains(&self.repo) {
+            watched.push(self.repo.clone());
+        }
+        self.repo_subs = watched.iter().flat_map(|r| self.subscribe_repo(r, window, cx)).collect();
+        self.repos = list;
+        let (repos, git) = (self.repos.clone(), self.git.clone());
+        self.git_panel.update(cx, |p, cx| p.set_repos(repos.clone(), git, cx));
+        let extra: Vec<PathBuf> = self.folders.iter().map(|f| f.read(cx).root.clone()).collect();
+        self.tree.update(cx, |t, cx| t.set_workspace(extra, repos, cx));
+        cx.notify();
+    }
+
+    fn subscribe_repo(&self, repo: &Entity<Repo>, window: &mut Window, cx: &mut Context<Self>) -> [Subscription; 2] {
+        [
+            cx.subscribe_in(repo, window, |ws, _, ev: &RepoEvent, window, cx| match ev {
+                RepoEvent::PushRejected => {
+                    // The remote moved on: Enter pulls (rebase) then pushes; "sync merge" merges instead.
+                    ws.open_cmd(CmdMode::Command, "sync", window, cx);
+                    ws.flash("Push rejected: the remote has new commits. Enter = pull --rebase then push · sync merge = merge instead".into(), true, cx);
+                }
+                RepoEvent::Message(m) => ws.flash(m.clone(), false, cx),
+                RepoEvent::Error(e) => ws.flash(e.clone(), true, cx),
+                RepoEvent::Output { title, text, ok } => {
+                    ws.show_output(title.clone(), text, !*ok, cx);
+                    let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(if *ok { "done" } else { "failed" });
+                    ws.flash(format!("{title}: {last}"), !*ok, cx);
+                }
+            }),
+            cx.observe(repo, |ws, repo, cx| {
+                for tab in &ws.tabs {
+                    if let TabKind::Editor(e) = &tab.kind
+                        && let Some(path) = e.read(cx).path.clone()
+                        && ws.repo_for(&path, cx) == repo
+                    {
+                        let email = repo.read(cx).user_email.clone();
+                        e.update(cx, |e, _| e.user_email = email);
+                    }
+                }
+                cx.notify();
+            }),
+        ]
+    }
+
+    /// Re-reads git status everywhere (after commands that may touch any repository).
+    fn refresh_all_status(&self, cx: &mut Context<Self>) {
+        for r in self.repos.clone() {
+            r.update(cx, |r, cx| r.refresh_status(cx));
+        }
+    }
+
+    fn select_repo(&mut self, root: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(r) = self.repos.iter().find(|r| r.read(cx).root == root).cloned() {
+            self.git = r;
+            self.refresh_repos(window, cx);
+        }
+    }
+
+    fn add_folder_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: true, prompt: Some("Add".into()) });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                this.update_in(cx, |ws, window, cx| {
+                    for p in paths {
+                        ws.add_folder(p, window, cx);
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Adds a folder to the workspace: another root in the explorer, its repositories in
+    /// Source Control, its files in Go to File.
+    pub fn add_folder(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = dir.canonicalize().unwrap_or(dir);
+        if !dir.is_dir() || self.roots(cx).contains(&dir) {
+            return;
+        }
+        if let Some(w) = self._watcher.as_mut() {
+            use notify::Watcher;
+            let _ = w.watch(&dir, notify::RecursiveMode::Recursive);
+        }
+        let folder = cx.new(|cx| Repo::at(dir.clone(), cx));
+        self.folders.push(folder);
+        self.refresh_repos(window, cx);
+    }
+
+    fn remove_folder(&mut self, dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.folders.iter().position(|f| f.read(cx).root == dir) else { return };
+        self.folders.remove(ix);
+        if let Some(w) = self._watcher.as_mut() {
+            use notify::Watcher;
+            let _ = w.unwatch(dir);
+        }
+        self.refresh_repos(window, cx);
     }
 
     fn flash(&mut self, msg: String, err: bool, cx: &mut Context<Self>) {
@@ -684,7 +817,7 @@ impl Workspace {
                 self.stage_resolved(rel, cx);
             }
             Request::Compare(other) => {
-                let base = self.repo.read(cx).branch_label();
+                let base = self.git.read(cx).branch_label();
                 self.open_compare(base, other.clone(), window, cx);
             }
             Request::OpenFile { path, line, preview } => self.open_file(path.clone(), *line, *preview, window, cx),
@@ -711,6 +844,9 @@ impl Workspace {
             Request::Deleted(paths) => self.paths_deleted(paths, window, cx),
             Request::Ask(ask) => self.open_ask(ask.clone(), window, cx),
             Request::OpenTerminal(dir) => self.open_terminal_in(dir.clone(), None, window, cx),
+            Request::SelectRepo(root) => self.select_repo(root, window, cx),
+            Request::AddFolder => self.add_folder_prompt(window, cx),
+            Request::RemoveFolder(dir) => self.remove_folder(dir, window, cx),
             Request::Message(m) => self.flash(m.clone(), false, cx),
             Request::Error(e) => self.flash(e.clone(), true, cx),
         }
@@ -1038,6 +1174,7 @@ impl Workspace {
             .into(),
             side_visible: self.side_visible,
             side_w: self.side_w,
+            folders: self.folders.iter().map(|f| f.read(cx).root.clone()).collect(),
         }
     }
 
@@ -1060,6 +1197,9 @@ impl Workspace {
             return;
         }
         let Some(saved) = crate::session::load(&self.root(cx)) else { return };
+        for dir in saved.folders.iter().filter(|d| d.is_dir()) {
+            self.add_folder(dir.clone(), window, cx);
+        }
         if saved.panes.is_empty() {
             return;
         }
@@ -1549,8 +1689,9 @@ impl Workspace {
             if !path.exists() {
                 return self.flash(format!("No such file: {}", path.display()), true, cx);
             }
-            let root = self.root(cx);
-            let (font_size, blame, email) = (self.font_size, self.blame_default, self.repo.read(cx).user_email.clone());
+            let owner = self.repo_for(&path, cx);
+            let root = owner.read(cx).root.clone();
+            let (font_size, blame, email) = (self.font_size, self.blame_default, owner.read(cx).user_email.clone());
             let editor = cx.new(|cx| {
                 let mut ed = Editor::open(path.clone(), Some(root), cx);
                 ed.font_size = font_size;
@@ -1620,15 +1761,15 @@ impl Workspace {
 
     fn open_diff(&mut self, spec: DiffSpec, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
         let key = spec.key();
-        if spec.right == Rev::Working && self.root(cx).join(&spec.path).is_file() {
+        if spec.right == Rev::Working && self.git_root(cx).join(&spec.path).is_file() {
             if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::DiffEdit(d) if d.read(cx).spec.key() == key)) {
                 if !preview {
                     self.tabs[ix].preview = false;
                 }
                 return self.activate(ix, window, cx);
             }
-            let root = self.root(cx);
-            let email = self.repo.read(cx).user_email.clone();
+            let root = self.git_root(cx);
+            let email = self.git.read(cx).user_email.clone();
             let (blame, font) = (self.blame_default, self.font_size);
             let view = cx.new(|cx| DiffEditView::new(root, spec, email, blame, font, window, cx));
             let right = view.read(cx).right.clone();
@@ -1677,8 +1818,8 @@ impl Workspace {
             }
             return self.activate(ix, window, cx);
         }
-        let root = self.root(cx);
-        let email = self.repo.read(cx).user_email.clone();
+        let root = self.git_root(cx);
+        let email = self.git.read(cx).user_email.clone();
         let blame = self.blame_default;
         let view = cx.new(|cx| DiffView::new(root, spec, email, blame, cx));
         let sub = cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx));
@@ -1689,7 +1830,7 @@ impl Workspace {
         if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Commit(c) if c.read(cx).sha == sha)) {
             return self.activate(ix, window, cx);
         }
-        let root = self.root(cx);
+        let root = self.git_root(cx);
         let view = cx.new(|cx| CommitView::new(root, sha, cx));
         let sub = cx.subscribe_in(&view, window, |ws, view, req: &Request, window, cx| {
             // Opening a file from a commit keeps the commit page (it was a preview, which
@@ -1706,7 +1847,7 @@ impl Workspace {
 
     /// "Resolve in Merge Editor" for a conflicted file.
     fn open_merge_editor(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let root = self.root(cx);
+        let root = self.repo_for(&path, cx).read(cx).root.clone();
         let Ok(rel) = path.strip_prefix(&root).map(|r| r.to_string_lossy().to_string()) else { return };
         if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Merge(m) if m.read(cx).rel == rel)) {
             return self.activate(ix, window, cx);
@@ -1729,7 +1870,9 @@ impl Workspace {
 
     /// Compare on a conflict: current (ours) vs incoming (theirs) for the whole file.
     fn compare_conflict(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let root = self.root(cx);
+        let owner = self.repo_for(&path, cx);
+        self.git = owner.clone();
+        let root = owner.read(cx).root.clone();
         let Ok(rel) = path.strip_prefix(&root).map(|r| r.to_string_lossy().to_string()) else { return };
         let spec = DiffSpec { path: rel, old_path: None, left: Rev::Stage(2), right: Rev::Stage(3), from_commit: None };
         self.open_diff(spec, false, window, cx);
@@ -1738,20 +1881,22 @@ impl Workspace {
     /// Stages a file whose conflicts are gone (VS Code marks it resolved on save).
     fn stage_resolved(&mut self, rel: String, cx: &mut Context<Self>) {
         let msg = format!("Marked {} as resolved", ui::file_name(&rel));
-        self.repo.update(cx, |r, cx| r.run_op("Mark resolved", cx, move |root| git::stage(root, &[rel]).map(|_| msg)));
+        self.git.update(cx, |r, cx| r.run_op("Mark resolved", cx, move |root| git::stage(root, &[rel]).map(|_| msg)));
     }
 
     /// After saving: a conflicted file with no markers left gets staged.
     fn after_save(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let Some(path) = editor.read(cx).path.clone() else { return };
-        let root = self.root(cx);
+        let owner = self.repo_for(&path, cx);
+        let root = owner.read(cx).root.clone();
         let Ok(rel) = path.strip_prefix(&root).map(|r| r.to_string_lossy().to_string()) else { return };
-        let conflicted = self.repo.read(cx).status.conflicts.iter().any(|c| c.path == rel);
+        let conflicted = owner.read(cx).status.conflicts.iter().any(|c| c.path == rel);
         if conflicted && editor.update(cx, |e, _| {
             e.refresh_conflicts();
             e.conflicts.is_empty()
         }) {
-            self.stage_resolved(rel, cx);
+            let msg = format!("Marked {} as resolved", ui::file_name(&rel));
+            owner.update(cx, |r, cx| r.run_op("Mark resolved", cx, move |root| git::stage(root, &[rel]).map(|_| msg)));
         }
     }
 
@@ -1760,7 +1905,7 @@ impl Workspace {
         if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Commit(c) if c.read(cx).sha == key)) {
             return self.activate(ix, window, cx);
         }
-        let root = self.root(cx);
+        let root = self.git_root(cx);
         let view = cx.new(|cx| CommitView::new_compare(root, base, other, cx));
         let sub = cx.subscribe_in(&view, window, |ws, view, req: &Request, window, cx| {
             if let Request::OpenDiff { .. } = req
@@ -1863,7 +2008,9 @@ impl Workspace {
             Ok(()) => {
                 let name = ed.read(cx).path.as_ref().map(|p| self.rel(p, cx)).unwrap_or_default();
                 self.flash(format!("Saved {name}"), false, cx);
-                self.repo.update(cx, |r, cx| r.refresh_status(cx));
+                if let Some(p) = ed.read(cx).path.clone() {
+                    self.repo_for(&p, cx).update(cx, |r, cx| r.refresh_status(cx));
+                }
             }
             Err(e) => self.flash(format!("Save failed: {e}"), true, cx),
         }
@@ -2128,7 +2275,7 @@ impl Workspace {
                 let text = format!("{}{}", out.stdout, out.stderr);
                 ws.show_output(format!("$ {}", out.tool), &text, !out.ok, cx);
                 ws.flash(format!("$ {} — {}", out.tool, if out.ok { "ok" } else { "failed" }), !out.ok, cx);
-                ws.repo.update(cx, |r, cx| r.refresh_status(cx));
+                ws.refresh_all_status(cx);
             })
             .ok();
         }));
@@ -2266,7 +2413,7 @@ impl Workspace {
             msg.push_str(&format!(" — skipped {} (changed since search or unsaved): {}", skipped.len(), skipped.join(", ")));
         }
         self.flash(msg, !skipped.is_empty(), cx);
-        self.repo.update(cx, |r, cx| r.refresh_status(cx));
+        self.refresh_all_status(cx);
     }
 
     /// Auto save: one second after the last edit, like VS Code's "afterDelay".
@@ -2283,7 +2430,11 @@ impl Workspace {
                     return;
                 }
                 match editor.update(cx, |e, cx| e.save(cx)) {
-                    Ok(()) => ws.repo.update(cx, |r, cx| r.refresh_status(cx)),
+                    Ok(()) => {
+                        if let Some(p) = editor.read(cx).path.clone() {
+                            ws.repo_for(&p, cx).update(cx, |r, cx| r.refresh_status(cx));
+                        }
+                    }
                     Err(e) => ws.flash(format!("Auto save failed: {e}"), true, cx),
                 }
                 cx.notify();
@@ -2700,13 +2851,22 @@ impl Workspace {
                 .collect();
         }
         let files = self.repo.read(cx).files.clone();
-        let mut scored: Vec<(i64, &String, Vec<usize>)> = files.iter().filter_map(|f| util::fuzzy(query, f).map(|(s, p)| (s, f, p))).collect();
+        let mut scored: Vec<(i64, String, Vec<usize>, String)> = files.iter().filter_map(|f| util::fuzzy(query, f).map(|(s, p)| (s, f.clone(), p, f.clone()))).collect();
+        // Added folders: shown as "folder/path", opened by full path.
+        for folder in &self.folders {
+            let folder = folder.read(cx);
+            let (name, froot) = (folder.name(), folder.root.clone());
+            scored.extend(folder.files.iter().filter_map(|f| {
+                let label = format!("{name}/{f}");
+                util::fuzzy(query, &label).map(|(s, p)| (s, label, p, froot.join(f).to_string_lossy().to_string()))
+            }));
+        }
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())));
         let _ = root;
         scored
             .into_iter()
             .take(60)
-            .map(|(_, f, positions)| CmdItem { label: f.clone(), detail: String::new(), value: f.clone(), positions, exec: true })
+            .map(|(_, label, positions, value)| CmdItem { label, detail: String::new(), value, positions, exec: true })
             .collect()
     }
 
@@ -2728,7 +2888,7 @@ impl Workspace {
         };
         let root = self.root(cx);
         match head {
-            "e" | "open" | "edit" | "new" | "mkdir" | "cd" | "lint" | "window" | "vsplit" | "vs" | "split" | "sp" => path_items(&root, head, "", rest),
+            "e" | "open" | "edit" | "new" | "mkdir" | "cd" | "lint" | "window" | "add-folder" | "remove-folder" | "vsplit" | "vs" | "split" | "sp" => path_items(&root, head, "", rest),
             "mv" => {
                 let (first, last) = rest.rsplit_once(' ').map(|(a, b)| (format!("{a} "), b)).unwrap_or((String::new(), rest));
                 path_items(&root, head, &first, last)
@@ -2746,7 +2906,7 @@ impl Workspace {
                 v.into_iter().map(|(_, i)| i).take(12).collect()
             }
             "stage" | "add" | "unstage" | "discard" => {
-                let st = &self.repo.read(cx).status;
+                let st = &self.git.read(cx).status;
                 let list = if head == "unstage" { &st.staged } else { &st.unstaged };
                 list.iter()
                     .filter_map(|c| {
@@ -2946,6 +3106,13 @@ impl Workspace {
                 }
             }
             "cd" => self.flash(format!("Not a folder: {rest}"), true, cx),
+            "add-folder" if rest.is_empty() => self.add_folder_prompt(window, cx),
+            "add-folder" => self.add_folder(resolve(&root, rest), window, cx),
+            "remove-folder" => {
+                let dir = resolve(&root, rest);
+                let dir = dir.canonicalize().unwrap_or(dir);
+                self.remove_folder(&dir, window, cx);
+            }
             "window" if rest.is_empty() => self.pick_folder(true, window, cx),
             "window" => crate::open_window(resolve(&root, rest), cx),
             "recent" => {
@@ -3065,7 +3232,7 @@ impl Workspace {
                     return self.flash("Nothing to discard".into(), true, cx);
                 }
                 let n = paths.len();
-                self.repo.update(cx, |r, cx| {
+                self.git.update(cx, |r, cx| {
                     r.run_op("Discard", cx, move |root| git::discard(root, &paths).map(|_| format!("Discarded changes in {n} file(s)")))
                 });
             }
@@ -3098,7 +3265,7 @@ impl Workspace {
                     return self.flash("Usage: checkout <branch>".into(), true, cx);
                 }
                 let branch = rest.strip_prefix("origin/").filter(|_| rest.starts_with("origin/")).unwrap_or(rest).to_string();
-                self.repo.update(cx, |r, cx| r.run_git(vec!["switch".into(), branch], cx));
+                self.git.update(cx, |r, cx| r.run_git(vec!["switch".into(), branch], cx));
             }
             "branch-from" => {
                 // branch-from <commit> <name>: create a branch at that commit and switch to it.
@@ -3106,48 +3273,48 @@ impl Workspace {
                 match (parts.next(), parts.next()) {
                     (Some(rev), Some(name)) => {
                         let args = vec!["switch".into(), "-c".into(), name.to_string(), rev.to_string()];
-                        self.repo.update(cx, |r, cx| r.run_git(args, cx));
+                        self.git.update(cx, |r, cx| r.run_git(args, cx));
                     }
                     _ => self.flash("Type the new branch name after the commit, then Enter".into(), true, cx),
                 }
             }
             "branch" => {
                 if rest.is_empty() {
-                    return self.repo.update(cx, |r, cx| r.run_git(vec!["branch".into(), "-vv".into()], cx));
+                    return self.git.update(cx, |r, cx| r.run_git(vec!["branch".into(), "-vv".into()], cx));
                 }
-                self.repo.update(cx, |r, cx| r.run_git(vec!["switch".into(), "-c".into(), rest.to_string()], cx));
+                self.git.update(cx, |r, cx| r.run_git(vec!["switch".into(), "-c".into(), rest.to_string()], cx));
             }
-            "fetch" => self.repo.update(cx, |r, cx| r.run_git(vec!["fetch".into(), "--all".into(), "--prune".into()], cx)),
+            "fetch" => self.git.update(cx, |r, cx| r.run_git(vec!["fetch".into(), "--all".into(), "--prune".into()], cx)),
             "sync" => {
                 let rebase = rest != "merge";
-                self.repo.update(cx, |r, cx| r.run_op(if rebase { "Pull (rebase) & push" } else { "Pull (merge) & push" }, cx, move |root| git::sync(root, rebase)));
+                self.git.update(cx, |r, cx| r.run_op(if rebase { "Pull (rebase) & push" } else { "Pull (merge) & push" }, cx, move |root| git::sync(root, rebase)));
             }
             "compare" => {
                 if rest.is_empty() {
                     return self.flash("compare <branch>: which branch?".into(), true, cx);
                 }
-                let base = self.repo.read(cx).branch_label();
+                let base = self.git.read(cx).branch_label();
                 self.open_compare(base, rest.to_string(), window, cx);
             }
-            "abort" => match self.repo.read(cx).status.op.clone() {
-                Some(op) => self.repo.update(cx, |r, cx| r.run_op("Abort", cx, move |root| git::abort_op(root, op.kind))),
+            "abort" => match self.git.read(cx).status.op.clone() {
+                Some(op) => self.git.update(cx, |r, cx| r.run_op("Abort", cx, move |root| git::abort_op(root, op.kind))),
                 None => self.flash("Nothing in progress to abort".into(), true, cx),
             },
             "pull" | "push" | "stash" | "merge" | "rebase" => {
                 let mut args = vec![cmd.to_string()];
                 args.extend(rest.split_whitespace().map(String::from));
-                self.repo.update(cx, |r, cx| r.run_git(args, cx));
+                self.git.update(cx, |r, cx| r.run_git(args, cx));
             }
             "git" => {
                 let args = shell_words(rest);
-                self.repo.update(cx, |r, cx| r.run_git(args, cx));
+                self.git.update(cx, |r, cx| r.run_git(args, cx));
             }
             "graph" | "log" => {
                 self.side = Side::Git;
                 self.side_visible = true;
                 if rest == "all" || rest == "auto" {
                     let all = rest == "all";
-                    self.repo.update(cx, |r, cx| {
+                    self.git.update(cx, |r, cx| {
                         r.graph_all = all;
                         r.refresh_log(cx);
                     });
@@ -3221,22 +3388,37 @@ impl Workspace {
     }
 
     fn on_fs_change(&mut self, paths: HashSet<PathBuf>, cx: &mut Context<Self>) {
-        let root = self.root(cx);
+        let roots = self.roots(cx);
+        let repo_roots: Vec<(Entity<Repo>, PathBuf)> = self.repos.iter().map(|r| (r.clone(), r.read(cx).root.clone())).collect();
         let (mut git_meta, mut worktree) = (false, false);
+        // Repositories whose .git changed (log too) / whose files changed (status only).
+        let mut meta_repos: Vec<Entity<Repo>> = Vec::new();
+        let mut touched: Vec<Entity<Repo>> = Vec::new();
         let mut dirs = HashSet::new();
         let mut changed_files = HashSet::new();
-        for p in paths {
-            let Ok(rel) = p.strip_prefix(&root) else { continue };
-            let rel_s = rel.to_string_lossy();
-            if rel.starts_with(".git") {
-                if rel_s.ends_with(".lock") || rel_s.contains("/objects/") || rel_s.contains("/logs/") {
-                    continue;
+        'paths: for p in paths {
+            for (r, root) in &repo_roots {
+                if let Ok(rel) = p.strip_prefix(root)
+                    && rel.starts_with(".git")
+                {
+                    let rel_s = rel.to_string_lossy();
+                    if !(rel_s.ends_with(".lock") || rel_s.contains("/objects/") || rel_s.contains("/logs/")) {
+                        git_meta = true;
+                        if !meta_repos.contains(r) {
+                            meta_repos.push(r.clone());
+                        }
+                    }
+                    continue 'paths;
                 }
-                git_meta = true;
+            }
+            let Some(rel) = roots.iter().find_map(|root| p.strip_prefix(root).ok()) else { continue };
+            if rel.starts_with(".git") || rel.components().any(|c| c.as_os_str() == "node_modules" || c.as_os_str() == "target") {
                 continue;
             }
-            if rel.components().any(|c| c.as_os_str() == "node_modules" || c.as_os_str() == "target") {
-                continue;
+            for (r, root) in &repo_roots {
+                if p.starts_with(root) && !touched.contains(r) {
+                    touched.push(r.clone());
+                }
             }
             worktree = true;
             if let Some(parent) = p.parent() {
@@ -3267,7 +3449,7 @@ impl Workspace {
                     }
                 }
                 TabKind::DiffEdit(d) => {
-                    let path = self.root(cx).join(&d.read(cx).spec.path);
+                    let path = d.read(cx).root.join(&d.read(cx).spec.path);
                     if git_meta || changed_files.contains(&path) {
                         d.update(cx, |d, cx| d.refresh(cx));
                     }
@@ -3275,16 +3457,20 @@ impl Workspace {
                 TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) => {}
             }
         }
-        self.repo.update(cx, |r, cx| {
-            r.refresh_status(cx);
-            if git_meta {
+        for r in &meta_repos {
+            r.update(cx, |r, cx| {
+                r.refresh_status(cx);
                 r.refresh_log(cx);
-            }
-            if worktree {
-                r.refresh_files(cx);
-            }
-        });
+            });
+        }
+        for r in touched.iter().filter(|r| !meta_repos.contains(r)) {
+            r.update(cx, |r, cx| r.refresh_status(cx));
+        }
         if worktree {
+            // File lists (Go to File) of the project and added folders.
+            for f in std::iter::once(self.repo.clone()).chain(self.folders.clone()) {
+                f.update(cx, |r, cx| r.refresh_files(cx));
+            }
             self.tree.update(cx, |t, cx| t.invalidate(&dirs, cx));
         }
     }
@@ -3292,7 +3478,7 @@ impl Workspace {
     // ------------------------------------------------------------ rendering
 
     fn render_activity_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let changes = self.repo.read(cx).status.change_count();
+        let changes: usize = self.repos.iter().map(|r| r.read(cx).status.change_count()).sum();
         let right = self.settings.sidebar_right;
         // A plain button in the activity bar (no selected state).
         let tool = |id: &'static str, icon: &'static str, tip: &'static str, size: f32| {
@@ -3344,6 +3530,7 @@ impl Workspace {
             }))
             .child(div().flex_1())
             .child(tool("tb-open", "folder", "Open Folder here (⌘O)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))))
+            .child(tool("tb-add-folder", "new-folder", "Add Folder to Workspace…", 16.).on_click(cx.listener(|ws, _, w, cx| ws.add_folder_prompt(w, cx))))
             .child(tool("tb-open-new", "plus", "Open another project in a new window (⌘⇧N) · ⌘` switches", 16.).on_click(cx.listener(|ws, _, w, cx| ws.pick_folder(true, w, cx))))
             .child(tool("tb-side", "split", "Move sidebar left/right (⌘K ⌘B)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.toggle_sidebar_side(&ToggleSidebarSide, w, cx))))
             .child(tool("tb-panel", "inline", "Toggle output panel (⌘J)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.toggle_output(&ToggleOutput, w, cx))))
@@ -3864,7 +4051,7 @@ impl Workspace {
     }
 
     fn render_status(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let repo = self.repo.read(cx);
+        let repo = self.git.read(cx);
         let base = div()
             .flex()
             .flex_none()
@@ -3942,7 +4129,7 @@ impl Workspace {
                 item("status-sync")
                     .child(ui::small_icon("sync", theme::fg()))
                     .child(sync)
-                    .on_click(cx.listener(|ws, _, _, cx| ws.repo.update(cx, |r, cx| r.run_git(vec!["pull".into()], cx)))),
+                    .on_click(cx.listener(|ws, _, _, cx| ws.git.update(cx, |r, cx| r.run_git(vec!["pull".into()], cx)))),
             )
         })
         .when_some(repo.busy.clone(), |d, busy| d.child(div().px(px(8.)).text_color(theme::fg_dim()).child(format!("⟳ {busy}"))))
@@ -4905,6 +5092,64 @@ mod ui_tests {
         assert!(ws.read_with(cx, |ws, _| ws.ask.is_none()), "Esc cancels");
         cx.run_until_parked();
         assert!(root.join("b.ts").is_file());
+    }
+
+    #[gpui::test]
+    fn several_repos_pick_one_in_source_control_and_folders_join_the_workspace(cx: &mut TestAppContext) {
+        let init = |dir: &std::path::Path, file: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            sh(&format!("echo one > {file} && git add . && git commit -qm first"));
+            sh(&format!("echo two > {file}"));
+        };
+        // A plain folder holding two projects, each its own repository.
+        let (ws, cx) = setup_with(cx, |root| {
+            init(&root.join("api"), "server.ts");
+            init(&root.join("apps/web"), "page.tsx");
+        });
+        cx.run_until_parked();
+        let names = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.repos.iter().map(|r| r.read(cx).name()).collect::<Vec<_>>());
+        let shown = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.git.read(cx).name());
+        assert_eq!(names(cx), vec!["api", "web"], "both found, nested ones too");
+        assert_eq!(shown(cx), "api");
+        let changed = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.git.read(cx).status.unstaged.iter().map(|c| c.path.clone()).collect::<Vec<_>>());
+        assert_eq!(changed(cx), vec!["server.ts"]);
+
+        // The picker on top of Source Control switches what's shown.
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
+        cx.run_until_parked();
+        let click = |cx: &mut VisualTestContext, sel: &str| {
+            cx.run_until_parked();
+            let at = cx.debug_bounds(Box::leak(sel.to_string().into_boxed_str())).unwrap_or_else(|| panic!("{sel} is on screen")).center();
+            cx.simulate_click(at, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        click(cx, "repo-picker");
+        click(cx, "repo-item-web");
+        assert_eq!(shown(cx), "web");
+        assert_eq!(changed(cx), vec!["page.tsx"], "the panel shows web's changes");
+        let panel_repo = ws.read_with(cx, |ws, cx| ws.git_panel.read(cx).repo_name(cx));
+        assert_eq!(panel_repo, "web");
+
+        // Add a folder from elsewhere: a second root in the explorer, its repo in the picker.
+        let other = std::env::temp_dir().join(format!("kite-added-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&other);
+        init(&other, "lib.rs");
+        ws.update_in(cx, |ws, window, cx| ws.add_folder(other.clone(), window, cx));
+        cx.run_until_parked();
+        let other = other.canonicalize().unwrap();
+        assert_eq!(names(cx).len(), 3);
+        assert_eq!(shown(cx), "web", "adding keeps the picked repo");
+        let roots = ws.read_with(cx, |ws, cx| ws.tree.read(cx).row_names().into_iter().filter(|(d, _)| *d == 0).map(|(_, n)| n).collect::<Vec<_>>());
+        assert_eq!(roots.len(), 2, "two roots in the explorer: {roots:?}");
+        assert!(ws.read_with(cx, |ws, cx| ws.snapshot(cx).folders == vec![other.clone()]), "remembered in the session");
+        ws.update_in(cx, |ws, window, cx| ws.remove_folder(&other, window, cx));
+        cx.run_until_parked();
+        assert_eq!(names(cx), vec!["api", "web"]);
+        std::fs::remove_dir_all(&other).ok();
     }
 
     #[gpui::test]

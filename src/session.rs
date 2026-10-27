@@ -32,6 +32,9 @@ pub struct Session {
     pub side: String,
     pub side_visible: bool,
     pub side_w: f32,
+    /// Folders added to the workspace.
+    #[serde(default)]
+    pub folders: Vec<PathBuf>,
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -98,6 +101,7 @@ mod tests {
             side: "git".into(),
             side_visible: true,
             side_w: 300.,
+            folders: vec![],
         };
         let text = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<Session>(&text).unwrap(), s);

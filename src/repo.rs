@@ -53,7 +53,17 @@ impl Repo {
             eprintln!("[kite] open {} -> git root {:?}", root.display(), git_root);
         }
         let is_git = git_root.is_some();
-        let root = git_root.unwrap_or(root);
+        Self::build(git_root.unwrap_or(root), is_git, cx)
+    }
+
+    /// Exactly this folder (a folder added to the workspace, or a repo found inside the
+    /// project): git only if the folder is itself a repository's top.
+    pub fn at(root: PathBuf, cx: &mut Context<Self>) -> Self {
+        let is_git = root.join(".git").exists();
+        Self::build(root, is_git, cx)
+    }
+
+    fn build(root: PathBuf, is_git: bool, cx: &mut Context<Self>) -> Self {
         let user_email = if is_git { git::user_email(&root) } else { None };
         let mut repo = Self {
             root,
@@ -208,6 +218,11 @@ impl Repo {
         }));
     }
 
+    /// The folder's name, as shown in pickers.
+    pub fn name(&self) -> String {
+        self.root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.root.to_string_lossy().to_string())
+    }
+
     pub fn status_of(&self, rel: &str) -> Option<FileStatus> {
         self.file_status.get(rel).copied()
     }
@@ -303,6 +318,37 @@ fn walk_files(root: &Path, limit: usize) -> Vec<String> {
                 if out.len() >= limit {
                     return out;
                 }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Git repositories inside `root` (not `root` itself), a few levels down: a folder holding
+/// several projects, or a monorepo with nested checkouts. Skips dependencies and build output.
+pub fn find_repos(root: &Path, max_depth: usize) -> Vec<PathBuf> {
+    const SKIP: &[&str] = &["node_modules", "target", "build", "dist", "Pods", "vendor", "DerivedData"];
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0)];
+    let mut seen = 0;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            seen += 1;
+            if seen > 20_000 {
+                break;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || SKIP.contains(&name.as_str()) || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.join(".git").exists() {
+                out.push(path.clone());
+            }
+            if depth + 1 < max_depth {
+                stack.push((path, depth + 1));
             }
         }
     }

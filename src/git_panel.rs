@@ -176,6 +176,8 @@ const MUTED: f32 = 0.38;
 const TREE_LEFT: f32 = 16.;
 const TREE_INDENT: f32 = 12.;
 const GRAPH_ROW_H: f32 = 20.;
+/// The repository picker under the title (only with more than one repository).
+const REPO_H: f32 = 30.;
 
 pub struct GitPanel {
     focus: FocusHandle,
@@ -205,6 +207,13 @@ pub struct GitPanel {
     collapsed: std::collections::HashSet<String>,
     /// `in_checkout` for the current log and HEAD, recomputed when either changes.
     reach: std::cell::RefCell<Option<(String, usize, Rc<(Vec<bool>, Option<usize>)>)>>,
+    /// Every repository in the workspace (the picker's choices) and whether the picker is open.
+    repos: Vec<Entity<Repo>>,
+    repo_menu: bool,
+    /// Unsent commit messages of the repositories not shown.
+    drafts: std::collections::HashMap<std::path::PathBuf, String>,
+    repo_sub: Subscription,
+    _repos_subs: Vec<Subscription>,
     _subs: Vec<Subscription>,
 }
 
@@ -217,26 +226,8 @@ impl GitPanel {
             ed.font_size = 12.;
             ed
         });
+        let repo_sub = Self::observe_repo(&repo, cx);
         let subs = vec![
-            cx.observe(&repo, |panel, repo, cx| {
-                let op = repo.read(cx).status.op.clone();
-                if op.as_ref().map(|o| (o.kind, &o.message)) != panel.last_op.as_ref().map(|o| (o.kind, &o.message)) {
-                    // A merge/rebase step started: put git's prepared message in the box.
-                    let msg = op.as_ref().map(|o| o.message.clone()).unwrap_or_default();
-                    let current = panel.commit_input.read(cx).text();
-                    let was_prefilled = panel.last_op.as_ref().is_some_and(|o| o.message == current);
-                    if current.trim().is_empty() || was_prefilled {
-                        panel.commit_input.update(cx, |ed, cx| ed.set_text(&msg, cx));
-                    }
-                    panel.last_op = op;
-                }
-                let branch = repo.read(cx).branch_label();
-                panel.commit_input.update(cx, |ed, cx| {
-                    ed.placeholder = format!("Message (⌘Enter to commit on \"{branch}\")").into();
-                    cx.notify();
-                });
-                cx.notify();
-            }),
             cx.subscribe_in(&commit_input, window, |panel, _, ev: &EditorEvent, window, cx| match ev {
                 EditorEvent::Submit => panel.commit(None, false, panel.amend, window, cx),
                 EditorEvent::Cancel => panel.focus(window),
@@ -245,6 +236,7 @@ impl GitPanel {
         ];
         Self {
             focus: cx.focus_handle(),
+            repos: vec![repo.clone()],
             repo,
             commit_input,
             changes_open: true,
@@ -268,8 +260,157 @@ impl GitPanel {
             last_op: None,
             collapsed: Default::default(),
             reach: Default::default(),
+            repo_menu: false,
+            drafts: Default::default(),
+            repo_sub,
+            _repos_subs: Vec::new(),
             _subs: subs,
         }
+    }
+
+    fn observe_repo(repo: &Entity<Repo>, cx: &mut Context<Self>) -> Subscription {
+        cx.observe(repo, |panel, repo, cx| {
+                let op = repo.read(cx).status.op.clone();
+                if op.as_ref().map(|o| (o.kind, &o.message)) != panel.last_op.as_ref().map(|o| (o.kind, &o.message)) {
+                    // A merge/rebase step started: put git's prepared message in the box.
+                    let msg = op.as_ref().map(|o| o.message.clone()).unwrap_or_default();
+                    let current = panel.commit_input.read(cx).text();
+                    let was_prefilled = panel.last_op.as_ref().is_some_and(|o| o.message == current);
+                    if current.trim().is_empty() || was_prefilled {
+                        panel.commit_input.update(cx, |ed, cx| ed.set_text(&msg, cx));
+                    }
+                    panel.last_op = op;
+                }
+                let branch = repo.read(cx).branch_label();
+                panel.commit_input.update(cx, |ed, cx| {
+                    ed.placeholder = format!("Message (⌘Enter to commit on \"{branch}\")").into();
+                    cx.notify();
+                });
+                cx.notify();
+        })
+    }
+
+    /// The workspace's repositories changed (found, added, removed) or another one was picked.
+    pub fn set_repos(&mut self, repos: Vec<Entity<Repo>>, active: Entity<Repo>, cx: &mut Context<Self>) {
+        self._repos_subs = repos.iter().filter(|r| **r != active).map(|r| cx.observe(r, |_, _, cx| cx.notify())).collect();
+        self.repos = repos;
+        if active != self.repo {
+            let old = self.repo.read(cx).root.clone();
+            let draft = self.commit_input.read(cx).text();
+            self.drafts.insert(old, draft);
+            let draft = self.drafts.remove(&active.read(cx).root).unwrap_or_default();
+            self.commit_input.update(cx, |ed, cx| ed.set_text(&draft, cx));
+            self.repo_sub = Self::observe_repo(&active, cx);
+            self.repo = active;
+            self.selected = None;
+            self.last_op = None;
+            self.amend = false;
+            self.collapsed.clear();
+            self.reach.replace(None);
+            self.scope_open = false;
+            self.branch_menu = None;
+            self.commit_menu = None;
+            self.graph_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            cx.notify();
+            // Show its state (branch in the message box, prepared merge message) right away.
+            self.repo.update(cx, |_, cx| cx.notify());
+        }
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn repo_name(&self, cx: &App) -> String {
+        self.repo.read(cx).name()
+    }
+
+    /// Title bar plus the repository picker, if shown.
+    fn head_h(&self) -> f32 {
+        35. + if self.repos.len() > 1 { REPO_H } else { 0. }
+    }
+
+    fn render_repo_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let repo = self.repo.read(cx);
+        let (name, branch) = (repo.name(), repo.branch_label());
+        div()
+            .id("repo-picker")
+            .debug_selector(|| "repo-picker".into())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .h(px(REPO_H - 6.))
+            .mx(px(10.))
+            .mb(px(6.))
+            .px(px(8.))
+            .rounded(px(4.))
+            .bg(theme::ca(0xffffff0d))
+            .border_1()
+            .border_color(if self.repo_menu { theme::focus_border() } else { theme::border_input() })
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::ca(0xffffff17)))
+            .tooltip(ui::tooltip("Repository shown here"))
+            .on_click(cx.listener(|p, _, _, cx| {
+                p.repo_menu = !p.repo_menu;
+                cx.notify();
+            }))
+            .child(ui::small_icon("repo", theme::fg_dim()))
+            .child(div().flex_none().text_color(theme::fg_bright()).child(name))
+            .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_color(theme::fg_dim()).child(branch))
+            .child(ui::small_icon("chevron-down", theme::fg_dim()))
+    }
+
+    fn render_repo_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let common = common_parent(self.repos.iter().map(|r| r.read(cx).root.clone()));
+        div()
+            .id("repo-menu")
+            .occlude()
+            .absolute()
+            .top(px(35. + REPO_H - 4.))
+            .left(px(10.))
+            .right(px(10.))
+            .max_h(px(420.))
+            .py(px(4.))
+            .bg(theme::bg_popup())
+            .border_1()
+            .border_color(theme::border_input())
+            .rounded(px(6.))
+            .shadow_lg()
+            .overflow_y_scroll()
+            .on_mouse_down_out(cx.listener(|p, _, _, cx| {
+                p.repo_menu = false;
+                cx.notify();
+            }))
+            .children(self.repos.iter().enumerate().map(|(ix, r)| {
+                let active = *r == self.repo;
+                let repo = r.read(cx);
+                let root = repo.root.clone();
+                let rel = common.as_ref().and_then(|c| root.parent()?.strip_prefix(c).ok()).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                let changes = repo.status.change_count();
+                let name = repo.name();
+                div()
+                    .id(("repo-item", ix))
+                    .debug_selector(move || format!("repo-item-{name}"))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .h(px(26.))
+                    .px(px(8.))
+                    .mx(px(4.))
+                    .rounded(px(3.))
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(theme::selected()))
+                    .hover(|s| s.bg(theme::selected_focused()))
+                    .on_click(cx.listener(move |p, _, _, cx| {
+                        p.repo_menu = false;
+                        cx.emit(Request::SelectRepo(root.clone()));
+                        cx.notify();
+                    }))
+                    .child(div().w(px(10.)).text_color(theme::frame_focused()).child(if active { "●" } else { "" }))
+                    .child(div().flex_none().text_color(if active { theme::fg_bright() } else { theme::fg() }).child(repo.name()))
+                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_color(theme::fg_muted()).child(rel))
+                    .child(div().flex_none().flex().items_center().gap(px(3.)).text_color(theme::fg_dim()).child(ui::small_icon("git", theme::fg_dim()).size(px(11.))).child(repo.branch_label()))
+                    .when(changes > 0, |d| d.child(ui::badge(changes.to_string(), theme::accent()).text_size(px(10.)).h(px(16.)).min_w(px(16.))))
+            }))
     }
 
     #[cfg(test)]
@@ -860,7 +1001,7 @@ impl GitPanel {
         let repo = self.repo.read(cx);
         let (all, only) = (repo.graph_all, repo.graph_only.clone());
         let auto = !all && only.is_empty();
-        let top = self.panel_bounds.get().size.height / px(1.) * if self.changes_open && self.graph_open { self.split } else { 0. } + 60.;
+        let top = self.panel_bounds.get().size.height / px(1.) * if self.changes_open && self.graph_open { self.split } else { 0. } + self.head_h() + 25.;
         let option = |id: &'static str, label: &str, on: bool| {
             div()
                 .id(id)
@@ -1511,7 +1652,8 @@ impl Render for GitPanel {
                     let b = p.panel_bounds.get();
                     let h = b.size.height / px(1.);
                     if h > 0. {
-                        p.split = (((ev.position.y - b.top()) / px(1.) - 35.) / (h - 35.)).clamp(0.12, 0.88);
+                        let head = p.head_h();
+                        p.split = (((ev.position.y - b.top()) / px(1.) - head) / (h - head)).clamp(0.12, 0.88);
                         cx.notify();
                     }
                 }
@@ -1541,6 +1683,8 @@ impl Render for GitPanel {
                         cx.notify();
                     }))),
             )
+            .when(self.repos.len() > 1, |d| d.child(self.render_repo_picker(cx)))
+            .when(self.repo_menu && self.repos.len() > 1, |d| d.child(deferred(self.render_repo_menu(cx)).with_priority(2)))
             .child(
                 div()
                     .flex()
@@ -1595,6 +1739,19 @@ impl Render for GitPanel {
                     }),
             )
     }
+}
+
+/// The folder all these paths sit in (to show each repository by where it is).
+fn common_parent(paths: impl Iterator<Item = std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    let mut common: Option<std::path::PathBuf> = None;
+    for p in paths {
+        let parent = p.parent().map(|x| x.to_path_buf()).unwrap_or(p);
+        common = Some(match common {
+            None => parent,
+            Some(c) => c.ancestors().find(|a| parent.starts_with(a)).map(|a| a.to_path_buf()).unwrap_or_default(),
+        });
+    }
+    common
 }
 
 #[cfg(test)]

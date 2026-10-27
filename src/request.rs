@@ -41,6 +41,12 @@ pub enum Request {
     Ask(crate::dialog::Ask),
     /// A terminal in this folder.
     OpenTerminal(PathBuf),
+    /// Show this repository in the Source Control panel.
+    SelectRepo(PathBuf),
+    /// Pick a folder to add to the workspace.
+    AddFolder,
+    /// Take this added folder out of the workspace.
+    RemoveFolder(PathBuf),
     Message(String),
     Error(String),
 }
