@@ -47,6 +47,56 @@ enum ListRow {
     File { staged: bool, change: Change, depth: usize },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiscardWhat {
+    All,
+    TrackedOnly,
+}
+
+struct DiscardPrompt {
+    message: String,
+    detail: String,
+    /// Buttons besides Cancel; the last one is the default.
+    buttons: Vec<(String, DiscardWhat)>,
+}
+
+/// The confirmation VS Code shows for discarding, for tracked and/or untracked files.
+fn discard_prompt(tracked: &[String], untracked: &[String]) -> Option<DiscardPrompt> {
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let name = |p: &String| format!("'{}'", ui::file_name(p));
+    const LOST: &str = "This is IRREVERSIBLE!\nYour current working set will be FOREVER LOST if you proceed.";
+    let discard_q = match tracked {
+        [one] => format!("Are you sure you want to discard changes in {}?", name(one)),
+        many => format!("Are you sure you want to discard ALL changes in {} files?", many.len()),
+    };
+    let delete_q = match untracked {
+        [one] => format!("Are you sure you want to DELETE {}?", name(one)),
+        many => format!("Are you sure you want to DELETE the {} untracked files?", many.len()),
+    };
+    let trash_note = if untracked.len() == 1 { "You can restore this file from the Trash." } else { "You can restore these files from the Trash." };
+    match (tracked.len(), untracked.len()) {
+        (0, 0) => None,
+        (t, 0) => Some(DiscardPrompt {
+            message: discard_q,
+            detail: LOST.into(),
+            buttons: vec![(if t == 1 { "Discard File".into() } else { format!("Discard {t} Files") }, DiscardWhat::All)],
+        }),
+        (0, u) => Some(DiscardPrompt {
+            message: delete_q,
+            detail: trash_note.into(),
+            buttons: vec![(if u == 1 { "Move to Trash".into() } else { format!("Move {u} Files to Trash") }, DiscardWhat::All)],
+        }),
+        (t, u) => Some(DiscardPrompt {
+            message: format!("Are you sure you want to DELETE the {u} untracked file{}? {trash_note}", plural(u)),
+            detail: format!("{discard_q}\n\n{LOST}"),
+            buttons: vec![
+                (format!("Discard All {} Files", t + u), DiscardWhat::All),
+                (format!("Discard {t} Tracked File{}", plural(t)), DiscardWhat::TrackedOnly),
+            ],
+        }),
+    }
+}
+
 /// Folder of the changes tree.
 #[derive(Default)]
 struct Node {
@@ -349,9 +399,46 @@ impl GitPanel {
         self.repo.update(cx, |repo, cx| repo.run_op("Unstage", cx, move |root| git::unstage(root, &paths, initial).map(|_| String::new())));
     }
 
-    fn ask_discard(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
-        // Confirmation happens on the command line: press Enter to run it.
-        cx.emit(Request::CommandLine(format!("discard {}", paths.join(" "))));
+    /// Asks like VS Code before discarding: tracked changes are lost for good, untracked
+    /// files go to the Trash. With both, you can discard everything or only the tracked ones.
+    pub(crate) fn ask_discard(&mut self, paths: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let st = self.repo.read(cx).status.clone();
+        let is_untracked = |p: &String| st.unstaged.iter().any(|c| &c.path == p && c.status == FileStatus::Untracked);
+        let (untracked, tracked): (Vec<String>, Vec<String>) = paths.into_iter().partition(is_untracked);
+        let Some(ask) = discard_prompt(&tracked, &untracked) else { return };
+        let answers: Vec<PromptButton> = ask
+            .buttons
+            .iter()
+            .map(|(label, _)| PromptButton::new(label.clone()))
+            .chain(std::iter::once(PromptButton::Cancel("Cancel".into())))
+            .collect();
+        let choice = window.prompt(PromptLevel::Warning, &ask.message, Some(&ask.detail), &answers, cx);
+        let buttons = ask.buttons;
+        cx.spawn(async move |this, cx| {
+            let Ok(ix) = choice.await else { return };
+            let Some((_, what)) = buttons.get(ix).cloned() else { return };
+            this.update(cx, |panel, cx| {
+                let untracked = if what == DiscardWhat::TrackedOnly { Vec::new() } else { untracked };
+                panel.run_discard(tracked, untracked, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn run_discard(&mut self, tracked: Vec<String>, untracked: Vec<String>, cx: &mut Context<Self>) {
+        let n = tracked.len() + untracked.len();
+        self.repo.update(cx, |repo, cx| {
+            repo.run_op("Discard", cx, move |root| {
+                if !tracked.is_empty() {
+                    git::discard(root, &tracked)?;
+                }
+                for p in &untracked {
+                    trash::delete(root.join(p)).map_err(|e| anyhow::anyhow!("couldn't move {p} to the Trash: {e}"))?;
+                }
+                Ok(format!("Discarded {n} file{}", if n == 1 { "" } else { "s" }))
+            })
+        });
     }
 
     fn open_change(&self, staged: bool, change: &Change, preview: bool, cx: &mut Context<Self>) {
@@ -470,9 +557,9 @@ impl GitPanel {
         }
     }
 
-    fn discard(&mut self, _: &Discard, _: &mut Window, cx: &mut Context<Self>) {
+    fn discard(&mut self, _: &Discard, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(Item::File { staged: false, path }) = self.selected.clone() {
-            self.ask_discard(vec![path], cx);
+            self.ask_discard(vec![path], window, cx);
         }
     }
 
@@ -512,8 +599,8 @@ impl GitPanel {
                 self.unstage(paths, cx)
             }
             6 => {
-                let tracked: Vec<String> = st.unstaged.iter().filter(|c| c.status != FileStatus::Untracked).map(|c| c.path.clone()).collect();
-                self.ask_discard(tracked, cx)
+                let all: Vec<String> = st.unstaged.iter().map(|c| c.path.clone()).collect();
+                self.ask_discard(all, window, cx)
             }
             7 => {
                 self.amend = !self.amend;
@@ -855,10 +942,8 @@ impl GitPanel {
                     let st = &self.repo.read(cx).status;
                     (if staged { &st.staged } else { &st.unstaged }).iter().map(|c| c.path.clone()).collect()
                 };
-                let tracked: Vec<String> = {
-                    let st = &self.repo.read(cx).status;
-                    st.unstaged.iter().filter(|c| c.status != FileStatus::Untracked).map(|c| c.path.clone()).collect()
-                };
+                // Discard-all covers untracked files too (the dialog asks about them).
+                let all: Vec<String> = self.repo.read(cx).status.unstaged.iter().map(|c| c.path.clone()).collect();
                 let actions = div().flex().gap(px(2.)).invisible().group_hover("section", |s| s.visible());
                 let actions = if staged {
                     let p = paths.clone();
@@ -869,9 +954,9 @@ impl GitPanel {
                 } else {
                     let p = paths.clone();
                     actions
-                        .child(ui::icon_button(("discard-all", ix), "discard").on_click(cx.listener(move |panel, _, _, cx| {
+                        .child(ui::icon_button(("discard-all", ix), "discard").on_click(cx.listener(move |panel, _, window, cx| {
                             cx.stop_propagation();
-                            panel.ask_discard(tracked.clone(), cx);
+                            panel.ask_discard(all.clone(), window, cx);
                         })))
                         .child(ui::icon_button(("stage-all", ix), "plus").on_click(cx.listener(move |panel, _, _, cx| {
                             cx.stop_propagation();
@@ -998,10 +1083,10 @@ impl GitPanel {
                                 cx.stop_propagation();
                                 cx.emit(Request::OpenFile { path: path_open.clone(), line: None, preview: false });
                             })))
-                            .when(!staged && !untracked, |d| {
-                                d.child(ui::icon_button(("discard", ix), "discard").on_click(cx.listener(move |panel, _, _, cx| {
+                            .when(!staged, |d| {
+                                d.child(ui::icon_button(("discard", ix), "discard").on_click(cx.listener(move |panel, _, window, cx| {
                                     cx.stop_propagation();
-                                    panel.ask_discard(vec![c2.path.clone()], cx);
+                                    panel.ask_discard(vec![c2.path.clone()], window, cx);
                                 })))
                             })
                             .child(ui::icon_button(("stage", ix), if staged { "minus" } else { "plus" }).on_click(cx.listener(move |panel, _, _, cx| {
@@ -1458,6 +1543,23 @@ mod tree_tests {
                 ListRow::Section { .. } => String::new(),
             })
             .collect()
+    }
+
+    #[test]
+    fn discard_prompt_wording() {
+        use super::{DiscardWhat, discard_prompt};
+        let t = vec!["docs/sprint-new-features3.md".to_string()];
+        let u = vec!["a.txt".to_string(), "b.txt".to_string()];
+        let both = discard_prompt(&t, &u).unwrap();
+        assert_eq!(both.message, "Are you sure you want to DELETE the 2 untracked files? You can restore these files from the Trash.");
+        assert!(both.detail.starts_with("Are you sure you want to discard changes in 'sprint-new-features3.md'?"));
+        assert_eq!(both.buttons, vec![("Discard All 3 Files".into(), DiscardWhat::All), ("Discard 1 Tracked File".into(), DiscardWhat::TrackedOnly)]);
+        let only_u = discard_prompt(&[], &u[..1]).unwrap();
+        assert_eq!(only_u.message, "Are you sure you want to DELETE 'a.txt'?");
+        assert_eq!(only_u.buttons[0].0, "Move to Trash");
+        let only_t = discard_prompt(&t, &[]).unwrap();
+        assert_eq!(only_t.buttons[0].0, "Discard File");
+        assert!(discard_prompt(&[], &[]).is_none());
     }
 
     #[test]

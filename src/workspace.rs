@@ -4209,6 +4209,27 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn discard_asks_and_can_keep_untracked_files(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            sh("echo one > notes.md && git add . && git commit -qm base && echo changed > notes.md && echo new > a.txt && echo new > b.txt");
+        });
+        cx.run_until_parked();
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let all: Vec<String> = ws.read_with(cx, |ws, cx| ws.repo.read(cx).status.unstaged.iter().map(|c| c.path.clone()).collect());
+        assert_eq!(all.len(), 3);
+        ws.update_in(cx, |ws, window, cx| ws.git_panel.update(cx, |p, cx| p.ask_discard(all, window, cx)));
+        assert!(cx.has_pending_prompt(), "asks first");
+        cx.simulate_prompt_answer("Discard 1 Tracked File");
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(root.join("notes.md")).unwrap(), "one\n", "tracked change discarded");
+        assert!(root.join("a.txt").exists() && root.join("b.txt").exists(), "untracked files kept");
+    }
+
+    #[gpui::test]
     fn merge_editor_checkboxes_and_accept(cx: &mut TestAppContext) {
         let (ws, cx) = setup_with(cx, merge_in_conflict);
         cx.run_until_parked();

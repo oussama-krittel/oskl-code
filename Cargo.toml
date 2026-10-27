@@ -15,6 +15,7 @@ ropey = "1.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 similar = "2"
+trash = "5"
 tree-sitter = "0.27"
 tree-sitter-bash = "0.25.1"
 tree-sitter-css = "0.25.0"
