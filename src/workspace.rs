@@ -4404,6 +4404,26 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn cmd_d_wraps_to_the_top_then_stops(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("wrap.txt");
+        std::fs::write(&file, "foo\nfoo\nfoo\nfoo\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file, None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).expect("editor open");
+        ed.update(cx, |e, _| e.buf.sel = crate::buffer::Sel::at(9));
+        let sels = |cx: &mut gpui::VisualTestContext| ed.read_with(cx, |e, _| (e.buf.sel.range(), e.buf.extra.len()));
+        cx.simulate_keystrokes("cmd-d cmd-d");
+        assert_eq!(sels(cx), (12..15, 1), "goes down to the last one");
+        cx.simulate_keystrokes("cmd-d");
+        assert_eq!(sels(cx), (0..3, 2), "then wraps to the first");
+        cx.simulate_keystrokes("cmd-d");
+        assert_eq!(sels(cx), (4..7, 3));
+        cx.simulate_keystrokes("cmd-d cmd-d");
+        assert_eq!(sels(cx), (4..7, 3), "back at the start: nothing more to add");
+    }
+
+    #[gpui::test]
     fn folding_skips_hidden_lines_and_brackets_autoclose(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("fold.rs");
