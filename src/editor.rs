@@ -4,6 +4,7 @@
 use crate::buffer::{Buffer, RowChange, Sel};
 use crate::git::{self, BlameCommit};
 use crate::highlight::{self, Lang, LineSpans};
+use crate::complete::{self, Ctx, Flavor, Item, Kind};
 use crate::{theme, tools, util};
 use gpui::prelude::*;
 use gpui::*;
@@ -285,6 +286,14 @@ struct Layout {
     scrollbar: Option<ScrollbarGeom>,
 }
 
+pub struct Completion {
+    pub ctx: Ctx,
+    pub items: Vec<Item>,
+    /// Indices into `items` that match what's typed, best first.
+    pub shown: Vec<usize>,
+    pub sel: usize,
+}
+
 pub struct Editor {
     focus: FocusHandle,
     pub buf: Buffer,
@@ -299,6 +308,8 @@ pub struct Editor {
     /// Where a ⌘D run started (the first selection and the scroll), to come back to once
     /// every occurrence is selected.
     occurrence_origin: Option<(Range<usize>, f32)>,
+    /// The suggestion list under the cursor (tags, attributes, words, import paths).
+    pub completion: Option<Completion>,
     layout: Option<Layout>,
     drag: Option<DragMode>,
     scroll_drag: Option<f32>,
@@ -360,6 +371,7 @@ impl Editor {
             scroll_y: 0.,
             autoscroll: None,
             occurrence_origin: None,
+            completion: None,
             layout: None,
             drag: None,
             scroll_drag: None,
@@ -969,10 +981,154 @@ impl Editor {
         }
     }
 
+    // ------------------------------------------------------------ completion
+
+    fn flavor(&self) -> Option<Flavor> {
+        if self.mode != EditorMode::Full {
+            return None;
+        }
+        complete::flavor(self.lang.or_else(|| self.path.as_deref().and_then(highlight::detect)))
+    }
+
+    /// After a character typed at a single cursor: close tags, then update the suggestions.
+    fn after_type(&mut self, text: &str) {
+        let Some(fl) = self.flavor() else { return };
+        if !self.buf.extra.is_empty() || !self.buf.sel.is_empty() {
+            return;
+        }
+        let pos = self.buf.sel.head;
+        let edit = crate::buffer::EditKind::Other;
+        match text {
+            ">" => {
+                if let Some(close) = complete::close_tag_after_gt(&self.buf, pos, fl) {
+                    self.buf.replace(pos..pos, &close, Some(Sel::at(pos)), edit);
+                }
+            }
+            "/" => {
+                if let Some(rest) = complete::close_tag_after_slash(&self.buf, pos, fl) {
+                    let existing = format!("</{}>", rest.trim_end_matches('>'));
+                    let end = (pos + existing.chars().count()).min(self.buf.len());
+                    if self.buf.slice(pos..end) == existing {
+                        // The closing tag `>` already added is right here: step over it instead.
+                        self.buf.replace(pos - 2..pos, "", Some(Sel::at(end - 2)), edit);
+                    } else {
+                        let n = rest.chars().count() + usize::from(!rest.ends_with('>'));
+                        self.buf.replace(pos..pos, &rest, Some(Sel::at(pos + n)), edit);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.refresh_completion(true);
+    }
+
+    /// Recomputes the suggestion list for the cursor. A new list only opens while typing;
+    /// otherwise (backspace) the open one is refiltered or closed.
+    fn refresh_completion(&mut self, typed: bool) {
+        let old = self.completion.take();
+        let Some(fl) = self.flavor() else { return };
+        if !self.buf.extra.is_empty() || !self.buf.sel.is_empty() {
+            return;
+        }
+        let Some(ctx) = complete::context(&self.buf, self.buf.sel.head, fl) else { return };
+        let items = match old {
+            Some(c) if c.ctx.same_source(&ctx) => c.items,
+            _ if typed => complete::candidates(&self.buf, &ctx, fl, self.path.as_deref(), self.root.as_deref()),
+            _ => return,
+        };
+        let shown = complete::filter(&items, ctx.prefix(), 60);
+        if !shown.is_empty() {
+            self.completion = Some(Completion { ctx, items, shown, sel: 0 });
+        }
+    }
+
+    pub fn accept_completion(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.completion.take() else { return };
+        let item = c.items[c.shown[c.sel]].clone();
+        let head = self.buf.sel.head;
+        let start = head.saturating_sub(c.ctx.prefix().chars().count());
+        let text = format!("{}{}", item.label, item.suffix);
+        let cursor = start + text.chars().count() - item.back;
+        self.buf.replace(start..head, &text, Some(Sel::at(cursor)), crate::buffer::EditKind::Other);
+        self.after_edit(cx);
+        // Into a folder: keep listing what's inside.
+        if item.kind == Kind::Folder {
+            self.refresh_completion(true);
+        }
+    }
+
+    fn completion_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        const ROWS: usize = 10;
+        let c = self.completion.as_ref()?;
+        let l = self.layout.as_ref()?;
+        let (row, col) = self.buf.pos_to_rc(self.buf.sel.head);
+        let col = col.saturating_sub(c.ctx.prefix().chars().count());
+        let st = self.seg_starts(row);
+        let k = seg_index(st, col);
+        let x = l.text_left - self.scroll_x + (self.buf.display_col(row, col) - self.buf.display_col(row, st[k])) as f32 * l.char_w;
+        let y = l.bounds.top() / px(1.) + l.pad_top + (self.disp_of(row) + k + 1) as f32 * l.line_h - self.scroll_y;
+        let first = (c.sel + 1).saturating_sub(ROWS);
+        let rows = c.shown.iter().enumerate().skip(first).take(ROWS).map(|(i, &ix)| {
+            let it = &c.items[ix];
+            let color = match it.kind {
+                Kind::Tag | Kind::Component => theme::accent(),
+                Kind::Attr => theme::git_modified(),
+                Kind::Type => theme::git_added(),
+                Kind::Keyword => theme::c(0xc678dd),
+                Kind::Folder | Kind::File => theme::fg_dim(),
+                Kind::Word => theme::fg_muted(),
+            };
+            div()
+                .id(i)
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .px(px(6.))
+                .h(px(20.))
+                .cursor_pointer()
+                .when(i == c.sel, |d| d.bg(theme::selected_focused()).text_color(theme::fg_bright()))
+                .child(div().w(px(16.)).flex_none().text_color(color).child(it.kind.glyph()))
+                .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(it.label.clone()))
+                .child(div().flex_none().text_color(theme::fg_muted()).child(it.kind.label()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |ed, _, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(c) = &mut ed.completion {
+                            c.sel = i;
+                        }
+                        ed.accept_completion(cx);
+                    }),
+                )
+        });
+        Some(
+            deferred(
+                anchored().position(point(px(x), px(y))).snap_to_window().child(
+                    div()
+                        .id("completion")
+                        .w(px(320.))
+                        .py(px(2.))
+                        .bg(theme::bg_popup())
+                        .border_1()
+                        .border_color(theme::border_input())
+                        .rounded(px(4.))
+                        .shadow_md()
+                        .font_family(theme::MONO_FONT)
+                        .text_size(px(12.))
+                        .text_color(theme::fg())
+                        .children(rows),
+                ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
     // ------------------------------------------------------------ edit plumbing
 
     fn after_move(&mut self, cx: &mut Context<Self>) {
         self.marked = None;
+        self.completion = None;
         self.autoscroll = Some(false);
         cx.notify();
     }
@@ -1106,12 +1262,20 @@ impl Editor {
     }
 
     fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(c) = &mut self.completion {
+            c.sel = c.sel.checked_sub(1).unwrap_or(c.shown.len() - 1);
+            return cx.notify();
+        }
         if self.mode == EditorMode::SingleLine {
             return cx.emit(EditorEvent::Up);
         }
         self.vertical(-1, false, cx)
     }
     fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(c) = &mut self.completion {
+            c.sel = (c.sel + 1) % c.shown.len();
+            return cx.notify();
+        }
         if self.mode == EditorMode::SingleLine {
             return cx.emit(EditorEvent::Down);
         }
@@ -1149,7 +1313,12 @@ impl Editor {
     fn select_page_up(&mut self, _: &SelectPageUp, _: &mut Window, cx: &mut Context<Self>) { let n = self.page_rows(); self.motion(cx, |b| b.move_vertical(-n, true)) }
     fn select_page_down(&mut self, _: &SelectPageDown, _: &mut Window, cx: &mut Context<Self>) { let n = self.page_rows(); self.motion(cx, |b| b.move_vertical(n, true)) }
 
-    fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| b.backspace()) }
+    fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        self.edit(cx, |b| b.backspace());
+        if self.completion.is_some() {
+            self.refresh_completion(false);
+        }
+    }
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| b.delete_forward()) }
     fn delete_word_left(&mut self, _: &DeleteWordLeft, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| b.delete_word(false)) }
     fn delete_word_right(&mut self, _: &DeleteWordRight, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| b.delete_word(true)) }
@@ -1165,6 +1334,9 @@ impl Editor {
     }
 
     fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
+        if self.completion.is_some() {
+            return self.accept_completion(cx);
+        }
         match self.mode {
             EditorMode::SingleLine => cx.emit(EditorEvent::Submit),
             _ => self.edit(cx, |b| b.newline()),
@@ -1182,6 +1354,9 @@ impl Editor {
         }
     }
     fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.completion.is_some() {
+            return self.accept_completion(cx);
+        }
         match self.mode {
             EditorMode::SingleLine => cx.emit(EditorEvent::Tab),
             _ => self.edit_rows(cx, |b| b.indent_lines(false)),
@@ -1263,6 +1438,9 @@ impl Editor {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
+        if self.completion.take().is_some() {
+            return cx.notify();
+        }
         if !self.buf.extra.is_empty() {
             self.buf.single_cursor();
             return cx.notify();
@@ -1338,6 +1516,7 @@ impl Editor {
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
+        self.completion = None;
         if let Some((_, ix, action)) = self.conflict_hits.iter().find(|(b, _, _)| b.contains(&ev.position)).cloned() {
             return self.resolve_conflict(ix, action, cx);
         }
@@ -2423,6 +2602,7 @@ impl EntityInputHandler for Editor {
         self.buf.sel = Sel { anchor: range.start, head: range.end };
         if code {
             self.buf.type_char(&text);
+            self.after_type(&text);
         } else {
             self.buf.insert(&text);
         }
@@ -2656,6 +2836,7 @@ impl Render for Editor {
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .child(EditorElement { editor: cx.entity() })
+            .children(self.completion_popup(cx))
     }
 }
 

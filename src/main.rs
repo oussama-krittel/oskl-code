@@ -1,6 +1,7 @@
 mod assets;
 mod buffer;
 mod commit_view;
+mod complete;
 mod datafiles;
 mod diagnostics;
 mod diff_edit;

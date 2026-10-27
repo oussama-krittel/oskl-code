@@ -4426,6 +4426,49 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn jsx_tags_close_and_suggestions_complete(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::create_dir_all(root.join("components")).unwrap();
+        std::fs::write(root.join("components/Card.tsx"), "").unwrap();
+        let file = root.join("app.tsx");
+        std::fs::write(&file, "import { View } from \"react-native\";\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file, None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).expect("editor open");
+        let text = |cx: &mut gpui::VisualTestContext| ed.read_with(cx, |e, _| e.buf.text());
+        let first = |cx: &mut gpui::VisualTestContext| ed.read_with(cx, |e, _| e.completion.as_ref().map(|c| c.items[c.shown[c.sel]].label.clone()));
+        ed.update(cx, |e, _| e.buf.sel = crate::buffer::Sel::at(e.buf.len()));
+
+        cx.simulate_input("<Vi");
+        assert_eq!(first(cx).as_deref(), Some("View"), "components from the file and React Native");
+        cx.simulate_keystrokes("tab");
+        cx.simulate_input(" sty");
+        assert_eq!(first(cx).as_deref(), Some("style"));
+        cx.simulate_keystrokes("enter");
+        assert!(text(cx).ends_with("<View style={}"), "props that take code get braces: {:?}", text(cx));
+        cx.simulate_input("s}>");
+        assert!(text(cx).ends_with("<View style={s}></View>"), "> closes the tag: {:?}", text(cx));
+        cx.simulate_keystrokes("enter");
+        assert!(text(cx).ends_with("<View style={s}>\n  \n</View>"), "Enter opens the pair: {:?}", text(cx));
+        cx.simulate_input("<Text>hi</");
+        assert!(text(cx).ends_with("<Text>hi</Text>\n</View>"), "</ steps over the tag > added: {:?}", text(cx));
+        cx.simulate_input("<Text>");
+        cx.simulate_keystrokes("right right right right right right right");
+        cx.simulate_input("x</");
+        assert!(text(cx).ends_with("<Text>hi</Text><Text></Text>x</View>\n</View>"), "</ finishes the innermost open tag: {:?}", text(cx));
+        cx.simulate_keystrokes("escape");
+
+        ed.update(cx, |e, _| e.buf.sel = crate::buffer::Sel::at(0));
+        cx.simulate_input("import Card from './co");
+        assert_eq!(first(cx).as_deref(), Some("components"));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(first(cx).as_deref(), Some("Card"), "a folder opens straight into its files");
+        cx.simulate_keystrokes("enter");
+        assert!(text(cx).starts_with("import Card from './components/Cardimport"), "{:?}", text(cx));
+    }
+
+    #[gpui::test]
     fn folding_skips_hidden_lines_and_brackets_autoclose(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("fold.rs");

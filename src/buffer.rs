@@ -928,8 +928,10 @@ impl Buffer {
         let indent: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').take(col).collect();
         let before = self.char_at(r.start.wrapping_sub(1)).filter(|_| r.start > 0);
         let after = self.char_at(r.end);
-        let opens = matches!(before, Some('{' | '[' | '('));
-        let closes = matches!((before, after), (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')')));
+        // `<div>|</div>` opens up like a bracket pair.
+        let tags = before == Some('>') && after == Some('<') && self.char_at(r.end + 1) == Some('/');
+        let opens = tags || matches!(before, Some('{' | '[' | '('));
+        let closes = tags || matches!((before, after), (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')')));
         if opens {
             let inner = format!("{indent}{}", self.indent);
             if closes {
