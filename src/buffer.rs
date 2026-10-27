@@ -1,4 +1,4 @@
-//! Text buffer: a rope plus one selection, undo/redo and all cursor motions.
+//! Text buffer: a rope plus a main selection (and extra cursors), undo/redo and all cursor motions.
 //! Positions are char indices into the rope.
 
 use ropey::Rope;
@@ -77,6 +77,12 @@ fn class(c: char) -> CharClass {
 pub struct Buffer {
     pub rope: Rope,
     pub sel: Sel,
+    /// Extra cursors (multi-cursor), besides the main `sel`. Never overlapping.
+    pub extra: Vec<Sel>,
+    /// ⌘D started on an empty selection: next occurrences must be whole words.
+    pub occurrence_word: bool,
+    /// Inside `each_cursor`: every edit gets its own undo entry, grouped afterwards.
+    grouping: bool,
     pub goal_col: Option<usize>,
     version: u64,
     saved_version: u64,
@@ -96,6 +102,9 @@ impl Buffer {
         Self {
             rope: Rope::from_str(&text),
             sel: Sel::default(),
+            extra: Vec::new(),
+            occurrence_word: false,
+            grouping: false,
             goal_col: None,
             version: 0,
             saved_version: 0,
@@ -140,6 +149,7 @@ impl Buffer {
         if text == self.text() {
             return;
         }
+        self.extra.clear();
         let (row, col) = self.pos_to_rc(self.sel.head);
         if undoable {
             let len = self.len();
@@ -279,6 +289,7 @@ impl Buffer {
         let edit = Edit { at: range.start, old, new: text.to_string() };
         let now = Instant::now();
         if let Some(last) = self.undo.last_mut()
+            && !self.grouping
             && kind != EditKind::Other
             && last.kind == kind
             && last.after == before
@@ -297,6 +308,7 @@ impl Buffer {
     }
 
     pub fn undo(&mut self) -> bool {
+        self.extra.clear();
         let Some(txn) = self.undo.pop() else { return false };
         for e in txn.edits.iter().rev() {
             let n = e.new.chars().count();
@@ -313,6 +325,7 @@ impl Buffer {
     }
 
     pub fn redo(&mut self) -> bool {
+        self.extra.clear();
         let Some(txn) = self.redo.pop() else { return false };
         for e in &txn.edits {
             let n = e.old.chars().count();
@@ -326,6 +339,220 @@ impl Buffer {
         self.version += 1;
         self.undo.push(txn);
         true
+    }
+
+    // ------------------------------------------------------------ multi-cursor
+
+    /// Main selection and extra cursors, sorted by position.
+    pub fn all_sels(&self) -> Vec<Sel> {
+        let mut all: Vec<Sel> = std::iter::once(self.sel).chain(self.extra.iter().copied()).collect();
+        all.sort_by_key(|s| s.range().start);
+        all
+    }
+
+    /// Runs a single-cursor operation once per cursor, last cursor first so earlier positions
+    /// stay valid, and makes the whole thing one undo step. With `rows`, cursors sharing a row
+    /// with one already handled are skipped (line operations like comment or indent).
+    pub fn each_cursor(&mut self, rows: bool, mut f: impl FnMut(&mut Buffer)) {
+        if self.extra.is_empty() {
+            return f(self);
+        }
+        let mut all: Vec<(Sel, bool)> = std::iter::once((self.sel, true)).chain(self.extra.iter().map(|s| (*s, false))).collect();
+        all.sort_by_key(|(s, _)| std::cmp::Reverse(s.range().start));
+        let before = self.sel;
+        let undo_len = self.undo.len();
+        let goal = self.goal_col;
+        let mut done: Vec<(Sel, bool)> = Vec::with_capacity(all.len());
+        let mut handled_rows: Vec<(usize, usize)> = Vec::new();
+        self.grouping = true;
+        for (s, primary) in all {
+            self.sel = s;
+            if rows {
+                let span = self.selected_rows();
+                if handled_rows.iter().any(|(a, b)| span.0 <= *b && *a <= span.1) {
+                    continue;
+                }
+                handled_rows.push(span);
+            }
+            self.goal_col = if primary { goal } else { None };
+            let len0 = self.len() as isize;
+            f(self);
+            let delta = self.len() as isize - len0;
+            if delta != 0 {
+                // The edit happened before every cursor handled so far: shift them.
+                let shift = |p: usize| (p as isize + delta).max(0) as usize;
+                for (d, _) in done.iter_mut() {
+                    *d = Sel { anchor: shift(d.anchor), head: shift(d.head) };
+                }
+            }
+            done.push((self.sel, primary));
+        }
+        self.grouping = false;
+        let primary_goal = self.goal_col;
+        self.sel = done.iter().find(|(_, p)| *p).map(|(s, _)| *s).unwrap_or(before);
+        self.extra = done.iter().filter(|(_, p)| !*p).map(|(s, _)| *s).collect();
+        self.goal_col = primary_goal.or(goal);
+        self.merge_cursors();
+        if self.undo.len() > undo_len {
+            // One undo step for all cursors.
+            let txns: Vec<Txn> = self.undo.drain(undo_len..).collect();
+            let kind = if txns.iter().all(|t| t.kind == txns[0].kind) { txns[0].kind } else { EditKind::Other };
+            let edits: Vec<Edit> = txns.into_iter().flat_map(|t| t.edits).collect();
+            let now = Instant::now();
+            // Keep typing at several cursors in one undo step, like with one cursor.
+            if let Some(last) = self.undo.last_mut()
+                && kind != EditKind::Other
+                && last.kind == kind
+                && last.after == before
+                && now.duration_since(last.time) < Duration::from_millis(1000)
+            {
+                last.edits.extend(edits);
+                last.after = self.sel;
+                last.time = now;
+            } else {
+                self.undo.push(Txn { edits, before, after: self.sel, kind, time: now });
+            }
+        }
+    }
+
+    /// Drops cursors that ended up overlapping (or on the same spot) after a motion or edit.
+    pub fn merge_cursors(&mut self) {
+        let len = self.len();
+        let clamp = |s: Sel| Sel { anchor: s.anchor.min(len), head: s.head.min(len) };
+        let mut all: Vec<(Sel, bool)> = self.extra.iter().map(|s| (clamp(*s), false)).chain(std::iter::once((clamp(self.sel), true))).collect();
+        all.sort_by_key(|(s, _)| (s.range().start, s.range().end));
+        let mut out: Vec<(Sel, bool)> = Vec::with_capacity(all.len());
+        for (s, primary) in all {
+            if let Some((last, last_primary)) = out.last_mut() {
+                let (lr, r) = (last.range(), s.range());
+                if r.start < lr.end || r == lr {
+                    let m = lr.start..lr.end.max(r.end);
+                    let forward = if primary { s.anchor <= s.head } else { last.anchor <= last.head };
+                    *last = if forward { Sel { anchor: m.start, head: m.end } } else { Sel { anchor: m.end, head: m.start } };
+                    *last_primary |= primary;
+                    continue;
+                }
+            }
+            out.push((s, primary));
+        }
+        let ix = out.iter().position(|(_, p)| *p).unwrap_or(0);
+        self.sel = out.remove(ix).0;
+        self.extra = out.into_iter().map(|(s, _)| s).collect();
+    }
+
+    /// Collapses to the main cursor.
+    pub fn single_cursor(&mut self) {
+        self.extra.clear();
+    }
+
+    /// Adds a cursor at `pos`, or removes the one already there (⌥-click).
+    pub fn toggle_cursor(&mut self, pos: usize) {
+        if let Some(i) = self.extra.iter().position(|s| s.range().contains(&pos) || s.head == pos) {
+            self.extra.remove(i);
+            return;
+        }
+        if self.sel.head == pos && self.sel.is_empty() && !self.extra.is_empty() {
+            self.sel = self.extra.pop().unwrap();
+            return;
+        }
+        self.extra.push(self.sel);
+        self.sel = Sel::at(pos);
+        self.merge_cursors();
+    }
+
+    fn occurrences(&self, needle: &str, whole_word: bool) -> Vec<Range<usize>> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let text = self.text();
+        let n = needle.chars().count();
+        let mut out = Vec::new();
+        let mut char_ix = 0;
+        let mut last_byte = 0;
+        for (b, _) in text.match_indices(needle) {
+            char_ix += text[last_byte..b].chars().count();
+            last_byte = b;
+            let r = char_ix..char_ix + n;
+            let is_word = |p: Option<char>| p.is_some_and(|c| class(c) == CharClass::Word);
+            if whole_word && (is_word(r.start.checked_sub(1).and_then(|p| self.char_at(p))) || is_word(self.char_at(r.end))) {
+                continue;
+            }
+            out.push(r);
+        }
+        out
+    }
+
+    /// ⌘D: selects the word under the cursor, then each next occurrence of the selection.
+    /// Returns false when every occurrence is already selected.
+    pub fn select_next_occurrence(&mut self) -> bool {
+        if self.sel.is_empty() && self.extra.is_empty() {
+            let r = self.word_range_at(self.sel.head);
+            if r.is_empty() {
+                return false;
+            }
+            self.sel = Sel { anchor: r.start, head: r.end };
+            self.occurrence_word = true;
+            return true;
+        }
+        if self.sel.is_empty() {
+            return false;
+        }
+        if self.extra.is_empty() && !self.occurrence_word_matches() {
+            self.occurrence_word = false;
+        }
+        let needle = self.slice(self.sel.range());
+        let found = self.occurrences(&needle, self.occurrence_word);
+        let taken = self.all_sels();
+        let after = self.sel.range().end;
+        let free = |r: &Range<usize>| !taken.iter().any(|s| s.range() == *r);
+        let next = found.iter().find(|r| r.start >= after && free(r)).or_else(|| found.iter().find(|r| free(r)));
+        let Some(r) = next.cloned() else { return false };
+        self.extra.push(self.sel);
+        self.sel = Sel { anchor: r.start, head: r.end };
+        true
+    }
+
+    /// The single selection is exactly a whole word (so ⌘D keeps matching whole words).
+    fn occurrence_word_matches(&self) -> bool {
+        self.occurrence_word && self.word_range_at(self.sel.range().start) == self.sel.range()
+    }
+
+    /// ⌘⇧L: a cursor on every occurrence of the selection (or of the word under the cursor).
+    pub fn select_all_occurrences(&mut self) {
+        let mut whole = false;
+        if self.sel.is_empty() {
+            let r = self.word_range_at(self.sel.head);
+            if r.is_empty() {
+                return;
+            }
+            self.sel = Sel { anchor: r.start, head: r.end };
+            whole = true;
+        }
+        let needle = self.slice(self.sel.range());
+        let found = self.occurrences(&needle, whole);
+        let main = self.sel.range();
+        self.extra = found.iter().filter(|r| **r != main).map(|r| Sel { anchor: r.start, head: r.end }).collect();
+    }
+
+    /// Column (box) selection between two (row, display column) corners; the main cursor is on `to`'s row.
+    pub fn select_columns(&mut self, from: (usize, usize), to: (usize, usize)) {
+        let (r0, r1) = (from.0.min(to.0), from.0.max(to.0));
+        let mut sels = Vec::new();
+        for row in r0..=r1.min(self.line_count().saturating_sub(1)) {
+            let a = self.rc_to_pos(row, self.col_for_display(row, from.1));
+            let h = self.rc_to_pos(row, self.col_for_display(row, to.1));
+            // Skip short lines the box doesn't reach (unless it's a plain column of cursors).
+            if from.1 != to.1 && a == h && self.display_col(row, self.line_len(row)) < from.1.min(to.1) {
+                continue;
+            }
+            sels.push((row, Sel { anchor: a, head: h }));
+        }
+        let main = sels.iter().position(|(r, _)| *r == to.0).unwrap_or(sels.len().saturating_sub(1));
+        if sels.is_empty() {
+            return;
+        }
+        self.sel = sels.remove(main).1;
+        self.extra = sels.into_iter().map(|(_, s)| s).collect();
     }
 
     // ------------------------------------------------------------ motions
@@ -962,5 +1189,67 @@ mod tests {
         assert_eq!(b.find("one", 1, true), Some(8..11));
         assert_eq!(b.find("one", 9, true), Some(0..3));
         assert_eq!(b.find("ONE", 0, true), None);
+    }
+
+    #[test]
+    fn cmd_d_selects_word_then_next_occurrences() {
+        let mut b = Buffer::new("foo bar foobar foo\nfoo");
+        b.sel = Sel::at(1);
+        assert!(b.select_next_occurrence());
+        assert_eq!(b.sel.range(), 0..3, "first ⌘D selects the word");
+        assert!(b.select_next_occurrence());
+        assert_eq!(b.sel.range(), 15..18, "skips 'foobar' (whole word)");
+        assert!(b.select_next_occurrence());
+        assert_eq!(b.sel.range(), 19..22);
+        assert!(!b.select_next_occurrence(), "all taken");
+        assert_eq!(b.extra.len(), 2);
+    }
+
+    #[test]
+    fn typing_at_every_cursor_is_one_undo() {
+        let mut b = Buffer::new("a\nb\nc");
+        b.sel = Sel::at(1);
+        b.extra = vec![Sel::at(3), Sel::at(5)];
+        b.each_cursor(false, |b| b.insert("!"));
+        assert_eq!(b.text(), "a!\nb!\nc!");
+        assert_eq!(b.all_sels(), vec![Sel::at(2), Sel::at(5), Sel::at(8)]);
+        b.each_cursor(false, |b| b.backspace());
+        assert_eq!(b.text(), "a\nb\nc");
+        b.each_cursor(false, |b| b.insert("xy"));
+        assert_eq!(b.text(), "axy\nbxy\ncxy");
+        b.undo();
+        assert_eq!(b.text(), "a\nb\nc", "one undo for all cursors");
+    }
+
+    #[test]
+    fn cursors_merge_when_they_meet() {
+        let mut b = Buffer::new("abc");
+        b.sel = Sel::at(1);
+        b.extra = vec![Sel::at(2)];
+        b.each_cursor(false, |b| b.move_horizontal(false, false));
+        b.each_cursor(false, |b| b.move_horizontal(false, false));
+        assert!(b.extra.is_empty(), "both cursors reached 0 and merged");
+        assert_eq!(b.sel, Sel::at(0));
+    }
+
+    #[test]
+    fn select_all_occurrences_and_columns() {
+        let mut b = Buffer::new("x = 1\nx = 2\ny = x");
+        b.sel = Sel::at(0);
+        b.select_all_occurrences();
+        assert_eq!(b.all_sels().len(), 3);
+        b.single_cursor();
+        b.select_columns((0, 4), (1, 5));
+        let r: Vec<_> = b.all_sels().iter().map(|s| b.slice(s.range())).collect();
+        assert_eq!(r, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn line_ops_run_once_per_line() {
+        let mut b = Buffer::new("one\ntwo");
+        b.sel = Sel::at(0);
+        b.extra = vec![Sel::at(2), Sel::at(5)];
+        b.each_cursor(true, |b| b.toggle_comment("//"));
+        assert_eq!(b.text(), "// one\n// two");
     }
 }

@@ -4050,6 +4050,25 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn cmd_d_adds_cursors_and_typing_edits_all(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("multi.txt");
+        std::fs::write(&file, "let a = a + a;\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file, None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).expect("editor open");
+        ed.update(cx, |e, _| e.buf.sel = crate::buffer::Sel::at(4));
+        cx.simulate_keystrokes("cmd-d cmd-d cmd-d");
+        assert_eq!(ed.read_with(cx, |e, _| e.buf.extra.len()), 2, "⌘D ×3 → three cursors");
+        cx.simulate_input("bc");
+        assert_eq!(ed.read_with(cx, |e, _| e.buf.text()), "let bc = bc + bc;\n");
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(ed.read_with(cx, |e, _| e.buf.text()), "let a = a + a;\n");
+        cx.simulate_keystrokes("cmd-d escape");
+        assert!(ed.read_with(cx, |e, _| e.buf.extra.is_empty()), "Esc goes back to one cursor");
+    }
+
+    #[gpui::test]
     fn ctrl_cmd_letters_scroll_without_moving_cursor(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("long.txt");

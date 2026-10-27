@@ -27,7 +27,8 @@ actions!(
         Newline, NewlineAbove, Indent, Outdent,
         SelectAll, SelectLine, Copy, Cut, Paste, Undo, Redo,
         MoveLineUp, MoveLineDown, DuplicateLineDown, DuplicateLineUp, DeleteLine, ToggleComment,
-        Escape, Submit, ShowCharacterPalette, ScrollLineUp, ScrollLineDown,
+        Escape, Submit, ShowCharacterPalette, ScrollLineUp, ScrollLineDown, SelectNextOccurrence,
+        SelectAllOccurrences,
     ]
 );
 
@@ -91,6 +92,8 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-[", Outdent, c),
         crate::keybindings::kb("cmd-a", SelectAll, c),
         crate::keybindings::kb("cmd-l", SelectLine, c),
+        crate::keybindings::kb("cmd-d", SelectNextOccurrence, c),
+        crate::keybindings::kb("cmd-shift-l", SelectAllOccurrences, c),
         crate::keybindings::kb("cmd-c", Copy, c),
         crate::keybindings::kb("cmd-x", Cut, c),
         crate::keybindings::kb("cmd-v", Paste, c),
@@ -213,6 +216,8 @@ pub enum DiffRole {
 #[derive(Clone)]
 enum DragMode {
     Char,
+    /// ⌥⇧-drag box selection from (row, display column).
+    Column(usize, usize),
     Word(Range<usize>),
     Line(usize),
 }
@@ -433,6 +438,7 @@ impl Editor {
 
     pub fn go_to(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
         let pos = self.buf.rc_to_pos(row, col);
+        self.buf.single_cursor();
         self.buf.sel = Sel::at(pos);
         self.autoscroll = Some(false);
         self.center_on_next_layout = true;
@@ -440,6 +446,7 @@ impl Editor {
     }
 
     pub fn select_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        self.buf.single_cursor();
         self.buf.sel = Sel { anchor: range.start, head: range.end };
         self.autoscroll = Some(false);
         self.center_on_next_layout = true;
@@ -658,16 +665,27 @@ impl Editor {
         cx.notify();
     }
 
-    fn motion(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Buffer)) {
-        f(&mut self.buf);
+    /// A cursor motion, applied to every cursor.
+    fn motion(&mut self, cx: &mut Context<Self>, f: impl FnMut(&mut Buffer)) {
+        self.buf.each_cursor(false, f);
         self.after_move(cx);
     }
 
-    fn edit(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Buffer)) {
+    /// An edit, applied at every cursor as one undo step.
+    fn edit(&mut self, cx: &mut Context<Self>, f: impl FnMut(&mut Buffer)) {
         if self.read_only {
             return;
         }
-        f(&mut self.buf);
+        self.buf.each_cursor(false, f);
+        self.after_edit(cx);
+    }
+
+    /// A line edit (comment, indent, move…): once per line even with several cursors on it.
+    fn edit_rows(&mut self, cx: &mut Context<Self>, f: impl FnMut(&mut Buffer)) {
+        if self.read_only {
+            return;
+        }
+        self.buf.each_cursor(true, f);
         self.after_edit(cx);
     }
 
@@ -697,8 +715,17 @@ impl Editor {
     fn move_doc_end(&mut self, _: &MoveDocEnd, _: &mut Window, cx: &mut Context<Self>) { self.motion(cx, |b| b.move_to(b.len(), false)) }
     fn select_doc_start(&mut self, _: &SelectDocStart, _: &mut Window, cx: &mut Context<Self>) { self.motion(cx, |b| b.move_to(0, true)) }
     fn select_doc_end(&mut self, _: &SelectDocEnd, _: &mut Window, cx: &mut Context<Self>) { self.motion(cx, |b| b.move_to(b.len(), true)) }
-    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) { self.buf.select_all(); cx.notify() }
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) { self.buf.single_cursor(); self.buf.select_all(); cx.notify() }
     fn select_line(&mut self, _: &SelectLine, _: &mut Window, cx: &mut Context<Self>) { self.motion(cx, |b| b.select_line()) }
+    fn select_next_occurrence(&mut self, _: &SelectNextOccurrence, _: &mut Window, cx: &mut Context<Self>) {
+        if self.buf.select_next_occurrence() {
+            self.after_move(cx);
+        }
+    }
+    fn select_all_occurrences(&mut self, _: &SelectAllOccurrences, _: &mut Window, cx: &mut Context<Self>) {
+        self.buf.select_all_occurrences();
+        self.after_move(cx);
+    }
 
     fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
         if self.mode == EditorMode::SingleLine {
@@ -779,30 +806,36 @@ impl Editor {
     fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
         match self.mode {
             EditorMode::SingleLine => cx.emit(EditorEvent::Tab),
-            _ => self.edit(cx, |b| b.indent_lines(false)),
+            _ => self.edit_rows(cx, |b| b.indent_lines(false)),
         }
     }
     fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
         if self.mode != EditorMode::SingleLine {
-            self.edit(cx, |b| b.indent_lines(true))
+            self.edit_rows(cx, |b| b.indent_lines(true))
         }
     }
-    fn move_line_up(&mut self, _: &MoveLineUp, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| b.move_lines(false)) }
-    fn move_line_down(&mut self, _: &MoveLineDown, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| b.move_lines(true)) }
-    fn duplicate_line_down(&mut self, _: &DuplicateLineDown, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| b.duplicate_lines(true)) }
-    fn duplicate_line_up(&mut self, _: &DuplicateLineUp, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| b.duplicate_lines(false)) }
-    fn delete_line(&mut self, _: &DeleteLine, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| b.delete_lines()) }
+    fn move_line_up(&mut self, _: &MoveLineUp, _: &mut Window, cx: &mut Context<Self>) { self.edit_rows(cx, |b| b.move_lines(false)) }
+    fn move_line_down(&mut self, _: &MoveLineDown, _: &mut Window, cx: &mut Context<Self>) { self.edit_rows(cx, |b| b.move_lines(true)) }
+    fn duplicate_line_down(&mut self, _: &DuplicateLineDown, _: &mut Window, cx: &mut Context<Self>) { self.edit_rows(cx, |b| b.duplicate_lines(true)) }
+    fn duplicate_line_up(&mut self, _: &DuplicateLineUp, _: &mut Window, cx: &mut Context<Self>) { self.edit_rows(cx, |b| b.duplicate_lines(false)) }
+    fn delete_line(&mut self, _: &DeleteLine, _: &mut Window, cx: &mut Context<Self>) { self.edit_rows(cx, |b| b.delete_lines()) }
     fn toggle_comment(&mut self, _: &ToggleComment, _: &mut Window, cx: &mut Context<Self>) {
         match tools::comment_style(self.path.as_deref()) {
-            tools::CommentStyle::Line(prefix) => self.edit(cx, |b| b.toggle_comment(prefix)),
-            tools::CommentStyle::Block(open, close) => self.edit(cx, |b| b.toggle_block_comment(open, close)),
+            tools::CommentStyle::Line(prefix) => self.edit_rows(cx, |b| b.toggle_comment(prefix)),
+            tools::CommentStyle::Block(open, close) => self.edit_rows(cx, |b| b.toggle_block_comment(open, close)),
         }
     }
 
-    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| { b.undo(); }) }
-    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) { self.edit(cx, |b| { b.redo(); }) }
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) { self.buf.single_cursor(); self.edit(cx, |b| { b.undo(); }) }
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) { self.buf.single_cursor(); self.edit(cx, |b| { b.redo(); }) }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.buf.extra.is_empty() {
+            // One line per cursor; pasting with the same number of cursors puts one at each.
+            let parts: Vec<String> = self.buf.all_sels().iter().map(|s| self.buf.slice(s.range())).collect();
+            self.line_copy = None;
+            return cx.write_to_clipboard(ClipboardItem::new_string(parts.join("\n")));
+        }
         let text = if self.buf.sel.is_empty() {
             let (row, _) = self.cursor_rc();
             let line = format!("{}\n", self.buf.line(row));
@@ -816,8 +849,11 @@ impl Editor {
     }
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         self.copy(&Copy, window, cx);
+        if !self.buf.extra.is_empty() {
+            return self.edit(cx, |b| b.insert(""));
+        }
         if self.buf.sel.is_empty() {
-            self.edit(cx, |b| b.delete_lines())
+            self.edit_rows(cx, |b| b.delete_lines())
         } else {
             self.edit(cx, |b| b.insert(""))
         }
@@ -828,6 +864,16 @@ impl Editor {
             text = text.replace(['\n', '\r'], " ");
         }
         let text = text.replace("\r\n", "\n");
+        let cursors = self.buf.extra.len() + 1;
+        let lines: Vec<&str> = text.split('\n').collect();
+        if cursors > 1 && lines.len() == cursors {
+            // Cursors are visited last-first, so hand out the lines from the end.
+            let mut next = cursors;
+            return self.edit(cx, |b| {
+                next -= 1;
+                b.insert(lines[next]);
+            });
+        }
         if self.buf.sel.is_empty() && self.line_copy.as_deref() == Some(text.as_str()) {
             // A whole line copied with an empty selection is pasted above the current line.
             let (row, col) = self.cursor_rc();
@@ -839,6 +885,10 @@ impl Editor {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.buf.extra.is_empty() {
+            self.buf.single_cursor();
+            return cx.notify();
+        }
         if self.mode == EditorMode::Full && (!self.buf.sel.is_empty() || self.search.is_some()) {
             self.buf.sel = Sel::at(self.buf.sel.head);
             self.search = None;
@@ -912,6 +962,23 @@ impl Editor {
         let in_numbers = self.mode == EditorMode::Full && x < l.text_left;
         let pos = self.pos_for_point(ev.position);
         self.buf.goal_col = None;
+        if !in_numbers && ev.modifiers.alt && ev.click_count <= 1 {
+            if ev.modifiers.shift {
+                // ⌥⇧-drag: box selection.
+                let (row, col) = self.buf.pos_to_rc(pos);
+                let dcol = self.buf.display_col(row, col);
+                self.buf.single_cursor();
+                self.buf.sel = Sel::at(pos);
+                self.drag = Some(DragMode::Column(row, dcol));
+            } else {
+                // ⌥-click: add a cursor (or remove the one there).
+                self.buf.toggle_cursor(pos);
+                self.drag = None;
+            }
+            self.marked = None;
+            return cx.notify();
+        }
+        self.buf.single_cursor();
         if in_numbers {
             let row = self.row_for_y(ev.position.y);
             let range = self.buf.rows_range(row, row);
@@ -955,6 +1022,11 @@ impl Editor {
         let pos = self.pos_for_point(p);
         match mode {
             DragMode::Char => self.buf.move_to(pos, true),
+            DragMode::Column(row0, col0) => {
+                let row = self.row_for_y(p.y);
+                let col = self.layout.as_ref().map(|l| ((p.x / px(1.) - l.text_left + self.scroll_x) / l.char_w).round().max(0.) as usize).unwrap_or(0);
+                self.buf.select_columns((row0, col0), (row, col));
+            }
             DragMode::Word(r) => {
                 let w = self.buf.word_range_at(pos);
                 self.buf.sel = if pos < r.start {
@@ -1308,10 +1380,9 @@ impl Editor {
             }
         }
 
-        // Selection.
-        let sel = self.buf.sel.range();
-        if !sel.is_empty() {
-            let color = if focused { theme::selection() } else { theme::selection_inactive() };
+        // Selections (every cursor's).
+        let color = if focused { theme::selection() } else { theme::selection_inactive() };
+        for sel in self.buf.all_sels().into_iter().map(|s| s.range()).filter(|r| !r.is_empty()) {
             for (row, shaped, map) in &lines {
                 let rs = self.buf.line_start(*row);
                 let re = rs + self.buf.line_len(*row);
@@ -1341,6 +1412,17 @@ impl Editor {
         if self.buf.len() == 0 && !self.placeholder.is_empty() {
             let ph = self.shape(window, self.placeholder.to_string(), theme::fg_muted());
             p.text.push((point(px(text_left), px(top + pad_top)), ph));
+        }
+
+        // Extra cursors.
+        if focused {
+            for s in &self.buf.extra {
+                let (r, c) = self.buf.pos_to_rc(s.head);
+                if let Some((_, shaped, map)) = lines.iter().find(|(lr, _, _)| *lr == r) {
+                    let x = text_x + x_for(shaped, map, c);
+                    p.quads_over.push(fill(Bounds::new(point(px(x), px(y_for(r))), size(px(2.), px(line_h))), theme::cursor()));
+                }
+            }
         }
 
         // Cursor.
@@ -1702,12 +1784,17 @@ impl EntityInputHandler for Editor {
         if self.read_only {
             return;
         }
+        let typed_at_cursors = range_utf16.is_none() && self.marked.is_none() && !self.buf.extra.is_empty();
         let range = range_utf16
             .map(|r| self.chars_from_utf16(&r))
             .or(self.marked.clone())
             .unwrap_or(self.buf.sel.range());
         self.marked = None;
         let text = if self.mode == EditorMode::SingleLine { text.replace('\n', " ") } else { text.to_string() };
+        if typed_at_cursors {
+            return self.edit(cx, |b| b.insert(&text));
+        }
+        self.buf.single_cursor();
         self.buf.sel = Sel { anchor: range.start, head: range.end };
         self.buf.insert(&text);
         self.after_edit(cx);
@@ -1904,6 +1991,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::outdent))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::select_line))
+            .on_action(cx.listener(Self::select_next_occurrence))
+            .on_action(cx.listener(Self::select_all_occurrences))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
