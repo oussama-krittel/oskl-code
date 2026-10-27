@@ -684,7 +684,7 @@ fn paths(typed: &str, file: Option<&Path>, root: Option<&Path>) -> Vec<Item> {
 
 /// Import aliases from the nearest tsconfig.json / jsconfig.json (`compilerOptions.paths`), as
 /// (prefix, folder) pairs, longest prefix first: `"@/*": ["./src/*"]` → ("@/", <dir>/src/).
-fn aliases(file: &Path, root: Option<&Path>) -> Vec<(String, PathBuf)> {
+pub(crate) fn aliases(file: &Path, root: Option<&Path>) -> Vec<(String, PathBuf)> {
     let mut dir = file.parent();
     for _ in 0..8 {
         let Some(d) = dir else { break };

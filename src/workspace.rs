@@ -1365,6 +1365,8 @@ impl Workspace {
                         ws.open_merge_editor(p, window, cx);
                     }
                 }
+                EditorEvent::OpenAt(t) => ws.open_definition(t.clone(), window, cx),
+                EditorEvent::Notice(msg) => ws.flash(msg.clone(), false, cx),
                 _ => {}
             });
             self.add_tab(TabKind::Editor(editor.clone()), sub, preview, window, cx);
@@ -1374,6 +1376,14 @@ impl Workspace {
         }
         if let (Some(line), Some(ed)) = (line, self.active_editor()) {
             ed.update(cx, |ed, cx| ed.go_to(line.saturating_sub(1), 0, cx));
+        }
+    }
+
+    /// Go to definition in another file: open it and put the cursor on the name.
+    fn open_definition(&mut self, t: crate::definition::Target, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file(t.path, None, false, window, cx);
+        if let Some(ed) = self.active_editor() {
+            ed.update(cx, |ed, cx| ed.go_to(t.row, t.col, cx));
         }
     }
 
@@ -1419,6 +1429,8 @@ impl Workspace {
                         ws.open_merge_editor(p, window, cx);
                     }
                 }
+                EditorEvent::OpenAt(t) => ws.open_definition(t.clone(), window, cx),
+                EditorEvent::Notice(msg) => ws.flash(msg.clone(), false, cx),
                 _ => {}
             });
             self.extra_subs.push(sub2);
@@ -2369,7 +2381,7 @@ impl Workspace {
                     self.cmd.update(cx, |c, cx| c.set_text(&value, cx));
                 }
             }
-            EditorEvent::OpenCommit(_) | EditorEvent::Saved | EditorEvent::CompareConflict | EditorEvent::OpenMergeEditor => {}
+            EditorEvent::OpenCommit(_) | EditorEvent::Saved | EditorEvent::CompareConflict | EditorEvent::OpenMergeEditor | EditorEvent::OpenAt(_) | EditorEvent::Notice(_) => {}
         }
     }
 
@@ -4466,6 +4478,45 @@ mod ui_tests {
         assert_eq!(first(cx).as_deref(), Some("Card"), "a folder opens straight into its files");
         cx.simulate_keystrokes("enter");
         assert!(text(cx).starts_with("import Card from './components/Cardimport"), "{:?}", text(cx));
+    }
+
+    #[gpui::test]
+    fn go_to_definition_follows_imports_and_searches(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::create_dir_all(root.join("ui")).unwrap();
+        std::fs::write(root.join("ui/Button.tsx"), "// button\n\nexport function Button() {\n  return null;\n}\n").unwrap();
+        std::fs::write(root.join("money.ts"), "export const formatMoney = (n: number) => n;\n").unwrap();
+        let file = root.join("app.tsx");
+        std::fs::write(&file, "import { Button } from './ui/Button';\nfunction local() {}\nlocal();\n<Button />;\nformatMoney(1);\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file.clone(), None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).expect("editor open");
+        let at = |cx: &mut gpui::VisualTestContext| {
+            let e = ws.read_with(cx, |ws, _| ws.active_editor()).unwrap();
+            e.read_with(cx, |e, _| (e.path.as_ref().unwrap().file_name().unwrap().to_string_lossy().to_string(), e.buf.pos_to_rc(e.buf.sel.head)))
+        };
+        let put = |cx: &mut gpui::VisualTestContext, row: usize, col: usize| ed.update(cx, |e, _| e.buf.sel = crate::buffer::Sel::at(e.buf.rc_to_pos(row, col)));
+
+        put(cx, 2, 2);
+        cx.simulate_keystrokes("f12");
+        assert_eq!(at(cx), ("app.tsx".into(), (1, 9)), "same file");
+        put(cx, 3, 3);
+        cx.simulate_keystrokes("f12");
+        cx.run_until_parked();
+        assert_eq!(at(cx), ("Button.tsx".into(), (2, 16)), "imported component");
+
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file.clone(), None, false, window, cx));
+        put(cx, 4, 3);
+        cx.simulate_keystrokes("f12");
+        cx.run_until_parked();
+        assert_eq!(at(cx), ("money.ts".into(), (0, 13)), "not imported: found in the project");
+
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file.clone(), None, false, window, cx));
+        put(cx, 0, 27);
+        cx.simulate_keystrokes("f12");
+        cx.run_until_parked();
+        assert_eq!(at(cx), ("Button.tsx".into(), (0, 0)), "import path opens the file");
     }
 
     #[gpui::test]

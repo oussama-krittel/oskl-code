@@ -29,7 +29,7 @@ actions!(
         SelectAll, SelectLine, Copy, Cut, Paste, Undo, Redo,
         MoveLineUp, MoveLineDown, DuplicateLineDown, DuplicateLineUp, DeleteLine, ToggleComment,
         Escape, Submit, ShowCharacterPalette, ScrollLineUp, ScrollLineDown, SelectNextOccurrence,
-        SelectAllOccurrences, Fold, Unfold, FoldAll, UnfoldAll, NextConflict, PrevConflict,
+        SelectAllOccurrences, GoToDefinition, Fold, Unfold, FoldAll, UnfoldAll, NextConflict, PrevConflict,
     ]
 );
 
@@ -94,6 +94,7 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-a", SelectAll, c),
         crate::keybindings::kb("cmd-l", SelectLine, c),
         crate::keybindings::kb("cmd-d", SelectNextOccurrence, c),
+        crate::keybindings::kb("f12", GoToDefinition, c),
         crate::keybindings::kb("cmd-shift-l", SelectAllOccurrences, c),
         crate::keybindings::kb("alt-cmd-[", Fold, c),
         crate::keybindings::kb("alt-cmd-]", Unfold, c),
@@ -172,6 +173,10 @@ pub enum EditorEvent {
     CompareConflict,
     /// "Resolve in Merge Editor".
     OpenMergeEditor,
+    /// Go to definition landed in another file.
+    OpenAt(crate::definition::Target),
+    /// A short message for the status bar.
+    Notice(String),
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -310,6 +315,8 @@ pub struct Editor {
     occurrence_origin: Option<(Range<usize>, f32)>,
     /// The suggestion list under the cursor (tags, attributes, words, import paths).
     pub completion: Option<Completion>,
+    /// The name or import path under the mouse while ⌘ is held (underlined, ⌘-click follows it).
+    link: Option<Range<usize>>,
     layout: Option<Layout>,
     drag: Option<DragMode>,
     scroll_drag: Option<f32>,
@@ -372,6 +379,7 @@ impl Editor {
             autoscroll: None,
             occurrence_origin: None,
             completion: None,
+            link: None,
             layout: None,
             drag: None,
             scroll_drag: None,
@@ -981,6 +989,63 @@ impl Editor {
         }
     }
 
+    // ------------------------------------------------------------ go to definition
+
+    fn link_at(&self, p: Point<Pixels>) -> Option<Range<usize>> {
+        let l = self.layout.as_ref()?;
+        if p.x / px(1.) < l.text_left {
+            return None;
+        }
+        match crate::definition::hit_at(&self.buf, self.pos_for_point(p))? {
+            crate::definition::Hit::Module(_, r) | crate::definition::Hit::Name(_, r) => Some(r),
+        }
+    }
+
+    fn modifiers_changed(&mut self, ev: &ModifiersChangedEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let link = (ev.modifiers.platform && self.mode == EditorMode::Full).then(|| self.link_at(self.last_mouse)).flatten();
+        if link != self.link {
+            self.link = link;
+            cx.notify();
+        }
+    }
+
+    fn go_to_definition_action(&mut self, _: &GoToDefinition, _: &mut Window, cx: &mut Context<Self>) {
+        self.go_to_definition(self.buf.sel.head, cx);
+    }
+
+    /// Jumps to what's at `pos`: in this file directly, in another through the workspace, or
+    /// after a project-wide search in the background.
+    pub fn go_to_definition(&mut self, pos: usize, cx: &mut Context<Self>) {
+        use crate::definition::{Found, Target};
+        self.completion = None;
+        let land = |ed: &mut Self, t: Target, cx: &mut Context<Self>| {
+            if ed.path.as_ref() == Some(&t.path) {
+                ed.go_to(t.row, t.col, cx);
+            } else {
+                cx.emit(EditorEvent::OpenAt(t));
+            }
+        };
+        match crate::definition::find(&self.buf, pos, self.path.as_deref(), self.root.as_deref()) {
+            Found::At(t) => land(self, t, cx),
+            Found::Nothing => {}
+            Found::Search(name) => {
+                let Some(root) = self.root.clone() else { return };
+                let skip = self.path.clone();
+                cx.emit(EditorEvent::Notice(format!("Looking for {name}…")));
+                cx.spawn(async move |this, cx| {
+                    let n = name.clone();
+                    let found = cx.background_spawn(async move { crate::definition::search_project(&root, &n, skip.as_deref()) }).await;
+                    this.update(cx, |ed, cx| match found {
+                        Some(t) => land(ed, t, cx),
+                        None => cx.emit(EditorEvent::Notice(format!("No definition found for {name}"))),
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+    }
+
     // ------------------------------------------------------------ completion
 
     fn flavor(&self) -> Option<Flavor> {
@@ -1554,6 +1619,10 @@ impl Editor {
         let in_numbers = self.mode == EditorMode::Full && x < l.text_left;
         let pos = self.pos_for_point(ev.position);
         self.buf.goal_col = None;
+        if !in_numbers && ev.modifiers.platform && ev.click_count <= 1 && self.mode == EditorMode::Full {
+            self.link = None;
+            return self.go_to_definition(pos, cx);
+        }
         if !in_numbers && ev.modifiers.alt && ev.click_count <= 1 {
             if ev.modifiers.shift {
                 // ⌥⇧-drag: box selection.
@@ -1641,6 +1710,11 @@ impl Editor {
 
     fn mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.last_mouse = ev.position;
+        let link = (ev.modifiers.platform && !ev.dragging() && self.mode == EditorMode::Full).then(|| self.link_at(ev.position)).flatten();
+        if link != self.link {
+            self.link = link;
+            cx.notify();
+        }
         if !ev.dragging() {
             self.drag = None;
             self.scroll_drag = None;
@@ -2008,6 +2082,17 @@ impl Editor {
                     for (x0, x1, y) in spans(row, shaped, map, cols.start, cols.end) {
                         p.quads_under.push(fill(Bounds::new(point(px(x0), px(y)), size(px((x1 - x0).max(2.)), px(line_h))), theme::find_match()));
                     }
+                }
+            }
+        }
+
+        // ⌘-hover: the name or path a click would follow.
+        if let Some(link) = self.link.clone() {
+            let (row, c0) = self.buf.pos_to_rc(link.start);
+            let c1 = c0 + (link.end - link.start);
+            if let Some((_, shaped, map)) = lines.iter().find(|(r, _, _)| *r == row) {
+                for (x0, x1, y) in spans(row, shaped, map, c0, c1) {
+                    p.quads_under.push(fill(Bounds::new(point(px(x0), px(y + line_h - 2.)), size(px(x1 - x0), px(1.))), theme::accent()));
                 }
             }
         }
@@ -2769,7 +2854,9 @@ impl Render for Editor {
             .size_full()
             .key_context("Editor")
             .track_focus(&self.focus)
-            .cursor(CursorStyle::IBeam)
+            .cursor(if self.link.is_some() { CursorStyle::PointingHand } else { CursorStyle::IBeam })
+            .on_modifiers_changed(cx.listener(Self::modifiers_changed))
+            .on_action(cx.listener(Self::go_to_definition_action))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
             .on_action(cx.listener(Self::move_up))

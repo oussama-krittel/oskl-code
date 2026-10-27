@@ -3,6 +3,7 @@ mod buffer;
 mod commit_view;
 mod complete;
 mod datafiles;
+mod definition;
 mod diagnostics;
 mod diff_edit;
 mod diff_view;

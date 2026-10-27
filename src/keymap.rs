@@ -67,6 +67,8 @@ pub const KEYS: &[(&str, &str, &str)] = &[
     ("General", "⌘Q", "Quit"),
     ("Editing", "Type / ⌫ / ⌦", "Insert / delete (⌫ in indentation removes one indent level)"),
     ("Editing", "Enter", "New line keeping indentation; between {} opens a block"),
+    ("Editing", "⌘-click  ·  F12", "Go to definition: a name (local, imported, or found in the project) or an import path; hold ⌘ to see what's clickable"),
+    ("Editing", "< >  ·  </", "HTML/JSX: > closes the tag, </ finishes the open one; suggestions for tags, props, types and import paths (↑↓, Enter/Tab, Esc)"),
     ("Editing", "⌘Enter  ·  ⌘⇧Enter", "New line below / above"),
     ("Editing", "Tab  ·  ⇧Tab  ·  ⌘]  ·  ⌘[", "Indent / outdent line or selection"),
     ("Editing", "⌥↑  ·  ⌥↓", "Move line(s) up / down"),
