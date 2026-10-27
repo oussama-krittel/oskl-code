@@ -276,6 +276,9 @@ pub struct Editor {
     link_gen: u64,
 }
 
+/// Lines per press for the scroll-view shortcuts.
+const SCROLL_STEP: f32 = 3.;
+
 const MARK_ADDED: u8 = 1;
 const MARK_MODIFIED: u8 = 2;
 const MARK_DELETED: u8 = 3;
@@ -701,20 +704,20 @@ impl Editor {
         self.scroll_y += n as f32 * self.line_height();
         self.motion(cx, |b| b.move_vertical(n, false))
     }
-    /// ⌃⌥↑ / ⌃⌥↓: scroll the view a line, leaving the cursor where it is.
+    /// ⌃⌘↑ / ⌃⌘↓ (and ⌃⌥↑ / ⌃⌥↓): scroll the view a few lines, leaving the cursor where it is.
     fn scroll_line_up(&mut self, _: &ScrollLineUp, _: &mut Window, cx: &mut Context<Self>) {
         // In one-line inputs (finder, command line, search) this moves through the options.
         if self.mode == EditorMode::SingleLine {
             return cx.emit(EditorEvent::Up);
         }
-        self.scroll_y = (self.scroll_y - self.line_height()).max(0.);
+        self.scroll_y = (self.scroll_y - self.line_height() * SCROLL_STEP).max(0.);
         cx.notify();
     }
     fn scroll_line_down(&mut self, _: &ScrollLineDown, _: &mut Window, cx: &mut Context<Self>) {
         if self.mode == EditorMode::SingleLine {
             return cx.emit(EditorEvent::Down);
         }
-        self.scroll_y += self.line_height();
+        self.scroll_y += self.line_height() * SCROLL_STEP;
         cx.notify();
     }
 
