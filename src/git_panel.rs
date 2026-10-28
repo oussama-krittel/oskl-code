@@ -429,6 +429,11 @@ impl GitPanel {
     // ------------------------------------------------------------ git actions
 
     pub fn commit(&mut self, message: Option<String>, all: bool, amend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_with(message, all, amend, false, window, cx);
+    }
+
+    /// `confirmed`: the user already chose to commit what the secrets check found.
+    fn commit_with(&mut self, message: Option<String>, all: bool, amend: bool, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {
         let message = message.unwrap_or_else(|| self.commit_input.read(cx).text()).trim().to_string();
         let repo = self.repo.read(cx);
         if let Some(op) = repo.status.op.clone() {
@@ -438,7 +443,7 @@ impl GitPanel {
             self.focus_commit_input(window, cx);
             return cx.emit(Request::Error("Write a commit message first".into()));
         }
-        if repo.status.staged.is_empty() && !all && !amend {
+        if repo.status.staged.is_empty() && !all && !amend && !confirmed {
             if repo.status.unstaged.is_empty() {
                 return cx.emit(Request::Error("Nothing to commit".into()));
             }
@@ -446,20 +451,29 @@ impl GitPanel {
             return cx.emit(Request::CommandLine(format!("commit -a {message}")));
         }
         let root = repo.root.clone();
+        let retry = message.clone();
         let task = cx.background_executor().spawn(async move {
             if all {
                 git::run(&root, &["add", "-A"])?;
             }
-            if amend && message.is_empty() {
-                return git::run(&root, &["commit", "--amend", "--no-edit"]);
+            // Env files or key-shaped strings in what's about to be committed: ask first.
+            if !confirmed {
+                let findings = crate::secrets::scan_staged(&root);
+                if !findings.is_empty() {
+                    return Ok(Err(findings));
+                }
             }
-            git::commit(&root, &message, amend)
+            if amend && message.is_empty() {
+                return git::run(&root, &["commit", "--amend", "--no-edit"]).map(Ok);
+            }
+            git::commit(&root, &message, amend).map(Ok)
         });
         self.commit_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             this.update_in(cx, |panel, _, cx| {
                 match result {
-                    Ok(out) => {
+                    Ok(Err(findings)) => panel.ask_secrets(findings, retry, amend, cx),
+                    Ok(Ok(out)) => {
                         panel.commit_input.update(cx, |ed, cx| ed.set_text("", cx));
                         panel.amend = false;
                         let summary = out.lines().next().unwrap_or("Committed").to_string();
@@ -473,6 +487,28 @@ impl GitPanel {
                 });
             })
             .ok();
+        }));
+    }
+
+    /// What the secrets check found, in the themed dialog: Cancel by default, or commit anyway.
+    fn ask_secrets(&mut self, findings: Vec<crate::secrets::Finding>, message: String, amend: bool, cx: &mut Context<Self>) {
+        let panel = cx.entity().downgrade();
+        let mut lines: Vec<String> = findings.iter().take(6).map(|f| format!("• {}", f.describe())).collect();
+        if findings.len() > 6 {
+            lines.push(format!("…and {} more", findings.len() - 6));
+        }
+        lines.push(String::new());
+        lines.push("Unstage them first, or commit anyway if they're meant to be shared.".into());
+        cx.emit(Request::Ask(crate::dialog::Ask {
+            title: "This commit may include secrets".into(),
+            detail: lines.join("\n"),
+            buttons: vec!["Commit Anyway".into()],
+            danger: true,
+            cancel_default: true,
+            on_answer: Rc::new(move |_, window, cx| {
+                let message = message.clone();
+                panel.update(cx, |p, cx| p.commit_with(Some(message), false, amend, true, window, cx)).ok();
+            }),
         }));
     }
 
@@ -571,6 +607,7 @@ impl GitPanel {
         let panel = cx.entity().downgrade();
         let choices = ask.buttons.clone();
         cx.emit(Request::Ask(crate::dialog::Ask {
+            cancel_default: false,
             title: ask.message,
             detail: ask.detail,
             buttons: ask.buttons.into_iter().map(|(label, _)| label).collect(),

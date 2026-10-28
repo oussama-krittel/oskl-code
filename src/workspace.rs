@@ -15,6 +15,7 @@ use crate::editor::{Editor, EditorEvent, EditorMode};
 use crate::file_tree::FileTree;
 use crate::git::{self, Rev};
 use crate::git_panel::GitPanel;
+use crate::preview::{self, PreviewView};
 use crate::repo::{Repo, RepoEvent};
 use crate::request::{DiffSpec, Request};
 use crate::{theme, tools, ui, util};
@@ -39,7 +40,7 @@ actions!(
         OpenFolder, OpenFolderNewWindow, NextWindow, SearchAll, ShowKeysPanel, ToggleSidebarSide,
         SplitRight, SplitDown, ClosePane, ZoomPane, FocusLeft, FocusRight, FocusUp, FocusDown,
         NewTerminal, ToggleTerminal, PaneBuffers,
-        GoBack, GoForward,
+        GoBack, GoForward, TogglePreview, PreviewToSide,
         MoveItemLeft, MoveItemRight, MoveItemUp, MoveItemDown,
         Buffer1, Buffer2, Buffer3, Buffer4, Buffer5, Buffer6, Buffer7, Buffer8, Buffer9,
     ]
@@ -114,6 +115,8 @@ pub fn bind_keys() {
         crate::keybindings::kb("ctrl-shift-1", RunShell, None),
         crate::keybindings::kb("cmd-k cmd-s", ShowKeysPanel, None),
         crate::keybindings::kb("cmd-o", OpenFolder, None),
+        crate::keybindings::kb("cmd-shift-v", TogglePreview, None),
+        crate::keybindings::kb("cmd-k v", PreviewToSide, None),
         crate::keybindings::kb("cmd-shift-n", OpenFolderNewWindow, None),
         crate::keybindings::kb("ctrl--", GoBack, None),
         crate::keybindings::kb("ctrl-shift--", GoForward, None),
@@ -187,6 +190,7 @@ enum TabKind {
     Commit(Entity<CommitView>),
     Terminal(Entity<TerminalView>),
     Merge(Entity<crate::merge_view::MergeView>),
+    Preview(Entity<PreviewView>),
 }
 
 /// Tiling layout of panes, like zellij / tmux / iTerm splits.
@@ -358,6 +362,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("open", "Open a folder in this window: open <dir> (⌘O for a picker)", true),
     ("window", "Open a project in a new window: window [dir] (⌘⇧N)", true),
     ("add-folder", "Add a folder to the workspace: add-folder [dir] (a picker without one)", true),
+    ("preview", "Preview this Markdown / SVG file beside it (⌘K V; ⇧⌘V in place)", false),
     ("remove-folder", "Take an added folder out of the workspace: remove-folder <dir>", true),
     ("recent", "Open a recent folder", true),
     ("search", "Search in all files: search <text> (⇧⌘F)", true),
@@ -856,7 +861,8 @@ impl Workspace {
         let focus = cx.focus_handle();
         let restore = window.focused(cx);
         window.focus(&focus);
-        self.ask = Some(AskState { ask, sel: 0, focus, restore });
+        let sel = if ask.cancel_default { ask.buttons.len() } else { 0 };
+        self.ask = Some(AskState { ask, sel, focus, restore });
         cx.notify();
     }
 
@@ -1277,9 +1283,10 @@ impl Workspace {
         self.flash("This split is already at the smallest size (1/8 of the window) — split a bigger one, or close/merge splits".into(), true, cx);
     }
 
-    fn split(&mut self, vertical: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// A new empty pane beside the focused one, focused; None at the split limit.
+    fn split_pane(&mut self, vertical: bool) -> Option<usize> {
         if !self.can_split(self.focused_pane) {
-            return self.split_limit_message(cx);
+            return None;
         }
         let new = self.next_id;
         self.next_id += 1;
@@ -1291,6 +1298,13 @@ impl Workspace {
         }
         self.zoomed = false;
         self.set_focused_pane(new);
+        Some(new)
+    }
+
+    fn split(&mut self, vertical: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.split_pane(vertical).is_none() {
+            return self.split_limit_message(cx);
+        }
         window.focus(&self.focus);
         // A new pane asks what to show, like a fresh terminal split.
         self.open_cmd(CmdMode::Files, "", window, cx);
@@ -1652,6 +1666,7 @@ impl Workspace {
             TabKind::Commit(c) => c.read(cx).focus(window),
             TabKind::Terminal(t) => t.read(cx).focus(window),
             TabKind::Merge(m) => m.read(cx).focus(window, cx),
+            TabKind::Preview(v) => v.read(cx).focus(window),
         }
     }
 
@@ -1680,6 +1695,9 @@ impl Workspace {
         self.recent.retain(|p| p != &path);
         self.recent.insert(0, path.clone());
         self.recent.truncate(30);
+        if preview::opens_as_preview(&path) && path.is_file() {
+            return self.open_preview(path, None, false, preview, window, cx);
+        }
         if let Some(ix) = existing {
             if !preview {
                 self.tabs[ix].preview = false;
@@ -1737,6 +1755,70 @@ impl Workspace {
         if let (Some(line), Some(ed)) = (line, self.active_editor()) {
             ed.update(cx, |ed, cx| ed.go_to(line.saturating_sub(1), 0, cx));
         }
+    }
+
+    /// ⇧⌘V: the rendered Markdown / SVG in this pane, or back to its text from a preview.
+    fn toggle_preview(&mut self, _: &TogglePreview, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.active else { return };
+        match &self.tabs[ix].kind {
+            TabKind::Editor(e) => {
+                let e = e.clone();
+                let Some(path) = e.read(cx).path.clone().filter(|p| preview::has_preview(p)) else {
+                    return self.flash("Preview is for Markdown and SVG files".into(), false, cx);
+                };
+                self.open_preview(path, Some(e), false, false, window, cx);
+            }
+            TabKind::Preview(v) => {
+                if let Some(src) = v.read(cx).source.clone()
+                    && let Some(i) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Editor(e) if *e == src))
+                {
+                    self.activate(i, window, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// ⌘K V: the preview in the split to the right (made if there's none); typing stays here.
+    fn preview_to_side(&mut self, _: &PreviewToSide, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.active else { return };
+        let TabKind::Editor(e) = &self.tabs[ix].kind else { return };
+        let e = e.clone();
+        let Some(path) = e.read(cx).path.clone().filter(|p| preview::has_preview(p)) else {
+            return self.flash("Preview is for Markdown and SVG files".into(), false, cx);
+        };
+        self.open_preview(path, Some(e), true, false, window, cx);
+    }
+
+    /// Opens a preview here, or (`side`) in the split to the right with the keyboard left where
+    /// it was. A preview of the same file and source already open is shown instead.
+    fn open_preview(&mut self, path: PathBuf, source: Option<Entity<Editor>>, side: bool, preview_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.focused_pane;
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Preview(v) if v.read(cx).path == path && v.read(cx).source == source)) {
+            self.activate(ix, window, cx);
+            if side {
+                self.set_focused_pane(from);
+                self.sync_active();
+                self.focus_active(window, cx);
+            }
+            return;
+        }
+        if side {
+            match self.neighbor(1, 0) {
+                Some(p) => self.set_focused_pane(p),
+                None if self.split_pane(true).is_some() => {}
+                None => return self.split_limit_message(cx),
+            }
+        }
+        let view = cx.new(|cx| PreviewView::new(path, source, window, cx));
+        let sub = cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx));
+        self.add_tab(TabKind::Preview(view), sub, preview_tab, window, cx);
+        if side {
+            self.set_focused_pane(from);
+            self.sync_active();
+            self.focus_active(window, cx);
+        }
+        cx.notify();
     }
 
     /// Go to definition in another file: open it and put the cursor on the name.
@@ -1927,6 +2009,9 @@ impl Workspace {
         }
         let id = self.tabs[ix].id;
         let pane = self.pane_of_tab(id);
+        if let TabKind::Preview(v) = &self.tabs[ix].kind {
+            v.clone().update(cx, |v, cx| v.release(window, cx));
+        }
         self.drop_tab(id);
         if let Some(p) = pane {
             if self.pane(p).is_some_and(|p| p.items.is_empty()) && self.panes.len() > 1 {
@@ -1965,6 +2050,10 @@ impl Workspace {
             TabKind::Terminal(t) => {
                 let t = t.read(cx);
                 (format!("$ {}", t.title), String::new(), false)
+            }
+            TabKind::Preview(v) => {
+                let v = v.read(cx);
+                (v.title(), v.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), false)
             }
         }
     }
@@ -2186,7 +2275,7 @@ impl Workspace {
                 d.update(cx, |d, cx| d.set_blame(on, cx));
                 self.blame_default = on;
             }
-            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) => {}
+            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Preview(_) => {}
         }
         self.settings.blame_default = self.blame_default;
         self.settings.save();
@@ -2616,7 +2705,7 @@ impl Workspace {
                     Severity::Warning => "warn ",
                     Severity::Info => "info ",
                 };
-                format!("{rel}:{}:{}  {sev}  {}  ({})", d.row + 1, d.col + 1, d.message.lines().next().unwrap_or(""), d.source)
+                format!("{rel}:{}:{}  {sev}  {}  ({})", d.row + 1, d.col + 1, crate::tserror::label(&d.message, d.source == "ts"), d.source)
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -3106,6 +3195,7 @@ impl Workspace {
                 }
             }
             "cd" => self.flash(format!("Not a folder: {rest}"), true, cx),
+            "preview" => self.preview_to_side(&PreviewToSide, window, cx),
             "add-folder" if rest.is_empty() => self.add_folder_prompt(window, cx),
             "add-folder" => self.add_folder(resolve(&root, rest), window, cx),
             "remove-folder" => {
@@ -3454,6 +3544,13 @@ impl Workspace {
                         d.update(cx, |d, cx| d.refresh(cx));
                     }
                 }
+                TabKind::Preview(v) => {
+                    // A picture changed on disk (previews of open files follow the editor instead).
+                    let stale = v.read(cx).source.is_none() && changed_files.contains(&v.read(cx).path);
+                    if stale {
+                        v.update(cx, |v, cx| v.mark_stale(cx));
+                    }
+                }
                 TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) => {}
             }
         }
@@ -3602,6 +3699,7 @@ impl Workspace {
         let (title, icon_name, dirty) = active_ix.map(|ix| self.tab_title(&self.tabs[ix], cx)).unwrap_or_else(|| ("empty".into(), String::new(), false));
         let is_term = active_ix.is_some_and(|ix| matches!(self.tabs[ix].kind, TabKind::Terminal(_)));
         let is_editor = active_ix.is_some_and(|ix| matches!(self.tabs[ix].kind, TabKind::Editor(_) | TabKind::Merge(_)));
+        let can_preview = active_ix.is_some_and(|ix| matches!(&self.tabs[ix].kind, TabKind::Editor(e) if e.read(cx).path.as_deref().is_some_and(preview::has_preview)));
         let frame = if focused { theme::frame_focused() } else { theme::frame() };
         let cell = self.pane_bounds.clone();
         let content: AnyElement = match active_ix.map(|ix| &self.tabs[ix].kind) {
@@ -3611,6 +3709,7 @@ impl Workspace {
             Some(TabKind::Commit(c)) => c.clone().into_any_element(),
             Some(TabKind::Terminal(t)) => t.clone().into_any_element(),
             Some(TabKind::Merge(m)) => m.clone().into_any_element(),
+            Some(TabKind::Preview(v)) => v.clone().into_any_element(),
             None if self.panes.len() == 1 => self.render_welcome(cx),
             None => self.render_empty_pane(),
         };
@@ -3746,6 +3845,12 @@ impl Workspace {
                             ws.navigate(false, window, cx);
                         })),
                 )
+            })
+            .when(can_preview, |d| {
+                d.child(glyph("preview", "eye", "Open preview to the side (⌘K V · ⇧⌘V here)").on_click(cx.listener(move |ws, _, w, cx| {
+                    ws.set_focused_pane(id);
+                    ws.preview_to_side(&PreviewToSide, w, cx);
+                })))
             })
             .when(is_editor, |d| {
                 // Word wrap toggle (same as ⌥Z / the status bar): lit while wrapping.
@@ -4469,6 +4574,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_keys_panel))
             .on_action(cx.listener(Self::toggle_sidebar_side))
             .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::toggle_preview))
+            .on_action(cx.listener(Self::preview_to_side))
             .on_action(cx.listener(Self::open_folder_new_window))
             .on_action(cx.listener(Self::next_window))
             .on_action(cx.listener(|ws, _: &SplitRight, w, cx| ws.split(true, w, cx)))
@@ -4644,7 +4751,7 @@ fn root_is_project(root: &Path) -> bool {
 
 #[cfg(test)]
 mod ui_tests {
-    use super::{CmdMode, Workspace};
+    use super::{CmdMode, TabKind, Workspace};
     use gpui::{TestAppContext, VisualTestContext};
 
     fn setup(cx: &mut TestAppContext) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
@@ -5024,6 +5131,188 @@ mod ui_tests {
         assert_eq!(color, crate::highlight::color(ed.read_with(cx, |e, _| e.capture_at(4, 9)).unwrap()), "underline in the text's own colour");
         assert!(link(cx, "missing", 0).is_none(), "nothing to go to");
         assert!(link(cx, "missing", 0).is_none(), "still nothing after the background search");
+    }
+
+    #[gpui::test]
+    fn tags_follow_renames_and_tab_expands_abbreviations(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let file = root.join("screen.tsx");
+        std::fs::write(&file, "import { View, Text } from 'react-native';\nconst A = () => (\n  <View style={s.a}>\n    <View />\n    <Text>hi</Text>\n  </View>\n);\nconst B = () => (\n  \n);\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file, None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).expect("editor open");
+        let line = |cx: &mut VisualTestContext, r: usize| ed.read_with(cx, |e, _| e.buf.line(r));
+
+        // Renaming the outer View renames its closing tag, not the self-closing one inside.
+        ed.update(cx, |e, cx| e.go_to(2, 7, cx));
+        cx.simulate_input("Box");
+        assert_eq!(line(cx, 2), "  <ViewBox style={s.a}>");
+        assert_eq!(line(cx, 5), "  </ViewBox>", "the closing tag follows");
+        assert_eq!(line(cx, 3), "    <View />", "other tags stay");
+        cx.simulate_keystrokes("backspace backspace backspace");
+        assert_eq!(line(cx, 5), "  </View>", "deleting follows too");
+
+        // From a closing tag back to its opening tag; one undo puts both back.
+        ed.update(cx, |e, cx| e.go_to(4, 18, cx));
+        cx.simulate_input("Line");
+        assert_eq!(line(cx, 4), "    <TextLine>hi</TextLine>");
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(line(cx, 4), "    <Text>hi</Text>", "undo restores both");
+
+        // Tab after an abbreviation writes the markup (React Native: Views and styles).
+        ed.update(cx, |e, cx| e.go_to(8, 2, cx));
+        cx.simulate_input("View.card>Text*2");
+        cx.simulate_keystrokes("tab");
+        let text = ed.read_with(cx, |e, _| e.buf.text());
+        assert!(text.contains("const B = () => (\n  <View style={styles.card}>\n    <Text></Text>\n    <Text></Text>\n  </View>\n);"), "{text}");
+        assert_eq!(ed.read_with(cx, |e, _| e.cursor_rc()), (9, 10), "the cursor waits in the first Text");
+
+        // Code stays code: after `=` Tab indents instead.
+        let end = ed.read_with(cx, |e, _| e.buf.line_count() - 1);
+        ed.update(cx, |e, cx| e.go_to(end, 0, cx));
+        cx.simulate_input("const y = a.b");
+        cx.simulate_keystrokes("escape tab");
+        assert!(ed.read_with(cx, |e, _| e.buf.text()).contains("const y = a.b"), "not expanded");
+
+        // Deleting the rest of the line inside a tag name doesn't rename the partner.
+        ed.update(cx, |e, cx| e.go_to(2, 5, cx));
+        cx.simulate_keystrokes("ctrl-k");
+        assert_eq!(line(cx, 2), "  <Vi");
+        assert_eq!(line(cx, 5), "  </View>", "an unfinished tag doesn't drag its partner along");
+    }
+
+    #[gpui::test]
+    fn colours_get_swatches_and_env_values_stay_hidden(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::write(root.join("theme.ts"), "export const c = { bg: '#1e90ff', shadow: 'rgba(0,0,0,0.5)' };\nconst tag = '#notacolor';\n").unwrap();
+        std::fs::write(root.join(".env"), "API_URL=https://example.com\nSECRET_KEY=abc123xyz\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("theme.ts"), None, false, window, cx));
+        cx.run_until_parked();
+        let theme_ed = ws.read_with(cx, |ws, _| ws.active_editor()).unwrap();
+        let shown = |cx: &mut VisualTestContext, ed: &gpui::Entity<crate::editor::Editor>, r: usize| ed.read_with(cx, |e, _| e.shown_row(r).unwrap_or_default());
+        assert_eq!(shown(cx, &theme_ed, 0), "export const c = { bg:   '#1e90ff', shadow:   'rgba(0,0,0,0.5)' };", "room for a swatch before each colour");
+        assert_eq!(shown(cx, &theme_ed, 1), "const tag = '#notacolor';");
+
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join(".env"), None, false, window, cx));
+        cx.run_until_parked();
+        let env = ws.read_with(cx, |ws, _| ws.active_editor()).unwrap();
+        assert_eq!(shown(cx, &env, 0), "API_URL=https://example.com", "the cursor's line shows its value");
+        assert_eq!(shown(cx, &env, 1), "SECRET_KEY=•••••••••");
+        env.update(cx, |e, cx| e.go_to(1, 0, cx));
+        cx.run_until_parked();
+        assert_eq!(shown(cx, &env, 1), "SECRET_KEY=abc123xyz");
+        assert_eq!(shown(cx, &env, 0), "API_URL=•••••••••••••••••••");
+        assert_eq!(env.read_with(cx, |e, _| e.buf.text()), "API_URL=https://example.com\nSECRET_KEY=abc123xyz\n", "only the drawing changes");
+    }
+
+    #[gpui::test]
+    fn commits_with_secrets_ask_first(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            sh("echo hi > a.txt && git add . && git commit -qm first");
+            sh("printf \"const key = 'sk_live_51HxQabcdefghijklmnop';\\n\" > pay.ts && printf 'TOKEN=abc\\n' > .env.local && git add -A");
+        });
+        cx.run_until_parked();
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let commit = |cx: &mut VisualTestContext| ws.update_in(cx, |ws, window, cx| ws.git_panel.update(cx, |p, cx| p.commit(Some("add payments".into()), false, false, window, cx)));
+        commit(cx);
+        cx.run_until_parked();
+        let (title, detail, sel, n) = ws.read_with(cx, |ws, _| ws.ask.as_ref().map(|a| (a.ask.title.clone(), a.ask.detail.clone(), a.sel, a.ask.buttons.len()))).expect("asks before committing");
+        assert_eq!(title, "This commit may include secrets");
+        assert!(detail.contains(".env.local") && detail.contains("pay.ts:1") && detail.contains("Stripe"), "{detail}");
+        assert!(!detail.contains("abcdefghijklmnop"), "the key itself isn't shown: {detail}");
+        assert_eq!(sel, n, "Enter means Cancel here");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(git_out(&root, &["rev-list", "--count", "HEAD"]), "1", "cancelled: nothing committed");
+
+        commit(cx);
+        cx.run_until_parked();
+        let at = cx.debug_bounds("dialog-button-Commit Anyway").expect("button on screen").center();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(git_out(&root, &["rev-list", "--count", "HEAD"]), "2", "Commit Anyway commits");
+    }
+
+    #[gpui::test]
+    fn previews_follow_markdown_and_show_pictures(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::write(root.join("README.md"), "# Hello\n\nSome **bold** text.\n").unwrap();
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend(64u32.to_be_bytes());
+        png.extend(32u32.to_be_bytes());
+        std::fs::write(root.join("icon.png"), &png).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("README.md"), None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).unwrap();
+        let previews = |cx: &mut VisualTestContext| {
+            ws.read_with(cx, |ws, cx| ws.tabs.iter().filter_map(|t| match &t.kind {
+                TabKind::Preview(v) => Some((v.read(cx).title(), v.read(cx).block_count())),
+                _ => None,
+            }).collect::<Vec<_>>())
+        };
+        cx.simulate_keystrokes("cmd-k v");
+        cx.run_until_parked();
+        assert_eq!(previews(cx), vec![("Preview README.md".to_string(), 2)]);
+        assert_eq!(ws.read_with(cx, |ws, _| ws.panes.len()), 2, "beside, in a new split");
+        assert!(ws.read_with(cx, |ws, _| ws.active_editor()) == Some(ed.clone()), "typing stays in the editor");
+        assert!(cx.debug_bounds("preview-markdown").is_some(), "drawn");
+
+        ed.update(cx, |e, cx| e.go_to(2, 19, cx));
+        cx.simulate_input("\n\n## More");
+        cx.executor().advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        assert_eq!(previews(cx)[0].1, 3, "follows the editor as you type");
+
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("icon.png"), None, false, window, cx));
+        cx.run_until_parked();
+        assert!(previews(cx).iter().any(|(t, _)| t == "icon.png"), "pictures open as pictures: {:?}", previews(cx));
+        assert!(cx.debug_bounds("preview-image").is_some());
+    }
+
+    #[gpui::test]
+    fn typescript_problems_open_a_readable_card(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::write(root.join("a.tsx"), "const b = <Button title=\"x\" />;\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("a.tsx"), None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).unwrap();
+        let diag = crate::editor::Diag {
+            row: 0,
+            col: 11,
+            end_row: 0,
+            end_col: 17,
+            severity: crate::editor::Severity::Error,
+            message: "Type '{ title: string; }' is not assignable to type 'IntrinsicAttributes & ButtonProps'. [TS2322]\n  Property 'onPress' is missing in type '{ title: string; }' but required in type 'ButtonProps'.".into(),
+            source: "ts".into(),
+        };
+        ed.update(cx, |e, cx| e.set_diagnostics(vec![diag], cx));
+        cx.run_until_parked();
+        // The mouse on the underline opens the card; moving away closes it. (This gpui keeps
+        // old debug bounds between frames, so "closed" is checked on the editor.)
+        let open = |cx: &mut VisualTestContext| ed.read_with(cx, |e, _| e.problem_card_open());
+        let spot = ed.read_with(cx, |e, _| e.problem_spots()).first().copied().expect("problem drawn");
+        cx.simulate_mouse_move(spot.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(open(cx) && cx.debug_bounds("problem-card").is_some(), "hover opens the card");
+        cx.simulate_mouse_move(gpui::point(spot.left() + gpui::px(4.), spot.top() + gpui::px(200.)), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(!open(cx), "and moving away closes it");
+        // ⌘K ⌘I opens it from the keyboard; Esc closes it.
+        ed.update(cx, |e, cx| e.go_to(0, 12, cx));
+        cx.simulate_keystrokes("cmd-k cmd-i");
+        cx.run_until_parked();
+        assert!(open(cx));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!open(cx));
     }
 
     #[gpui::test]

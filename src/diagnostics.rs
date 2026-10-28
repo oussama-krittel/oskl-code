@@ -103,8 +103,9 @@ pub fn parse_tsc(out: &str, cwd: &Path) -> FileDiags {
             if let Some((path, ix)) = &last
                 && let Some(d) = map.get_mut(path).and_then(|v| v.get_mut(*ix))
             {
+                // Keep the indent: it's how deep this line is in tsc's explanation.
                 d.message.push('\n');
-                d.message.push_str(line.trim());
+                d.message.push_str(line.trim_end());
             }
             continue;
         }

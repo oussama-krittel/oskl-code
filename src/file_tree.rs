@@ -503,6 +503,7 @@ impl FileTree {
         let _ = window;
         let tree = cx.entity().downgrade();
         cx.emit(Request::Ask(crate::dialog::Ask {
+            cancel_default: false,
             title: format!("Are you sure you want to delete {what}?"),
             detail: "You can restore it from the Trash.".into(),
             buttons: vec!["Move to Trash".into()],

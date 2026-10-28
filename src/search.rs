@@ -635,6 +635,8 @@ fn search_file(root: &Path, rel: &str, re: &Regex) -> Option<FileResult> {
         return None;
     }
     let content = String::from_utf8(bytes).ok()?;
+    // `.env` values stay hidden in results too.
+    let env = crate::secrets::is_env_path(&path);
     let mut matches = Vec::new();
     let mut line_start = 0;
     for (line_no, line) in content.split_inclusive('\n').enumerate() {
@@ -659,7 +661,8 @@ fn search_file(root: &Path, rel: &str, re: &Regex) -> Option<FileResult> {
                 pend += 1;
             }
             let prefix = if pstart > 0 && body[..pstart].trim().len() > 0 { "…" } else { "" };
-            let preview = format!("{prefix}{}", &body[pstart..pend]);
+            let shown = if env { std::borrow::Cow::Owned(crate::secrets::mask_line(body)) } else { std::borrow::Cow::Borrowed(body) };
+            let preview = format!("{prefix}{}", &shown[pstart..pend]);
             let off = prefix.len();
             matches.push(Match {
                 line: line_no,

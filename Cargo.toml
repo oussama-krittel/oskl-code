@@ -11,6 +11,7 @@ anyhow = "1"
 futures = "0.3"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 notify = "6"
+pulldown-cmark = { version = "0.13", default-features = false }
 regex = "1"
 ropey = "1.6"
 serde = { version = "1.0.229", features = ["derive"] }

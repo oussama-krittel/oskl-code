@@ -5,7 +5,7 @@ use crate::buffer::{Buffer, RowChange, Sel};
 use crate::git::{self, BlameCommit};
 use crate::highlight::{self, Lang, LineSpans};
 use crate::complete::{self, Ctx, Flavor, Item, Kind};
-use crate::{theme, tools, util};
+use crate::{colors, emmet, secrets, theme, tools, tserror, util};
 use gpui::prelude::*;
 use gpui::*;
 use std::ops::Range;
@@ -29,7 +29,7 @@ actions!(
         SelectAll, SelectLine, Copy, Cut, Paste, Undo, Redo,
         MoveLineUp, MoveLineDown, DuplicateLineDown, DuplicateLineUp, DeleteLine, ToggleComment,
         Escape, Submit, ShowCharacterPalette, ScrollLineUp, ScrollLineDown, SelectNextOccurrence,
-        SelectAllOccurrences, GoToDefinition, Fold, Unfold, FoldAll, UnfoldAll, NextConflict, PrevConflict,
+        SelectAllOccurrences, GoToDefinition, Fold, Unfold, FoldAll, UnfoldAll, NextConflict, PrevConflict, ShowHover,
     ]
 );
 
@@ -95,6 +95,7 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-l", SelectLine, c),
         crate::keybindings::kb("cmd-d", SelectNextOccurrence, c),
         crate::keybindings::kb("f12", GoToDefinition, c),
+        crate::keybindings::kb("cmd-k cmd-i", ShowHover, c),
         crate::keybindings::kb("cmd-shift-l", SelectAllOccurrences, c),
         crate::keybindings::kb("alt-cmd-[", Fold, c),
         crate::keybindings::kb("alt-cmd-]", Unfold, c),
@@ -362,6 +363,12 @@ pub struct Editor {
     pub decors: Option<Arc<DiffDecors>>,
     pub scroll_link: Option<Rc<Cell<(f32, u64)>>>,
     link_gen: u64,
+    /// The problems card: the row it's for, where it hangs, and whether the keyboard opened it.
+    hover_diag: Option<(usize, Point<Pixels>, bool)>,
+    /// Where problems are drawn (underlines and end-of-line labels), for hovering.
+    diag_hits: Vec<(Bounds<Pixels>, usize)>,
+    /// `.env` values to hide, per row, for this buffer version.
+    env_masks: Option<(u64, Arc<Vec<Option<Range<usize>>>>)>,
 }
 
 /// Lines per press for the scroll-view shortcuts.
@@ -427,6 +434,9 @@ impl Editor {
             decors: None,
             scroll_link: None,
             link_gen: 0,
+            hover_diag: None,
+            diag_hits: Vec::new(),
+            env_masks: None,
         }
     }
 
@@ -1205,7 +1215,9 @@ impl Editor {
         let start = head.saturating_sub(c.ctx.prefix().chars().count());
         let text = format!("{}{}", item.label, item.suffix);
         let cursor = start + text.chars().count() - item.back;
+        let link = self.tag_link();
         self.buf.replace(start..head, &text, Some(Sel::at(cursor)), crate::buffer::EditKind::Other);
+        self.sync_tag(link);
         self.after_edit(cx);
         // Into a folder: keep listing what's inside.
         if item.kind == Kind::Folder {
@@ -1285,6 +1297,9 @@ impl Editor {
     fn after_move(&mut self, cx: &mut Context<Self>) {
         self.marked = None;
         self.completion = None;
+        if self.hover_diag.is_some_and(|(_, _, keyboard)| keyboard) {
+            self.hover_diag = None;
+        }
         self.autoscroll = Some(false);
         cx.notify();
     }
@@ -1347,6 +1362,17 @@ impl Editor {
 
     /// An edit, applied at every cursor as one undo step.
     fn edit(&mut self, cx: &mut Context<Self>, f: impl FnMut(&mut Buffer)) {
+        if self.read_only {
+            return;
+        }
+        let link = self.tag_link();
+        self.buf.each_cursor(false, f);
+        self.sync_tag(link);
+        self.after_edit(cx);
+    }
+
+    /// An edit that must not drag a tag partner along (undo / redo restore both themselves).
+    fn edit_unlinked(&mut self, cx: &mut Context<Self>, f: impl FnMut(&mut Buffer)) {
         if self.read_only {
             return;
         }
@@ -1510,6 +1536,9 @@ impl Editor {
         }
     }
     fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.try_emmet(cx) {
+            return;
+        }
         if self.completion.is_some() {
             return self.accept_completion(cx);
         }
@@ -1535,8 +1564,8 @@ impl Editor {
         }
     }
 
-    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) { self.buf.single_cursor(); self.edit(cx, |b| { b.undo(); }) }
-    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) { self.buf.single_cursor(); self.edit(cx, |b| { b.redo(); }) }
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) { self.buf.single_cursor(); self.edit_unlinked(cx, |b| { b.undo(); }) }
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) { self.buf.single_cursor(); self.edit_unlinked(cx, |b| { b.redo(); }) }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.buf.extra.is_empty() {
@@ -1594,7 +1623,7 @@ impl Editor {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.completion.take().is_some() {
+        if self.completion.take().is_some() || self.hover_diag.take().is_some() {
             return cx.notify();
         }
         if !self.buf.extra.is_empty() {
@@ -1806,6 +1835,7 @@ impl Editor {
         if !ev.dragging() {
             self.drag = None;
             self.scroll_drag = None;
+            self.hover_problems(ev.position, cx);
             return;
         }
         if self.scroll_drag.is_some() {
@@ -1860,6 +1890,7 @@ impl Editor {
         }
         self.scroll_y -= d.y / px(1.);
         self.scroll_x -= d.x / px(1.);
+        self.hover_diag = None;
         if let Some(link) = &self.scroll_link {
             let (_, g) = link.get();
             self.link_gen = g + 1;
@@ -2004,6 +2035,10 @@ impl Editor {
         let y_disp = move |d: usize| top + pad_top + d as f32 * line_h - scroll_y;
         let y_for = |row: usize| y_disp(match &decor { Some(d) => disp_of(d, row), None => row });
 
+        // `.env` values hidden except on the lines with a cursor; colour swatches elsewhere.
+        let env_masks = if self.masks_env() { Some(self.env_masks_now()) } else { None };
+        let revealed: std::collections::HashSet<usize> = if focused { self.buf.all_sels().iter().map(|s| self.buf.pos_to_rc(s.head).0).collect() } else { Default::default() };
+        let mut swatches: Vec<(usize, usize, Hsla)> = Vec::new();
         let mut lines = Vec::with_capacity(visible);
         let mut max_line_w: f32 = 0.;
         let mut fillers: Vec<f32> = Vec::new();
@@ -2038,6 +2073,14 @@ impl Editor {
                 }
             };
             let (mut display, mut map) = self.buf.display_line(row);
+            if let Some(m) = env_masks.as_ref().and_then(|m| m.get(row).cloned().flatten()).filter(|_| !revealed.contains(&row)) {
+                (display, map) = mask_cols(&display, &map, m.start, m.end);
+            } else if full {
+                for (col, color) in self.colors_in(row).into_iter().rev() {
+                    (display, map) = insert_gap(&display, &map, col, 2);
+                    swatches.push((row, col, color));
+                }
+            }
             if display.len() > 6000 {
                 let mut cut = 6000;
                 while !display.is_char_boundary(cut) {
@@ -2313,6 +2356,17 @@ impl Editor {
             }
         }
 
+        // Colour swatches, in the gap opened before each colour.
+        let sw = (char_w * 1.5).min(line_h * 0.7).round();
+        for (srow, scol, color) in &swatches {
+            if let Some((_, shaped, map)) = lines.iter().find(|(r, _, _)| r == srow) {
+                let (x, y) = at(*srow, shaped, map, *scol);
+                let gap = 2. * char_w;
+                let b = Bounds::new(point(px((x - gap + (gap - sw) / 2.).round()), px((y + (line_h - sw) / 2.).round())), size(px(sw), px(sw)));
+                p.quads_under.push(fill(b, *color).corner_radii(px(2.)).border_widths(px(1.)).border_color(theme::fg_muted().opacity(0.7)));
+            }
+        }
+
         // Text.
         for (row, shaped, map) in &lines {
             let st = starts(*row);
@@ -2433,6 +2487,7 @@ impl Editor {
 
             // Diagnostics: wavy underline, faint line tint and the message at the end of the line.
             let mut diag_rows = std::collections::HashSet::new();
+            let mut hits = Vec::new();
             for d in self.diagnostics.iter() {
                 for (r, shaped, map) in lines.iter().filter(|(r, _, _)| *r >= d.row && *r <= d.end_row) {
                     let y = y_for(*r);
@@ -2449,6 +2504,7 @@ impl Editor {
                     let color = d.severity.color();
                     for (x0, x1, sy) in spans(*r, shaped, map, c0, c1) {
                         let x1 = x1.max(x0 + char_w);
+                        hits.push((Bounds::new(point(px(x0), px(sy)), size(px(x1 - x0), px(line_h))), d.row));
                         let mut pb = PathBuilder::stroke(px(1.));
                         let base = sy + line_h - 2.5;
                         pb.move_to(point(px(x0), px(base)));
@@ -2466,14 +2522,17 @@ impl Editor {
                     if *r == d.row && diag_rows.insert(*r) {
                         p.quads_under.push(fill(Bounds::new(point(px(left + blame_w), px(y)), size(px(width - blame_w), px(line_h * nsegs(*r) as f32))), color.opacity(0.07)));
                         let more = self.diagnostics.iter().filter(|o| o.row == *r).count();
-                        let label = if more > 1 { format!("● {}  (+{})", d.message.lines().next().unwrap_or(""), more - 1) } else { format!("● {}", d.message.lines().next().unwrap_or("")) };
+                        let text = tserror::label(&d.message, d.source == "ts");
+                        let label = if more > 1 { format!("● {text}  (+{})", more - 1) } else { format!("● {text}") };
                         let shaped_label = self.shape(window, label, color.opacity(0.85));
                         let (ex, ey) = at(*r, shaped, map, len);
+                        hits.push((Bounds::new(point(px(ex + char_w * 3.), px(ey)), size(shaped_label.width, px(line_h))), d.row));
                         p.text.push((point(px(ex + char_w * 3.), px(ey)), shaped_label));
                     }
                 }
             }
 
+            self.diag_hits = hits;
             if self.blame_gutter || diag_rows.contains(&row) {
             } else if focused
                 && self.buf.sel.is_empty()
@@ -2547,6 +2606,116 @@ fn blame_label(c: &BlameCommit, user_email: Option<&str>, width: usize) -> Strin
 }
 
 /// Which segment of a wrapped line a column is in.
+/// Hides char columns `c0..c1` of a displayed line behind dots (one per char), keeping `map`
+/// (char column → byte offset) right.
+fn mask_cols(display: &str, map: &[usize], c0: usize, c1: usize) -> (String, Vec<usize>) {
+    let last = map.len() - 1;
+    let (c0, c1) = (c0.min(last), c1.min(last).max(c0.min(last)));
+    let (b0, b1) = (map[c0], map[c1]);
+    let dot = '•';
+    let n = c1 - c0;
+    let mut out = String::with_capacity(display.len() + n * 2);
+    out.push_str(&display[..b0]);
+    out.extend(std::iter::repeat_n(dot, n));
+    out.push_str(&display[b1..]);
+    let delta = (n * dot.len_utf8()) as isize - (b1 - b0) as isize;
+    let map = map
+        .iter()
+        .enumerate()
+        .map(|(k, &b)| if k < c0 { b } else if k <= c1 { b0 + (k - c0) * dot.len_utf8() } else { (b as isize + delta) as usize })
+        .collect();
+    (out, map)
+}
+
+/// Opens a gap of `n` spaces before char column `col` of a displayed line (for a swatch).
+fn insert_gap(display: &str, map: &[usize], col: usize, n: usize) -> (String, Vec<usize>) {
+    let col = col.min(map.len() - 1);
+    let b = map[col];
+    let mut out = String::with_capacity(display.len() + n);
+    out.push_str(&display[..b]);
+    out.extend(std::iter::repeat_n(' ', n));
+    out.push_str(&display[b..]);
+    let map = map.iter().enumerate().map(|(k, &x)| if k >= col { x + n } else { x }).collect();
+    (out, map)
+}
+
+/// One problem in the hover card: severity, code or rule, and the message laid out (TypeScript
+/// chains as indented steps, long types formatted).
+fn problem_card(d: &Diag) -> AnyElement {
+    let ts = d.source == "ts";
+    let code = tserror::code(&d.message);
+    let tag = match (&code, ts) {
+        (Some(c), true) => c.clone(),
+        (Some(c), false) => format!("{} · {c}", d.source),
+        (None, _) => d.source.clone(),
+    };
+    let head = div()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .child(div().text_color(d.severity.color()).child("●"))
+        .child(div().text_color(theme::fg_dim()).child(tag));
+    let body: Vec<AnyElement> = if ts {
+        tserror::steps(&d.message).iter().flat_map(step_elements).collect()
+    } else {
+        vec![div().child(tserror::body(&d.message)).into_any_element()]
+    };
+    div().flex().flex_col().gap(px(5.)).child(head).children(body).into_any_element()
+}
+
+/// A step of a TypeScript explanation: prose with the short types coloured inline, and long
+/// types as their own formatted block.
+fn step_elements(st: &tserror::Step) -> Vec<AnyElement> {
+    let type_color = highlight::color(highlight_index("type"));
+    let pad = px(st.depth as f32 * 14.);
+    let mut out = Vec::new();
+    let mut text = String::new();
+    let mut hl: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    fn flush(text: &mut String, hl: &mut Vec<(Range<usize>, HighlightStyle)>, pad: Pixels, out: &mut Vec<AnyElement>) {
+        if !text.trim().is_empty() {
+            let styled = StyledText::new(std::mem::take(text)).with_highlights(std::mem::take(hl));
+            out.push(div().pl(pad).child(styled).into_any_element());
+        }
+        text.clear();
+        hl.clear();
+    }
+    if st.depth > 0 {
+        text.push_str("↳ ");
+    }
+    for part in &st.parts {
+        match part {
+            tserror::Part::Text(t) => text.push_str(t),
+            tserror::Part::Code(c) if c.chars().count() > 60 => {
+                flush(&mut text, &mut hl, pad, &mut out);
+                out.push(
+                    div()
+                        .ml(pad + px(14.))
+                        .px(px(8.))
+                        .py(px(6.))
+                        .rounded(px(4.))
+                        .bg(theme::ca(0xffffff0a))
+                        .font_family(theme::MONO_FONT)
+                        .text_color(type_color)
+                        .child(tserror::format_type(c))
+                        .into_any_element(),
+                );
+            }
+            tserror::Part::Code(c) => {
+                let start = text.len();
+                text.push_str(c);
+                hl.push((start..text.len(), HighlightStyle { color: Some(type_color), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() }));
+            }
+        }
+    }
+    flush(&mut text, &mut hl, pad, &mut out);
+    out
+}
+
+/// The index of a capture name, for its colour.
+fn highlight_index(name: &str) -> u8 {
+    (0..u8::MAX).find(|i| highlight::name(*i) == name).unwrap_or(0)
+}
+
 fn seg_index(starts: &[usize], col: usize) -> usize {
     starts.partition_point(|s| *s <= col).saturating_sub(1)
 }
@@ -2773,11 +2942,14 @@ impl EntityInputHandler for Editor {
         }
         self.buf.single_cursor();
         self.buf.sel = Sel { anchor: range.start, head: range.end };
+        let link = self.tag_link();
         if code {
             self.buf.type_char(&text);
+            self.sync_tag(link);
             self.after_type(&text);
         } else {
             self.buf.insert(&text);
+            self.sync_tag(link);
         }
         self.after_edit(cx);
     }
@@ -2826,6 +2998,212 @@ impl Editor {
     fn utf16_from_chars(&self, r: &Range<usize>) -> Range<usize> {
         let len = self.buf.len();
         self.buf.rope.char_to_utf16_cu(r.start.min(len))..self.buf.rope.char_to_utf16_cu(r.end.min(len))
+    }
+}
+
+impl Editor {
+    // ------------------------------------------------------------ linked tags, abbreviations
+
+    /// The tag name the cursor is in, with the matching tag that should follow it (one cursor).
+    fn tag_link(&self) -> Option<complete::TagLink> {
+        let fl = self.flavor()?;
+        if !self.buf.extra.is_empty() || self.read_only {
+            return None;
+        }
+        complete::tag_link(&self.buf, self.buf.sel.range(), fl)
+    }
+
+    /// After an edit inside a tag name: the matching tag gets the same name, in the same undo step.
+    fn sync_tag(&mut self, link: Option<complete::TagLink>) {
+        if let Some(link) = link
+            && let Some((range, name)) = complete::linked_rename(&self.buf, &link)
+        {
+            self.buf.replace_linked(range, &name);
+        }
+    }
+
+    /// Tab right after an abbreviation (`View.card>Text*2`) in JSX or HTML: expands it.
+    fn try_emmet(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(fl) = self.flavor() else { return false };
+        if fl == Flavor::Script || self.read_only || !self.buf.extra.is_empty() || !self.buf.sel.is_empty() {
+            return false;
+        }
+        let pos = self.buf.sel.head;
+        let (row, col) = self.buf.pos_to_rc(pos);
+        let line: Vec<char> = self.buf.line(row).chars().collect();
+        if line.get(col).is_some_and(|c| !c.is_whitespace() && !matches!(c, ')' | '}' | ']' | ';' | ',')) {
+            return false;
+        }
+        let before: String = line[..col.min(line.len())].iter().collect();
+        let start_col = emmet::abbreviation_start(&before);
+        if start_col >= col {
+            return false;
+        }
+        let start = self.buf.line_start(row) + start_col;
+        if complete::emmet_blocked(&self.buf, start) {
+            return false;
+        }
+        // In scripts, only where markup can start (`const x = a.b` stays code).
+        let lead: String = line[..start_col].iter().collect();
+        let lead = lead.trim_end();
+        let markup_spot = lead.is_empty() || lead.ends_with(['(', '>', '{', '?', ':']) || ["return", "&&", "||", "=>"].iter().any(|w| lead.ends_with(w));
+        if fl == Flavor::Jsx && !markup_spot {
+            return false;
+        }
+        let target = match fl {
+            Flavor::Html => emmet::Target::Html,
+            _ if complete::is_react_native(&self.buf) => emmet::Target::ReactNative,
+            _ => emmet::Target::Jsx,
+        };
+        let abbr: String = line[start_col..col].iter().collect();
+        // With suggestions open, Tab picks one, unless what's typed is clearly an abbreviation.
+        if self.completion.is_some() && !abbr.contains(['.', '#', '>', '+', '*', '[', '{', '^', '(']) {
+            return false;
+        }
+        let base: String = line.iter().take_while(|c| **c == ' ' || **c == '\t').collect();
+        let Some((text, cursor)) = emmet::expand(&abbr, target, &self.buf.indent, &base) else { return false };
+        self.completion = None;
+        self.buf.replace(start..pos, &text, Some(Sel::at(start + cursor)), crate::buffer::EditKind::Other);
+        self.after_edit(cx);
+        true
+    }
+
+    // ------------------------------------------------------------ env values, colours
+
+    /// Whether the problems card is open.
+    #[cfg(test)]
+    pub fn problem_card_open(&self) -> bool {
+        self.hover_diag.is_some()
+    }
+
+    /// Where problems were drawn in the last layout (underlines, then labels).
+    #[cfg(test)]
+    pub fn problem_spots(&self) -> Vec<Bounds<Pixels>> {
+        self.diag_hits.iter().map(|(b, _)| *b).collect()
+    }
+
+    /// The text drawn for a row in the last layout (masks and swatch gaps included).
+    #[cfg(test)]
+    pub fn shown_row(&self, row: usize) -> Option<String> {
+        self.layout.as_ref()?.lines.iter().find(|(r, _, _)| *r == row).map(|(_, s, _)| s.text.to_string())
+    }
+
+    /// `.env` files show their values as dots, except on the line being edited.
+    fn masks_env(&self) -> bool {
+        self.mode == EditorMode::Full && self.path.as_deref().is_some_and(secrets::is_env_path)
+    }
+
+    fn env_masks_now(&mut self) -> Arc<Vec<Option<Range<usize>>>> {
+        let version = self.buf.version();
+        if let Some((v, m)) = &self.env_masks
+            && *v == version
+        {
+            return m.clone();
+        }
+        let m = Arc::new(secrets::env_masks(&self.buf.text()));
+        self.env_masks = Some((version, m.clone()));
+        m
+    }
+
+    /// Colours written on a row: the column the swatch goes before (the opening quote when the
+    /// colour is the whole string) and the colour.
+    fn colors_in(&self, row: usize) -> Vec<(usize, Hsla)> {
+        let Some(lang) = self.lang else { return Vec::new() };
+        let line = self.buf.line(row);
+        if line.len() > 3_000 || !(line.contains('#') || line.contains("rgb") || line.contains("hsl")) {
+            return Vec::new();
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let spans = self.spans.as_ref().and_then(|s| s.get(row)).filter(|s| !s.is_empty());
+        let in_string = |col: usize| match spans {
+            Some(sp) => sp.iter().any(|(r, h)| r.contains(&col) && highlight::name(*h).starts_with("string")),
+            None => col > 0 && matches!(chars.get(col - 1), Some('\'' | '"' | '`')),
+        };
+        colors::find(&line, matches!(lang, Lang::Css | Lang::Html), in_string)
+            .into_iter()
+            .map(|f| {
+                let quote = f.cols.start.checked_sub(1).and_then(|i| chars.get(i)).filter(|q| matches!(q, '\'' | '"' | '`'));
+                let whole = quote.is_some() && chars.get(f.cols.end) == quote;
+                let [r, g, b, a] = f.rgba;
+                (if whole { f.cols.start - 1 } else { f.cols.start }, Hsla::from(Rgba { r, g, b, a }))
+            })
+            .collect()
+    }
+
+    // ------------------------------------------------------------ problems card
+
+    /// ⌘K ⌘I: the card for the problems on the cursor's line.
+    fn show_hover(&mut self, _: &ShowHover, _: &mut Window, cx: &mut Context<Self>) {
+        let (row, col) = self.cursor_rc();
+        if !self.diagnostics.iter().any(|d| d.row == row) {
+            return;
+        }
+        let Some(l) = &self.layout else { return };
+        let Some((_, shaped, map)) = l.lines.iter().find(|(r, _, _)| *r == row) else { return };
+        let x = l.text_left - self.scroll_x + shaped.x_for_index(map[col.min(map.len() - 1)]) / px(1.);
+        let y = l.bounds.top() / px(1.) + l.pad_top + (self.disp_of(row) + 1) as f32 * l.line_h - self.scroll_y;
+        self.hover_diag = Some((row, point(px(x), px(y)), true));
+        cx.notify();
+    }
+
+    /// The mouse on a problem's underline or label opens its card; moving off it closes it.
+    fn hover_problems(&mut self, p: Point<Pixels>, cx: &mut Context<Self>) {
+        let hit = self.diag_hits.iter().find(|(b, _)| b.contains(&p)).map(|(b, row)| (*row, point(b.left(), b.bottom())));
+        match (hit, self.hover_diag) {
+            (Some((row, _)), Some((r, _, _))) if r == row => {}
+            (Some((row, at)), _) => {
+                self.hover_diag = Some((row, at, false));
+                cx.notify();
+            }
+            (None, Some((_, _, false))) => {
+                self.hover_diag = None;
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn diag_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (row, at, _) = self.hover_diag?;
+        let mut diags: Vec<&Diag> = self.diagnostics.iter().filter(|d| d.row == row).collect();
+        if diags.is_empty() {
+            return None;
+        }
+        diags.sort_by_key(|d| d.severity);
+        Some(
+            deferred(
+                anchored().position(at).snap_to_window().child(
+                    div()
+                        .id("problem-card")
+                        .debug_selector(|| "problem-card".into())
+                        .occlude()
+                        .max_w(px(580.))
+                        .max_h(px(400.))
+                        .overflow_y_scroll()
+                        .p(px(10.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.))
+                        .bg(theme::bg_popup())
+                        .border_1()
+                        .border_color(theme::border_input())
+                        .rounded(px(6.))
+                        .shadow_lg()
+                        .font_family(theme::UI_FONT)
+                        .text_size(px(12.))
+                        .text_color(theme::fg())
+                        .on_hover(cx.listener(|ed, hovered: &bool, _, cx| {
+                            if !*hovered && ed.hover_diag.is_some_and(|(_, _, keyboard)| !keyboard) {
+                                ed.hover_diag = None;
+                                cx.notify();
+                            }
+                        }))
+                        .children(diags.into_iter().map(problem_card)),
+                ),
+            )
+            .with_priority(2)
+            .into_any_element(),
+        )
     }
 }
 
@@ -2945,6 +3323,7 @@ impl Render for Editor {
             .cursor(if self.link.is_some() { CursorStyle::PointingHand } else { CursorStyle::IBeam })
             .on_modifiers_changed(cx.listener(Self::modifiers_changed))
             .on_action(cx.listener(Self::go_to_definition_action))
+            .on_action(cx.listener(Self::show_hover))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
             .on_action(cx.listener(Self::move_up))
@@ -3012,6 +3391,7 @@ impl Render for Editor {
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .child(EditorElement { editor: cx.entity() })
             .children(self.completion_popup(cx))
+            .children(self.diag_popup(cx))
     }
 }
 

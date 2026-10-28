@@ -130,8 +130,18 @@ impl DiffView {
             let left_path = spec.old_path.clone().unwrap_or(spec.path.clone());
             let left = git::read_rev(&root, &spec.left, &left_path);
             let right = git::read_rev(&root, &spec.right, &spec.path);
+            // `.env` values stay hidden here too (the diff itself is computed on the real text).
+            let env = crate::secrets::is_env_path(std::path::Path::new(&spec.path));
             match (left, right) {
-                (Some(l), Some(r)) => Ok(compute(&l, &r)),
+                (Some(l), Some(r)) => Ok({
+                    let mut d = compute(&l, &r);
+                    if env {
+                        for line in d.left.iter_mut().chain(d.right.iter_mut()) {
+                            *line = crate::secrets::mask_line(line);
+                        }
+                    }
+                    d
+                }),
                 _ => Err("Binary file or missing revision — nothing to show.".to_string()),
             }
         });

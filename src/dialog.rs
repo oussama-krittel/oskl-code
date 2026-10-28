@@ -30,6 +30,8 @@ pub struct Ask {
     pub buttons: Vec<String>,
     /// The main button destroys something (drawn red).
     pub danger: bool,
+    /// Enter means Cancel until another button is picked (for warnings you should read).
+    pub cancel_default: bool,
     pub on_answer: Answer,
 }
 

@@ -94,6 +94,7 @@ Works like VS Code's:
 - Click a commit to see its files and diffs; right-click it to create a branch there, cherry-pick, revert or copy its hash.
 - **Several repositories:** if your folder (or an added folder) contains more than one git repository, a select at the top of the panel picks which one you see. Changes, graph, commit box and git commands follow it.
 - Merge conflicts open in a merge editor; files with no conflict markers left are staged when you save.
+- **Secrets check:** committing asks first when an env file or something shaped like an API key, token or private key is staged (the key itself is never shown in full). Enter cancels; Commit Anyway goes ahead.
 
 ### Diffs and blame
 
@@ -105,8 +106,13 @@ Works like VS Code's:
 
 - VS Code keys: ⌘D adds the next match, ⌥↑ ⌥↓ move lines, ⌘/ comments in the file's language, ⌘⇧K deletes a line, and more.
 - **Go to definition:** ⌘-click or F12 on a name, an import, or an import path. ⌃- goes back, ⌃⇧- forward (or the ← → buttons in the split header). Hold ⌘ to see what's clickable.
-- **HTML / JSX / React Native:** `>` closes the tag, `</` finishes it, suggestions for tags, props, types and import paths (it reads `tsconfig` / `jsconfig` path aliases).
+- **HTML / JSX / React Native:** `>` closes the tag, `</` finishes it, and renaming a tag renames its closing tag too. Suggestions for tags, props, types and import paths (it reads `tsconfig` / `jsconfig` path aliases).
+- **Emmet-style abbreviations:** type `View.card>Text*2` and press Tab. In React Native files `.card` becomes `style={styles.card}` and `#id` becomes `testID`; elsewhere `className` / `class`. Supports `>`, `+`, `^`, `*N` with `$` numbering, `[attr=value]`, `{text}` and `( )` groups.
+- **Colour swatches** before `#hex`, `rgb()` and `hsl()` values, in styles, themes and stylesheets.
+- **Readable TypeScript errors:** the label at the end of the line shortens long types and adds the innermost reason; hover the error (or ⌘K ⌘I) for the whole explanation, step by step, with long types laid out.
 - Search in the file with ⌘F; search and replace across files with ⌘⇧F (match case, whole word, regex, include/exclude globs).
+- **Previews:** ⇧⌘V shows the rendered Markdown or SVG in place, ⌘K V beside the editor (it follows as you type). Images (PNG, JPEG, GIF, WebP…) open as pictures with their size; click to switch between a dark and a light background.
+- **`.env` files** show their values as dots except on the line with the cursor, in the editor, diffs and search results, so screen sharing is safe.
 - Auto save is on (1 second after you stop typing). ⌘S formats with your project's formatter first.
 
 ### Splits and terminals

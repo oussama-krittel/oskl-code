@@ -252,6 +252,157 @@ pub fn close_tag_after_slash(buf: &Buffer, pos: usize, fl: Flavor) -> Option<Str
     Some(format!("{name}>"))
 }
 
+// ------------------------------------------------------------------ linked tag names
+
+/// A tag name about to be edited, and the matching tag's name that should follow it
+/// (`<View>` … `</View>`).
+#[derive(Clone, Debug)]
+pub struct TagLink {
+    /// Where the edited name starts, and whether it's in the closing tag.
+    pub name_start: usize,
+    pub closing: bool,
+    pub name: String,
+    /// The other tag's name, where it was before the edit.
+    pub partner: std::ops::Range<usize>,
+    /// Buffer length before the edit (to know how far the partner moves).
+    pub len: usize,
+}
+
+/// Tags in `t` (start index and parsed tag), skipping `<!-- comments -->`.
+fn tags_in(t: &[char]) -> Vec<(usize, Tag)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < t.len() {
+        if t[i] == '<' && t.get(i + 1..i + 4) == Some(&['!', '-', '-']) {
+            let mut j = i + 4;
+            while j + 2 < t.len() && !(t[j] == '-' && t[j + 1] == '-' && t[j + 2] == '>') {
+                j += 1;
+            }
+            i = j + 3;
+            continue;
+        }
+        if t[i] == '<'
+            && starts_tag(t, i)
+            && let Some(tag) = parse_tag(t, i)
+            && let Some(end) = tag.end
+        {
+            out.push((i, tag));
+            i = end + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// If `range` (the cursor or selection) is inside the name of a complete opening or closing
+/// tag, that tag and the name of the tag that matches it.
+pub fn tag_link(buf: &Buffer, range: std::ops::Range<usize>, fl: Flavor) -> Option<TagLink> {
+    if fl == Flavor::Script {
+        return None;
+    }
+    let mut s = range.start;
+    while s > 0 && range.start - s < 200 && buf.char_at(s - 1).is_some_and(is_name_char) {
+        s -= 1;
+    }
+    let closing = s >= 2 && buf.char_at(s - 1) == Some('/') && buf.char_at(s - 2) == Some('<');
+    if !closing && (s == 0 || buf.char_at(s - 1) != Some('<')) {
+        return None;
+    }
+    let lt = if closing { s - 2 } else { s - 1 };
+    let mut e = s;
+    while e - s < 200 && buf.char_at(e).is_some_and(is_name_char) {
+        e += 1;
+    }
+    if range.end > e {
+        return None;
+    }
+    let name = buf.slice(s..e);
+    if looks_generic(&name) {
+        return None;
+    }
+    // The tag itself must be whole (its `>` typed) and not `<Name />`.
+    let from = lt.saturating_sub(1);
+    let t: Vec<char> = buf.rope.slice(from..(lt + TAG_WINDOW).min(buf.len())).chars().collect();
+    if !starts_tag(&t, lt - from) {
+        return None;
+    }
+    let tag = parse_tag(&t, lt - from)?;
+    let end = tag.end?;
+    if tag.self_closing {
+        return None;
+    }
+    let same = |tag: &Tag| tag.name == name;
+    let partner = if closing {
+        // Back to the opening tag that this one closes.
+        let start = lt.saturating_sub(NEST_WINDOW);
+        let t: Vec<char> = buf.rope.slice(start..lt).chars().collect();
+        let mut depth = 0;
+        let mut found = None;
+        for (i, tag) in tags_in(&t).into_iter().rev().filter(|(_, t)| same(t)) {
+            if tag.closing {
+                depth += 1;
+            } else if !tag.self_closing {
+                if depth == 0 {
+                    found = Some(start + i + 1);
+                    break;
+                }
+                depth -= 1;
+            }
+        }
+        found?
+    } else {
+        // Forward to the closing tag that ends this one.
+        let start = from + end + 1;
+        let t: Vec<char> = buf.rope.slice(start..(start + NEST_WINDOW).min(buf.len())).chars().collect();
+        let mut depth = 0;
+        let mut found = None;
+        for (i, tag) in tags_in(&t).into_iter().filter(|(_, t)| same(t)) {
+            if tag.closing {
+                if depth == 0 {
+                    found = Some(start + i + 2);
+                    break;
+                }
+                depth -= 1;
+            } else if !tag.self_closing {
+                depth += 1;
+            }
+        }
+        found?
+    };
+    let n = name.chars().count();
+    Some(TagLink { name_start: s, closing, name, partner: partner..partner + n, len: buf.len() })
+}
+
+/// After an edit inside a linked tag name: the new name, and where the partner's old name is
+/// now (to be replaced with it). None when nothing needs to follow.
+pub fn linked_rename(buf: &Buffer, link: &TagLink) -> Option<(std::ops::Range<usize>, String)> {
+    let s = link.name_start;
+    let opener_ok = if link.closing { s >= 2 && buf.char_at(s - 2) == Some('<') && buf.char_at(s - 1) == Some('/') } else { s >= 1 && buf.char_at(s - 1) == Some('<') };
+    if !opener_ok {
+        return None;
+    }
+    let mut e = s;
+    while e - s < 200 && buf.char_at(e).is_some_and(is_name_char) {
+        e += 1;
+    }
+    let new_name = buf.slice(s..e);
+    if new_name == link.name {
+        return None;
+    }
+    // Still a whole tag (not cut short by deleting to the end of the line, not turned into `<X />`).
+    let lt = if link.closing { s - 2 } else { s - 1 };
+    let from = lt.saturating_sub(1);
+    let t: Vec<char> = buf.rope.slice(from..(lt + TAG_WINDOW).min(buf.len())).chars().collect();
+    let tag = parse_tag(&t, lt - from)?;
+    if tag.end.is_none() || tag.self_closing {
+        return None;
+    }
+    let shift = if link.partner.start > s { buf.len() as isize - link.len as isize } else { 0 };
+    let p = (link.partner.start as isize + shift).max(0) as usize..(link.partner.end as isize + shift).max(0) as usize;
+    (p.end <= buf.len() && buf.slice(p.clone()) == link.name).then_some((p, new_name))
+}
+
 // ------------------------------------------------------------------ suggestions
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -415,6 +566,20 @@ fn import_path(line: &[char]) -> Option<String> {
     let b = before.trim_end();
     let ok = b.ends_with("from") || b.ends_with("import") || b.ends_with("require(") || b.ends_with("import(") || b.ends_with("jest.mock(");
     ok.then(|| line[q + 1..].iter().collect())
+}
+
+/// Places where Tab shouldn't expand an abbreviation: inside a string or `//` comment on the
+/// line, or inside a tag's attributes.
+pub fn emmet_blocked(buf: &Buffer, pos: usize) -> bool {
+    let (row, col) = buf.pos_to_rc(pos);
+    let line: Vec<char> = buf.line(row).chars().take(col).collect();
+    in_string_or_comment(&line) || open_tag(&window(buf, pos, TAG_WINDOW)).is_some()
+}
+
+/// The file imports from `react-native` (and not `react-dom`).
+pub fn is_react_native(buf: &Buffer) -> bool {
+    let (native, dom) = has_react_native(buf);
+    native && !dom
 }
 
 fn has_react_native(buf: &Buffer) -> (bool, bool) {

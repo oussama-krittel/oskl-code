@@ -316,6 +316,34 @@ impl Buffer {
         }
     }
 
+    /// An edit that belongs to the one just made (a closing tag renamed along with its opening
+    /// tag): same undo step, and the cursors keep their place in the text.
+    pub fn replace_linked(&mut self, range: Range<usize>, text: &str) {
+        let range = range.start.min(self.len())..range.end.min(self.len());
+        let old = self.slice(range.clone());
+        let delta = text.chars().count() as isize - old.chars().count() as isize;
+        let shift = |p: usize| if p >= range.end { (p as isize + delta).max(0) as usize } else { p };
+        let start_row = self.rope.char_to_line(range.start);
+        let old_end = self.rope.char_to_line(range.end);
+        self.rope.remove(range.clone());
+        self.rope.insert(range.start, text);
+        self.changes.push(RowChange { start: start_row, old_end, new_end: start_row + text.matches('\n').count() });
+        self.sel = Sel { anchor: shift(self.sel.anchor), head: shift(self.sel.head) };
+        for s in self.extra.iter_mut() {
+            *s = Sel { anchor: shift(s.anchor), head: shift(s.head) };
+        }
+        self.version += 1;
+        self.redo.clear();
+        let edit = Edit { at: range.start, old, new: text.to_string() };
+        match self.undo.last_mut() {
+            Some(last) => {
+                last.edits.push(edit);
+                last.after = self.sel;
+            }
+            None => self.undo.push(Txn { edits: vec![edit], before: self.sel, after: self.sel, kind: EditKind::Other, time: Instant::now() }),
+        }
+    }
+
     pub fn undo(&mut self) -> bool {
         self.extra.clear();
         let Some(txn) = self.undo.pop() else { return false };
