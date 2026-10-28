@@ -2597,7 +2597,7 @@ impl Workspace {
         if std::env::var_os("KITE_DEBUG").is_some() {
             eprintln!("[kite] check_file {} (checks on: {})", path.display(), self.settings.checks);
         }
-        if !self.settings.checks {
+        if !self.settings.checks || crate::diagnostics::is_dependency(&path) {
             return;
         }
         let root = self.root(cx);
@@ -2671,7 +2671,8 @@ impl Workspace {
             this.update(cx, |ws, cx| {
                 ws.tsc_running = false;
                 match result {
-                    Some(Ok(map)) => {
+                    Some(Ok(mut map)) => {
+                        map.retain(|p, _| !crate::diagnostics::is_dependency(p));
                         ws.ts_diags = map;
                         ws.push_diagnostics(cx);
                     }

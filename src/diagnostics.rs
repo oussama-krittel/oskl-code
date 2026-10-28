@@ -28,8 +28,13 @@ fn failure(tool: &str, stderr: &str, stdout: &str) -> String {
 
 /// Lints one file. Returns its diagnostics (possibly empty), Err when the linter itself
 /// failed (so it isn't mistaken for "no problems"), or None when no linter applies.
+/// Installed packages (`node_modules`): not the project's code, so never checked or listed.
+pub fn is_dependency(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "node_modules")
+}
+
 pub fn lint_file(root: &Path, file: &Path) -> Option<Result<(String, Vec<Diag>), String>> {
-    if !is_web(file) {
+    if !is_web(file) || is_dependency(file) {
         return None;
     }
     let dir = file.parent().unwrap_or(root);
@@ -139,6 +144,10 @@ pub fn parse_eslint(out: &str) -> FileDiags {
             let severity = if num("severity") == Some(2) { Severity::Error } else { Severity::Warning };
             let rule = m.get("ruleId").and_then(|r| r.as_str()).unwrap_or("");
             let msg = m.get("message").and_then(|r| r.as_str()).unwrap_or("");
+            // "File ignored because…": ESLint saying it skipped the file, not a problem in it.
+            if rule.is_empty() && msg.starts_with("File ignored") {
+                continue;
+            }
             list.push(Diag { row, col, end_row, end_col, severity, message: if rule.is_empty() { msg.to_string() } else { format!("{msg} [{rule}]") }, source: "eslint".into() });
         }
     }
@@ -202,6 +211,15 @@ mod tests {
         assert_eq!(a[0].severity, Severity::Error);
         assert!(a[0].message.contains("TS2322") && a[0].message.contains("Extra detail"));
         assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn ignored_files_and_packages_are_not_problems() {
+        let out = r#"[{"filePath":"/p/node_modules/x/a.d.ts","messages":[{"ruleId":null,"severity":1,"message":"File ignored by default because it is located under the node_modules directory. Use ignore pattern \"!**/node_modules/\" to disable file ignore settings or use \"--no-warn-ignored\" to suppress this warning."}]},{"filePath":"/p/dist/b.js","messages":[{"ruleId":null,"severity":1,"message":"File ignored because of a matching ignore pattern."}]}]"#;
+        assert!(parse_eslint(out).values().all(|d| d.is_empty()), "no ignore notices");
+        assert!(super::is_dependency(Path::new("/p/node_modules/expo/build/a.d.ts")));
+        assert!(!super::is_dependency(Path::new("/p/src/modules/a.ts")));
+        assert!(super::lint_file(Path::new("/p"), Path::new("/p/node_modules/x/a.ts")).is_none(), "packages aren't linted");
     }
 
     #[test]
