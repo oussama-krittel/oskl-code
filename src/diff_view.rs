@@ -1,6 +1,7 @@
 //! Side-by-side (or inline) diff with word-level highlights and blame on both sides.
 
 use crate::git::{self, BlameCommit, Rev};
+use crate::highlight::{self, LineSpans};
 use crate::request::{DiffSpec, Request};
 use crate::{theme, ui, util};
 use gpui::prelude::*;
@@ -64,6 +65,9 @@ struct Loaded {
     right: Vec<String>,
     side: Vec<Row>,
     inline: Vec<Row>,
+    /// Syntax colours per line of each side (char columns), when the language is known.
+    left_syn: Option<LineSpans>,
+    right_syn: Option<LineSpans>,
 }
 
 pub struct DiffView {
@@ -137,18 +141,8 @@ impl DiffView {
             let left_path = spec.old_path.clone().unwrap_or(spec.path.clone());
             let left = git::read_rev(&root, &spec.left, &left_path);
             let right = git::read_rev(&root, &spec.right, &spec.path);
-            // `.env` values stay hidden here too (the diff itself is computed on the real text).
-            let env = crate::secrets::is_env_path(std::path::Path::new(&spec.path));
             match (left, right) {
-                (Some(l), Some(r)) => Ok({
-                    let mut d = compute(&l, &r);
-                    if env {
-                        for line in d.left.iter_mut().chain(d.right.iter_mut()) {
-                            *line = crate::secrets::mask_line(line);
-                        }
-                    }
-                    d
-                }),
+                (Some(l), Some(r)) => Ok(prepare(&l, &r, &spec.path)),
                 _ => Err("Binary file or missing revision — nothing to show.".to_string()),
             }
         });
@@ -441,6 +435,23 @@ fn blame_side(root: &std::path::Path, rev: &Rev, path: &str) -> Option<BlameLine
     blame.ok().map(|b| b.lines)
 }
 
+/// The diff of two versions, with `.env` values hidden (the diff itself is computed on the real
+/// text) and syntax colours for both sides.
+fn prepare(left: &str, right: &str, path: &str) -> Loaded {
+    let mut d = compute(left, right);
+    let path = std::path::Path::new(path);
+    if crate::secrets::is_env_path(path) {
+        for line in d.left.iter_mut().chain(d.right.iter_mut()) {
+            *line = crate::secrets::mask_line(line);
+        }
+    }
+    if let Some(lang) = highlight::detect(path) {
+        d.left_syn = highlight::highlight(lang, &d.left.join("\n"));
+        d.right_syn = highlight::highlight(lang, &d.right.join("\n"));
+    }
+    d
+}
+
 fn compute(left: &str, right: &str) -> Loaded {
     let left_lines: Vec<String> = left.split('\n').map(String::from).collect();
     let right_lines: Vec<String> = right.split('\n').map(String::from).collect();
@@ -492,7 +503,7 @@ fn compute(left: &str, right: &str) -> Loaded {
             }
         }
     }
-    Loaded { left: left_lines, right: right_lines, side, inline }
+    Loaded { left: left_lines, right: right_lines, side, inline, left_syn: None, right_syn: None }
 }
 
 /// Byte ranges that differ between two versions of a line.
@@ -533,27 +544,27 @@ fn push_range(v: &mut Vec<Range<usize>>, r: Range<usize>) {
     v.push(r);
 }
 
-fn styled_line(text: &str, highlights: &[(Range<usize>, Hsla)]) -> StyledText {
+/// A line with its syntax colours (char columns) and background highlights (byte ranges);
+/// tabs are drawn as four spaces.
+fn styled_line(text: &str, syntax: &[(Range<usize>, u8)], highlights: &[(Range<usize>, Hsla)]) -> StyledText {
     let display = text.replace('\t', "    ");
-    if highlights.is_empty() || display.len() != text.len() {
+    if syntax.is_empty() && highlights.is_empty() {
         return StyledText::new(display);
     }
-    let font = font(theme::MONO_FONT);
-    let mut runs = Vec::new();
-    let mut pos = 0;
-    let run = |len: usize, bg: Option<Hsla>| TextRun { len, font: font.clone(), color: theme::fg(), background_color: bg, underline: None, strikethrough: None };
-    for (r, color) in highlights {
-        let (s, e) = (r.start.min(text.len()).max(pos), r.end.min(text.len()));
-        if s > pos {
-            runs.push(run(s - pos, None));
+    let mono = font(theme::MONO_FONT);
+    let mut italic = mono.clone();
+    italic.style = FontStyle::Italic;
+    let mut runs: Vec<TextRun> = Vec::new();
+    for (col, (b, ch)) in text.char_indices().enumerate() {
+        let syn = syntax.iter().rev().find(|(r, _)| r.contains(&col)).map(|(_, h)| *h);
+        let color = syn.map(highlight::color).unwrap_or_else(theme::fg);
+        let f = if syn.is_some_and(highlight::is_comment) { &italic } else { &mono };
+        let bg = highlights.iter().find(|(r, _)| r.contains(&b)).map(|(_, c)| *c);
+        let len = if ch == '\t' { 4 } else { ch.len_utf8() };
+        match runs.last_mut() {
+            Some(last) if last.color == color && last.background_color == bg && last.font == *f => last.len += len,
+            _ => runs.push(TextRun { len, font: f.clone(), color, background_color: bg, underline: None, strikethrough: None }),
         }
-        if e > s {
-            runs.push(run(e - s, Some(*color)));
-            pos = e;
-        }
-    }
-    if pos < text.len() {
-        runs.push(run(text.len() - pos, None));
     }
     StyledText::new(display).with_runs(runs)
 }
@@ -582,6 +593,8 @@ impl DiffView {
             .collect();
         let highlights: Vec<(Range<usize>, Hsla)> =
             if found.is_empty() { (if left { &row.l_hl } else { &row.r_hl }).iter().map(|r| (r.clone(), hl)).collect() } else { found };
+        let syn = if left { &data.left_syn } else { &data.right_syn };
+        let syntax = line.and_then(|i| syn.as_ref().and_then(|s| s.get(i))).map(Vec::as_slice).unwrap_or(&[]);
         let blame = if left { &self.left_blame } else { &self.right_blame };
 
         let mut side = div().flex().flex_1().min_w_0().h_full().overflow_hidden();
@@ -639,7 +652,7 @@ impl DiffView {
             div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(
                 div()
                     .ml(px(-self.scroll_x))
-                    .child(styled_line(text, &highlights)),
+                    .child(styled_line(text, syntax, &highlights)),
             ),
         )
     }
@@ -777,5 +790,20 @@ impl Render for DiffView {
                     .child(canvas(move |b, _, _| cell.set(b), |_, _, _, _| {}).absolute().size_full())
                     .child(body)
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare;
+
+    #[test]
+    fn both_sides_get_syntax_colours() {
+        let d = prepare("fn a() {}\n", "fn a() {}\nlet x = \"hi\";\n", "src/main.rs");
+        let (l, r) = (d.left_syn.expect("left coloured"), d.right_syn.expect("right coloured"));
+        assert!(!l[0].is_empty() && !r[1].is_empty(), "keywords and strings get spans");
+        assert!(prepare("a\n", "b\n", "notes.unknownext").right_syn.is_none());
+        let env = prepare("KEY=old\n", "KEY=new\n", ".env");
+        assert_eq!(env.right[0], "KEY=***", "env values stay hidden");
     }
 }
