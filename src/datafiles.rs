@@ -1,4 +1,4 @@
-//! Built-in checks and formatting for JSON and YAML (no external tools needed).
+//! Built-in checks and formatting for JSON, YAML and Terraform (no external tools needed).
 
 use crate::editor::{Diag, Severity};
 use std::collections::HashSet;
@@ -10,6 +10,8 @@ pub enum Kind {
     /// JSON with comments and trailing commas (tsconfig, VS Code settings, .jsonc).
     Jsonc,
     Yaml,
+    /// Terraform / HCL, read with the same tree-sitter parser that colours it.
+    Terraform,
 }
 
 pub fn kind(path: &Path) -> Option<Kind> {
@@ -21,6 +23,7 @@ pub fn kind(path: &Path) -> Option<Kind> {
         "json" if in_vscode || name.starts_with("tsconfig") || name.starts_with("jsconfig") || name == ".eslintrc.json" || name == "devcontainer.json" || name == "biome.json" => Some(Kind::Jsonc),
         "json" => Some(Kind::Json),
         "yml" | "yaml" => Some(Kind::Yaml),
+        "tf" | "tfvars" | "hcl" | "tftest" => Some(Kind::Terraform),
         _ => None,
     }
 }
@@ -32,6 +35,7 @@ fn diag(row: usize, col: usize, severity: Severity, message: String, source: &st
 /// Syntax errors and duplicate keys.
 pub fn check(kind: Kind, text: &str) -> Vec<Diag> {
     match kind {
+        Kind::Terraform => check_terraform(text),
         Kind::Yaml => match yaml_rust2::YamlLoader::load_from_str(text) {
             Ok(_) => Vec::new(),
             Err(e) => {
@@ -53,6 +57,75 @@ pub fn check(kind: Kind, text: &str) -> Vec<Diag> {
             out
         }
     }
+}
+
+/// Terraform: what the parser couldn't read (unclosed blocks, missing `=` or values, stray
+/// characters) and arguments set twice in one block. Parsing is in-process and the tree is
+/// dropped right away, so nothing stays in memory.
+fn check_terraform(text: &str) -> Vec<Diag> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&tree_sitter_hcl::LANGUAGE.into()).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(text, None) else { return Vec::new() };
+    let lines: Vec<&str> = text.split('\n').collect();
+    // tree-sitter columns are bytes; diagnostics use chars.
+    let col = |p: tree_sitter::Point| lines.get(p.row).map(|l| l.get(..p.column.min(l.len())).map(|s| s.chars().count()).unwrap_or(p.column)).unwrap_or(0);
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if out.len() >= 20 {
+            break;
+        }
+        let (start, end) = (node.start_position(), node.end_position());
+        if node.is_missing() {
+            let what = match node.kind() {
+                "expression" | "_expr_term" => "a value".to_string(),
+                "identifier" => "a name".to_string(),
+                "}" | "block_end" | "object_end" => "`}` (a block or map isn't closed)".to_string(),
+                "]" | "tuple_end" => "`]` (a list isn't closed)".to_string(),
+                ")" => "`)`".to_string(),
+                "quoted_template_end" => "the closing `\"` of a string".to_string(),
+                "template_interpolation_end" => "the `}` of a `${…}`".to_string(),
+                k => format!("`{k}`"),
+            };
+            out.push(Diag { row: start.row, col: col(start), end_row: start.row, end_col: col(start), severity: Severity::Error, message: format!("Terraform: missing {what}"), source: "terraform".into() });
+            continue;
+        }
+        if node.is_error() {
+            let snippet: String = text[node.byte_range()].lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(30).collect();
+            let end_col = if end.row == start.row { col(end) } else { lines.get(start.row).map(|l| l.chars().count()).unwrap_or(0) };
+            let message = match snippet.trim_end() {
+                "" => "Terraform: syntax error".to_string(),
+                s if s.ends_with('=') => format!("Terraform: missing a value after `{s}`"),
+                s if s.ends_with(['+', '-', '*', '/', '%', '&', '|', '?', ':']) => format!("Terraform: `{s}` needs something after it"),
+                s => format!("Terraform: unexpected `{s}`"),
+            };
+            out.push(Diag { row: start.row, col: col(start), end_row: start.row, end_col, severity: Severity::Error, message, source: "terraform".into() });
+            continue;
+        }
+        if node.kind() == "body" {
+            // The same argument twice in one block (Terraform: "Attribute redefined").
+            let mut seen = HashSet::new();
+            let mut walk = node.walk();
+            for child in node.children(&mut walk).filter(|c| c.kind() == "attribute") {
+                if let Some(name) = child.child(0).filter(|n| n.kind() == "identifier") {
+                    let key = &text[name.byte_range()];
+                    if !seen.insert(key.to_string()) {
+                        let p = name.start_position();
+                        out.push(Diag { row: p.row, col: col(p), end_row: p.row, end_col: col(name.end_position()), severity: Severity::Error, message: format!("Terraform: `{key}` is set twice in this block"), source: "terraform".into() });
+                    }
+                }
+            }
+        }
+        if node.has_error() || node.kind() == "body" || node.kind() == "block" || node.kind() == "config_file" {
+            let mut walk = node.walk();
+            let children: Vec<_> = node.children(&mut walk).collect();
+            stack.extend(children.into_iter().rev());
+        }
+    }
+    out.sort_by_key(|d| (d.row, d.col));
+    out
 }
 
 struct Scan {
@@ -286,5 +359,22 @@ mod tests {
         let out = format_json(r#"{"z":1,"a":[1,2],"e":{},"s":"x,y:{}"}"#, "  ").unwrap();
         assert_eq!(out, "{\n  \"z\": 1,\n  \"a\": [\n    1,\n    2\n  ],\n  \"e\": {},\n  \"s\": \"x,y:{}\"\n}\n");
         assert!(format_json("{bad", "  ").is_none());
+    }
+
+    #[test]
+    fn terraform_syntax_and_repeated_arguments() {
+        use super::{Kind, check};
+        let ok = "resource \"aws_s3_bucket\" \"logs\" {\n  bucket = \"logs\"\n  tags = { Name = var.name }\n}\n";
+        assert!(check(Kind::Terraform, ok).is_empty(), "{:?}", check(Kind::Terraform, ok));
+        let unclosed = "resource \"a\" \"b\" {\n  x = 1\n";
+        assert!(!check(Kind::Terraform, unclosed).is_empty(), "unclosed block");
+        let no_value = "variable \"x\" {\n  default =\n}\n";
+        let d = check(Kind::Terraform, no_value);
+        assert!(!d.is_empty() && d[0].row <= 2, "{d:?}");
+        let twice = "resource \"a\" \"b\" {\n  name = \"x\"\n  name = \"y\"\n}\n";
+        let d = check(Kind::Terraform, twice);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!((d[0].row, d[0].col), (2, 2));
+        assert!(d[0].message.contains("set twice"));
     }
 }
