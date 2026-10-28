@@ -371,7 +371,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("pull", "git pull", false),
     ("push", "git push", false),
     ("sync", "Pull then push: sync (rebase) | sync merge", true),
-    ("compare", "Compare the current branch with another: compare <branch>", true),
+    ("compare", "Compare branches: compare <branch> (with the current one) or compare <base> <branch>", true),
     ("abort", "Abort the merge / rebase / cherry-pick in progress", false),
     ("stash", "git stash (stash pop to restore)", false),
     ("graph", "Graph scope: graph all | graph auto", true),
@@ -837,8 +837,8 @@ impl Workspace {
                 }
                 self.stage_resolved(rel, cx);
             }
-            Request::Compare(other) => {
-                let base = self.git.read(cx).branch_label();
+            Request::Compare { base, other } => {
+                let base = base.clone().unwrap_or_else(|| self.git.read(cx).branch_label());
                 self.open_compare(base, other.clone(), window, cx);
             }
             Request::OpenFile { path, line, preview } => self.open_file(path.clone(), *line, *preview, window, cx),
@@ -1980,7 +1980,7 @@ impl Workspace {
         self.git = owner.clone();
         let root = owner.read(cx).root.clone();
         let Ok(rel) = path.strip_prefix(&root).map(|r| r.to_string_lossy().to_string()) else { return };
-        let spec = DiffSpec { path: rel, old_path: None, left: Rev::Stage(2), right: Rev::Stage(3), from_commit: None };
+        let spec = DiffSpec { path: rel, old_path: None, left: Rev::Stage(2), right: Rev::Stage(3), back: None };
         self.open_diff(spec, false, window, cx);
     }
 
@@ -2007,7 +2007,7 @@ impl Workspace {
     }
 
     fn open_compare(&mut self, base: String, other: String, window: &mut Window, cx: &mut Context<Self>) {
-        let key = format!("{base}...{other}");
+        let key = crate::commit_view::compare_key(&base, &other);
         if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Commit(c) if c.read(cx).sha == key)) {
             return self.activate(ix, window, cx);
         }
@@ -3359,7 +3359,7 @@ impl Workspace {
             "lint" => self.lint(rest == "." || self.active_editor().is_none(), cx),
             "blame" => self.toggle_blame(&ToggleBlame, window, cx),
             "diff" => match active_rel {
-                Some(rel) => self.open_diff(DiffSpec { path: rel, old_path: None, left: Rev::Index, right: Rev::Working, from_commit: None }, false, window, cx),
+                Some(rel) => self.open_diff(DiffSpec { path: rel, old_path: None, left: Rev::Index, right: Rev::Working, back: None }, false, window, cx),
                 None => self.flash("Open a file to diff it".into(), true, cx),
             },
             "stage" | "add" => {
@@ -3434,11 +3434,14 @@ impl Workspace {
                 self.git.update(cx, |r, cx| r.run_op(if rebase { "Pull (rebase) & push" } else { "Pull (merge) & push" }, cx, move |root| git::sync(root, rebase)));
             }
             "compare" => {
-                if rest.is_empty() {
-                    return self.flash("compare <branch>: which branch?".into(), true, cx);
-                }
-                let base = self.git.read(cx).branch_label();
-                self.open_compare(base, rest.to_string(), window, cx);
+                // `compare <branch>` (against the current one) or `compare <base> <branch>`.
+                let words: Vec<&str> = rest.split_whitespace().collect();
+                let (base, other) = match words[..] {
+                    [other] => (self.git.read(cx).branch_label(), other),
+                    [base, other] => (base.to_string(), other),
+                    _ => return self.flash("compare <branch> or compare <base> <branch>".into(), true, cx),
+                };
+                self.open_compare(base, other.to_string(), window, cx);
             }
             "abort" => match self.git.read(cx).status.op.clone() {
                 Some(op) => self.git.update(cx, |r, cx| r.run_op("Abort", cx, move |root| git::abort_op(root, op.kind))),
@@ -5354,7 +5357,7 @@ mod ui_tests {
         cx.run_until_parked();
         let count = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.find.read(cx).match_count());
         // Read-only diff (staged: HEAD ↔ index).
-        let spec = crate::request::DiffSpec { path: "a.txt".into(), old_path: None, left: crate::git::Rev::Commit("HEAD".into()), right: crate::git::Rev::Index, from_commit: None };
+        let spec = crate::request::DiffSpec { path: "a.txt".into(), old_path: None, left: crate::git::Rev::Commit("HEAD".into()), right: crate::git::Rev::Index, back: None };
         ws.update_in(cx, |ws, window, cx| ws.open_diff(spec, false, window, cx));
         cx.run_until_parked();
         cx.simulate_keystrokes("cmd-f");
@@ -5369,7 +5372,7 @@ mod ui_tests {
 
         // Editable diff (working tree): the bar shows on its editor side.
         std::fs::write(ws.read_with(cx, |ws, cx| ws.root(cx)).join("a.txt"), "alpha\nbeta two\ngamma\nbeta three\nbeta four\n").unwrap();
-        let spec = crate::request::DiffSpec { path: "a.txt".into(), old_path: None, left: crate::git::Rev::Index, right: crate::git::Rev::Working, from_commit: None };
+        let spec = crate::request::DiffSpec { path: "a.txt".into(), old_path: None, left: crate::git::Rev::Index, right: crate::git::Rev::Working, back: None };
         ws.update_in(cx, |ws, window, cx| ws.open_diff(spec, false, window, cx));
         cx.run_until_parked();
         cx.simulate_keystrokes("cmd-f");
@@ -5377,6 +5380,51 @@ mod ui_tests {
         cx.run_until_parked();
         assert!(ws.read_with(cx, |ws, cx| ws.find_target(cx).is_some()), "the bar shows on the editable diff too");
         assert_eq!(count(cx).0, 1);
+    }
+
+    #[gpui::test]
+    fn compare_any_two_branches_and_come_back_from_a_diff(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            sh("echo a > a.txt && git add . && git commit -qm one && git branch dev");
+            sh("git switch -qc feature && echo b > b.txt && git add . && git commit -qm two && echo c > c.txt && git add . && git commit -qm three");
+            sh("git switch -q main && echo m > m.txt && git add . && git commit -qm main-only");
+        });
+        cx.run_until_parked();
+        let click = |cx: &mut VisualTestContext, sel: &str| {
+            cx.run_until_parked();
+            let at = cx.debug_bounds(Box::leak(sel.to_string().into_boxed_str())).unwrap_or_else(|| panic!("{sel} is on screen")).center();
+            cx.simulate_click(at, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let page = |cx: &mut VisualTestContext| {
+            ws.read_with(cx, |ws, cx| match &ws.tabs[ws.active.unwrap()].kind {
+                TabKind::Commit(c) => Some((c.read(cx).sha.clone(), c.read(cx).ahead_behind())),
+                _ => None,
+            })
+        };
+        ws.update_in(cx, |ws, window, cx| ws.handle_request(&crate::request::Request::Compare { base: None, other: "feature".into() }, window, cx));
+        cx.run_until_parked();
+        assert_eq!(page(cx), Some(("main...feature".into(), Some((2, 1)))), "feature is 2 ahead, 1 behind main");
+
+        // Either side can be any branch.
+        click(cx, "compare-base");
+        click(cx, "compare-branch-dev");
+        assert_eq!(page(cx), Some(("dev...feature".into(), Some((2, 0)))));
+        click(cx, "compare-swap");
+        assert_eq!(page(cx), Some(("feature...dev".into(), Some((0, 2)))), "swapped: dev is 2 behind feature");
+        click(cx, "compare-swap");
+
+        // A file opens its diff, which links back to this comparison.
+        click(cx, "commit-file-c.txt");
+        assert!(page(cx).is_none(), "the diff is showing");
+        click(cx, "back-to-commit");
+        assert_eq!(page(cx).map(|p| p.0), Some("dev...feature".into()), "back on the same comparison");
+        let tabs = ws.read_with(cx, |ws, _| ws.tabs.iter().filter(|t| matches!(t.kind, TabKind::Commit(_))).count());
+        assert_eq!(tabs, 1, "no second compare tab");
     }
 
     #[gpui::test]

@@ -2,7 +2,7 @@
 
 use crate::git::{self, BlameCommit, Rev};
 use crate::highlight::{self, LineSpans};
-use crate::request::{DiffSpec, Request};
+use crate::request::{Back, DiffSpec, Request};
 use crate::{theme, ui, util};
 use gpui::prelude::*;
 use gpui::*;
@@ -374,12 +374,17 @@ impl DiffView {
             .gap(px(8.))
             .border_b_1()
             .border_color(theme::border())
-            .when_some(self.spec.from_commit.clone(), |d, sha| {
-                let short = sha[..sha.len().min(7)].to_string();
+            .when_some(self.spec.back.clone(), |d, back| {
+                let (label, tip) = match &back {
+                    Back::Commit(sha) => (format!("commit {}", &sha[..sha.len().min(7)]), "Back to the commit (⌃-)"),
+                    Back::Compare(base, other) => (format!("{base} ← {other}"), "Back to the branch comparison (⌃-)"),
+                };
                 d.child(
                     div()
                         .id("back-to-commit")
+                        .debug_selector(|| "back-to-commit".into())
                         .flex()
+                        .flex_none()
                         .items_center()
                         .gap(px(2.))
                         .px(px(6.))
@@ -389,10 +394,15 @@ impl DiffView {
                         .text_color(theme::accent())
                         .cursor_pointer()
                         .hover(|s| s.bg(theme::hover()))
-                        .tooltip(ui::tooltip("Back to the commit (⌃-)"))
-                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(Request::OpenCommit(sha.clone()))))
+                        .tooltip(ui::tooltip(tip))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(match &back {
+                                Back::Commit(sha) => Request::OpenCommit(sha.clone()),
+                                Back::Compare(base, other) => Request::Compare { base: Some(base.clone()), other: other.clone() },
+                            })
+                        }))
                         .child(ui::small_icon("chevron-left", theme::accent()).size(px(12.)))
-                        .child(format!("commit {short}")),
+                        .child(label),
                 )
             })
             .child(ui::file_icon(&self.spec.path))

@@ -650,7 +650,7 @@ impl GitPanel {
             (Rev::Index, right)
         };
         cx.emit(Request::OpenDiff {
-            spec: DiffSpec { path: change.path.clone(), old_path: change.orig_path.clone(), left, right, from_commit: None },
+            spec: DiffSpec { path: change.path.clone(), old_path: change.orig_path.clone(), left, right, back: None },
             preview,
         });
     }
@@ -1025,7 +1025,7 @@ impl GitPanel {
                 .child(div().my(px(4.)).h(px(1.)).bg(theme::border()))
                 .child(item("bm-compare", format!("Compare with {current}"), true).on_click(cx.listener(move |p, _, _, cx| {
                     p.branch_menu = None;
-                    cx.emit(Request::Compare(n1.clone()));
+                    cx.emit(Request::Compare { base: None, other: n1.clone() });
                     cx.notify();
                 })))
                 .child(item("bm-merge", format!("Merge into {current}"), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["merge".into(), "--no-edit".into(), n2.clone()], cx))))

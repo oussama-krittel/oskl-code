@@ -1,7 +1,7 @@
 //! Commit details: hash, author, message and the files it changed.
 
 use crate::git::{self, CommitDetails, FileStatus, RefKind, Rev};
-use crate::request::{DiffSpec, Request};
+use crate::request::{Back, DiffSpec, Request};
 use crate::{theme, ui, util};
 use gpui::prelude::*;
 use gpui::*;
@@ -33,6 +33,12 @@ pub struct CommitView {
     scroll: ScrollHandle,
     /// Comparing two branches (base, other) instead of showing one commit.
     pub compare: Option<(String, String)>,
+    /// When comparing: commits `other` has that `base` lacks, and the other way round.
+    ahead_behind: Option<(usize, usize)>,
+    /// Branches to pick from when comparing.
+    branches: Vec<String>,
+    /// The open branch picker: true for the base side.
+    picker: Option<bool>,
     _task: Task<()>,
 }
 
@@ -53,26 +59,61 @@ impl CommitView {
             })
             .ok();
         });
-        Self { focus: cx.focus_handle(), root, sha, details: None, error: None, selected: 0, scroll: ScrollHandle::new(), compare: None, _task: task }
+        Self::with(root, sha, None, task, cx)
+    }
+
+    fn with(root: PathBuf, sha: String, compare: Option<(String, String)>, task: Task<()>, cx: &mut Context<Self>) -> Self {
+        Self {
+            focus: cx.focus_handle(),
+            root,
+            sha,
+            details: None,
+            error: None,
+            selected: 0,
+            scroll: ScrollHandle::new(),
+            compare,
+            ahead_behind: None,
+            branches: Vec::new(),
+            picker: None,
+            _task: task,
+        }
     }
 
     /// What `other` changed since it split from `base` (like comparing branches on GitHub).
     pub fn new_compare(root: PathBuf, base: String, other: String, cx: &mut Context<Self>) -> Self {
-        let (r, b, o) = (root.clone(), base.clone(), other.clone());
-        let load = cx.background_executor().spawn(async move { git::compare(&r, &b, &o) });
-        let task = cx.spawn(async move |this, cx| {
-            let result = load.await;
+        let mut view = Self::with(root, String::new(), None, Task::ready(()), cx);
+        view.set_compare(base, other, cx);
+        view
+    }
+
+    /// Compares another pair of branches in this page.
+    pub fn set_compare(&mut self, base: String, other: String, cx: &mut Context<Self>) {
+        self.sha = compare_key(&base, &other);
+        self.compare = Some((base.clone(), other.clone()));
+        self.picker = None;
+        self.error = None;
+        self.selected = 0;
+        let r = self.root.clone();
+        let load = cx.background_executor().spawn(async move { (git::compare(&r, &base, &other), git::branches(&r)) });
+        self._task = cx.spawn(async move |this, cx| {
+            let (result, branches) = load.await;
             this.update(cx, |view, cx| {
+                view.branches = branches;
                 match result {
-                    Ok(d) => view.details = Some(d),
-                    Err(e) => view.error = Some(e.to_string()),
+                    Ok(c) => {
+                        view.details = Some(c.details);
+                        view.ahead_behind = Some((c.ahead, c.behind));
+                    }
+                    Err(e) => {
+                        view.details = None;
+                        view.error = Some(e.to_string());
+                    }
                 }
                 cx.notify();
             })
             .ok();
         });
-        let sha = format!("{base}...{other}");
-        Self { focus: cx.focus_handle(), root, sha, details: None, error: None, selected: 0, scroll: ScrollHandle::new(), compare: Some((base, other)), _task: task }
+        cx.notify();
     }
 
     pub fn title(&self) -> String {
@@ -98,7 +139,16 @@ impl CommitView {
         };
         let right = if file.status == FileStatus::Deleted { Rev::Empty } else { Rev::Commit(d.sha.clone()) };
         cx.emit(Request::OpenDiff {
-            spec: DiffSpec { path: file.path.clone(), old_path: file.orig_path.clone(), left, right, from_commit: self.compare.is_none().then(|| d.sha.clone()) },
+            spec: DiffSpec {
+                path: file.path.clone(),
+                old_path: file.orig_path.clone(),
+                left,
+                right,
+                back: Some(match &self.compare {
+                    Some((base, other)) => Back::Compare(base.clone(), other.clone()),
+                    None => Back::Commit(d.sha.clone()),
+                }),
+            },
             preview,
         });
     }
@@ -119,6 +169,161 @@ impl CommitView {
         cx.write_to_clipboard(ClipboardItem::new_string(self.sha.clone()));
         cx.emit(Request::Message(format!("Copied {}", self.sha)));
     }
+}
+
+impl CommitView {
+    /// `base ← compared` pickers, a swap button, and how far apart the branches are.
+    fn render_compare_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (base, other) = self.compare.clone().unwrap_or_default();
+        let counts = self.ahead_behind.map(|(ahead, behind)| {
+            let commits = |n: usize| if n == 1 { "1 commit".to_string() } else { format!("{n} commits") };
+            let text = match (ahead, behind) {
+                (0, 0) => format!("{other} and {base} point at the same history"),
+                (a, 0) => format!("{other} is {} ahead of {base}", commits(a)),
+                (0, b) => format!("{other} is {} behind {base}", commits(b)),
+                (a, b) => format!("{other} is {} ahead and {} behind {base}", commits(a), commits(b)),
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().text_color(theme::git_added()).child(format!("↑{ahead}")))
+                .child(div().text_color(theme::git_deleted()).child(format!("↓{behind}")))
+                .child(div().text_color(theme::fg_dim()).child(text))
+        });
+        let (b1, b2) = (base.clone(), other.clone());
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(8.))
+                    .child(div().text_color(theme::fg_muted()).child("base"))
+                    .child(self.branch_chip(true, &base, cx))
+                    .child(div().text_color(theme::fg_muted()).child("←"))
+                    .child(div().text_color(theme::fg_muted()).child("compare"))
+                    .child(self.branch_chip(false, &other, cx))
+                    .child(
+                        div()
+                            .id("compare-swap")
+                            .debug_selector(|| "compare-swap".into())
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .px(px(8.))
+                            .h(px(24.))
+                            .rounded(px(4.))
+                            .text_color(theme::accent())
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            .tooltip(ui::tooltip("Swap base and compare"))
+                            .on_click(cx.listener(move |v, _, _, cx| v.set_compare(b2.clone(), b1.clone(), cx)))
+                            .child("⇄ Swap"),
+                    ),
+            )
+            .children(counts)
+    }
+
+    fn branch_chip(&self, base_side: bool, name: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.picker == Some(base_side);
+        let id = if base_side { "compare-base" } else { "compare-other" };
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id(id)
+                    .debug_selector(move || id.into())
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(8.))
+                    .h(px(24.))
+                    .rounded(px(4.))
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(if open { theme::focus_border() } else { theme::border_input() })
+                    .font_family(theme::MONO_FONT)
+                    .text_color(theme::fg_bright())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(move |v, _, _, cx| {
+                        v.picker = if open { None } else { Some(base_side) };
+                        cx.notify();
+                    }))
+                    .child(ui::small_icon("git", theme::fg_dim()))
+                    .child(name.to_string())
+                    .child(ui::small_icon("chevron-down", theme::fg_dim())),
+            )
+            .when(open, |d| d.child(deferred(anchored().snap_to_window().child(self.render_picker(base_side, cx))).with_priority(2)))
+    }
+
+    fn render_picker(&self, base_side: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let (base, other) = self.compare.clone().unwrap_or_default();
+        let current = if base_side { &base } else { &other };
+        div()
+            .id("compare-picker")
+            .occlude()
+            .mt(px(4.))
+            .min_w(px(220.))
+            .max_h(px(360.))
+            .py(px(4.))
+            .bg(theme::bg_popup())
+            .border_1()
+            .border_color(theme::border_input())
+            .rounded(px(6.))
+            .shadow_lg()
+            .overflow_y_scroll()
+            .on_mouse_down_out(cx.listener(|v, _, _, cx| {
+                v.picker = None;
+                cx.notify();
+            }))
+            .children(self.branches.iter().enumerate().map(|(ix, b)| {
+                let active = b == current;
+                let pick = b.clone();
+                let (base, other) = (base.clone(), other.clone());
+                div()
+                    .id(("compare-branch", ix))
+                    .debug_selector({
+                        let b = b.clone();
+                        move || format!("compare-branch-{b}")
+                    })
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .h(px(24.))
+                    .px(px(8.))
+                    .mx(px(4.))
+                    .rounded(px(3.))
+                    .font_family(theme::MONO_FONT)
+                    .cursor_pointer()
+                    .when(active, |d| d.bg(theme::selected()))
+                    .hover(|s| s.bg(theme::selected_focused()))
+                    .on_click(cx.listener(move |v, _, _, cx| {
+                        if base_side {
+                            v.set_compare(pick.clone(), other.clone(), cx);
+                        } else {
+                            v.set_compare(base.clone(), pick.clone(), cx);
+                        }
+                    }))
+                    .child(div().w(px(10.)).text_color(theme::frame_focused()).child(if active { "●" } else { "" }))
+                    .child(b.clone())
+            }))
+    }
+
+    #[cfg(test)]
+    pub fn ahead_behind(&self) -> Option<(usize, usize)> {
+        self.ahead_behind
+    }
+}
+
+/// The tab key of a comparison (the same pair opens the same tab).
+pub fn compare_key(base: &str, other: &str) -> String {
+    format!("{base}...{other}")
 }
 
 fn meta_row(label: &str, value: impl IntoElement) -> Div {
@@ -149,9 +354,17 @@ impl Render for CommitView {
             .size_full()
             .bg(theme::bg_editor());
 
-        let Some(d) = &self.details else {
-            let msg = self.error.clone().unwrap_or_else(|| "Loading commit…".into());
-            return root.child(div().p(px(24.)).text_color(theme::fg_muted()).child(msg));
+        let Some(d) = self.details.as_ref().filter(|_| self.error.is_none()) else {
+            let msg = self.error.clone().unwrap_or_else(|| "Loading…".into());
+            return root.child(
+                div()
+                    .p(px(24.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.))
+                    .when(self.compare.is_some(), |el| el.child(self.render_compare_bar(cx).into_any_element()))
+                    .child(div().text_color(theme::fg_muted()).child(msg)),
+            );
         };
 
         let sha = d.sha.clone();
@@ -187,12 +400,17 @@ impl Render for CommitView {
                 .child(p[..7].to_string())
         }));
 
+        let compare_bar = self.compare.is_some().then(|| self.render_compare_bar(cx).into_any_element());
         let files = d.files.iter().enumerate().map(|(ix, f)| {
             let name = ui::file_name(&f.path).to_string();
             let dir = ui::file_dir(&f.path).to_string();
             let selected = ix == self.selected;
             div()
                 .id(("commit-file", ix))
+                .debug_selector({
+                    let name = name.clone();
+                    move || format!("commit-file-{name}")
+                })
                 .flex()
                 .items_center()
                 .gap(px(6.))
@@ -235,17 +453,14 @@ impl Render for CommitView {
                 .flex()
                 .flex_col()
                 .gap(px(14.))
-                .child(div().text_size(px(20.)).text_color(theme::fg_bright()).child(d.subject().to_string()))
-                .child(refs)
+                .when(self.compare.is_none(), |el| el.child(div().text_size(px(20.)).text_color(theme::fg_bright()).child(d.subject().to_string())).child(refs))
                 .when_some(self.compare.clone(), |el, (a, b)| {
-                    let short = |s: &str| s[..s.len().min(7)].to_string();
-                    el.child(
+                    let split = d.parents.first().map(|p| p[..p.len().min(7)].to_string()).unwrap_or_default();
+                    el.children(compare_bar).child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.))
-                            .child(meta_row("Base", div().font_family(theme::MONO_FONT).child(format!("{a}  (split at {})", d.parents.first().map(|p| short(p)).unwrap_or_default()))))
-                            .child(meta_row("Compared", div().font_family(theme::MONO_FONT).child(format!("{b}  ({})", short(&d.sha))))),
+                            .text_color(theme::fg_muted())
+                            .text_size(px(11.5))
+                            .child(format!("Files below: what {b} changed since it split from {a} (at {split}).")),
                     )
                 })
                 .when(self.compare.is_none(), |el| el.child(

@@ -276,15 +276,24 @@ pub fn sync(root: &Path, rebase: bool) -> Result<String> {
     run(root, &["push"])
 }
 
-/// What `other` has that `base` doesn't: files changed since their merge base, as a
-/// commit-like summary (the "parent" is the merge base).
-pub fn compare(root: &Path, base: &str, other: &str) -> Result<CommitDetails> {
+/// Two branches side by side: what `other` changed since it split from `base`, and how far
+/// apart they are.
+pub struct Comparison {
+    /// Commit-like summary of `other`'s changes (the "parent" is the merge base).
+    pub details: CommitDetails,
+    /// Commits in `other` that `base` doesn't have.
+    pub ahead: usize,
+    /// Commits in `base` that `other` doesn't have.
+    pub behind: usize,
+}
+
+pub fn compare(root: &Path, base: &str, other: &str) -> Result<Comparison> {
     let mb = run(root, &["merge-base", base, other])?.trim().to_string();
     let tip = run(root, &["rev-parse", other])?.trim().to_string();
     let files = run(root, &["diff", "-z", "-M", "--name-status", &mb, &tip])?;
-    let count = run(root, &["rev-list", "--count", &format!("{mb}..{tip}")]).map(|s| s.trim().to_string()).unwrap_or_default();
-    let behind = run(root, &["rev-list", "--count", &format!("{tip}..{base}")]).map(|s| s.trim().to_string()).unwrap_or_default();
-    Ok(CommitDetails {
+    let count = |range: String| run(root, &["rev-list", "--count", &range]).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let (ahead, behind) = (count(format!("{mb}..{tip}")), count(format!("{tip}..{base}")));
+    let details = CommitDetails {
         sha: tip,
         parents: vec![mb],
         author: String::new(),
@@ -293,9 +302,10 @@ pub fn compare(root: &Path, base: &str, other: &str) -> Result<CommitDetails> {
         time: 0,
         committer: String::new(),
         refs: Vec::new(),
-        message: format!("Compare {base} … {other}\n\n{other} has {count} commit(s) not in {base}; {base} has {behind} not in {other}.\nFiles below: what {other} changed since they split."),
+        message: format!("{other} compared with {base}"),
         files: parse_name_status(&files),
-    })
+    };
+    Ok(Comparison { details, ahead, behind })
 }
 
 impl Status {
@@ -913,9 +923,11 @@ mod live {
     #[test]
     fn compare_branches_lists_their_changes() {
         let dir = conflicting_repo("compare");
-        let d = compare(&dir, "main", "feature").unwrap();
-        assert_eq!(d.files.len(), 1);
-        assert_eq!(d.files[0].path, "a.txt");
-        assert!(d.message.contains("feature has 1 commit(s) not in main"), "{}", d.message);
+        let c = compare(&dir, "main", "feature").unwrap();
+        assert_eq!(c.details.files.len(), 1);
+        assert_eq!(c.details.files[0].path, "a.txt");
+        assert_eq!((c.ahead, c.behind), (1, 1), "each branch has one commit the other lacks");
+        let back = compare(&dir, "feature", "main").unwrap();
+        assert_eq!((back.ahead, back.behind), (1, 1));
     }
 }

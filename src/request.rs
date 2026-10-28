@@ -9,8 +9,15 @@ pub struct DiffSpec {
     pub old_path: Option<String>,
     pub left: Rev,
     pub right: Rev,
-    /// The commit page this diff was opened from (shown as a link back).
-    pub from_commit: Option<String>,
+    /// The page this diff was opened from (shown as a link back).
+    pub back: Option<Back>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Back {
+    Commit(String),
+    /// A branch comparison: (base, compared).
+    Compare(String, String),
 }
 
 impl DiffSpec {
@@ -27,8 +34,8 @@ pub enum Request {
     OpenAt { path: PathBuf, line: usize, cols: std::ops::Range<usize> },
     OpenDiff { spec: DiffSpec, preview: bool },
     OpenCommit(String),
-    /// Compare the current branch with this one.
-    Compare(String),
+    /// What `other` changed since it split from `base` (the current branch when None).
+    Compare { base: Option<String>, other: String },
     /// A conflicted file (repo-relative) was resolved in the merge editor: stage it.
     MarkResolved(String),
     /// Opens the command line pre-filled with this text.
