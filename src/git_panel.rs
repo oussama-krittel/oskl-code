@@ -1019,11 +1019,16 @@ impl GitPanel {
                     .child(item("bm-delete", format!("Delete tag {name}"), true).text_color(theme::git_deleted()).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["tag".into(), "-d".into(), n2.clone()], cx))));
             }
         }
+        let pick = name.clone();
+        menu = menu.child(div().my(px(4.)).h(px(1.)).bg(theme::border())).child(item("bm-compare-to", "Compare to…".into(), true).on_click(cx.listener(move |p, _, _, cx| {
+            p.branch_menu = None;
+            cx.emit(Request::CompareTo(pick.clone()));
+            cx.notify();
+        })));
         if !r.is_head {
             let current = self.repo.read(cx).branch_label();
             let (n1, n2, n3) = (name.clone(), name.clone(), name.clone());
             menu = menu
-                .child(div().my(px(4.)).h(px(1.)).bg(theme::border()))
                 .child(item("bm-compare", format!("Compare with {current}"), true).on_click(cx.listener(move |p, _, _, cx| {
                     p.branch_menu = None;
                     cx.emit(Request::Compare { base: None, other: n1.clone() });

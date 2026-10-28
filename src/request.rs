@@ -36,6 +36,8 @@ pub enum Request {
     OpenCommit(String),
     /// What `other` changed since it split from `base` (the current branch when None).
     Compare { base: Option<String>, other: String },
+    /// Ask which branch to compare this one to, then compare.
+    CompareTo(String),
     /// A conflicted file (repo-relative) was resolved in the merge editor: stage it.
     MarkResolved(String),
     /// Opens the command line pre-filled with this text.

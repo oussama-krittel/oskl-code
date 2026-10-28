@@ -174,6 +174,8 @@ enum CmdMode {
     Search,
     Files,
     Buffers,
+    /// Picking the branch to compare `compare_from` to.
+    CompareTo,
 }
 
 struct CmdItem {
@@ -441,6 +443,8 @@ pub struct Workspace {
     cmd_sel: usize,
     cmd_nav: bool,
     branches: Vec<String>,
+    /// The branch being compared while the "compare to" picker is open.
+    compare_from: Option<String>,
     history: Vec<String>,
     hist_ix: Option<usize>,
     return_focus: Option<FocusHandle>,
@@ -560,6 +564,7 @@ impl Workspace {
             cmd_sel: 0,
             cmd_nav: false,
             branches: Vec::new(),
+            compare_from: None,
             history: Vec::new(),
             hist_ix: None,
             return_focus: None,
@@ -837,6 +842,10 @@ impl Workspace {
                     self.close_tab(ix, true, window, cx);
                 }
                 self.stage_resolved(rel, cx);
+            }
+            Request::CompareTo(branch) => {
+                self.compare_from = Some(branch.clone());
+                self.open_cmd(CmdMode::CompareTo, "", window, cx);
             }
             Request::Compare { base, other } => {
                 let base = base.clone().unwrap_or_else(|| self.git.read(cx).branch_label());
@@ -2853,8 +2862,8 @@ impl Workspace {
         }
         self.cmd_mode = Some(mode);
         self.hist_ix = None;
-        if mode == CmdMode::Command {
-            let root = self.root(cx);
+        if matches!(mode, CmdMode::Command | CmdMode::CompareTo) {
+            let root = self.git_root(cx);
             self.branches = git::branches(&root);
         }
         self.cmd.update(cx, |c, cx| {
@@ -2863,6 +2872,7 @@ impl Workspace {
                 CmdMode::Search => "search in file".into(),
                 CmdMode::Files => "file name — append :line to jump".into(),
                 CmdMode::Buffers => "files open in this pane".into(),
+                CmdMode::CompareTo => format!("compare {} to which branch?", self.compare_from.clone().unwrap_or_default()).into(),
             };
             c.set_text(text, cx);
             c.focus(window);
@@ -2961,8 +2971,27 @@ impl Workspace {
             Some(CmdMode::Files) => self.file_items(&text, cx),
             Some(CmdMode::Buffers) => self.buffer_items(&text, cx),
             Some(CmdMode::Command) => self.command_items(&text, cx),
+            Some(CmdMode::CompareTo) => self.compare_items(&text, cx),
             _ => Vec::new(),
         };
+    }
+
+    /// Branches to compare `compare_from` to: the current one first, then the rest.
+    fn compare_items(&self, query: &str, cx: &App) -> Vec<CmdItem> {
+        let current = self.git.read(cx).branch_label();
+        let from = self.compare_from.clone().unwrap_or_default();
+        let mut items: Vec<(bool, i64, CmdItem)> = self
+            .branches
+            .iter()
+            .filter(|b| **b != from)
+            .filter_map(|b| {
+                let (score, positions) = util::fuzzy(query, b)?;
+                let detail = if *b == current { "current branch".to_string() } else { String::new() };
+                Some((*b != current, -score, CmdItem { label: b.clone(), detail, value: b.clone(), positions, exec: true }))
+            })
+            .collect();
+        items.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        items.into_iter().map(|(_, _, i)| i).collect()
     }
 
     fn buffer_items(&self, query: &str, cx: &App) -> Vec<CmdItem> {
@@ -3100,6 +3129,14 @@ impl Workspace {
                 self.close_cmd(window, cx);
                 if let Some(ix) = id.and_then(|id| self.tab_ix(id)) {
                     self.activate(ix, window, cx);
+                }
+            }
+            CmdMode::CompareTo => {
+                let base = self.cmd_items.get(self.cmd_sel).map(|i| i.value.clone());
+                let other = self.compare_from.take();
+                self.close_cmd(window, cx);
+                if let (Some(base), Some(other)) = (base, other) {
+                    self.open_compare(base, other, window, cx);
                 }
             }
             CmdMode::Files => {
@@ -4231,12 +4268,14 @@ impl Workspace {
                 CmdMode::Search => "/",
                 CmdMode::Files => "›",
                 CmdMode::Buffers => "≡",
+                CmdMode::CompareTo => "⇄",
             };
             let hint = match mode {
                 CmdMode::Command => "Tab complete · ↑↓ history · Esc cancel",
                 CmdMode::Search => "Enter keep · ⌘G next · Esc cancel",
                 CmdMode::Files => "↑↓ select · Enter open here · Esc cancel",
                 CmdMode::Buffers => "↑↓ select · Enter show · Esc cancel",
+                CmdMode::CompareTo => "↑↓ select · Enter compare · Esc cancel",
             };
             return base
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -5467,6 +5506,31 @@ mod ui_tests {
         assert_eq!(page(cx).map(|p| p.0), Some("dev...feature".into()), "back on the same comparison");
         let tabs = ws.read_with(cx, |ws, _| ws.tabs.iter().filter(|t| matches!(t.kind, TabKind::Commit(_))).count());
         assert_eq!(tabs, 1, "no second compare tab");
+
+        // The list/tree switch is there (and switches back).
+        click(cx, "files-as-tree");
+        click(cx, "files-as-tree");
+        click(cx, "commit-file-c.txt");
+        assert!(page(cx).is_none(), "files still open in either view");
+        click(cx, "back-to-commit");
+
+        // "Compare to…": pick the other branch in a popup, the current one listed first.
+        ws.update_in(cx, |ws, window, cx| ws.handle_request(&crate::request::Request::CompareTo("main".into()), window, cx));
+        cx.run_until_parked();
+        let listed = ws.read_with(cx, |ws, _| ws.cmd_items.iter().map(|i| i.label.clone()).collect::<Vec<_>>());
+        assert_eq!(listed.first().map(String::as_str), Some("dev"), "after main itself is left out: {listed:?}");
+        assert!(!listed.contains(&"main".to_string()), "no comparing a branch with itself");
+        cx.simulate_input("feat");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(page(cx), Some(("feature...main".into(), Some((1, 2)))), "main compared to feature");
+        // From the current branch too.
+        ws.update_in(cx, |ws, window, cx| ws.handle_request(&crate::request::Request::CompareTo("feature".into()), window, cx));
+        cx.run_until_parked();
+        let first = ws.read_with(cx, |ws, _| ws.cmd_items.first().map(|i| (i.label.clone(), i.detail.clone())));
+        assert_eq!(first, Some(("main".into(), "current branch".into())));
+        cx.simulate_keystrokes("escape");
+        assert!(ws.read_with(cx, |ws, _| ws.cmd_mode.is_none()));
     }
 
     #[gpui::test]

@@ -53,6 +53,8 @@ fn icon_body(name: &str) -> Option<&'static str> {
         "commit" => r#"<circle cx="8" cy="8" r="2.8"/><path d="M1 8h4.2M10.8 8H15"/>"#,
         "keyboard" => r#"<rect x="1.5" y="4" width="13" height="8.5" rx="1.2"/><path d="M4 6.6h.01M6.5 6.6h.01M9 6.6h.01M11.5 6.6h.01M4 9h.01M11.5 9h.01M6 10.3h4"/>"#,
         "error" => r#"<circle cx="8" cy="8" r="6"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/>"#,
+        "list-tree" => r#"<path d="M2.5 3h4M5 6.5h4M5 10h4M5 13.5h4M3.5 3v10.5M3.5 6.5H5M3.5 10H5M3.5 13.5H5"/><path d="M10.5 6.5h3M10.5 10h3M10.5 13.5h3"/>"#,
+        "list-flat" => r#"<path d="M2.5 4h11M2.5 8h11M2.5 12h11"/>"#,
         "filter" => r#"<path d="M2 3h12l-4.5 5.5v4l-3 1.5v-5.5z"/>"#,
         "warning" => r#"<path d="M8 2l6.5 11.5h-13z"/><path d="M8 6.5v3.5M8 12v.01"/>"#,
         _ => return None,

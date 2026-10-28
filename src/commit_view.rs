@@ -5,7 +5,63 @@ use crate::request::{Back, DiffSpec, Request};
 use crate::{theme, ui, util};
 use gpui::prelude::*;
 use gpui::*;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Files shown as a folder tree instead of a flat list (remembered for every commit page).
+static AS_TREE: AtomicBool = AtomicBool::new(false);
+
+/// A row of the files: a folder (tree view only) or a file by its index in `details.files`.
+#[derive(Clone, Debug, PartialEq)]
+enum FileRow {
+    /// `label` is the folder, or a chain of single folders like "src / lib".
+    Folder { key: String, label: String, depth: usize, open: bool },
+    File { ix: usize, depth: usize },
+}
+
+/// The files in display order: as they are (list), or folders first then files, like the
+/// explorer (tree). Folders whose key is in `collapsed` hide what's inside.
+fn file_rows(files: &[git::Change], tree: bool, collapsed: &HashSet<String>) -> Vec<FileRow> {
+    if !tree {
+        return (0..files.len()).map(|ix| FileRow::File { ix, depth: 0 }).collect();
+    }
+    #[derive(Default)]
+    struct Node {
+        dirs: BTreeMap<String, Node>,
+        files: Vec<usize>,
+    }
+    let mut root = Node::default();
+    for (ix, f) in files.iter().enumerate() {
+        let mut node = &mut root;
+        for part in ui::file_dir(&f.path).split('/').filter(|p| !p.is_empty()) {
+            node = node.dirs.entry(part.to_string()).or_default();
+        }
+        node.files.push(ix);
+    }
+    fn emit(node: &Node, prefix: &str, depth: usize, files: &[git::Change], collapsed: &HashSet<String>, rows: &mut Vec<FileRow>) {
+        for (name, child) in &node.dirs {
+            let (mut label, mut key, mut child) = (name.clone(), if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") }, child);
+            while child.files.is_empty() && child.dirs.len() == 1 {
+                let (n, c) = child.dirs.iter().next().unwrap();
+                label = format!("{label} / {n}");
+                key = format!("{key}/{n}");
+                child = c;
+            }
+            let open = !collapsed.contains(&key);
+            rows.push(FileRow::Folder { key: key.clone(), label, depth, open });
+            if open {
+                emit(child, &key, depth + 1, files, collapsed, rows);
+            }
+        }
+        let mut ixs = node.files.clone();
+        ixs.sort_by(|a, b| ui::file_name(&files[*a].path).cmp(ui::file_name(&files[*b].path)));
+        rows.extend(ixs.into_iter().map(|ix| FileRow::File { ix, depth }));
+    }
+    let mut rows = Vec::new();
+    emit(&root, "", 0, files, collapsed, &mut rows);
+    rows
+}
 
 actions!(commit_view, [Next, Prev, OpenSelected, CopySha]);
 
@@ -39,6 +95,8 @@ pub struct CommitView {
     branches: Vec<String>,
     /// The open branch picker: true for the base side.
     picker: Option<bool>,
+    /// Collapsed folders of the tree view.
+    collapsed: HashSet<String>,
     _task: Task<()>,
 }
 
@@ -75,6 +133,7 @@ impl CommitView {
             ahead_behind: None,
             branches: Vec::new(),
             picker: None,
+            collapsed: HashSet::new(),
             _task: task,
         }
     }
@@ -153,14 +212,38 @@ impl CommitView {
         });
     }
 
-    fn next(&mut self, _: &Next, _: &mut Window, cx: &mut Context<Self>) {
-        let n = self.details.as_ref().map(|d| d.files.len()).unwrap_or(0);
-        self.selected = (self.selected + 1).min(n.saturating_sub(1));
+    fn rows(&self) -> Vec<FileRow> {
+        self.details.as_ref().map(|d| file_rows(&d.files, AS_TREE.load(Ordering::Relaxed), &self.collapsed)).unwrap_or_default()
+    }
+
+    /// Moves through the files in the order they're shown (folded ones skipped).
+    fn step(&mut self, by: isize, cx: &mut Context<Self>) {
+        let shown: Vec<usize> = self.rows().into_iter().filter_map(|r| if let FileRow::File { ix, .. } = r { Some(ix) } else { None }).collect();
+        if shown.is_empty() {
+            return;
+        }
+        let at = shown.iter().position(|ix| *ix == self.selected).unwrap_or(0) as isize;
+        self.selected = shown[(at + by).clamp(0, shown.len() as isize - 1) as usize];
         cx.notify();
     }
+
+    fn next(&mut self, _: &Next, _: &mut Window, cx: &mut Context<Self>) {
+        self.step(1, cx);
+    }
     fn prev(&mut self, _: &Prev, _: &mut Window, cx: &mut Context<Self>) {
-        self.selected = self.selected.saturating_sub(1);
-        cx.notify();
+        self.step(-1, cx);
+    }
+
+    #[cfg(test)]
+    pub fn row_labels(&self) -> Vec<String> {
+        let Some(d) = &self.details else { return Vec::new() };
+        self.rows()
+            .into_iter()
+            .map(|r| match r {
+                FileRow::Folder { label, depth, .. } => format!("{}{label}/", "  ".repeat(depth)),
+                FileRow::File { ix, depth } => format!("{}{}", "  ".repeat(depth), ui::file_name(&d.files[ix].path)),
+            })
+            .collect()
     }
     fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
         self.open(self.selected, true, cx);
@@ -401,46 +484,81 @@ impl Render for CommitView {
         }));
 
         let compare_bar = self.compare.is_some().then(|| self.render_compare_bar(cx).into_any_element());
-        let files = d.files.iter().enumerate().map(|(ix, f)| {
-            let name = ui::file_name(&f.path).to_string();
-            let dir = ui::file_dir(&f.path).to_string();
-            let selected = ix == self.selected;
-            div()
-                .id(("commit-file", ix))
-                .debug_selector({
-                    let name = name.clone();
-                    move || format!("commit-file-{name}")
-                })
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .h(px(24.))
-                .px(px(8.))
-                .rounded(px(3.))
-                .cursor_pointer()
-                .when(selected, |d| d.bg(if focused { theme::selected_focused() } else { theme::selected() }))
-                .hover(|s| s.bg(theme::hover()))
-                .on_click(cx.listener(move |view, ev: &ClickEvent, _, cx| {
-                    view.selected = ix;
-                    view.open(ix, ev.click_count() < 2, cx);
-                    cx.notify();
-                }))
-                .child(ui::file_icon(&name))
-                .child(div().text_color(ui::status_color(f.status)).child(name))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_color(theme::fg_muted())
-                        .text_size(px(11.))
-                        .child(match &f.orig_path {
-                            Some(old) => format!("{old} → {dir}"),
-                            None => dir,
-                        }),
-                )
-                .child(div().w(px(16.)).text_color(ui::status_color(f.status)).child(f.status.letter()))
+        let tree = AS_TREE.load(Ordering::Relaxed);
+        const INDENT: f32 = 12.;
+        let files = self.rows().into_iter().enumerate().map(|(row_ix, row)| match row {
+            FileRow::Folder { key, label, depth, open } => {
+                let name = label.rsplit(" / ").next().unwrap_or(&label).to_string();
+                div()
+                    .id(("commit-folder", row_ix))
+                    .debug_selector({
+                        let key = key.clone();
+                        move || format!("commit-folder-{key}")
+                    })
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .h(px(24.))
+                    .pl(px(8. + depth as f32 * INDENT))
+                    .pr(px(8.))
+                    .rounded(px(3.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        if !view.collapsed.remove(&key) {
+                            view.collapsed.insert(key.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .child(ui::small_icon(if open { "chevron-down" } else { "chevron-right" }, theme::fg()))
+                    .child(ui::folder_icon(&name, open))
+                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(label))
+            }
+            FileRow::File { ix, depth } => {
+                let f = &d.files[ix];
+                let name = ui::file_name(&f.path).to_string();
+                let dir = ui::file_dir(&f.path).to_string();
+                let selected = ix == self.selected;
+                div()
+                    .id(("commit-file", ix))
+                    .debug_selector({
+                        let name = name.clone();
+                        move || format!("commit-file-{name}")
+                    })
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .h(px(24.))
+                    // In the tree, files line up under their folder's name (past its chevron).
+                    .pl(px(8. + if tree { depth as f32 * INDENT + 18. } else { 0. }))
+                    .pr(px(8.))
+                    .rounded(px(3.))
+                    .cursor_pointer()
+                    .when(selected, |d| d.bg(if focused { theme::selected_focused() } else { theme::selected() }))
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(move |view, ev: &ClickEvent, _, cx| {
+                        view.selected = ix;
+                        view.open(ix, ev.click_count() < 2, cx);
+                        cx.notify();
+                    }))
+                    .child(ui::file_icon(&name))
+                    .child(div().text_color(ui::status_color(f.status)).child(name))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_color(theme::fg_muted())
+                            .text_size(px(11.))
+                            .child(match (&f.orig_path, tree) {
+                                (Some(old), _) => format!("{old} → {dir}"),
+                                (None, true) => String::new(),
+                                (None, false) => dir,
+                            }),
+                    )
+                    .child(div().w(px(16.)).text_color(ui::status_color(f.status)).child(f.status.letter()))
+            }
         });
 
         root.child(
@@ -513,9 +631,49 @@ impl Render for CommitView {
                             let d: Vec<char> = crate::keybindings::direction_letters().chars().collect();
                             let (down, up) = (d.get(1).copied().unwrap_or('k'), d.get(2).copied().unwrap_or('i'));
                             format!("{down}/{up} or ↓/↑ to move · enter for diff · y copies hash")
-                        })),
+                        }))
+                        .child(div().flex_1())
+                        .child(
+                            ui::icon_button("files-as-tree", if tree { "list-flat" } else { "list-tree" })
+                                .debug_selector(|| "files-as-tree".into())
+                                .tooltip(ui::tooltip(if tree { "View as list" } else { "View as tree" }))
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    AS_TREE.fetch_xor(true, Ordering::Relaxed);
+                                    cx.notify();
+                                })),
+                        ),
                 )
                 .child(div().flex().flex_col().children(files)),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileRow, file_rows};
+    use crate::git::{Change, FileStatus};
+    use std::collections::HashSet;
+
+    #[test]
+    fn files_as_a_tree_folders_first_and_foldable() {
+        let files: Vec<Change> = [".env.example", ".github/workflows/eas-build.yml", ".github/workflows/release.yml", "src/app/a.ts", "src/b.ts", "README.md"]
+            .iter()
+            .map(|p| Change { path: p.to_string(), orig_path: None, status: FileStatus::Modified })
+            .collect();
+        let label = |rows: Vec<FileRow>| -> Vec<String> {
+            rows.into_iter()
+                .map(|r| match r {
+                    FileRow::Folder { label, depth, .. } => format!("{}{label}/", "  ".repeat(depth)),
+                    FileRow::File { ix, depth } => format!("{}{}", "  ".repeat(depth), crate::ui::file_name(&files[ix].path)),
+                })
+                .collect()
+        };
+        assert_eq!(label(file_rows(&files, false, &HashSet::new())).len(), 6, "list: as they are");
+        assert_eq!(
+            label(file_rows(&files, true, &HashSet::new())),
+            [".github / workflows/", "  eas-build.yml", "  release.yml", "src/", "  app/", "    a.ts", "  b.ts", ".env.example", "README.md"]
+        );
+        let folded = HashSet::from(["src".to_string()]);
+        assert_eq!(label(file_rows(&files, true, &folded)), [".github / workflows/", "  eas-build.yml", "  release.yml", "src/", ".env.example", "README.md"]);
     }
 }
