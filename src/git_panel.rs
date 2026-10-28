@@ -15,7 +15,8 @@ use std::rc::Rc;
 actions!(git_panel, [Down, Up, Open, ToggleStage, Discard, OpenFile, FocusCommit, Refresh, Top, Bottom]);
 
 pub fn bind_keys() {
-    let c = Some("GitPanel");
+    // Not while typing a commit message: s, d, c… are letters there.
+    let c = Some("GitPanel && !typing");
     crate::keybindings::collect([
         crate::keybindings::kb("{down}", Down, c),
         crate::keybindings::kb("down", Down, c),
@@ -1694,7 +1695,7 @@ impl Render for GitPanel {
         let both_open = self.changes_open && self.graph_open;
 
         div()
-            .key_context("GitPanel")
+            .key_context(if self.commit_input.read(cx).focus_handle(cx).contains_focused(window, cx) { "GitPanel typing" } else { "GitPanel" })
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::up))

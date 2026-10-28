@@ -141,7 +141,8 @@ pub fn bind_keys() {
         crate::keybindings::kb("escape", OutputLeave, o),
     ]);
     // In the non-text panes, ":" opens the command line and "/" finds files, like a terminal UI.
-    for ctx in ["FileTree", "GitPanel", "DiffView", "CommitView", "Output"] {
+    // Not while typing a name or a commit message.
+    for ctx in ["FileTree && !naming", "GitPanel && !typing", "DiffView", "CommitView", "Output"] {
         crate::keybindings::collect([
             crate::keybindings::kb("shift-;", CommandPalette, Some(ctx)),
             crate::keybindings::kb(":", CommandPalette, Some(ctx)),
@@ -5380,6 +5381,47 @@ mod ui_tests {
         cx.run_until_parked();
         assert!(ws.read_with(cx, |ws, cx| ws.find_target(cx).is_some()), "the bar shows on the editable diff too");
         assert_eq!(count(cx).0, 1);
+    }
+
+    #[gpui::test]
+    fn every_letter_types_in_the_commit_message(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            std::process::Command::new("sh").arg("-c").arg("git init -q -b main && echo a > a.txt").current_dir(dir).output().unwrap();
+        });
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
+        cx.run_until_parked();
+        // A file selected in the list: its keys (s stages, d discards…) must not fire while typing.
+        let click = |cx: &mut VisualTestContext, sel: &'static str| {
+            cx.run_until_parked();
+            let at = cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} on screen")).center();
+            cx.simulate_click(at, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        click(cx, "change-row-a.txt");
+        ws.update_in(cx, |ws, window, cx| ws.git_panel.read(cx).focus_commit_input(window, cx));
+        cx.run_until_parked();
+        let letters = "abcdefghijklmnopqrstuvwxyz";
+        for k in letters.chars() {
+            cx.simulate_keystrokes(&k.to_string());
+        }
+        cx.simulate_keystrokes("space shift-g");
+        cx.simulate_input(": /!");
+        cx.run_until_parked();
+        let msg = ws.read_with(cx, |ws, cx| ws.git_panel.read(cx).commit_input.read(cx).text());
+        assert_eq!(msg, format!("{letters} G: /!"), "no shortcut fired, : / ! included");
+        let staged = ws.read_with(cx, |ws, cx| ws.git.read(cx).status.staged.len());
+        assert_eq!(staged, 0, "typing staged nothing");
+
+        // The explorer's rename box: letters were already safe; : / ! are too now.
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Files, window, cx));
+        let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("a.txt");
+        ws.update(cx, |ws, cx| ws.tree.update(cx, |t, _| t.select(file)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("r cmd-a");
+        cx.simulate_input("x: /!sdo");
+        cx.run_until_parked();
+        let name = ws.read_with(cx, |ws, cx| ws.tree.read(cx).naming_text(cx));
+        assert_eq!(name.as_deref(), Some("x: /!sdo"));
     }
 
     #[gpui::test]

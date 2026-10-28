@@ -147,6 +147,11 @@ impl FileTree {
     }
 
     #[cfg(test)]
+    pub(crate) fn naming_text(&self, cx: &App) -> Option<String> {
+        self.editing.as_ref().map(|e| e.input.read(cx).text())
+    }
+
+    #[cfg(test)]
     pub(crate) fn row_names(&self) -> Vec<(usize, String)> {
         self.rows.iter().map(|r| (r.depth, r.entry.name.clone())).collect()
     }
