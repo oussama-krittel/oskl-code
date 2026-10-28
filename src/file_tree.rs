@@ -85,6 +85,9 @@ struct Inline {
     _subs: Vec<Subscription>,
 }
 
+type MenuAct = fn(&mut FileTree, &mut Window, &mut Context<FileTree>);
+type MenuItem = (&'static str, &'static str, bool, MenuAct);
+
 pub struct FileTree {
     focus: FocusHandle,
     root: PathBuf,
@@ -660,20 +663,22 @@ impl FileTree {
         cx.notify();
     }
 
-    fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (at, path) = self.menu.clone()?;
-        let is_root = self.is_root(&path);
-        let added = self.extra.contains(&path);
+    /// The right-click menu for `path`: (label, keys, enabled, action), None for a separator.
+    fn menu_items(&self, path: &Path) -> Vec<Option<MenuItem>> {
+        let is_root = self.is_root(path);
+        let added = self.extra.iter().any(|r| r == path);
         let can_paste = self.clip.is_some();
-        type Act = fn(&mut FileTree, &mut Window, &mut Context<FileTree>);
-        let mut items: Vec<Option<(&'static str, &'static str, bool, Act)>> = vec![
+        let mut items: Vec<Option<MenuItem>> = vec![
             Some(("New File…", "A", true, |t, w, cx| t.new_file(&NewFile, w, cx))),
             Some(("New Folder…", "⇧A", true, |t, w, cx| t.new_folder(&NewFolder, w, cx))),
             None,
             Some(("Reveal in Finder", "⌥⌘R", true, |t, w, cx| t.reveal_in_finder(&RevealInFinder, w, cx))),
-            Some(("Open in Integrated Terminal", "", true, |t, _, cx| t.open_in_terminal(cx))),
-            None,
         ];
+        // A terminal opens in a folder, so only folders offer it.
+        if path.is_dir() {
+            items.push(Some(("Open in Integrated Terminal", "", true, |t, _, cx| t.open_in_terminal(cx))));
+        }
+        items.push(None);
         if !is_root {
             items.push(Some(("Cut", "⌘X", true, |t, w, cx| t.cut_file(&CutFile, w, cx))));
             items.push(Some(("Copy", "⌘C", true, |t, w, cx| t.copy_file(&CopyFile, w, cx))));
@@ -690,12 +695,15 @@ impl FileTree {
             items.push(Some(("Rename…", "F2", true, |t, w, cx| t.rename(&Rename, w, cx))));
             items.push(Some(("Delete", "⌘⌫", true, |t, w, cx| t.delete(&Delete, w, cx))));
         }
-        items.push(None);
-        items.push(Some(("Add Folder to Workspace…", "", true, |t, _, cx| {
-            t.menu = None;
-            cx.emit(Request::AddFolder);
-            cx.notify();
-        })));
+        // Workspace folders are managed from the roots (or the empty space below the files).
+        if is_root {
+            items.push(None);
+            items.push(Some(("Add Folder to Workspace…", "", true, |t, _, cx| {
+                t.menu = None;
+                cx.emit(Request::AddFolder);
+                cx.notify();
+            })));
+        }
         if added {
             items.push(Some(("Remove Folder from Workspace", "", true, |t, _, cx| {
                 if let Some((_, p)) = t.menu.take() {
@@ -704,6 +712,17 @@ impl FileTree {
                 cx.notify();
             })));
         }
+        items
+    }
+
+    #[cfg(test)]
+    pub(crate) fn menu_labels(&self, path: &Path) -> Vec<&'static str> {
+        self.menu_items(path).into_iter().flatten().map(|i| i.0).collect()
+    }
+
+    fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (at, path) = self.menu.clone()?;
+        let items = self.menu_items(&path);
         let list = div()
             .id("tree-menu")
             .occlude()

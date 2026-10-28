@@ -1186,8 +1186,10 @@ impl GitPanel {
             ListRow::Folder { staged, key, label, depth, open, paths } => {
                 let (staged, paths, open, key) = (*staged, paths.clone(), *open, key.clone());
                 let name = label.rsplit(" / ").next().unwrap_or(label).to_string();
+                let row_selector = format!("folder-row-{name}");
                 div()
                     .id(("folder", ix))
+                    .debug_selector(move || row_selector)
                     .group("folder")
                     .flex()
                     .items_center()
@@ -1206,14 +1208,35 @@ impl GitPanel {
                     .child(ui::small_icon(if open { "chevron-down" } else { "chevron-right" }, theme::fg()))
                     .child(ui::folder_icon(&name, open))
                     .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_color(theme::fg()).child(label.clone()))
-                    .child(
-                        div().invisible().group_hover("folder", |s| s.visible()).child(
-                            ui::icon_button(("folder-stage", ix), if staged { "minus" } else { "plus" }).on_click(cx.listener(move |panel, _, _, cx| {
-                                cx.stop_propagation();
-                                if staged { panel.unstage(paths.clone(), cx) } else { panel.stage(paths.clone(), cx) }
-                            })),
-                        ),
-                    )
+                    .child({
+                        let discard = paths.clone();
+                        let selector = format!("folder-discard-{name}");
+                        div()
+                            .flex()
+                            .gap(px(1.))
+                            .invisible()
+                            .group_hover("folder", |s| s.visible())
+                            // Discard everything in the folder (asks first, like a file), like VS Code.
+                            .when(!staged, |d| {
+                                d.child(
+                                    ui::icon_button(("folder-discard", ix), "discard")
+                                        .debug_selector(move || selector)
+                                        .tooltip(ui::tooltip("Discard changes in this folder"))
+                                        .on_click(cx.listener(move |panel, _, window, cx| {
+                                            cx.stop_propagation();
+                                            panel.ask_discard(discard.clone(), window, cx);
+                                        })),
+                                )
+                            })
+                            .child(
+                                ui::icon_button(("folder-stage", ix), if staged { "minus" } else { "plus" })
+                                    .tooltip(ui::tooltip(if staged { "Unstage this folder" } else { "Stage this folder" }))
+                                    .on_click(cx.listener(move |panel, _, _, cx| {
+                                        cx.stop_propagation();
+                                        if staged { panel.unstage(paths.clone(), cx) } else { panel.stage(paths.clone(), cx) }
+                                    })),
+                            )
+                    })
                     .child(ui::small_icon("dot", theme::git_modified()).size(px(8.)))
                     .into_any_element()
             }

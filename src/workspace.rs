@@ -946,7 +946,7 @@ impl Workspace {
                 .on_click(cx.listener(move |ws, _, window, cx| ws.answer_ask(Some(ix).filter(|i| *i < n), window, cx)))
                 .child(label)
         });
-        let detail = st.ask.detail.lines().map(|l| if l.is_empty() { div().h(px(8.)) } else { div().child(l.to_string()) });
+        let detail = st.ask.detail.lines().map(|l| if l.is_empty() { div().h(px(8.)) } else { div().min_w_0().child(l.to_string()) });
         let icon_color = if st.ask.danger { danger } else { theme::c(0xe5c07b) };
         Some(
             div()
@@ -956,11 +956,11 @@ impl Workspace {
                 .bg(theme::ca(0x00000073))
                 .flex()
                 .justify_center()
-                .items_start()
-                .pt(px(110.))
+                .items_center()
                 .child(
                     div()
                         .id("dialog")
+                        .debug_selector(|| "dialog-card".into())
                         .track_focus(&st.focus)
                         .key_context("Dialog")
                         .on_action(cx.listener(|ws, _: &DialogConfirm, window, cx| {
@@ -970,7 +970,8 @@ impl Workspace {
                         .on_action(cx.listener(|ws, _: &DialogCancel, window, cx| ws.answer_ask(None, window, cx)))
                         .on_action(cx.listener(|ws, _: &DialogNext, _, cx| ws.ask_step(1, cx)))
                         .on_action(cx.listener(|ws, _: &DialogPrev, _, cx| ws.ask_step(-1, cx)))
-                        .w(px(460.))
+                        .w(px(480.))
+                        .max_w(relative(0.9))
                         .flex()
                         .flex_col()
                         .gap(px(12.))
@@ -985,11 +986,12 @@ impl Workspace {
                                 .flex()
                                 .items_start()
                                 .gap(px(10.))
-                                .child(ui::small_icon("warning", icon_color).size(px(18.)))
-                                .child(div().flex_1().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(st.ask.title.clone())),
+                                .child(ui::small_icon("warning", icon_color).size(px(18.)).flex_none())
+                                // min_w_0: a long title wraps inside the card instead of running out of it.
+                                .child(div().debug_selector(|| "dialog-title".into()).flex_1().min_w_0().text_size(px(13.)).line_height(relative(1.4)).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(st.ask.title.clone())),
                         )
-                        .child(div().pl(px(28.)).flex().flex_col().text_size(px(12.)).text_color(theme::fg_dim()).children(detail))
-                        .child(div().flex().justify_end().gap(px(8.)).pt(px(4.)).children(buttons)),
+                        .child(div().pl(px(28.)).min_w_0().flex().flex_col().text_size(px(12.)).line_height(relative(1.45)).text_color(theme::fg_dim()).children(detail))
+                        .child(div().flex().flex_wrap().justify_end().gap(px(8.)).pt(px(4.)).children(buttons)),
                 )
                 .into_any_element(),
         )
@@ -5267,6 +5269,76 @@ mod ui_tests {
         assert!(panel_focused(cx), "switching files keeps it there too");
         click(cx, "change-row-b.txt", 2);
         assert!(!panel_focused(cx), "double-click goes into the diff");
+    }
+
+    #[gpui::test]
+    fn folders_in_the_changes_tree_can_be_discarded(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            sh("mkdir -p src && echo a > src/a.ts && echo b > src/b.ts && echo c > c.ts && git add . && git commit -qm one");
+            sh("echo A >> src/a.ts && echo B >> src/b.ts && echo C >> c.ts");
+        });
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
+        cx.run_until_parked();
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let row = cx.debug_bounds("folder-row-src").expect("src folder in the tree").center();
+        cx.simulate_mouse_move(row, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let at = cx.debug_bounds("folder-discard-src").expect("discard button on the hovered folder").center();
+        cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let title = ws.read_with(cx, |ws, _| ws.ask.as_ref().map(|a| a.ask.title.clone())).expect("asks first");
+        assert!(title.contains("2 files"), "{title}");
+        let at = cx.debug_bounds("dialog-button-Discard 2 Files").expect("button").center();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(root.join("src/a.ts")).unwrap(), "a\n");
+        assert_eq!(std::fs::read_to_string(root.join("src/b.ts")).unwrap(), "b\n");
+        assert_eq!(std::fs::read_to_string(root.join("c.ts")).unwrap(), "c\nC\n", "outside the folder: untouched");
+    }
+
+    #[gpui::test]
+    fn explorer_menu_fits_what_was_clicked(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/index.ts"), "").unwrap();
+        let labels = |cx: &mut VisualTestContext, p: std::path::PathBuf| ws.read_with(cx, |ws, cx| ws.tree.read(cx).menu_labels(&p));
+        let file = labels(cx, root.join("src/index.ts"));
+        assert!(!file.contains(&"Open in Integrated Terminal"), "files: {file:?}");
+        assert!(!file.contains(&"Add Folder to Workspace…"), "files: {file:?}");
+        assert!(file.contains(&"Rename…") && file.contains(&"Delete"));
+        let folder = labels(cx, root.join("src"));
+        assert!(folder.contains(&"Open in Integrated Terminal"), "folders: {folder:?}");
+        assert!(!folder.contains(&"Add Folder to Workspace…"));
+        let top = labels(cx, root.clone());
+        assert!(top.contains(&"Add Folder to Workspace…") && top.contains(&"Open in Integrated Terminal"), "root: {top:?}");
+    }
+
+    #[gpui::test]
+    fn long_dialog_titles_wrap_inside_the_card(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let ask = crate::dialog::Ask {
+            title: "Are you sure you want to DELETE the 6 untracked files? You can restore these files from the Trash.".into(),
+            detail: "Are you sure you want to discard ALL changes in 28 files?\n\nThis is IRREVERSIBLE!".into(),
+            buttons: vec!["Discard All 34 Files".into(), "Discard 28 Tracked Files".into()],
+            danger: true,
+            cancel_default: false,
+            on_answer: std::rc::Rc::new(|_, _, _| {}),
+        };
+        ws.update_in(cx, |ws, window, cx| ws.open_ask(ask, window, cx));
+        cx.run_until_parked();
+        let card = cx.debug_bounds("dialog-card").expect("dialog shown");
+        let title = cx.debug_bounds("dialog-title").expect("title shown");
+        assert!(title.right() <= card.right(), "title stays inside: {title:?} vs {card:?}");
+        assert!(title.size.height > gpui::px(24.), "and wraps onto more lines");
+        let view = cx.update(|window, _| window.viewport_size());
+        let (dx, dy) = ((card.center().x - view.width / 2.).abs(), (card.center().y - view.height / 2.).abs());
+        assert!(dx < gpui::px(1.) && dy < gpui::px(1.), "centred in the window: {card:?} in {view:?}");
     }
 
     #[gpui::test]
