@@ -178,6 +178,11 @@ pub fn format(root: &Path, path: &Path, text: &str) -> Result<(String, String), 
             "swift" => ("swift-format", vec![]),
             "sh" | "bash" | "zsh" => ("shfmt", vec!["-".into()]),
             "lua" => ("stylua", vec!["-".into()]),
+            // Terraform's own formatter (or OpenTofu's), reading stdin with `-`.
+            "tf" | "tfvars" | "hcl" | "tftest" => {
+                let name = if find_tool("terraform", dir, root).is_some() || find_tool("tofu", dir, root).is_none() { "terraform" } else { "tofu" };
+                (name, vec!["fmt".into(), "-no-color".into(), "-".into()])
+            }
             "c" | "h" | "cpp" | "hpp" | "cc" | "m" | "mm" => ("clang-format", vec![format!("--assume-filename={p}")]),
             _ => return Err(format!("No formatter configured for .{e} files")),
         };
@@ -330,5 +335,24 @@ mod live_format {
         let (out, tool) = super::format(&root, &file, "const   x={a:1,b:2}\nexport   function f( ){return x}\n").expect("formats");
         println!("{tool}:\n{out}");
         assert!(out.contains("const x = { a: 1, b: 2 };"));
+    }
+}
+
+#[cfg(test)]
+mod terraform_tests {
+    /// Runs only where terraform (or tofu) is installed.
+    #[test]
+    fn formats_terraform() {
+        let dir = std::env::temp_dir().join(format!("kite-tf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("main.tf");
+        match super::format(&dir, &file, "resource \"a\" \"b\" {\nx=1\n  longer_name=\"y\"\n}\n") {
+            Ok((out, tool)) => {
+                assert_eq!(out, "resource \"a\" \"b\" {\n  x           = 1\n  longer_name = \"y\"\n}\n");
+                assert!(tool.contains("terraform") || tool.contains("tofu"), "{tool}");
+            }
+            Err(e) => assert!(e.contains("not found"), "only a missing tool may fail: {e}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

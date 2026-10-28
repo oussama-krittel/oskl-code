@@ -64,6 +64,7 @@ pub enum Lang {
     Bash,
     Yaml,
     Toml,
+    Terraform,
 }
 
 pub fn detect(path: &Path) -> Option<Lang> {
@@ -82,6 +83,7 @@ pub fn detect(path: &Path) -> Option<Lang> {
         "sh" | "bash" | "zsh" => Lang::Bash,
         "yml" | "yaml" => Lang::Yaml,
         "toml" => Lang::Toml,
+        "tf" | "tfvars" | "hcl" | "tftest" => Lang::Terraform,
         _ if name == ".zshrc" || name == ".bashrc" || name.ends_with(".env") || name == ".envrc" => Lang::Bash,
         _ if name == "cargo.lock" => Lang::Toml,
         _ => return None,
@@ -111,6 +113,7 @@ fn build(lang: Lang) -> Option<HighlightConfiguration> {
         Lang::Bash => (tree_sitter_bash::LANGUAGE.into(), tree_sitter_bash::HIGHLIGHT_QUERY.into(), ""),
         Lang::Yaml => (tree_sitter_yaml::LANGUAGE.into(), tree_sitter_yaml::HIGHLIGHTS_QUERY.into(), ""),
         Lang::Toml => (tree_sitter_toml_ng::LANGUAGE.into(), tree_sitter_toml_ng::HIGHLIGHTS_QUERY.into(), ""),
+        Lang::Terraform => (tree_sitter_hcl::LANGUAGE.into(), include_str!("hcl_highlights.scm").into(), ""),
     };
     let mut config = HighlightConfiguration::new(language, format!("{lang:?}"), &highlights, injections, "").ok()?;
     config.configure(NAMES);
@@ -118,7 +121,7 @@ fn build(lang: Lang) -> Option<HighlightConfiguration> {
 }
 
 fn config(lang: Lang) -> Option<&'static HighlightConfiguration> {
-    static CONFIGS: [OnceLock<Option<HighlightConfiguration>>; 12] = [const { OnceLock::new() }; 12];
+    static CONFIGS: [OnceLock<Option<HighlightConfiguration>>; 13] = [const { OnceLock::new() }; 13];
     CONFIGS[lang as usize].get_or_init(|| build(lang)).as_ref()
 }
 
@@ -176,8 +179,24 @@ mod tests {
     }
 
     #[test]
+    fn highlights_terraform() {
+        let src = "# note\nresource \"aws_s3_bucket\" \"logs\" {\n  bucket = \"logs-${var.env}\"\n  count  = 2\n}\n";
+        let spans = highlight(Lang::Terraform, src).expect("hcl query compiles");
+        let name_at = |row: usize, col: usize| spans[row].iter().find(|(r, _)| r.contains(&col)).map(|(_, h)| super::name(*h));
+        assert_eq!(name_at(0, 0), Some("comment"));
+        assert_eq!(name_at(1, 0), Some("keyword"), "block type");
+        assert_eq!(name_at(1, 10), Some("type"), "block label");
+        assert_eq!(name_at(2, 2), Some("property"), "attribute name");
+        assert_eq!(name_at(2, 12), Some("string"));
+        assert_eq!(name_at(2, 19), Some("variable.builtin"), "var in an interpolation");
+        assert_eq!(name_at(3, 11), Some("number"));
+        let map = highlight(Lang::Terraform, "tags = { Name = var.x }\n").unwrap();
+        assert_eq!(map[0].iter().find(|(r, _)| r.contains(&9)).map(|(_, h)| super::name(*h)), Some("property"), "map keys");
+    }
+
+    #[test]
     fn all_languages_compile() {
-        for lang in [Lang::Tsx, Lang::JavaScript, Lang::Json, Lang::Css, Lang::Html, Lang::Rust, Lang::Python, Lang::Go, Lang::Bash, Lang::Yaml, Lang::Toml] {
+        for lang in [Lang::Tsx, Lang::JavaScript, Lang::Json, Lang::Css, Lang::Html, Lang::Rust, Lang::Python, Lang::Go, Lang::Bash, Lang::Yaml, Lang::Toml, Lang::Terraform] {
             assert!(highlight(lang, "x").is_some(), "{lang:?} failed to build");
         }
     }
