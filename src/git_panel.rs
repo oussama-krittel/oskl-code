@@ -638,7 +638,8 @@ impl GitPanel {
     fn open_change(&self, staged: bool, change: &Change, preview: bool, cx: &mut Context<Self>) {
         let root = self.repo.read(cx).root.clone();
         if matches!(change.status, FileStatus::Untracked | FileStatus::Conflicted) {
-            return cx.emit(Request::OpenFile { path: root.join(&change.path), line: None, preview });
+            let path = root.join(&change.path);
+            return cx.emit(if preview { Request::ShowFile(path) } else { Request::OpenFile { path, line: None, preview } });
         }
         let (left, right) = if staged {
             let left = if change.status == FileStatus::Added { Rev::Empty } else { Rev::Commit("HEAD".into()) };
@@ -1227,8 +1228,10 @@ impl GitPanel {
                 let root = self.repo.read(cx).root.clone();
                 let path_open = root.join(&change.path);
                 let untracked = change.status == FileStatus::Untracked;
+                let selector = format!("change-row-{}", c1.path);
                 div()
                     .id(("file", ix))
+                    .debug_selector(move || selector)
                     .group("file")
                     .flex()
                     .items_center()

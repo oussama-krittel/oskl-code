@@ -193,6 +193,22 @@ enum TabKind {
     Preview(Entity<PreviewView>),
 }
 
+/// What the find bar (⌘F) searches: a text editor, or a read-only diff.
+#[derive(Clone)]
+enum FindOn {
+    Editor(WeakEntity<Editor>),
+    Diff(WeakEntity<DiffView>),
+}
+
+impl FindOn {
+    fn id(&self) -> EntityId {
+        match self {
+            FindOn::Editor(e) => e.entity_id(),
+            FindOn::Diff(d) => d.entity_id(),
+        }
+    }
+}
+
 /// Tiling layout of panes, like zellij / tmux / iTerm splits.
 #[derive(Clone, Debug)]
 enum Layout {
@@ -431,7 +447,7 @@ pub struct Workspace {
     last_search: Option<String>,
     find: Entity<crate::findbar::FindBar>,
     /// Pane and editor the find bar is open on.
-    find_on: Option<(usize, WeakEntity<Editor>)>,
+    find_on: Option<(usize, FindOn)>,
     message: Option<(String, bool)>,
     message_task: Option<Task<()>>,
     recent: Vec<PathBuf>,
@@ -842,7 +858,13 @@ impl Workspace {
                     });
                 }
             }
-            Request::OpenDiff { spec, preview } => self.open_diff(spec.clone(), *preview, window, cx),
+            Request::OpenDiff { spec, preview } => {
+                // A single click (preview) shows the diff but leaves the keyboard where it was,
+                // like the explorer; Enter / double-click go into it.
+                self.keep_focus = *preview;
+                self.open_diff(spec.clone(), *preview, window, cx);
+                self.keep_focus = false;
+            }
             Request::OpenCommit(sha) => self.open_commit(sha.clone(), window, cx),
             Request::CommandLine(text) => self.open_cmd(CmdMode::Command, text, window, cx),
             Request::Moved { from, to } => self.path_moved(from, to, cx),
@@ -2742,38 +2764,68 @@ impl Workspace {
     }
 
     fn open_find(&mut self, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ed) = self.active_editor() else { return self.flash("Open a file to search in it".into(), true, cx) };
+        let diff = self.active.and_then(|ix| match &self.tabs[ix].kind {
+            TabKind::Diff(d) => Some(d.clone()),
+            _ => None,
+        });
+        let target = match (diff, self.active_editor()) {
+            (Some(d), _) => FindOn::Diff(d.downgrade()),
+            (None, Some(ed)) => FindOn::Editor(ed.downgrade()),
+            _ => return self.flash("Open a file to search in it".into(), true, cx),
+        };
         if self.cmd_mode.is_some() {
             self.cancel_cmd(window, cx);
         }
-        if let Some((_, old)) = &self.find_on
-            && old.upgrade().is_some_and(|o| o != ed)
-        {
+        if self.find_on.as_ref().is_some_and(|(_, old)| old.id() != target.id()) {
             self.find.update(cx, |f, cx| f.close(cx));
         }
-        self.find_on = Some((self.focused_pane, ed.downgrade()));
-        self.find.update(cx, |f, cx| f.open(ed, replace, window, cx));
+        self.find_on = Some((self.focused_pane, target.clone()));
+        match target {
+            FindOn::Editor(ed) => {
+                if let Some(ed) = ed.upgrade() {
+                    self.find.update(cx, |f, cx| f.open(ed, replace, window, cx));
+                }
+            }
+            FindOn::Diff(d) => {
+                if let Some(d) = d.upgrade() {
+                    self.find.update(cx, |f, cx| f.open_diff(d, window, cx));
+                }
+            }
+        }
         cx.notify();
     }
 
     fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((_, ed)) = self.find_on.take() else { return };
+        let Some((_, on)) = self.find_on.take() else { return };
         self.find.update(cx, |f, cx| f.close(cx));
-        if let Some(ed) = ed.upgrade() {
-            ed.read(cx).focus(window);
+        match on {
+            FindOn::Editor(ed) => {
+                if let Some(ed) = ed.upgrade() {
+                    ed.read(cx).focus(window);
+                }
+            }
+            FindOn::Diff(d) => {
+                if let Some(d) = d.upgrade() {
+                    d.read(cx).focus(window);
+                }
+            }
         }
         cx.notify();
     }
 
-    /// The editor the find bar is showing on, if it's still the visible item of its pane.
-    fn find_target(&self, _cx: &App) -> Option<(usize, Entity<Editor>)> {
-        let (pane, ed) = self.find_on.as_ref()?;
-        let ed = ed.upgrade()?;
+    /// The pane the find bar is showing on, while what it searches is still that pane's
+    /// visible item (a file, the editable side of a diff, a merge result, or a diff).
+    fn find_target(&self, _cx: &App) -> Option<usize> {
+        let (pane, on) = self.find_on.as_ref()?;
         let active = self.pane(*pane)?.active.and_then(|t| self.tab_ix(t))?;
-        match &self.tabs[active].kind {
-            TabKind::Editor(e) if *e == ed => Some((*pane, ed)),
-            _ => None,
-        }
+        let ok = match (&self.tabs[active].kind, on) {
+            (TabKind::Diff(d), FindOn::Diff(w)) => d.entity_id() == w.entity_id(),
+            (TabKind::Editor(e), FindOn::Editor(w)) => e.entity_id() == w.entity_id(),
+            (TabKind::DiffEdit(_), FindOn::Editor(w)) => self.diff_edit_right(active).is_some_and(|e| e.entity_id() == w.entity_id()),
+            (TabKind::Merge(m), FindOn::Editor(w)) => self.merge_results.iter().any(|(v, e)| v == m && e.entity_id() == w.entity_id()),
+            _ => false,
+        };
+        ok.then_some(*pane)
     }
 
     fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
@@ -3932,7 +3984,7 @@ impl Workspace {
                             .flex_1()
                             .min_h_0()
                             .child(content)
-                            .when(self.find_target(cx).is_some_and(|(p, _)| p == id), |d| {
+                            .when(self.find_target(cx).is_some_and(|p| p == id), |d| {
                                 d.child(div().absolute().top(px(4.)).right(px(14.)).child(self.find.clone()))
                             }),
                     )
@@ -5180,6 +5232,94 @@ mod ui_tests {
         cx.simulate_keystrokes("ctrl-k");
         assert_eq!(line(cx, 2), "  <Vi");
         assert_eq!(line(cx, 5), "  </View>", "an unfinished tag doesn't drag its partner along");
+    }
+
+    #[gpui::test]
+    fn changes_tree_single_click_keeps_the_keyboard_like_the_explorer(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            sh("echo a > a.txt && echo b > b.txt && git add . && git commit -qm one && echo A >> a.txt && echo B >> b.txt");
+        });
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
+        cx.run_until_parked();
+        let panel_focused = |cx: &mut VisualTestContext| ws.update_in(cx, |ws, window, cx| gpui::Focusable::focus_handle(&ws.git_panel, cx).is_focused(window));
+        let click = |cx: &mut VisualTestContext, sel: &'static str, count: usize| {
+            cx.run_until_parked();
+            let at = cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} on screen")).center();
+            for n in 1..=count {
+                cx.simulate_event(gpui::MouseDownEvent { position: at, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: n, first_mouse: false });
+                cx.simulate_event(gpui::MouseUpEvent { position: at, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: n });
+            }
+            cx.run_until_parked();
+        };
+        let shown = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.active.and_then(|ix| match &ws.tabs[ix].kind {
+            TabKind::DiffEdit(d) => Some(d.read(cx).spec.path.clone()),
+            _ => None,
+        }));
+        click(cx, "change-row-a.txt", 1);
+        assert_eq!(shown(cx).as_deref(), Some("a.txt"));
+        assert!(panel_focused(cx), "one click shows the diff, the keyboard stays in the panel");
+        click(cx, "change-row-b.txt", 1);
+        assert_eq!(shown(cx).as_deref(), Some("b.txt"));
+        assert!(panel_focused(cx), "switching files keeps it there too");
+        click(cx, "change-row-b.txt", 2);
+        assert!(!panel_focused(cx), "double-click goes into the diff");
+    }
+
+    #[gpui::test]
+    fn find_works_in_diffs(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            sh("printf 'alpha\\nbeta\\ngamma\\n' > a.txt && git add . && git commit -qm one");
+            sh("printf 'alpha\\nbeta two\\ngamma\\nbeta three\\n' > a.txt && git add a.txt");
+        });
+        cx.run_until_parked();
+        let count = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.find.read(cx).match_count());
+        // Read-only diff (staged: HEAD ↔ index).
+        let spec = crate::request::DiffSpec { path: "a.txt".into(), old_path: None, left: crate::git::Rev::Commit("HEAD".into()), right: crate::git::Rev::Index, from_commit: None };
+        ws.update_in(cx, |ws, window, cx| ws.open_diff(spec, false, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input("beta");
+        cx.run_until_parked();
+        assert_eq!(count(cx), (3, Some(0)), "both sides searched: old beta, new beta two, beta three");
+        assert!(ws.read_with(cx, |ws, cx| ws.find_target(cx).is_some()), "the bar shows on the diff");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(count(cx).1, Some(1), "Enter goes to the next match");
+        cx.simulate_keystrokes("escape");
+        assert!(ws.read_with(cx, |ws, _| ws.find_on.is_none()));
+
+        // Editable diff (working tree): the bar shows on its editor side.
+        std::fs::write(ws.read_with(cx, |ws, cx| ws.root(cx)).join("a.txt"), "alpha\nbeta two\ngamma\nbeta three\nbeta four\n").unwrap();
+        let spec = crate::request::DiffSpec { path: "a.txt".into(), old_path: None, left: crate::git::Rev::Index, right: crate::git::Rev::Working, from_commit: None };
+        ws.update_in(cx, |ws, window, cx| ws.open_diff(spec, false, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input("four");
+        cx.run_until_parked();
+        assert!(ws.read_with(cx, |ws, cx| ws.find_target(cx).is_some()), "the bar shows on the editable diff too");
+        assert_eq!(count(cx).0, 1);
+    }
+
+    #[gpui::test]
+    fn ignored_env_files_are_found_by_go_to_file(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && printf '.env*\\n!.env.example\\n' > .gitignore && touch .env .env.example app.ts && mkdir -p api && touch api/.env.production");
+        });
+        cx.run_until_parked();
+        let found = ws.read_with(cx, |ws, cx| ws.file_items(".env", cx).into_iter().map(|i| i.value).collect::<Vec<_>>());
+        for f in [".env", ".env.example", "api/.env.production"] {
+            assert!(found.contains(&f.to_string()), "{f} missing from {found:?}");
+        }
     }
 
     #[gpui::test]

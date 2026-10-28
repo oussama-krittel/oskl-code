@@ -84,6 +84,10 @@ pub struct DiffView {
     scroll: UniformListScrollHandle,
     scroll_x: f32,
     user_email: Option<String>,
+    /// The find bar's query, and its matches: (row, left side?, byte range in that line).
+    find: Option<regex::Regex>,
+    find_hits: Vec<(usize, bool, Range<usize>)>,
+    find_current: Option<usize>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -108,6 +112,9 @@ impl DiffView {
             scroll: UniformListScrollHandle::new(),
             scroll_x: 0.,
             user_email,
+            find: None,
+            find_hits: Vec::new(),
+            find_current: None,
             _tasks: Vec::new(),
         };
         view.reload(cx);
@@ -153,6 +160,7 @@ impl DiffView {
                         let first_hunk = data.side.iter().position(|r| r.kind != Kind::Equal);
                         view.data = Some(Arc::new(data));
                         view.error = None;
+                        view.collect_hits();
                         if view.selected.is_none()
                             && let Some(ix) = first_hunk
                         {
@@ -205,6 +213,59 @@ impl DiffView {
             Some(d) => &d.side,
             None => &[],
         }
+    }
+
+    /// The find bar's query (None clears it). Returns how many matches and which is current
+    /// (the first at or after the selected row, which gets selected).
+    pub fn set_find(&mut self, re: Option<regex::Regex>, cx: &mut Context<Self>) -> (usize, Option<usize>) {
+        self.find = re;
+        self.collect_hits();
+        let from = self.selected.unwrap_or(0);
+        self.find_current = self.find_hits.iter().position(|h| h.0 >= from).or((!self.find_hits.is_empty()).then_some(0));
+        if let Some(i) = self.find_current {
+            self.select(self.find_hits[i].0, cx);
+        }
+        cx.notify();
+        (self.find_hits.len(), self.find_current)
+    }
+
+    /// Next (or previous) match, wrapping around.
+    pub fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) -> Option<usize> {
+        let n = self.find_hits.len();
+        if n == 0 {
+            return None;
+        }
+        let next = match self.find_current {
+            Some(c) if forward => (c + 1) % n,
+            Some(c) => (c + n - 1) % n,
+            None => 0,
+        };
+        self.find_current = Some(next);
+        self.select(self.find_hits[next].0, cx);
+        Some(next)
+    }
+
+    /// Matches of the query in the lines shown (both sides side by side; one side inline).
+    fn collect_hits(&mut self) {
+        let mut hits = Vec::new();
+        if let (Some(re), Some(data)) = (&self.find, &self.data) {
+            let inline = self.show_inline();
+            'rows: for (ix, row) in self.rows().iter().enumerate() {
+                let sides: &[bool] = if inline { if row.r.is_none() { &[true] } else { &[false] } } else { &[true, false] };
+                for &left in sides {
+                    let Some(i) = (if left { row.l } else { row.r }) else { continue };
+                    let text = if left { &data.left[i] } else { &data.right[i] };
+                    for m in re.find_iter(text).filter(|m| m.start() < m.end()).take(200) {
+                        hits.push((ix, left, m.range()));
+                        if hits.len() >= 20_000 {
+                            break 'rows;
+                        }
+                    }
+                }
+            }
+        }
+        self.find_hits = hits;
+        self.find_current = self.find_current.filter(|c| *c < self.find_hits.len());
     }
 
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -277,6 +338,7 @@ impl DiffView {
         // Keep roughly the same position when switching layouts.
         let line = self.selected.and_then(|s| self.rows().get(s)).and_then(|r| r.r.or(r.l));
         self.inline = !self.inline;
+        self.collect_hits();
         if let Some(line) = line
             && let Some(ix) = self.rows().iter().position(|r| r.r == Some(line) || r.l == Some(line))
         {
@@ -471,7 +533,7 @@ fn push_range(v: &mut Vec<Range<usize>>, r: Range<usize>) {
     v.push(r);
 }
 
-fn styled_line(text: &str, highlights: &[Range<usize>], hl_color: Hsla) -> StyledText {
+fn styled_line(text: &str, highlights: &[(Range<usize>, Hsla)]) -> StyledText {
     let display = text.replace('\t', "    ");
     if highlights.is_empty() || display.len() != text.len() {
         return StyledText::new(display);
@@ -480,15 +542,15 @@ fn styled_line(text: &str, highlights: &[Range<usize>], hl_color: Hsla) -> Style
     let mut runs = Vec::new();
     let mut pos = 0;
     let run = |len: usize, bg: Option<Hsla>| TextRun { len, font: font.clone(), color: theme::fg(), background_color: bg, underline: None, strikethrough: None };
-    for r in highlights {
-        let (s, e) = (r.start.min(text.len()), r.end.min(text.len()));
+    for (r, color) in highlights {
+        let (s, e) = (r.start.min(text.len()).max(pos), r.end.min(text.len()));
         if s > pos {
             runs.push(run(s - pos, None));
         }
         if e > s {
-            runs.push(run(e - s, Some(hl_color)));
+            runs.push(run(e - s, Some(*color)));
+            pos = e;
         }
-        pos = e.max(pos);
     }
     if pos < text.len() {
         runs.push(run(text.len() - pos, None));
@@ -510,7 +572,16 @@ impl DiffView {
             (Kind::Insert, _, true) | (Kind::Change, false, true) => (Some(theme::diff_ins_line()), theme::diff_ins_char(), "+"),
         };
         let text = line.map(|i| if left { data.left[i].as_str() } else { data.right[i].as_str() }).unwrap_or("");
-        let highlights = if left { &row.l_hl } else { &row.r_hl };
+        // Find bar matches on this line win over the changed-word highlights.
+        let found: Vec<(Range<usize>, Hsla)> = self
+            .find_hits
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.0 == row_ix && h.1 == left)
+            .map(|(k, h)| (h.2.clone(), if Some(k) == self.find_current { theme::ca(0xff9d0077) } else { theme::find_match() }))
+            .collect();
+        let highlights: Vec<(Range<usize>, Hsla)> =
+            if found.is_empty() { (if left { &row.l_hl } else { &row.r_hl }).iter().map(|r| (r.clone(), hl)).collect() } else { found };
         let blame = if left { &self.left_blame } else { &self.right_blame };
 
         let mut side = div().flex().flex_1().min_w_0().h_full().overflow_hidden();
@@ -568,7 +639,7 @@ impl DiffView {
             div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(
                 div()
                     .ml(px(-self.scroll_x))
-                    .child(styled_line(text, highlights, hl)),
+                    .child(styled_line(text, &highlights)),
             ),
         )
     }

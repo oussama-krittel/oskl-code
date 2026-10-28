@@ -2230,7 +2230,9 @@ impl Editor {
 
         // Selections (every cursor's).
         let color = if focused { theme::selection() } else { theme::selection_inactive() };
-        for sel in self.buf.all_sels().into_iter().map(|s| s.range()).filter(|r| !r.is_empty()) {
+        // The current find match is drawn in its own colour, not hidden under the selection.
+        let current_match = self.find_current.and_then(|i| self.find_matches.get(i)).cloned();
+        for sel in self.buf.all_sels().into_iter().map(|s| s.range()).filter(|r| !r.is_empty() && Some(r) != current_match.as_ref()) {
             for (row, shaped, map) in &lines {
                 let rs = self.buf.line_start(*row);
                 let re = rs + self.buf.line_len(*row);

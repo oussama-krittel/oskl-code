@@ -203,7 +203,12 @@ impl Repo {
         let root = self.root.clone();
         let is_git = self.is_git;
         let task = cx.background_executor().spawn(async move {
-            if is_git { git::list_files(&root) } else { walk_files(&root, 20_000) }
+            let mut files = if is_git { git::list_files(&root) } else { walk_files(&root, 20_000) };
+            // Env files are usually git-ignored (and hidden), but you still want to find them.
+            files.extend(env_files(&root));
+            files.sort();
+            files.dedup();
+            files
         });
         self.files_task = Some(cx.spawn(async move |this, cx| {
             let files = task.await;
@@ -300,6 +305,35 @@ impl Repo {
     }
 }
 
+/// `.env`, `.env.local`, `prod.env`… a few folders deep (not in dependencies or build output).
+pub fn env_files(root: &Path) -> Vec<String> {
+    const SKIP: &[&str] = &["node_modules", "target", "build", "dist", "Pods", "vendor", "DerivedData"];
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0)];
+    let mut seen = 0;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            seen += 1;
+            if seen > 30_000 {
+                return out;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                if depth < 4 && !name.starts_with('.') && !SKIP.contains(&name.as_str()) {
+                    stack.push((entry.path(), depth + 1));
+                }
+            } else if (crate::secrets::is_env_file(&name) || name.starts_with(".env"))
+                && let Ok(rel) = entry.path().strip_prefix(root)
+            {
+                out.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+    out
+}
+
 fn walk_files(root: &Path, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -354,4 +388,22 @@ pub fn find_repos(root: &Path, max_depth: usize) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn finds_env_files_but_not_in_dependencies() {
+        let d = std::env::temp_dir().join(format!("kite-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for f in [".env", ".env.example", "apps/api/.env.local", "node_modules/x/.env", ".git/.env", "src/a.ts"] {
+            let p = d.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "").unwrap();
+        }
+        let mut found = super::env_files(&d);
+        found.sort();
+        assert_eq!(found, vec![".env", ".env.example", "apps/api/.env.local"]);
+        std::fs::remove_dir_all(&d).ok();
+    }
 }

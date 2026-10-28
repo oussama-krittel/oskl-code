@@ -33,6 +33,8 @@ pub struct FindBar {
     pub show_replace: bool,
     opts: Options,
     target: Option<WeakEntity<Editor>>,
+    /// Searching a read-only diff instead of an editor (no replace there).
+    diff: Option<WeakEntity<crate::diff_view::DiffView>>,
     matches: Arc<Vec<Range<usize>>>,
     current: Option<usize>,
     error: Option<String>,
@@ -78,6 +80,7 @@ impl FindBar {
             show_replace: false,
             opts: Options::default(),
             target: None,
+            diff: None,
             matches: Arc::default(),
             current: None,
             error: None,
@@ -89,6 +92,9 @@ impl FindBar {
 
     /// Opens on `target`, starting from its selection (used as the query when it's one line).
     pub fn open(&mut self, target: Entity<Editor>, replace: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(d) = self.diff.take().and_then(|d| d.upgrade()) {
+            d.update(cx, |d, cx| d.set_find(None, cx));
+        }
         let (sel_text, origin) = {
             let e = target.read(cx);
             let r = e.buf.sel.range();
@@ -114,9 +120,25 @@ impl FindBar {
         self.refresh(true, cx);
     }
 
+    /// Opens on a read-only diff: the same search, matches highlighted in its rows.
+    pub fn open_diff(&mut self, target: Entity<crate::diff_view::DiffView>, window: &mut Window, cx: &mut Context<Self>) {
+        self.close(cx);
+        self.show_replace = false;
+        self.diff = Some(target.downgrade());
+        self.query.update(cx, |q, cx| {
+            q.buf.select_all();
+            cx.notify();
+        });
+        self.query.read(cx).focus(window);
+        self.refresh(true, cx);
+    }
+
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if let Some(t) = self.target.as_ref().and_then(|t| t.upgrade()) {
             t.update(cx, |e, cx| e.set_find_matches(Arc::default(), None, cx));
+        }
+        if let Some(d) = self.diff.take().and_then(|d| d.upgrade()) {
+            d.update(cx, |d, cx| d.set_find(None, cx));
         }
         self.target = None;
         self._target_sub = None;
@@ -128,9 +150,23 @@ impl FindBar {
 
     /// Recomputes matches. With `jump`, selects the nearest match from where the search started.
     fn refresh(&mut self, jump: bool, cx: &mut Context<Self>) {
-        let Some(target) = self.target() else { return };
         let query = self.query.read(cx).text();
         self.error = None;
+        if let Some(diff) = self.diff.as_ref().and_then(|d| d.upgrade()) {
+            let re = match SearchPanel::matcher(&query, self.opts) {
+                Ok(re) if !query.is_empty() => Some(re),
+                Ok(_) => None,
+                Err(e) => {
+                    self.error = Some(e);
+                    None
+                }
+            };
+            let (n, current) = diff.update(cx, |d, cx| d.set_find(re, cx));
+            self.matches = Arc::new(vec![0..0; n]);
+            self.current = current;
+            return cx.notify();
+        }
+        let Some(target) = self.target() else { return };
         let matches: Vec<Range<usize>> = if query.is_empty() {
             Vec::new()
         } else {
@@ -164,6 +200,10 @@ impl FindBar {
 
     /// Next (or previous) match after the cursor, wrapping around.
     pub fn step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(diff) = self.diff.as_ref().and_then(|d| d.upgrade()) {
+            self.current = diff.update(cx, |d, cx| d.find_step(forward, cx));
+            return cx.notify();
+        }
         let Some(target) = self.target() else { return };
         if self.matches.is_empty() {
             return;
@@ -185,6 +225,11 @@ impl FindBar {
         cx.notify();
     }
 
+    #[cfg(test)]
+    pub fn match_count(&self) -> (usize, Option<usize>) {
+        (self.matches.len(), self.current)
+    }
+
     pub fn has_query(&self, cx: &App) -> bool {
         !self.query.read(cx).text().is_empty()
     }
@@ -202,6 +247,9 @@ impl FindBar {
 
     /// Replaces the current match (if the cursor is on it) and moves to the next.
     fn replace_one(&mut self, cx: &mut Context<Self>) {
+        if self.diff.is_some() {
+            return;
+        }
         let Some(target) = self.target() else { return };
         let Some(m) = self.current.and_then(|i| self.matches.get(i)).cloned() else { return };
         let sel = target.read(cx).buf.sel.range();
@@ -219,6 +267,9 @@ impl FindBar {
     }
 
     fn replace_all(&mut self, _: &ReplaceAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.diff.is_some() {
+            return;
+        }
         let Some(target) = self.target() else { return };
         let query = self.query.read(cx).text();
         if query.is_empty() || self.matches.is_empty() {
