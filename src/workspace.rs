@@ -5644,6 +5644,72 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn hovering_a_function_shows_its_signature_and_docs(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(root.join("lib/money.ts"), "/**\n * Formats cents as money.\n * @param cents - the amount\n */\nexport function formatMoney(cents: number, currency = 'EUR'): string {\n  return '';\n}\n").unwrap();
+        std::fs::write(root.join("util.ts"), "export const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));\n").unwrap();
+        let src = "import { formatMoney } from './lib/money';\n\n// Shows a label.\nfunction show(v: number) {\n  return formatMoney(v) + clamp(v, 0, 1) + nothing;\n}\nshow(1);\n";
+        let file = root.join("app.ts");
+        std::fs::write(&file, src).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(file.clone(), None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).expect("editor open");
+        let card = |cx: &mut VisualTestContext| ed.read_with(cx, |e, _| e.hover_card());
+        let pos = |needle: &str, nth: usize| {
+            let byte = src.match_indices(needle).nth(nth).unwrap().0;
+            src[..byte].chars().count() + 1
+        };
+        let key = |cx: &mut VisualTestContext, at: usize| {
+            ed.update(cx, |e, cx| {
+                let (r, c) = e.buf.pos_to_rc(at);
+                e.go_to(r, c, cx)
+            });
+            cx.simulate_keystrokes("cmd-k cmd-i");
+            cx.run_until_parked();
+        };
+
+        // ⌘K ⌘I on a call of an imported function: its declaration and docs from the other file.
+        key(cx, pos("formatMoney", 1));
+        assert_eq!(card(cx), Some(("function formatMoney(cents: number, currency = 'EUR'): string".into(), "Formats cents as money.".into())));
+        assert!(cx.debug_bounds("hover-card").is_some());
+        cx.simulate_keystrokes("right");
+        assert_eq!(card(cx), None, "moving the cursor closes it");
+
+        // Not imported: found across the project in the background.
+        key(cx, pos("clamp", 0));
+        assert_eq!(card(cx).map(|c| c.0).as_deref(), Some("const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))"));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(card(cx), None, "Esc closes it");
+        key(cx, pos("nothing", 0));
+        assert_eq!(card(cx), None, "nothing to show for an unknown name");
+
+        // The mouse resting on a name opens it; moving off closes it.
+        let rest = |cx: &mut VisualTestContext, p: gpui::Point<gpui::Pixels>| {
+            cx.simulate_mouse_move(p, None, gpui::Modifiers::none());
+            cx.executor().advance_clock(std::time::Duration::from_millis(400));
+            cx.run_until_parked();
+        };
+        let show = ed.read_with(cx, |e, _| e.point_of(pos("show", 1))).expect("on screen");
+        rest(cx, show);
+        assert_eq!(card(cx), Some(("function show(v: number)".into(), "Shows a label.".into())), "a function in this file");
+        rest(cx, gpui::point(show.x, show.y + gpui::px(300.)));
+        assert_eq!(card(cx), None, "off the name closes it");
+        let keyword = ed.read_with(cx, |e, _| e.point_of(pos("function", 0))).unwrap();
+        rest(cx, keyword);
+        assert_eq!(card(cx), None, "keywords have no card");
+
+        // The place under the docs goes to the declaration.
+        key(cx, pos("formatMoney", 1));
+        let place = cx.debug_bounds("hover-card-place").expect("where it's declared");
+        cx.simulate_click(place.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let at = ws.read_with(cx, |ws, _| ws.active_editor()).unwrap().read_with(cx, |e, _| (e.path.clone(), e.cursor_rc()));
+        assert_eq!(at, (Some(root.join("lib/money.ts")), (4, 16)));
+    }
+
+    #[gpui::test]
     fn typescript_problems_open_a_readable_card(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));

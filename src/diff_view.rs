@@ -556,7 +556,7 @@ fn push_range(v: &mut Vec<Range<usize>>, r: Range<usize>) {
 
 /// A line with its syntax colours (char columns) and background highlights (byte ranges);
 /// tabs are drawn as four spaces.
-fn styled_line(text: &str, syntax: &[(Range<usize>, u8)], highlights: &[(Range<usize>, Hsla)]) -> StyledText {
+pub(crate) fn styled_line(text: &str, syntax: &[(Range<usize>, u8)], highlights: &[(Range<usize>, Hsla)]) -> StyledText {
     let display = text.replace('\t', "    ");
     if syntax.is_empty() && highlights.is_empty() {
         return StyledText::new(display);

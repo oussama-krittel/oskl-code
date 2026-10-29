@@ -292,6 +292,21 @@ struct Layout {
     scrollbar: Option<ScrollbarGeom>,
 }
 
+pub struct HoverCard {
+    /// The name it's for.
+    range: Range<usize>,
+    at: Point<Pixels>,
+    keyboard: bool,
+    info: crate::signature::Info,
+}
+
+/// What a project-wide definition search is for.
+enum Then {
+    Underline,
+    Go,
+    Hover(Range<usize>, bool),
+}
+
 pub struct Completion {
     pub ctx: Ctx,
     pub items: Vec<Item>,
@@ -367,6 +382,10 @@ pub struct Editor {
     hover_diag: Option<(usize, Point<Pixels>, bool)>,
     /// Where problems are drawn (underlines and end-of-line labels), for hovering.
     diag_hits: Vec<(Bounds<Pixels>, usize)>,
+    /// The card for the name under the mouse (or the cursor, with ⌘K ⌘I): its declaration and docs.
+    hover_info: Option<HoverCard>,
+    /// The name the mouse rests on, before its card opens.
+    hover_wait: Option<Range<usize>>,
     /// `.env` values to hide, per row, for this buffer version.
     env_masks: Option<(u64, Arc<Vec<Option<Range<usize>>>>)>,
 }
@@ -436,6 +455,8 @@ impl Editor {
             link_gen: 0,
             hover_diag: None,
             diag_hits: Vec::new(),
+            hover_info: None,
+            hover_wait: None,
             env_masks: None,
         }
     }
@@ -1038,9 +1059,7 @@ impl Editor {
         };
         let (row, col) = self.buf.pos_to_rc(range.start);
         let cap = self.capture_at(row, col);
-        let kind = cap.map(highlight::name).unwrap_or("");
-        const INERT: &[&str] = &["comment", "string", "number", "keyword", "boolean", "punctuation", "operator", "escape", "character", "constant.builtin", "type.builtin", "variable.builtin", "text."];
-        if !module && INERT.iter().any(|k| kind.starts_with(k)) {
+        if !module && self.inert(&range) {
             return None;
         }
         let version = self.buf.version();
@@ -1054,7 +1073,7 @@ impl Editor {
                         Some(t) => t.is_some(),
                         None => {
                             // Unknown yet: look it up in the background and underline when found.
-                            self.search_definition(name, false, cx);
+                            self.search_definition(name, Then::Underline, cx);
                             return None;
                         }
                     },
@@ -1064,6 +1083,14 @@ impl Editor {
             }
         };
         ok.then(|| (range, cap.map(highlight::color).unwrap_or_else(theme::fg)))
+    }
+
+    /// Whether the name at `range` is code that can't lead anywhere (a keyword, string, comment…).
+    fn inert(&self, range: &Range<usize>) -> bool {
+        const INERT: &[&str] = &["comment", "string", "number", "keyword", "boolean", "punctuation", "operator", "escape", "character", "constant.builtin", "type.builtin", "variable.builtin", "text."];
+        let (row, col) = self.buf.pos_to_rc(range.start);
+        let kind = self.capture_at(row, col).map(highlight::name).unwrap_or("");
+        INERT.iter().any(|k| kind.starts_with(k))
     }
 
     fn update_link(&mut self, cx: &mut Context<Self>) {
@@ -1083,17 +1110,17 @@ impl Editor {
         self.def_cache.get(name).filter(|(at, _)| at.elapsed() < Duration::from_secs(30)).map(|(_, t)| t.clone())
     }
 
-    /// Looks `name` up across the project off the UI thread; `go` jumps there once found.
-    fn search_definition(&mut self, name: String, go: bool, cx: &mut Context<Self>) {
+    /// Looks `name` up across the project off the UI thread, then does `then` with it.
+    fn search_definition(&mut self, name: String, then: Then, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
-        if !go && !self.def_pending.insert(name.clone()) {
+        if matches!(then, Then::Underline) && !self.def_pending.insert(name.clone()) {
             return;
         }
         let skip = self.path.clone();
         // In JS/TS a name that isn't imported or declared here can only come from an export
         // elsewhere (anything else is a parameter or a local we couldn't place).
         let exported_only = complete::flavor(self.lang.or_else(|| self.path.as_deref().and_then(highlight::detect))).is_some();
-        if go {
+        if matches!(then, Then::Go) {
             cx.emit(EditorEvent::Notice(format!("Looking for {name}…")));
         }
         cx.spawn(async move |this, cx| {
@@ -1103,14 +1130,22 @@ impl Editor {
                 ed.def_pending.remove(&name);
                 ed.def_cache.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(30));
                 ed.def_cache.insert(name.clone(), (std::time::Instant::now(), found.clone()));
-                if go {
-                    match found {
+                match then {
+                    Then::Go => match found {
                         Some(t) => ed.land(t, cx),
                         None => cx.emit(EditorEvent::Notice(format!("No definition found for {name}"))),
+                    },
+                    Then::Underline => {
+                        ed.link_memo = None;
+                        ed.update_link(cx);
                     }
-                } else {
-                    ed.link_memo = None;
-                    ed.update_link(cx);
+                    // Only if that name is still what the card is wanted for.
+                    Then::Hover(range, keyboard) => {
+                        let wanted = if keyboard { range.contains(&ed.buf.sel.head) || range.end == ed.buf.sel.head } else { ed.hover_wait.as_ref() == Some(&range) };
+                        if let Some(t) = found.filter(|_| wanted) {
+                            ed.open_hover(range, t, keyboard, cx);
+                        }
+                    }
                 }
             })
             .ok();
@@ -1142,7 +1177,7 @@ impl Editor {
             Found::Search(name) => match self.cached_definition(&name) {
                 Some(Some(t)) => self.land(t, cx),
                 Some(None) => cx.emit(EditorEvent::Notice(format!("No definition found for {name}"))),
-                None => self.search_definition(name, true, cx),
+                None => self.search_definition(name, Then::Go, cx),
             },
         }
     }
@@ -1299,6 +1334,9 @@ impl Editor {
         self.completion = None;
         if self.hover_diag.is_some_and(|(_, _, keyboard)| keyboard) {
             self.hover_diag = None;
+        }
+        if self.hover_info.as_ref().is_some_and(|h| h.keyboard) {
+            self.hover_info = None;
         }
         self.autoscroll = Some(false);
         cx.notify();
@@ -1623,7 +1661,7 @@ impl Editor {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.completion.take().is_some() || self.hover_diag.take().is_some() {
+        if self.completion.take().is_some() | self.hover_diag.take().is_some() | self.hover_info.take().is_some() {
             return cx.notify();
         }
         if !self.buf.extra.is_empty() {
@@ -1702,6 +1740,8 @@ impl Editor {
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
         self.completion = None;
+        self.hover_info = None;
+        self.hover_wait = None;
         if let Some((_, ix, action)) = self.conflict_hits.iter().find(|(b, _, _)| b.contains(&ev.position)).cloned() {
             return self.resolve_conflict(ix, action, cx);
         }
@@ -1828,7 +1868,7 @@ impl Editor {
         self.autoscroll = Some(true);
     }
 
-    fn mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.last_mouse = ev.position;
         self.cmd_held = ev.modifiers.platform && !ev.dragging();
         self.update_link(cx);
@@ -1836,6 +1876,7 @@ impl Editor {
             self.drag = None;
             self.scroll_drag = None;
             self.hover_problems(ev.position, cx);
+            self.hover_word(ev.position, window, cx);
             return;
         }
         if self.scroll_drag.is_some() {
@@ -1891,6 +1932,8 @@ impl Editor {
         self.scroll_y -= d.y / px(1.);
         self.scroll_x -= d.x / px(1.);
         self.hover_diag = None;
+        self.hover_info = None;
+        self.hover_wait = None;
         if let Some(link) = &self.scroll_link {
             let (_, g) = link.get();
             self.link_gen = g + 1;
@@ -3072,6 +3115,20 @@ impl Editor {
 
     // ------------------------------------------------------------ env values, colours
 
+    /// The open hover card's declaration and description.
+    #[cfg(test)]
+    pub fn hover_card(&self) -> Option<(String, String)> {
+        self.hover_info.as_ref().map(|h| (h.info.sig.clone(), h.info.doc.text.clone()))
+    }
+
+    /// The middle of the character at `pos`, on screen.
+    #[cfg(test)]
+    pub fn point_of(&self, pos: usize) -> Option<Point<Pixels>> {
+        let l = self.layout.as_ref()?;
+        let a = self.anchor_below(pos)?;
+        Some(point(a.x + px(l.char_w / 2.), a.y - px(l.line_h / 2.)))
+    }
+
     /// Whether the problems card is open.
     #[cfg(test)]
     pub fn problem_card_open(&self) -> bool {
@@ -3134,17 +3191,118 @@ impl Editor {
 
     // ------------------------------------------------------------ problems card
 
-    /// ⌘K ⌘I: the card for the problems on the cursor's line.
+    /// ⌘K ⌘I: the card for what's at the cursor: the name's declaration and docs, and the
+    /// problems on the line.
     fn show_hover(&mut self, _: &ShowHover, _: &mut Window, cx: &mut Context<Self>) {
-        let (row, col) = self.cursor_rc();
-        if !self.diagnostics.iter().any(|d| d.row == row) {
+        let pos = self.buf.sel.head;
+        let (row, _) = self.cursor_rc();
+        if self.diagnostics.iter().any(|d| d.row == row)
+            && let Some(at) = self.anchor_below(pos)
+        {
+            self.hover_diag = Some((row, at, true));
+            cx.notify();
+        }
+        if let Some(range) = self.name_at(pos) {
+            self.find_hover(range, true, cx);
+        }
+    }
+
+    /// The name at `pos` worth a card (not a keyword, string, comment…).
+    fn name_at(&self, pos: usize) -> Option<Range<usize>> {
+        if self.mode != EditorMode::Full {
+            return None;
+        }
+        match crate::definition::hit_at(&self.buf, pos)? {
+            crate::definition::Hit::Name(_, r) if !self.inert(&r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Where a card for the text at `pos` hangs: right under it.
+    fn anchor_below(&self, pos: usize) -> Option<Point<Pixels>> {
+        let l = self.layout.as_ref()?;
+        let (row, col) = self.buf.pos_to_rc(pos);
+        let st = self.seg_starts(row);
+        let k = seg_index(st, col);
+        let x = l.text_left - self.scroll_x + (self.buf.display_col(row, col) - self.buf.display_col(row, st[k])) as f32 * l.char_w;
+        let y = l.bounds.top() / px(1.) + l.pad_top + (self.disp_of(row) + k + 1) as f32 * l.line_h - self.scroll_y;
+        Some(point(px(x), px(y)))
+    }
+
+    /// The name right under the mouse, if any.
+    fn word_at_point(&self, p: Point<Pixels>) -> Option<Range<usize>> {
+        let l = self.layout.as_ref()?;
+        if !l.bounds.contains(&p) || p.x / px(1.) < l.text_left {
+            return None;
+        }
+        let range = self.name_at(self.pos_for_point(p))?;
+        let (a, b) = (self.anchor_below(range.start)?, self.anchor_below(range.end)?);
+        let (x, y) = (p.x / px(1.), p.y / px(1.));
+        let bottom = a.y / px(1.);
+        (x >= a.x / px(1.) - 1. && x <= b.x / px(1.) + 1. && y <= bottom && y >= bottom - l.line_h).then_some(range)
+    }
+
+    /// The mouse over a name: its card opens once it rests there a moment.
+    fn hover_word(&mut self, p: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        const DELAY: Duration = Duration::from_millis(350);
+        let range = self.word_at_point(p);
+        if self.hover_info.as_ref().is_some_and(|h| Some(&h.range) == range.as_ref()) {
             return;
         }
-        let Some(l) = &self.layout else { return };
-        let Some((_, shaped, map)) = l.lines.iter().find(|(r, _, _)| *r == row) else { return };
-        let x = l.text_left - self.scroll_x + shaped.x_for_index(map[col.min(map.len() - 1)]) / px(1.);
-        let y = l.bounds.top() / px(1.) + l.pad_top + (self.disp_of(row) + 1) as f32 * l.line_h - self.scroll_y;
-        self.hover_diag = Some((row, point(px(x), px(y)), true));
+        if self.hover_info.as_ref().is_some_and(|h| !h.keyboard) {
+            self.hover_info = None;
+            cx.notify();
+        }
+        if self.hover_wait == range {
+            return;
+        }
+        self.hover_wait = range.clone();
+        let Some(range) = range else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(DELAY).await;
+            this.update_in(cx, |ed, window, cx| {
+                if ed.hover_wait.as_ref() == Some(&range) && ed.word_at_point(window.mouse_position()).as_ref() == Some(&range) {
+                    ed.find_hover(range, false, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Finds where the name at `range` is declared (maybe across the project, in the background)
+    /// and opens its card.
+    fn find_hover(&mut self, range: Range<usize>, keyboard: bool, cx: &mut Context<Self>) {
+        use crate::definition::Found;
+        match crate::definition::find(&self.buf, range.start, self.path.as_deref(), self.root.as_deref()) {
+            Found::At(t) => self.open_hover(range, t, keyboard, cx),
+            Found::Nothing => {}
+            Found::Search(name) => match self.cached_definition(&name) {
+                Some(Some(t)) => self.open_hover(range, t, keyboard, cx),
+                Some(None) => {}
+                None => self.search_definition(name, Then::Hover(range, keyboard), cx),
+            },
+        }
+    }
+
+    fn open_hover(&mut self, range: Range<usize>, t: crate::definition::Target, keyboard: bool, cx: &mut Context<Self>) {
+        let here = t.path.as_os_str().is_empty() || self.path.as_ref() == Some(&t.path);
+        // A whole module (`import * as x`, or an export we couldn't place) has no declaration to show.
+        if !here && (t.row, t.col) == (0, 0) {
+            return;
+        }
+        let text = if here {
+            self.buf.text()
+        } else {
+            match std::fs::read_to_string(&t.path) {
+                Ok(s) => s,
+                Err(_) => return,
+            }
+        };
+        let path = if here { self.path.clone().unwrap_or_default() } else { t.path };
+        let Some(info) = crate::signature::info(&text, &path, t.row, t.col) else { return };
+        let Some(at) = self.anchor_below(range.start) else { return };
+        self.hover_info = Some(HoverCard { range, at, keyboard, info });
         cx.notify();
     }
 
@@ -3165,19 +3323,24 @@ impl Editor {
         }
     }
 
-    fn diag_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (row, at, _) = self.hover_diag?;
-        let mut diags: Vec<&Diag> = self.diagnostics.iter().filter(|d| d.row == row).collect();
-        if diags.is_empty() {
+    /// One card for both: the name's declaration and docs, then the line's problems.
+    fn hover_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let info = self.hover_info.as_ref();
+        let info_row = info.map(|h| self.buf.pos_to_rc(h.range.start).0);
+        let diag = self.hover_diag.filter(|(row, _, _)| info_row.is_none_or(|r| r == *row));
+        let mut diags: Vec<&Diag> = diag.map(|(row, _, _)| self.diagnostics.iter().filter(|d| d.row == row).collect()).unwrap_or_default();
+        if info.is_none() && diags.is_empty() {
             return None;
         }
         diags.sort_by_key(|d| d.severity);
+        let at = info.map(|h| h.at).or(diag.map(|d| d.1))?;
+        let problems = !diags.is_empty();
         Some(
             deferred(
                 anchored().position(at).snap_to_window().child(
                     div()
                         .id("problem-card")
-                        .debug_selector(|| "problem-card".into())
+                        .debug_selector(move || if problems { "problem-card" } else { "hover-card" }.into())
                         .occlude()
                         .max_w(px(580.))
                         .max_h(px(400.))
@@ -3195,17 +3358,97 @@ impl Editor {
                         .text_size(px(12.))
                         .text_color(theme::fg())
                         .on_hover(cx.listener(|ed, hovered: &bool, _, cx| {
-                            if !*hovered && ed.hover_diag.is_some_and(|(_, _, keyboard)| !keyboard) {
+                            if *hovered {
+                                return;
+                            }
+                            let mouse_diag = ed.hover_diag.is_some_and(|(_, _, keyboard)| !keyboard);
+                            let mouse_info = ed.hover_info.as_ref().is_some_and(|h| !h.keyboard);
+                            if mouse_diag {
                                 ed.hover_diag = None;
+                            }
+                            if mouse_info {
+                                ed.hover_info = None;
+                                ed.hover_wait = None;
+                            }
+                            if mouse_diag || mouse_info {
                                 cx.notify();
                             }
                         }))
+                        .children(info.map(|h| self.info_card(h, cx)))
+                        .when(info.is_some() && problems, |d| d.child(div().h(px(1.)).flex_none().bg(theme::border_input())))
                         .children(diags.into_iter().map(problem_card)),
                 ),
             )
             .with_priority(2)
             .into_any_element(),
         )
+    }
+
+    /// The declaration in colour, its docs, and where it is (click to go there).
+    fn info_card(&self, h: &HoverCard, cx: &mut Context<Self>) -> AnyElement {
+        let i = &h.info;
+        let code_color = highlight::color(highlight_index("type"));
+        let rich = move |s: &str| {
+            let (text, code) = crate::signature::inline_code(s);
+            let style = HighlightStyle { color: Some(code_color), ..Default::default() };
+            StyledText::new(text).with_highlights(code.into_iter().map(|r| (r, style)))
+        };
+        let sig = div().font_family(theme::MONO_FONT).flex().flex_col().children(i.sig.lines().enumerate().map(|(n, line)| {
+            let spans = i.syntax.as_ref().and_then(|s| s.get(n)).map(|v| v.as_slice()).unwrap_or(&[]);
+            div().min_h(px(16.)).child(crate::diff_view::styled_line(line, spans, &[]))
+        }));
+        let d = &i.doc;
+        let label = |s: &str| div().flex_none().text_color(theme::fg_dim()).child(s.to_string());
+        let docs = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .children(d.text.lines().map(|p| div().child(rich(p))))
+            .children(d.params.iter().map(|(name, desc)| {
+                div()
+                    .flex()
+                    .gap(px(6.))
+                    .child(label("@param"))
+                    .child(div().flex_none().font_family(theme::MONO_FONT).text_color(theme::accent()).child(name.clone()))
+                    .when(!desc.is_empty(), |r| r.child(div().flex_1().min_w_0().child(rich(desc))))
+            }))
+            .children(d.returns.iter().map(|r| div().flex().gap(px(6.)).child(label("@returns")).child(div().flex_1().min_w_0().child(rich(r)))))
+            .children(d.tags.iter().map(|(tag, text)| {
+                div()
+                    .flex()
+                    .gap(px(6.))
+                    .child(label(&format!("@{tag}")).when(tag == "deprecated", |l| l.text_color(theme::git_modified())))
+                    .child(div().flex_1().min_w_0().flex().flex_col().children(text.lines().map(|l| div().child(rich(l)))))
+            }));
+        let target = crate::definition::Target { path: i.path.clone(), row: i.row, col: i.col };
+        let shown = self.root.as_deref().and_then(|r| i.path.strip_prefix(r).ok()).unwrap_or(&i.path).to_string_lossy().to_string();
+        let place = (!shown.is_empty()).then(|| {
+            div()
+                .id("hover-card-place")
+                .debug_selector(|| "hover-card-place".into())
+                .text_size(px(11.))
+                .text_color(theme::fg_muted())
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme::accent()))
+                .child(format!("{shown}:{}", i.row + 1))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |ed, _, _, cx| {
+                        cx.stop_propagation();
+                        ed.hover_info = None;
+                        ed.hover_wait = None;
+                        ed.land(target.clone(), cx);
+                    }),
+                )
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(sig)
+            .when(!d.is_empty(), |c| c.child(div().h(px(1.)).flex_none().bg(theme::border_input())).child(docs))
+            .children(place)
+            .into_any_element()
     }
 }
 
@@ -3393,7 +3636,7 @@ impl Render for Editor {
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .child(EditorElement { editor: cx.entity() })
             .children(self.completion_popup(cx))
-            .children(self.diag_popup(cx))
+            .children(self.hover_popup(cx))
     }
 }
 

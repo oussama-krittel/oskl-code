@@ -27,6 +27,7 @@ mod request;
 mod search;
 mod secrets;
 mod session;
+mod signature;
 mod settings;
 mod terminal;
 mod theme;
