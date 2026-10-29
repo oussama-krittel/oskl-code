@@ -84,6 +84,7 @@ pub enum Lang {
     Tsv,
     /// SQL (keywords, strings, numbers, comments, functions): colored by a small lexer.
     Sql,
+    Java,
 }
 
 pub fn detect(path: &Path) -> Option<Lang> {
@@ -106,6 +107,7 @@ pub fn detect(path: &Path) -> Option<Lang> {
         "tsv" | "tab" => Lang::Tsv,
         "sql" | "psql" | "pgsql" => Lang::Sql,
         "tf" | "tfvars" | "hcl" | "tftest" => Lang::Terraform,
+        "java" => Lang::Java,
         _ if name == ".zshrc" || name == ".bashrc" || name.ends_with(".env") || name == ".envrc" => Lang::Bash,
         _ if name == "cargo.lock" => Lang::Toml,
         _ => return None,
@@ -138,6 +140,7 @@ fn build(lang: Lang) -> Option<HighlightConfiguration> {
         Lang::Terraform => (tree_sitter_hcl::LANGUAGE.into(), include_str!("hcl_highlights.scm").into(), ""),
         // Colored by `columns`, not tree-sitter.
         Lang::Csv | Lang::Tsv | Lang::Sql => return None,
+        Lang::Java => (tree_sitter_java::LANGUAGE.into(), tree_sitter_java::HIGHLIGHTS_QUERY.into(), ""),
     };
     let mut config = HighlightConfiguration::new(language, format!("{lang:?}"), &highlights, injections, "").ok()?;
     config.configure(NAMES);
@@ -145,7 +148,7 @@ fn build(lang: Lang) -> Option<HighlightConfiguration> {
 }
 
 fn config(lang: Lang) -> Option<&'static HighlightConfiguration> {
-    static CONFIGS: [OnceLock<Option<HighlightConfiguration>>; 13] = [const { OnceLock::new() }; 13];
+    static CONFIGS: [OnceLock<Option<HighlightConfiguration>>; 16] = [const { OnceLock::new() }; 16];
     CONFIGS[lang as usize].get_or_init(|| build(lang)).as_ref()
 }
 
@@ -389,7 +392,7 @@ mod tests {
 
     #[test]
     fn all_languages_compile() {
-        for lang in [Lang::Tsx, Lang::JavaScript, Lang::Json, Lang::Css, Lang::Html, Lang::Rust, Lang::Python, Lang::Go, Lang::Bash, Lang::Yaml, Lang::Toml, Lang::Terraform] {
+        for lang in [Lang::Tsx, Lang::JavaScript, Lang::Json, Lang::Css, Lang::Html, Lang::Rust, Lang::Python, Lang::Go, Lang::Bash, Lang::Yaml, Lang::Toml, Lang::Terraform, Lang::Java] {
             assert!(highlight(lang, "x").is_some(), "{lang:?} failed to build");
         }
     }

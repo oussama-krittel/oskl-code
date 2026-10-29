@@ -12,6 +12,8 @@ pub enum Kind {
     Yaml,
     /// Terraform / HCL, read with the same tree-sitter parser that colours it.
     Terraform,
+    /// Java syntax, from the parser that colours it (compile errors come from javac on save).
+    Java,
 }
 
 pub fn kind(path: &Path) -> Option<Kind> {
@@ -24,6 +26,7 @@ pub fn kind(path: &Path) -> Option<Kind> {
         "json" => Some(Kind::Json),
         "yml" | "yaml" => Some(Kind::Yaml),
         "tf" | "tfvars" | "hcl" | "tftest" => Some(Kind::Terraform),
+        "java" => Some(Kind::Java),
         _ => None,
     }
 }
@@ -36,6 +39,7 @@ fn diag(row: usize, col: usize, severity: Severity, message: String, source: &st
 pub fn check(kind: Kind, text: &str) -> Vec<Diag> {
     match kind {
         Kind::Terraform => check_terraform(text),
+        Kind::Java => crate::java::check_syntax(text),
         Kind::Yaml => match yaml_rust2::YamlLoader::load_from_str(text) {
             Ok(_) => Vec::new(),
             Err(e) => {
