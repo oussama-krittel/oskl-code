@@ -2,7 +2,8 @@
 //!
 //! In order: an import path opens the module; a name imported from a module jumps to its export
 //! there (following re-exports); a name defined in this file jumps to that line; anything else is
-//! looked up across the project in the background.
+//! looked up across the project in the background. Rust paths have their own resolver
+//! (`rust_def`).
 
 use crate::buffer::Buffer;
 use regex::Regex;
@@ -297,6 +298,13 @@ pub fn find(buf: &Buffer, pos: usize, file: Option<&Path>, root: Option<&Path>) 
         },
         Hit::Name(name, range) => {
             let here = file.map(Path::to_path_buf).unwrap_or_default();
+            let rust = file.filter(|f| f.extension().is_some_and(|e| e == "rs"));
+            // Rust paths (`use a::b`, `a::b::c`) and names their `use`s bring in.
+            if let Some(f) = rust
+                && let Some(t) = crate::rust_def::find(&text, range.clone(), &name, f)
+            {
+                return Found::At(t);
+            }
             // `ns.member` where ns is `import * as ns` (or a default import object).
             let before: String = buf.rope.slice(range.start.saturating_sub(200)..range.start).chars().collect();
             let qualifier = before.strip_suffix('.').map(|b| b.chars().rev().take_while(|c| is_ident(*c)).collect::<String>().chars().rev().collect::<String>());
@@ -328,6 +336,13 @@ pub fn find(buf: &Buffer, pos: usize, file: Option<&Path>, root: Option<&Path>) 
                 && let Some((row, col)) = declaration(&text, &name, None)
             {
                 return Found::At(Target { path: here, row, col });
+            }
+            // Rust: maybe from one of the file's `use x::*`.
+            if let Some(f) = rust
+                && qualifier.is_none()
+                && let Some(t) = crate::rust_def::from_globs(&text, range.clone(), &name, f)
+            {
+                return Found::At(t);
             }
             // A member or a global: look across the project.
             Found::Search(name)
@@ -441,6 +456,29 @@ mod tests {
         assert_eq!(go("Btn", 1), Some(("Button.tsx".into(), 5, 24)), "a default import");
         assert_eq!(go("./ui'", 0), Some(("index.ts".into(), 0, 0)), "the import path opens the module");
         assert_eq!(go("./ui/Button", 0), Some(("Button.tsx".into(), 0, 0)));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn rust_paths_and_globs() {
+        let d = tmp("rust");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(d.join("src/main.rs"), "mod ui;\nmod theme;\n").unwrap();
+        std::fs::write(d.join("src/theme.rs"), "pub fn fg() {}\npub mod prelude {\n    pub fn accent() {}\n}\n").unwrap();
+        let file = d.join("src/ui.rs");
+        let buf = Buffer::new("use crate::theme::{self, fg};\nuse crate::theme::*;\nfn f() {\n    theme::fg();\n    prelude::accent();\n}\n");
+        let go = |needle: &str, nth: usize| {
+            let text = buf.text();
+            let byte = text.match_indices(needle).nth(nth).unwrap().0;
+            match find(&buf, text[..byte].chars().count() + 1, Some(&file), Some(&d)) {
+                Found::At(t) => Some((t.path.file_name().unwrap().to_string_lossy().to_string(), t.row, t.col)),
+                _ => None,
+            }
+        };
+        assert_eq!(go("theme", 0), Some(("theme.rs".into(), 0, 0)), "a module in a use path");
+        assert_eq!(go("fg", 1), Some(("theme.rs".into(), 0, 7)), "a path in code");
+        assert_eq!(go("prelude", 0), Some(("theme.rs".into(), 1, 8)), "an inline module, through a glob");
         std::fs::remove_dir_all(&d).ok();
     }
 

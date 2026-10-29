@@ -23,6 +23,7 @@ mod keymap;
 mod merge_view;
 mod preview;
 mod repo;
+mod rust_def;
 mod request;
 mod search;
 mod secrets;
