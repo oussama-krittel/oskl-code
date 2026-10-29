@@ -140,78 +140,172 @@ impl UseParser<'_> {
     }
 }
 
+/// A module: its file, and the `mod x { … }` blocks inside it, outermost first.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Mod {
+    file: PathBuf,
+    inline: Vec<String>,
+}
+
+impl Mod {
+    fn file(file: &Path) -> Self {
+        Mod { file: file.to_path_buf(), inline: Vec::new() }
+    }
+}
+
 /// What a path leads to.
 #[derive(Clone)]
 enum Res {
-    Module(PathBuf),
+    Module(Mod),
     Item(Target),
 }
 
-impl Res {
-    fn target(self) -> Target {
-        match self {
-            Res::Module(path) => Target { path, row: 0, col: 0 },
-            Res::Item(t) => t,
-        }
+/// A module's code: the whole file, and the part that is the module.
+struct Source {
+    full: String,
+    body: Range<usize>,
+    uses: Vec<UseItem>,
+}
+
+impl Source {
+    fn text(&self) -> &str {
+        &self.full[self.body.clone()]
     }
+
+    fn target(&self, file: &Path, byte: usize) -> Target {
+        let (row, col) = row_col(&self.full, self.body.start + byte);
+        Target { path: file.to_path_buf(), row, col }
+    }
+}
+
+/// The byte range of the body of `mod name { … }` in `text`, and where its name is.
+fn inline_mod(text: &str, name: &str) -> Option<(Range<usize>, usize)> {
+    let n = regex::escape(name);
+    let c = re(&format!(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+({n})\s*\{{")).captures(text)?;
+    let open = c.get(0)?.end();
+    let bytes = text.as_bytes();
+    let (mut depth, mut i) = (1, open);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((open..i, c.get(1)?.start()));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 struct Resolver<'a> {
     /// The open file and its (maybe unsaved) text.
     here: (&'a Path, &'a str),
-    /// Lookups under way (module, name, from inside), so `pub use` cycles end.
-    busy: HashSet<(PathBuf, String, bool)>,
+    /// Lookups under way (module, name, the asking crate), so `pub use` cycles end.
+    busy: HashSet<(Mod, String, Option<PathBuf>)>,
     /// Answers so far: a crate's globs are walked once, however many paths cross them.
-    memo: HashMap<(PathBuf, String, bool), Option<Res>>,
-    files: HashMap<PathBuf, Option<Rc<(String, Vec<UseItem>)>>>,
+    memo: HashMap<(Mod, String, Option<PathBuf>), Option<Res>>,
+    files: HashMap<Mod, Option<Rc<Source>>>,
     crates: HashMap<String, Option<PathBuf>>,
+    roots: HashMap<PathBuf, Option<PathBuf>>,
 }
 
 impl<'a> Resolver<'a> {
     fn new(file: &'a Path, text: &'a str) -> Self {
-        Resolver { here: (file, text), busy: HashSet::new(), memo: HashMap::new(), files: HashMap::new(), crates: HashMap::new() }
+        Resolver { here: (file, text), busy: HashSet::new(), memo: HashMap::new(), files: HashMap::new(), crates: HashMap::new(), roots: HashMap::new() }
     }
 
-    /// A module file's text and its `use` items.
-    fn read(&mut self, path: &Path) -> Option<Rc<(String, Vec<UseItem>)>> {
-        if let Some(f) = self.files.get(path) {
+    fn crate_of(&mut self, file: &Path) -> Option<PathBuf> {
+        if let Some(r) = self.roots.get(file) {
+            return r.clone();
+        }
+        let r = crate_root(file);
+        self.roots.insert(file.to_path_buf(), r.clone());
+        r
+    }
+
+    /// A module's code and its `use` items.
+    fn read(&mut self, m: &Mod) -> Option<Rc<Source>> {
+        if let Some(f) = self.files.get(m) {
             return f.clone();
         }
-        let text = if path == self.here.0 { Some(self.here.1.to_string()) } else { std::fs::read_to_string(path).ok() };
-        let f = text.map(|t| {
-            let u = uses(&t);
-            Rc::new((t, u))
-        });
-        self.files.insert(path.to_path_buf(), f.clone());
-        f
+        let src = (|| {
+            let full = if m.file == self.here.0 { self.here.1.to_string() } else { std::fs::read_to_string(&m.file).ok()? };
+            let mut body = 0..full.len();
+            for name in &m.inline {
+                let (r, _) = inline_mod(&full[body.clone()], name)?;
+                body = body.start + r.start..body.start + r.end;
+            }
+            let uses = uses(&full[body.clone()]);
+            Some(Rc::new(Source { full, body, uses }))
+        })();
+        self.files.insert(m.clone(), src.clone());
+        src
+    }
+
+    fn target(&mut self, r: Res) -> Option<Target> {
+        match r {
+            Res::Item(t) => Some(t),
+            Res::Module(m) if m.inline.is_empty() => Some(Target { path: m.file, row: 0, col: 0 }),
+            // An inline module: where it's declared.
+            Res::Module(mut m) => {
+                let name = m.inline.pop()?;
+                let outer = self.read(&m)?;
+                let (_, at) = inline_mod(outer.text(), &name)?;
+                Some(outer.target(&m.file, at))
+            }
+        }
     }
 
     fn extern_crate(&mut self, name: &str, from: &Path) -> Option<PathBuf> {
         if let Some(c) = self.crates.get(name) {
             return c.clone();
         }
-        let c = extern_crate(name, from);
+        let mut c = extern_crate(name, from);
+        // `extern crate alloc as alloc_crate;` in the crate's root.
+        if c.is_none()
+            && let Some(root) = crate_root(from)
+            && let Some(src) = self.read(&Mod::file(&root))
+            && let Some(real) = re(&format!(r"\bextern\s+crate\s+(\w+)\s+as\s+{}\s*;", regex::escape(name))).captures(src.text()).map(|c| c[1].to_string())
+            && real != name
+        {
+            c = extern_crate(&real, from);
+        }
         self.crates.insert(name.to_string(), c.clone());
         c
     }
 
-    /// The module path `segs` names, as seen from module file `from`.
-    fn resolve(&mut self, segs: &[String], from: &Path, depth: u32) -> Option<Res> {
+    /// The module path `segs` names, as seen from module `from`.
+    fn resolve(&mut self, segs: &[String], from: &Mod, depth: u32) -> Option<Res> {
         if depth > 10 || segs.is_empty() {
             return None;
         }
         let first = segs[0].as_str();
         let mut cur = match first {
-            "crate" => Res::Module(crate_root(from)?),
-            "self" => Res::Module(from.to_path_buf()),
+            "crate" => Res::Module(Mod::file(&crate_root(&from.file)?)),
+            "self" => Res::Module(from.clone()),
             "super" => Res::Module(parent_module(from)?),
             // In scope by name first, then the crates, then what globs bring in.
-            _ => match self.lookup_named(from, first, depth, true) {
+            _ => match self.lookup_named(from, first, depth, Some(&from.file)) {
                 Some(r) => r,
-                None => match self.extern_crate(first, from) {
-                    Some(c) => Res::Module(c),
+                None => match self.extern_crate(first, &from.file) {
+                    Some(c) => Res::Module(Mod::file(&c)),
                     None if matches!(first, "std" | "core" | "alloc") => return None,
-                    None => self.lookup(from, first, depth, true)?,
+                    None => self.lookup(from, first, depth, Some(&from.file))?,
                 },
             },
         };
@@ -220,14 +314,14 @@ impl<'a> Resolver<'a> {
                 Res::Module(m) => match seg.as_str() {
                     "super" => Res::Module(parent_module(&m)?),
                     "self" => Res::Module(m),
-                    _ => self.lookup(&m, seg, depth, false)?,
+                    _ => self.lookup(&m, seg, depth, Some(&from.file))?,
                 },
                 // `Type::method`: a function of that name in the type's file, else the type.
                 Res::Item(t) => {
                     let last = segs.last()?;
-                    let f = self.read(&t.path)?;
-                    return Some(match item_in(&f.0, last) {
-                        Some((row, col)) if k + 1 == segs.len() => Res::Item(Target { path: t.path, row, col }),
+                    let f = self.read(&Mod::file(&t.path))?;
+                    return Some(match item_in(f.text(), last) {
+                        Some(at) if k + 1 == segs.len() => Res::Item(f.target(&t.path, at)),
                         _ => Res::Item(t),
                     });
                 }
@@ -236,62 +330,64 @@ impl<'a> Resolver<'a> {
         Some(cur)
     }
 
-    /// `name` inside module file `module`: a child module, an item, or something it `use`s.
-    /// `inside` is a lookup from that module itself, which sees its private modules.
-    fn lookup(&mut self, module: &Path, name: &str, depth: u32, inside: bool) -> Option<Res> {
-        self.lookup_with(module, name, depth, inside, true)
+    /// `name` inside module `module`: a child module, an item, or something it `use`s, as
+    /// seen from code in file `asking`, which sees its own crate's private modules (none
+    /// through a glob: `use x::*` only brings in what's public).
+    fn lookup(&mut self, module: &Mod, name: &str, depth: u32, asking: Option<&Path>) -> Option<Res> {
+        self.lookup_with(module, name, depth, asking, true)
     }
 
     /// Like `lookup`, without what globs bring in.
-    fn lookup_named(&mut self, module: &Path, name: &str, depth: u32, inside: bool) -> Option<Res> {
-        self.lookup_with(module, name, depth, inside, false)
+    fn lookup_named(&mut self, module: &Mod, name: &str, depth: u32, asking: Option<&Path>) -> Option<Res> {
+        self.lookup_with(module, name, depth, asking, false)
     }
 
-    fn lookup_with(&mut self, module: &Path, name: &str, depth: u32, inside: bool, globs: bool) -> Option<Res> {
-        let key = (module.to_path_buf(), format!("{name}{}", if globs { "" } else { " (named)" }), inside);
+    fn lookup_with(&mut self, module: &Mod, name: &str, depth: u32, asking: Option<&Path>, globs: bool) -> Option<Res> {
+        let asking = asking.and_then(|a| self.crate_of(a));
+        let key = (module.clone(), format!("{name}{}", if globs { "" } else { " (named)" }), asking.clone());
         if let Some(r) = self.memo.get(&key) {
             return r.clone();
         }
         if depth > 10 || !self.busy.insert(key.clone()) {
             return None;
         }
-        let r = self.lookup_in(module, name, depth, inside, globs);
+        let r = self.lookup_in(module, name, depth, asking, globs);
         self.busy.remove(&key);
         self.memo.insert(key, r.clone());
         r
     }
 
-    fn lookup_in(&mut self, module: &Path, name: &str, depth: u32, inside: bool, globs: bool) -> Option<Res> {
-        let f = self.read(module)?;
-        let (text, items) = (&f.0, &f.1);
+    fn lookup_in(&mut self, module: &Mod, name: &str, depth: u32, asking: Option<PathBuf>, globs: bool) -> Option<Res> {
+        let src = self.read(module)?;
+        let text = src.text();
         let n = regex::escape(name);
         let m = re(&format!(r"(?m)^[ \t]*(?:#\[[^\]]*\]\s*)*(pub(?:\([^)]*\))?\s+)?mod\s+({n})\s*([;{{])"));
         if let Some(c) = m.captures(text) {
             // A private module is only seen from its own crate (another crate's `mod div;` next
             // to `pub use div::*` isn't the `div` it exports).
-            let visible = c.get(1).is_some() || inside || crate_root(module) == crate_root(self.here.0);
+            let visible = c.get(1).is_some() || asking.is_some() && self.crate_of(&module.file) == asking;
             if visible {
-                let at = c.get(2).unwrap().start();
-                if &c[3] == ";" {
-                    return child_module(module, name).map(Res::Module);
+                if &c[3] == "{" {
+                    let mut inner = module.clone();
+                    inner.inline.push(name.to_string());
+                    return Some(Res::Module(inner));
                 }
-                let (row, col) = row_col(text, at);
-                return Some(Res::Item(Target { path: module.to_path_buf(), row, col }));
+                return child_module(module, name).map(|f| Res::Module(Mod::file(&f)));
             }
         }
-        if let Some((row, col)) = item_in(text, name) {
-            return Some(Res::Item(Target { path: module.to_path_buf(), row, col }));
+        if let Some(at) = item_in(text, name) {
+            return Some(Res::Item(src.target(&module.file, at)));
         }
-        if let Some(it) = items.iter().find(|it| it.local.as_deref() == Some(name) || !it.glob && it.local.as_deref() == Some("_") && it.path.last().map(String::as_str) == Some(name)) {
+        if let Some(it) = src.uses.iter().find(|it| it.local.as_deref() == Some(name) || !it.glob && it.local.as_deref() == Some("_") && it.path.last().map(String::as_str) == Some(name)) {
             let path = it.path.clone();
             if let Some(r) = self.resolve(&path, module, depth + 1) {
                 return Some(r);
             }
         }
-        for it in items.iter().filter(|it| it.glob && globs) {
+        for it in src.uses.iter().filter(|it| it.glob && globs) {
             let path = it.path.clone();
             if let Some(Res::Module(m)) = self.resolve(&path, module, depth + 1)
-                && let Some(r) = self.lookup(&m, name, depth + 1, false)
+                && let Some(r) = self.lookup(&m, name, depth + 1, None)
             {
                 return Some(r);
             }
@@ -305,30 +401,40 @@ fn row_col(text: &str, byte: usize) -> (usize, usize) {
 }
 
 /// Where item `name` (fn, struct, trait, macro…) is declared in `text`.
-fn item_in(text: &str, name: &str) -> Option<(usize, usize)> {
+fn item_in(text: &str, name: &str) -> Option<usize> {
     let n = regex::escape(name);
     let item = re(&format!(r"(?m)\b(?:fn|struct|enum|trait|type|const|static|union|macro_rules!)\s+({n})\b"));
-    item.captures(text).and_then(|c| c.get(1)).map(|m| row_col(text, m.start()))
+    item.captures(text).and_then(|c| c.get(1)).map(|m| m.start())
 }
 
 /// A module file's own name decides where its children live: `a/mod.rs`, `lib.rs` and
-/// `main.rs` hold them next to themselves, `a.rs` in `a/`.
-fn children_dir(module: &Path) -> Option<PathBuf> {
-    let dir = module.parent()?;
-    let stem = module.file_stem()?.to_string_lossy();
-    if stem == "mod" || is_crate_root(module) {
-        Some(dir.to_path_buf())
-    } else {
-        Some(dir.join(stem.as_ref()))
+/// `main.rs` hold them next to themselves, `a.rs` in `a/`; `mod b { mod c; }` in `b/`.
+fn children_dir(module: &Mod) -> Option<PathBuf> {
+    let f = &module.file;
+    let dir = f.parent()?;
+    let stem = f.file_stem()?.to_string_lossy();
+    let mut d = if stem == "mod" || is_crate_root(f) { dir.to_path_buf() } else { dir.join(stem.as_ref()) };
+    for name in &module.inline {
+        d = d.join(name);
     }
+    Some(d)
 }
 
-fn child_module(module: &Path, name: &str) -> Option<PathBuf> {
+fn child_module(module: &Mod, name: &str) -> Option<PathBuf> {
     let dir = children_dir(module)?;
     [dir.join(format!("{name}.rs")), dir.join(name).join("mod.rs")].into_iter().find(|p| p.is_file())
 }
 
-fn parent_module(module: &Path) -> Option<PathBuf> {
+fn parent_module(module: &Mod) -> Option<Mod> {
+    if !module.inline.is_empty() {
+        let mut m = module.clone();
+        m.inline.pop();
+        return Some(m);
+    }
+    parent_file(&module.file).map(|f| Mod::file(&f))
+}
+
+fn parent_file(module: &Path) -> Option<PathBuf> {
     if is_crate_root(module) {
         return None;
     }
@@ -453,7 +559,8 @@ pub fn find(text: &str, range: Range<usize>, name: &str, file: &Path) -> Option<
     let mut r = Resolver::new(file, text);
     let items = uses(text);
     if let Some(it) = items.iter().find(|it| it.range == range) {
-        return r.resolve(&it.path, file, 0).map(Res::target);
+        let res = r.resolve(&it.path, &Mod::file(file), 0)?;
+        return r.target(res);
     }
     let before: String = text.chars().take(range.start).collect::<Vec<_>>().into_iter().rev().take_while(|c| *c != '\n').collect();
     let line: Vec<char> = before.chars().rev().collect();
@@ -462,11 +569,13 @@ pub fn find(text: &str, range: Range<usize>, name: &str, file: &Path) -> Option<
         return None;
     }
     segs.push(name.to_string());
-    if segs.len() == 1 && !items.iter().any(|it| it.local.as_deref() == Some(name)) {
-        // A plain name is only ours to answer when a `use` brings it in.
+    let heads_path = text.chars().skip(range.end).take(2).eq("::".chars());
+    if segs.len() == 1 && !heads_path && !items.iter().any(|it| it.local.as_deref() == Some(name)) {
+        // A plain name is only ours to answer when a `use` brings it in, or a path starts with it.
         return None;
     }
-    r.resolve(&segs, file, 0).map(Res::target)
+    let res = r.resolve(&segs, &Mod::file(file), 0)?;
+    r.target(res)
 }
 
 /// A plain name that isn't declared or imported by name in `file`: look in what its
@@ -480,11 +589,17 @@ pub fn from_globs(text: &str, range: Range<usize>, name: &str, file: &Path) -> O
         return None;
     }
     for it in items.into_iter().filter(|it| it.glob) {
-        if let Some(Res::Module(m)) = r.resolve(&it.path, file, 0)
-            && let Some(res) = r.lookup(&m, name, 1, false)
+        if let Some(Res::Module(m)) = r.resolve(&it.path, &Mod::file(file), 0)
+            && let Some(res) = r.lookup(&m, name, 1, None)
         {
-            return Some(res.target());
+            return r.target(res);
         }
+    }
+    // Last, the standard prelude (Vec, String, Option…).
+    if let Some(Res::Module(m)) = r.resolve(&["std".into(), "prelude".into(), "v1".into()], &Mod::file(file), 0)
+        && let Some(res) = r.lookup(&m, name, 1, None)
+    {
+        return r.target(res);
     }
     None
 }
@@ -532,20 +647,21 @@ mod tests {
         // The app: src/main.rs with `mod git;` and src/git.rs, src/git/sub.rs.
         std::fs::create_dir_all(d.join("app/src/git")).unwrap();
         std::fs::write(d.join("app/Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
-        std::fs::write(d.join("app/src/main.rs"), "mod git;\nfn main() {}\n").unwrap();
+        std::fs::write(d.join("app/src/main.rs"), "extern crate ui_kit as widgets;\nmod git;\nfn main() {}\n").unwrap();
         std::fs::write(d.join("app/src/git.rs"), "pub mod sub;\npub struct CommitDetails;\nimpl CommitDetails {\n    pub fn load() {}\n}\n").unwrap();
         std::fs::write(d.join("app/src/git/sub.rs"), "pub fn thing() {}\nuse super::CommitDetails;\n").unwrap();
         // A dependency in a workspace folder, found through Cargo.lock: [lib] path, `pub use x::*`.
         std::fs::create_dir_all(d.join("app/vendor/ui/src/elements")).unwrap();
         std::fs::write(d.join("app/vendor/ui/Cargo.toml"), "[package]\nname = \"ui-kit\"\n[lib]\npath = \"src/ui.rs\"\n").unwrap();
-        std::fs::write(d.join("app/vendor/ui/src/ui.rs"), "mod elements;\npub mod prelude;\npub use elements::*;\n").unwrap();
+        std::fs::write(d.join("app/vendor/ui/src/ui.rs"), "mod elements;\nmod inner;\npub mod prelude;\npub use elements::*;\n#[stable]\npub mod maps {\n    pub use super::inner::*;\n}\n").unwrap();
+        std::fs::write(d.join("app/vendor/ui/src/inner.rs"), "pub struct Map;\n").unwrap();
         std::fs::write(d.join("app/vendor/ui/src/elements/mod.rs"), "mod div;\npub use div::*;\n").unwrap();
         std::fs::write(d.join("app/vendor/ui/src/elements/div.rs"), "\npub fn div() {}\n").unwrap();
         std::fs::write(d.join("app/vendor/ui/src/prelude.rs"), "pub use crate::{Styled as _, div};\npub trait Styled {}\n").unwrap();
         std::fs::write(d.join("app/Cargo.lock"), "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"ui-kit\"\nversion = \"0.2.0\"\n").unwrap();
 
         let file = d.join("app/src/git/other.rs");
-        let text = "use crate::git::{self, CommitDetails};\nuse ui_kit::prelude::*;\nuse ui_kit::div as make;\nfn f() {\n    CommitDetails::load();\n    crate::git::sub::thing();\n    make();\n    div();\n    super::CommitDetails;\n}\n";
+        let text = "use crate::git::{self, CommitDetails};\nuse ui_kit::prelude::*;\nuse ui_kit::div as make;\nfn f() {\n    CommitDetails::load();\n    crate::git::sub::thing();\n    make();\n    div();\n    super::CommitDetails;\n    widgets::maps::Map;\n}\n";
         let go = |needle: &str, nth: usize| {
             let byte = text.match_indices(needle).nth(nth).unwrap().0;
             let a = text[..byte].chars().count();
@@ -564,6 +680,9 @@ mod tests {
         assert_eq!(go("thing", 0), Some(("app/src/git/sub.rs".into(), 0, 7)));
         assert_eq!(go("div", 1), Some(("app/vendor/ui/src/elements/div.rs".into(), 1, 7)), "a name from a glob");
         assert_eq!(go("CommitDetails", 2), Some(("app/src/git.rs".into(), 1, 11)), "super::");
+        assert_eq!(go("widgets", 0), Some(("app/vendor/ui/src/ui.rs".into(), 0, 0)), "extern crate … as");
+        assert_eq!(go("maps", 0), Some(("app/vendor/ui/src/ui.rs".into(), 5, 8)), "an inline module");
+        assert_eq!(go("Map", 0), Some(("app/vendor/ui/src/inner.rs".into(), 0, 11)), "a glob in an inline module, through super::");
         std::fs::remove_dir_all(&d).ok();
     }
 }
