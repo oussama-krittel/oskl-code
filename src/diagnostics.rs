@@ -34,6 +34,9 @@ pub fn is_dependency(path: &Path) -> bool {
 }
 
 pub fn lint_file(root: &Path, file: &Path) -> Option<Result<(String, Vec<Diag>), String>> {
+    if file.extension().is_some_and(|e| e == "java") {
+        return Some(crate::java::javac_check(root, file));
+    }
     if !is_web(file) || is_dependency(file) {
         return None;
     }

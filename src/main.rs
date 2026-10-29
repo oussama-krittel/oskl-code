@@ -25,6 +25,7 @@ mod git_panel;
 mod graph;
 mod highlight;
 mod icons;
+mod java;
 mod keybindings;
 mod keymap;
 mod merge_view;

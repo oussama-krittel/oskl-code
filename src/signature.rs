@@ -45,7 +45,7 @@ pub fn info(text: &str, path: &Path, row: usize, col: usize) -> Option<Info> {
         return None;
     }
     let (sig, end_row, body) = signature(&lines, row, lang)?;
-    let mut doc = doc_above(&lines, row);
+    let mut doc: Vec<String> = doc_above(&lines, row);
     if lang == Some(Lang::Python) && doc.is_empty() {
         doc = docstring(&lines, end_row + 1);
     }
@@ -54,6 +54,9 @@ pub fn info(text: &str, path: &Path, row: usize, col: usize) -> Option<Info> {
         let whole = if body { format!("{sig} {{}}") } else { sig.clone() };
         highlight::highlight(l, &whole)
     });
+    if lang == Some(Lang::Java) {
+        doc = doc.iter().map(|l| javadoc_html(l)).collect();
+    }
     Some(Info { sig, syntax, doc: parse_doc(&doc), path: path.to_path_buf(), row, col })
 }
 
@@ -73,7 +76,12 @@ fn signature(lines: &[&str], row: usize, lang: Option<Lang>) -> Option<(String, 
     let word = |s: &str| s.split(|c: char| !is_ident(c)).next().unwrap_or("").to_string();
     let mut kw = word(head);
     let mut rest = head;
-    while matches!(kw.as_str(), "pub" | "async" | "abstract" | "const" | "static" | "unsafe") && rest.len() > kw.len() {
+    const MODIFIERS: &[&str] = &[
+        "pub", "async", "abstract", "const", "static", "unsafe",
+        // Java
+        "public", "private", "protected", "final", "synchronized", "native", "default", "sealed", "strictfp", "transient", "volatile",
+    ];
+    while MODIFIERS.contains(&kw.as_str()) && rest.len() > kw.len() {
         rest = rest[kw.len()..].trim_start();
         if rest.starts_with('(') {
             // `pub(crate)`
@@ -86,7 +94,8 @@ fn signature(lines: &[&str], row: usize, lang: Option<Lang>) -> Option<(String, 
         kw = next;
     }
     // Type-like declarations show their body; Go's `type X struct {` too.
-    let shows_body = matches!(kw.as_str(), "type" | "interface" | "enum" | "struct" | "union");
+    // (Not Java's: its classes, interfaces and enums are bodies of methods.)
+    let shows_body = lang != Some(Lang::Java) && matches!(kw.as_str(), "type" | "interface" | "enum" | "struct" | "union");
     let colon_ends = python && matches!(kw.as_str(), "def" | "class" | "async");
 
     let mut src: Vec<char> = Vec::new();
@@ -255,6 +264,12 @@ fn doc_above(lines: &[&str], row: usize) -> Vec<String> {
     } {
         r -= 1;
     }
+    // A blank line or two between the comment and the declaration (the JDK does that).
+    let mut blank = 0;
+    while r > 0 && blank < 2 && lines[r - 1].trim().is_empty() {
+        r -= 1;
+        blank += 1;
+    }
     if r == 0 {
         return Vec::new();
     }
@@ -262,7 +277,7 @@ fn doc_above(lines: &[&str], row: usize) -> Vec<String> {
     if prev.ends_with("*/") {
         let mut start = r - 1;
         while !lines[start].contains("/*") {
-            if start == 0 || r - start > 200 {
+            if start == 0 || r - start > 400 {
                 return Vec::new();
             }
             start -= 1;
@@ -296,6 +311,15 @@ fn doc_above(lines: &[&str], row: usize) -> Vec<String> {
         return Vec::new();
     }
     out
+}
+
+/// Javadoc is HTML: tags dropped, `{@code x}` as code, entities decoded.
+fn javadoc_html(line: &str) -> String {
+    let code = regex::Regex::new(r"\{@(?:code|literal)\s+([^}]*)\}").expect("valid regex");
+    let tags = regex::Regex::new(r"</?(?:p|br|i|b|em|strong|tt|code|pre|ul|ol|li|a|h\d|blockquote|table|tr|td|th|dl|dt|dd|div|span|sup|sub)\b[^>]*>").expect("valid regex");
+    let s = code.replace_all(line, "`$1`");
+    let s = tags.replace_all(&s, "");
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&nbsp;", " ").replace("&amp;", "&")
 }
 
 /// Python: the string right under the `def`.
@@ -472,6 +496,17 @@ mod tests {
         assert_eq!(d.text, "Sum with tax.\nRounds down.");
         let go = "// Open opens it.\nfunc (r *Repo) Open(name string) (*File, error) {\n}\n";
         assert_eq!(sig(go, 1, "go").0, "func (r *Repo) Open(name string) (*File, error)");
+    }
+
+    #[test]
+    fn java_methods_and_javadoc() {
+        let src = "/**\n * Returns the <i>larger</i> of {@code a} and &lt;b&gt;.\n *\n * @param a the first\n * @return the larger\n */\n\n@Override\npublic static <T extends Comparable<T>> T max(T a,\n        T b) throws IOException {\n    return a;\n}\npublic interface Shape extends Base {\n    double area();\n}\n";
+        let (s, d) = sig(src, 8, "java");
+        assert_eq!(s, "public static <T extends Comparable<T>> T max(T a,\n        T b) throws IOException");
+        assert_eq!(d.text, "Returns the larger of `a` and <b>.");
+        assert_eq!(d.params, vec![("a".into(), "the first".into())]);
+        assert_eq!(d.returns.as_deref(), Some("the larger"));
+        assert_eq!(sig(src, 12, "java").0, "public interface Shape extends Base", "a Java type shows its header only");
     }
 
     #[test]

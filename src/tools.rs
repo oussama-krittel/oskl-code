@@ -38,7 +38,7 @@ fn shell_path() -> Option<&'static String> {
         .as_ref()
 }
 
-fn command(program: &Path) -> Command {
+pub(crate) fn command(program: &Path) -> Command {
     let mut cmd = Command::new(program);
     if let Some(path) = shell_path() {
         cmd.env("PATH", path);
@@ -171,6 +171,11 @@ pub fn format(root: &Path, path: &Path, text: &str) -> Result<(String, String), 
             return Err("No formatter found. Install Biome (npm i -D @biomejs/biome) or Prettier.".into());
         }
     } else {
+        if e == "java" {
+            let (c, name) = crate::java::format_command(path, dir, root)?;
+            let out = run(c, name.to_string(), Some(text), root);
+            return if out.ok && !out.stdout.is_empty() { Ok((out.stdout, out.tool)) } else { Err(format!("{} failed:\n{}{}", out.tool, out.stderr, out.stdout)) };
+        }
         let (name, args): (&str, Vec<String>) = match e.as_str() {
             "rs" => ("rustfmt", vec!["--emit".into(), "stdout".into(), "--edition".into(), "2024".into()]),
             "go" => ("gofmt", vec![]),
