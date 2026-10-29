@@ -347,6 +347,18 @@ mod live_format {
 mod terraform_tests {
     /// Runs only where terraform (or tofu) is installed.
     #[test]
+    fn formats_java_when_a_formatter_is_installed() {
+        let dir = std::env::temp_dir().join(format!("kite-fmt-java-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("A.java");
+        match super::format(&dir, &file, "class A{void f(){int x=1;}}\n") {
+            Ok((out, _)) => assert_eq!(out, "class A {\n  void f() {\n    int x = 1;\n  }\n}\n"),
+            Err(e) => assert!(e.contains("No Java formatter"), "{e}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn formats_terraform() {
         let dir = std::env::temp_dir().join(format!("kite-tf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
