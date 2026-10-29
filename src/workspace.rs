@@ -5465,6 +5465,28 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn the_new_file_name_shows_while_typing(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        ws.update(cx, |ws, cx| {
+            ws.tree.update(cx, |t, cx| {
+                t.invalidate(&std::collections::HashSet::from([root.clone()]), cx);
+                t.select(root.clone())
+            })
+        });
+        ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("a");
+        cx.simulate_input("home");
+        cx.run_until_parked();
+        let input = ws.read_with(cx, |ws, cx| ws.tree.read(cx).naming_input()).expect("the name box");
+        let (width, scrolled) = input.read_with(cx, |e, _| e.drawn_width());
+        // An empty box used to get no width, so typing scrolled the name out of sight.
+        assert!(width > 100., "the box spans the row: {width}");
+        assert_eq!(scrolled, 0., "the name stays in view");
+    }
+
+    #[gpui::test]
     fn compare_any_two_branches_and_come_back_from_a_diff(cx: &mut TestAppContext) {
         let (ws, cx) = setup_with(cx, |dir| {
             let sh = |cmd: &str| {

@@ -147,6 +147,11 @@ impl FileTree {
     }
 
     #[cfg(test)]
+    pub(crate) fn naming_input(&self) -> Option<Entity<Editor>> {
+        self.editing.as_ref().map(|e| e.input.clone())
+    }
+
+    #[cfg(test)]
     pub(crate) fn naming_text(&self, cx: &App) -> Option<String> {
         self.editing.as_ref().map(|e| e.input.read(cx).text())
     }
@@ -792,6 +797,8 @@ impl FileTree {
             .debug_selector(move || selector)
             .flex()
             .items_center()
+            // The full width, not just the content's: an empty name box has none.
+            .w_full()
             .h(theme::row_h())
             .pl(px(if is_root { 4. } else { 8. + (row.depth - 1) as f32 * 12. }))
             .pr(px(10.))

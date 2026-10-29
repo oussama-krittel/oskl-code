@@ -3115,6 +3115,12 @@ impl Editor {
 
     // ------------------------------------------------------------ env values, colours
 
+    /// The width drawn into last frame, and how far the text is scrolled sideways.
+    #[cfg(test)]
+    pub fn drawn_width(&self) -> (f32, f32) {
+        (self.layout.as_ref().map_or(0., |l| l.bounds.size.width / px(1.)), self.scroll_x)
+    }
+
     /// The open hover card's declaration and description.
     #[cfg(test)]
     pub fn hover_card(&self) -> Option<(String, String)> {
