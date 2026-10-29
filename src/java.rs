@@ -194,11 +194,22 @@ fn java_home() -> Option<&'static PathBuf> {
     .as_ref()
 }
 
+/// The newest JDK that's 21 or later, if any.
+fn modern_java_home() -> Option<PathBuf> {
+    let out = Command::new("/usr/libexec/java_home").args(["-v", "21+"]).output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !s.is_empty()).then(|| PathBuf::from(s))
+}
+
 /// Formats with google-java-format, else clang-format (which knows Java).
 pub fn format_command(path: &Path, dir: &Path, root: &Path) -> Result<(Command, &'static str), String> {
     if let Some(bin) = crate::tools::find_named("google-java-format", dir, root) {
         let mut c = crate::tools::command(&bin);
         c.arg("-");
+        // It needs Java 21+, whatever JAVA_HOME the shell has.
+        if let Some(home) = modern_java_home() {
+            c.env("JAVA_HOME", home);
+        }
         return Ok((c, "google-java-format"));
     }
     if let Some(bin) = crate::tools::find_named("clang-format", dir, root) {
