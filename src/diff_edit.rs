@@ -162,6 +162,7 @@ impl Render for DiffEditView {
         }
         let dirty = self.right.read(cx).buf.is_dirty();
         let path = self.root.join(&self.spec.path);
+        let blame_on = self.right.read(cx).blame_gutter;
         let header = div()
             .flex()
             .flex_none()
@@ -181,10 +182,16 @@ impl Render for DiffEditView {
             .child(ui::icon_button("de-prev", "arrow-up").on_click(cx.listener(|v, _, w, cx| v.step(false, w, cx))))
             .child(ui::icon_button("de-next", "arrow-down").on_click(cx.listener(|v, _, w, cx| v.step(true, w, cx))))
             .when(!one_sided, |d| d.child(ui::icon_button("de-inline", if self.inline { "split" } else { "inline" }).on_click(cx.listener(|v, _, _, cx| v.toggle_inline(cx)))))
-            .child(ui::icon_button("de-blame", "blame").on_click(cx.listener(|v, _, _, cx| {
-                let on = !v.right.read(cx).blame_gutter;
-                v.set_blame(on, cx);
-            })))
+            .child(
+                ui::icon_button("de-blame", "blame")
+                    .tooltip(ui::tooltip("Blame: who wrote each line, on both sides"))
+                    .when(blame_on, |b| b.bg(theme::selected()))
+                    .on_click(cx.listener(|v, _, _, cx| {
+                        let on = !v.right.read(cx).blame_gutter;
+                        v.set_blame(on, cx);
+                        cx.emit(Request::BlameShown(on));
+                    })),
+            )
             .child(ui::icon_button("de-open", "open").on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(Request::OpenFile { path: path.clone(), line: None, preview: false });
             })));

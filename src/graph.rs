@@ -147,6 +147,7 @@ mod tests {
             time: 0,
             refs: vec![],
             subject: String::new(),
+            body: String::new(),
         }
     }
 

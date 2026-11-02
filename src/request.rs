@@ -34,6 +34,8 @@ pub enum Request {
     OpenAt { path: PathBuf, line: usize, cols: std::ops::Range<usize> },
     OpenDiff { spec: DiffSpec, preview: bool },
     OpenCommit(String),
+    /// Blame was switched on or off in a diff: new diffs open the same way.
+    BlameShown(bool),
     /// What `other` changed since it split from `base` (the current branch when None).
     Compare { base: Option<String>, other: String },
     /// Ask which branch to compare this one to, then compare.

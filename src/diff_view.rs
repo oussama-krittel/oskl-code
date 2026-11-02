@@ -325,8 +325,17 @@ impl DiffView {
         }
         cx.notify();
     }
+    /// Who each line on one side is blamed on (tests).
+    #[cfg(test)]
+    pub fn blame_authors(&self, left: bool) -> Vec<String> {
+        let b = if left { &self.left_blame } else { &self.right_blame };
+        b.iter().flat_map(|b| b.iter()).map(|c| c.as_ref().map(|c| c.author.clone()).unwrap_or_default()).collect()
+    }
+
+    /// The button or `b`: also remembered, so the next diff opens the same way.
     fn on_toggle_blame(&mut self, _: &ToggleBlame, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_blame(cx);
+        cx.emit(Request::BlameShown(self.show_blame));
     }
     fn toggle_inline(&mut self, _: &ToggleInline, _: &mut Window, cx: &mut Context<Self>) {
         // Keep roughly the same position when switching layouts.
@@ -425,8 +434,9 @@ impl DiffView {
             })
             .child(
                 ui::icon_button("toggle-blame", "blame")
+                    .tooltip(ui::tooltip("Blame: who wrote each line, on both sides (B)"))
                     .when(self.show_blame, |b| b.bg(theme::selected()))
-                    .on_click(cx.listener(|v, _, _, cx| v.toggle_blame(cx))),
+                    .on_click(cx.listener(|v, _, w, cx| v.on_toggle_blame(&ToggleBlame, w, cx))),
             )
             .child(ui::icon_button("open-file", "open").on_click(cx.listener(|v, _, w, cx| v.open_file(&OpenFile, w, cx))))
     }

@@ -876,6 +876,11 @@ impl Workspace {
                 self.keep_focus = false;
             }
             Request::OpenCommit(sha) => self.open_commit(sha.clone(), window, cx),
+            Request::BlameShown(on) => {
+                self.blame_default = *on;
+                self.settings.blame_default = *on;
+                self.settings.save();
+            }
             Request::CommandLine(text) => self.open_cmd(CmdMode::Command, text, window, cx),
             Request::Moved { from, to } => self.path_moved(from, to, cx),
             Request::Deleted(paths) => self.paths_deleted(paths, window, cx),
@@ -5322,12 +5327,14 @@ mod ui_tests {
                 std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
             };
             sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
-            sh("echo a > a.txt && git add . && git commit -qm one && mkdir src && echo b > src/b.rs && echo A >> a.txt && git add . && git commit -qm two");
+            sh("echo a > a.txt && git add . && git commit -qm one && mkdir src && echo b > src/b.rs && echo A >> a.txt && git add . && git commit -qm two -m 'why: the details'");
         });
         ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
         cx.run_until_parked();
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));
         let head = git_out(&root, &["rev-parse", "--short", "HEAD"]);
+        let (subject, body) = ws.read_with(cx, |ws, cx| ws.repo.read(cx).commits.first().map(|c| (c.subject.clone(), c.body.clone()))).unwrap();
+        assert_eq!((subject.as_str(), body.as_str()), ("two", "why: the details"), "the whole message is there for the hover card");
         let row: &'static str = Box::leak(format!("commit-row-{head}").into_boxed_str());
         let click = |cx: &mut VisualTestContext, sel: &str, count: usize| {
             cx.run_until_parked();
@@ -5362,6 +5369,45 @@ mod ui_tests {
         click(cx, row, 2);
         assert!(commit_tab(cx), "a double-click opens the commit page");
         assert_eq!(open(cx), 0, "without unfolding it");
+    }
+
+    #[gpui::test]
+    fn commit_diffs_blame_both_sides_and_remember_it(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config commit.gpgsign false");
+            sh("printf 'keep\\nold\\n' > a.txt && git add . && git -c user.name=Ann -c user.email=ann@x commit -qm one");
+            sh("printf 'keep\\nnew\\n' > a.txt && git -c user.name=Bob -c user.email=bob@x commit -qam two");
+        });
+        cx.run_until_parked();
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let (parent, head) = (git_out(&root, &["rev-parse", "HEAD~1"]), git_out(&root, &["rev-parse", "HEAD"]));
+        let spec = |left: &str, right: &str| crate::request::DiffSpec {
+            path: "a.txt".into(),
+            old_path: None,
+            left: crate::git::Rev::Commit(left.into()),
+            right: crate::git::Rev::Commit(right.into()),
+            back: None,
+        };
+        ws.update_in(cx, |ws, window, cx| ws.handle_request(&crate::request::Request::OpenDiff { spec: spec(&parent, &head), preview: false }, window, cx));
+        cx.run_until_parked();
+        let diff = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.active.and_then(|ix| match &ws.tabs[ix].kind {
+            TabKind::Diff(d) => Some(d.clone()),
+            _ => None,
+        })).expect("a diff tab");
+        let d = diff(cx);
+        assert!(!d.read_with(cx, |d, _| d.show_blame), "off by default");
+        cx.simulate_keystrokes("b");
+        cx.run_until_parked();
+        assert_eq!(d.read_with(cx, |d, _| d.blame_authors(true)), ["Ann", "Ann"], "old side: the removed line is Ann's");
+        assert_eq!(d.read_with(cx, |d, _| d.blame_authors(false)), ["Ann", "Bob"], "new side: the unchanged line stays Ann's, the new one is Bob's");
+
+        // The next diff opens with blame on too.
+        ws.update_in(cx, |ws, window, cx| ws.handle_request(&crate::request::Request::OpenDiff { spec: spec(&head, &parent), preview: false }, window, cx));
+        cx.run_until_parked();
+        assert!(diff(cx).read_with(cx, |d, _| d.show_blame), "remembered");
     }
 
     #[gpui::test]

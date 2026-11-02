@@ -198,8 +198,6 @@ const MUTED: f32 = 0.38;
 const TREE_LEFT: f32 = 16.;
 const TREE_INDENT: f32 = 12.;
 const GRAPH_ROW_H: f32 = 20.;
-/// The expand arrow in front of each commit.
-const ARROW_W: f32 = 14.;
 /// The repository picker under the title (only with more than one repository).
 const REPO_H: f32 = 30.;
 
@@ -1670,12 +1668,18 @@ impl GitPanel {
 
         let lane_color = colors[row.color % colors.len()];
         let sha = commit.sha.clone();
-        let sha2 = sha.clone();
-        let open = self.expanded.contains(&commit.sha);
         let short = commit.short().to_string();
+        let card = CommitCard {
+            subject: commit.subject.clone().into(),
+            body: commit.body.clone().into(),
+            author: commit.author.clone().into(),
+            when: crate::util::relative_time(commit.time).into(),
+            short: short.clone().into(),
+        };
         div()
             .id(("commit", ix))
             .debug_selector(move || format!("commit-row-{short}"))
+            .tooltip(move |_, cx| cx.new(|_| card.clone()).into())
             .w_full()
             .overflow_hidden()
             .flex()
@@ -1707,23 +1711,6 @@ impl GitPanel {
                 panel.commit_menu = Some((ix, ev.position));
                 cx.notify();
             }))
-            .child(
-                div()
-                    .id(("commit-arrow", ix))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .w(px(ARROW_W))
-                    .h_full()
-                    .on_click(cx.listener(move |panel, _, window, cx| {
-                        cx.stop_propagation();
-                        window.focus(&panel.focus);
-                        panel.selected = Some(Item::Commit(ix));
-                        panel.toggle_commit(&sha2, cx);
-                    }))
-                    .child(ui::small_icon(if open { "chevron-down" } else { "chevron-right" }, theme::fg_dim())),
-            )
             .child(graph)
             .child(
                 div()
@@ -1733,13 +1720,27 @@ impl GitPanel {
                     .gap(px(6.))
                     .overflow_hidden()
                     .whitespace_nowrap()
+                    // A long subject ends in "…" (the whole message shows on hover).
                     .child(
                         div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
                             .text_color(if is_head { theme::fg_bright() } else if contained { theme::fg() } else { theme::fg_muted() })
                             .when(is_head, |d| d.font_weight(FontWeight::BOLD))
                             .child(commit.subject.clone()),
                     )
-                    .child(div().text_size(px(11.)).text_color(theme::fg_muted()).when(!contained, |d| d.opacity(0.6)).child(commit.author.clone())),
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .max_w(relative(0.35))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(11.))
+                            .text_color(theme::fg_muted())
+                            .when(!contained, |d| d.opacity(0.6))
+                            .child(commit.author.clone()),
+                    ),
             )
             .when(detached, |d| {
                 d.child(
@@ -1807,7 +1808,6 @@ impl GitPanel {
             .pl(px(4.))
             .pr(px(8.))
             .gap(px(4.))
-            .child(div().w(px(ARROW_W)).flex_none())
             .child(lines);
         let Some(fi) = file else {
             return base.child(div().pl(px(8.)).text_color(theme::fg_muted()).child("Loading…")).into_any_element();
@@ -1855,6 +1855,48 @@ impl GitPanel {
             )
             .child(div().flex_none().text_size(px(11.)).text_color(ui::status_color(change.status)).child(change.status.letter()))
             .into_any_element()
+    }
+}
+
+/// The whole message of a commit, shown when the pointer rests on it in the graph.
+#[derive(Clone)]
+struct CommitCard {
+    subject: SharedString,
+    body: SharedString,
+    author: SharedString,
+    when: SharedString,
+    short: SharedString,
+}
+
+impl Render for CommitCard {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .max_w(px(420.))
+            .px(px(10.))
+            .py(px(8.))
+            .bg(theme::bg_popup())
+            .border_1()
+            .border_color(theme::border_input())
+            .rounded(px(6.))
+            .shadow_md()
+            .text_size(px(12.))
+            .text_color(theme::fg())
+            .child(
+                div()
+                    .flex()
+                    .gap(px(6.))
+                    .text_size(px(11.))
+                    .text_color(theme::fg_muted())
+                    .child(div().text_color(theme::fg()).font_weight(FontWeight::BOLD).child(self.author.clone()))
+                    .child(self.when.clone())
+                    .child(self.short.clone()),
+            )
+            .child(div().text_color(theme::fg_bright()).child(self.subject.clone()))
+            .when(!self.body.is_empty(), |d| d.child(div().text_color(theme::fg_dim()).child(self.body.clone())))
+            .with_animation("commit-card", Animation::new(std::time::Duration::from_millis(120)).with_easing(ease_out_quint()), |d, t| d.opacity(t))
     }
 }
 
@@ -2132,6 +2174,7 @@ mod tree_tests {
             time: 0,
             refs: Vec::new(),
             subject: String::new(),
+            body: String::new(),
         };
         // newer (not checked out) → head → merge of side into base
         let commits = vec![c("new", &["head"]), c("other", &["base"]), c("head", &["base", "side"]), c("side", &["base"]), c("base", &[])];

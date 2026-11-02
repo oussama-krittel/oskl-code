@@ -433,6 +433,8 @@ pub struct Commit {
     pub time: i64,
     pub refs: Vec<Ref>,
     pub subject: String,
+    /// The message after its first line (shown when hovering the commit in the graph).
+    pub body: String,
 }
 
 impl Commit {
@@ -471,7 +473,7 @@ fn parse_refs(decoration: &str, remotes: &[String]) -> Vec<Ref> {
     refs
 }
 
-const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s%x1e";
+const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s%x1f%b%x1e";
 
 /// History for the graph. `all = false` mirrors VS Code's "Auto" mode:
 /// the current branch, its upstream and the remote's default branch.
@@ -511,8 +513,8 @@ pub fn log(root: &Path, limit: usize, all: bool, only: &[String]) -> Result<Vec<
         if rec.is_empty() {
             continue;
         }
-        let f: Vec<&str> = rec.splitn(7, '\x1f').collect();
-        if f.len() < 7 {
+        let f: Vec<&str> = rec.splitn(8, '\x1f').collect();
+        if f.len() < 8 {
             continue;
         }
         commits.push(Commit {
@@ -523,6 +525,7 @@ pub fn log(root: &Path, limit: usize, all: bool, only: &[String]) -> Result<Vec<
             time: f[4].parse().unwrap_or(0),
             refs: parse_refs(f[5], &remotes),
             subject: f[6].to_string(),
+            body: f[7].trim().to_string(),
         });
     }
     Ok(commits)
