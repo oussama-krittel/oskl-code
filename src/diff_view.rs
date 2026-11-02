@@ -169,9 +169,8 @@ impl DiffView {
             .ok();
         });
         self._tasks = vec![task];
-        if self.show_blame {
-            self.load_blame(cx);
-        }
+        // Always read: the selected line shows who wrote it even with the blame column off.
+        self.load_blame(cx);
     }
 
     fn load_blame(&mut self, cx: &mut Context<Self>) {
@@ -320,9 +319,6 @@ impl DiffView {
 
     pub fn toggle_blame(&mut self, cx: &mut Context<Self>) {
         self.show_blame = !self.show_blame;
-        if self.show_blame && self.left_blame.is_none() && self.right_blame.is_none() {
-            self.load_blame(cx);
-        }
         cx.notify();
     }
     /// Who each line on one side is blamed on (tests).
@@ -594,7 +590,9 @@ const NUM_W: f32 = 44.;
 const BLAME_W: f32 = 190.;
 
 impl DiffView {
-    fn render_side(&self, row: &Row, left: bool, data: &Loaded, row_ix: usize, cx: &mut Context<Self>) -> Div {
+    /// `top`: the first row on screen, which always names its commit (like the editor's gutter).
+    fn render_side(&self, row: &Row, left: bool, data: &Loaded, row_ix: usize, top: bool, cx: &mut Context<Self>) -> Div {
+        let selected = self.selected == Some(row_ix);
         let line = if left { row.l } else { row.r };
         let (bg, hl, sign) = match (row.kind, left, line.is_some()) {
             (Kind::Equal, _, _) => (None, theme::diff_del_char(), " "),
@@ -616,29 +614,34 @@ impl DiffView {
         let syn = if left { &data.left_syn } else { &data.right_syn };
         let syntax = line.and_then(|i| syn.as_ref().and_then(|s| s.get(i))).map(Vec::as_slice).unwrap_or(&[]);
         let blame = if left { &self.left_blame } else { &self.right_blame };
+        let commit = line.and_then(|i| blame.as_ref().and_then(|b| b.get(i)).and_then(|c| c.clone()));
 
         let mut side = div().flex().flex_1().min_w_0().h_full().overflow_hidden();
         if let Some(bg) = bg {
             side = side.bg(bg);
         }
         if self.show_blame {
-            let commit = line.and_then(|i| blame.as_ref().and_then(|b| b.get(i)).and_then(|c| c.clone()));
-            let show = match (line, &commit) {
+            let starts = match (line, &commit) {
                 (Some(i), Some(c)) => i == 0 || blame.as_ref().and_then(|b| b.get(i - 1)).and_then(|p| p.as_ref()).map(|p| p.sha != c.sha).unwrap_or(true),
                 _ => false,
             };
+            // How old the line is, as a bar on every line (brighter is newer).
+            let age = commit.as_ref().map(|c| if c.is_uncommitted() { theme::accent() } else { theme::blame_age((util::now() - c.time) as f64 / 86400.) });
             let cell = div()
                 .id(("blame", row_ix * 2 + left as usize))
                 .flex_none()
                 .w(px(BLAME_W))
                 .h_full()
-                .px(px(6.))
+                .pr(px(6.))
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .bg(theme::bg_side())
                 .text_color(theme::fg_dim())
                 .text_size(px(11.))
-                .when_some(commit.filter(|_| show), |cell, c| {
+                .when(starts && !top, |cell| cell.border_t_1().border_color(theme::border()))
+                .child(div().flex_none().w(px(3.)).h_full().mr(px(5.)).when_some(age, |d, c| d.bg(c)))
+                .flex()
+                .when_some(commit.clone().filter(|_| starts || top), |cell, c| {
                     let sha = c.sha.clone();
                     let label = if c.is_uncommitted() {
                         "You · uncommitted".to_string()
@@ -648,9 +651,7 @@ impl DiffView {
                     };
                     cell.cursor_pointer()
                         .hover(|s| s.text_color(theme::fg_bright()))
-                        .border_t_1()
-                        .border_color(theme::border())
-                        .child(label)
+                        .child(div().min_w_0().overflow_hidden().text_ellipsis().child(label))
                         .when(!c.is_uncommitted(), |cell| {
                             cell.on_click(cx.listener(move |_, _, _, cx| cx.emit(Request::OpenCommit(sha.clone()))))
                         })
@@ -671,8 +672,16 @@ impl DiffView {
         .child(
             div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(
                 div()
+                    .flex()
                     .ml(px(-self.scroll_x))
-                    .child(styled_line(text, syntax, &highlights)),
+                    .child(styled_line(text, syntax, &highlights))
+                    // The selected line says who wrote it, GitLens-style (the column does that when on).
+                    .when_some(commit.filter(|_| selected && !self.show_blame), |d, c| {
+                        let who = if self.user_email.as_deref() == Some(c.email.as_str()) || c.is_uncommitted() { "You".to_string() } else { c.author.clone() };
+                        let note = if c.is_uncommitted() { format!("{who}, Uncommitted changes") } else { format!("{who}, {} • {}", util::relative_time(c.time), c.summary) };
+                        let selector = format!("blame-note-{}", if left { "old" } else { "new" });
+                        d.child(div().debug_selector(move || selector).flex_none().ml(px(32.)).text_color(theme::fg_muted()).child(note))
+                    }),
             ),
         )
     }
@@ -698,8 +707,10 @@ impl Render for DiffView {
                     count,
                     cx.processor(move |view, range: Range<usize>, _window, cx| {
                         let rows = if view.show_inline() { &data.inline } else { &data.side };
+                        let first = range.start;
                         range
                             .map(|ix| {
+                                let top = ix == first;
                                 let row = rows[ix].clone();
                                 let selected = view.selected == Some(ix);
                                 let base = div()
@@ -720,10 +731,10 @@ impl Render for DiffView {
                                     }));
                                 if view.show_inline() {
                                     let left = row.r.is_none();
-                                    base.child(view.render_side(&row, left, &data, ix, cx))
+                                    base.child(view.render_side(&row, left, &data, ix, top, cx))
                                 } else {
                                     let split = view.split;
-                                    base.child(div().flex().flex_none().w(relative(split)).h_full().child(view.render_side(&row, true, &data, ix, cx)))
+                                    base.child(div().flex().flex_none().w(relative(split)).h_full().child(view.render_side(&row, true, &data, ix, top, cx)))
                                         .child(
                                             // Drag to resize old vs new.
                                             div()
@@ -741,7 +752,7 @@ impl Render for DiffView {
                                                 }))
                                                 .child(div().w(px(1.)).h_full().bg(theme::border())),
                                         )
-                                        .child(view.render_side(&row, false, &data, ix, cx))
+                                        .child(view.render_side(&row, false, &data, ix, top, cx))
                                 }
                             })
                             .collect::<Vec<_>>()

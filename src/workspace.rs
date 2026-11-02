@@ -4300,6 +4300,13 @@ impl Workspace {
             (b, a) if st.upstream.is_some() => format!("{b}↓ {a}↑"),
             _ => String::new(),
         };
+        // Blame applies to editors and to both sides of any diff.
+        let blame_on = match self.active.and_then(|a| self.tabs.get(a)).map(|t| &t.kind) {
+            Some(TabKind::Diff(d)) => Some(d.read(cx).show_blame),
+            Some(TabKind::DiffEdit(d)) => Some(d.read(cx).right.read(cx).blame_gutter),
+            Some(TabKind::Editor(e)) => Some(e.read(cx).blame_gutter),
+            _ => None,
+        };
         let editor_info = self.active_editor().map(|e| {
             let e = e.read(cx);
             let (row, col) = e.cursor_rc();
@@ -4313,7 +4320,7 @@ impl Workspace {
                 lang,
             )
         });
-        let item = |id: &'static str| div().id(id).flex().items_center().gap(px(4.)).px(px(8.)).h_full().cursor_pointer().hover(|s| s.bg(theme::hover()));
+        let item = |id: &'static str| div().id(id).debug_selector(move || id.to_string()).flex().items_center().gap(px(4.)).px(px(8.)).h_full().cursor_pointer().hover(|s| s.bg(theme::hover()));
         let _ = window;
         let chip = |label: String, bg: Hsla| div().flex().items_center().h_full().px(px(8.)).bg(bg).text_color(theme::bg_app()).font_weight(FontWeight::BOLD).child(label);
         let hint = |key: &str, label: &str| {
@@ -4377,12 +4384,16 @@ impl Workspace {
                 .child(item("status-enc").child("UTF-8"))
                 .child(item("status-eol").child(eol))
                 .child(item("status-lang").child(lang))
-                .child(
-                    item("status-blame")
-                        .child(ui::small_icon("blame", theme::fg()))
-                        .child("Blame")
-                        .on_click(cx.listener(|ws, _, w, cx| ws.toggle_blame(&ToggleBlame, w, cx))),
-                )
+        })
+        .when_some(blame_on, |d, on| {
+            d.child(
+                item("status-blame")
+                    .tooltip(ui::tooltip("Blame: who wrote each line, on both sides of a diff (⌥⌘B)"))
+                    .when(on, |b| b.bg(theme::selected()))
+                    .child(ui::small_icon("blame", theme::fg()))
+                    .child("Blame")
+                    .on_click(cx.listener(|ws, _, w, cx| ws.toggle_blame(&ToggleBlame, w, cx))),
+            )
         })
         .child({
             let on = self.settings.format_on_save;
@@ -5399,10 +5410,24 @@ mod ui_tests {
         })).expect("a diff tab");
         let d = diff(cx);
         assert!(!d.read_with(cx, |d, _| d.show_blame), "off by default");
+        assert_eq!(d.read_with(cx, |d, _| d.blame_authors(false)), ["Ann", "Bob"], "read anyway, for the selected line's note");
         cx.simulate_keystrokes("b");
         cx.run_until_parked();
+        assert!(d.read_with(cx, |d, _| d.show_blame));
         assert_eq!(d.read_with(cx, |d, _| d.blame_authors(true)), ["Ann", "Ann"], "old side: the removed line is Ann's");
         assert_eq!(d.read_with(cx, |d, _| d.blame_authors(false)), ["Ann", "Bob"], "new side: the unchanged line stays Ann's, the new one is Bob's");
+
+        // The status bar's Blame works on diffs too: switch it off, then a selected line still says who wrote it.
+        let at = cx.debug_bounds("status-blame").expect("Blame in the status bar for a diff").center();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(!d.read_with(cx, |d, _| d.show_blame), "the status bar switched it off");
+        d.update_in(cx, |d, window, _| d.focus(window));
+        cx.simulate_keystrokes("down down");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("blame-note-new").is_some() && cx.debug_bounds("blame-note-old").is_some(), "the selected line shows its author on both sides");
+        cx.simulate_keystrokes("b");
+        cx.run_until_parked();
 
         // The next diff opens with blame on too.
         ws.update_in(cx, |ws, window, cx| ws.handle_request(&crate::request::Request::OpenDiff { spec: spec(&head, &parent), preview: false }, window, cx));
@@ -6276,3 +6301,4 @@ pub fn open_project_roots(cx: &App) -> Vec<PathBuf> {
             .collect()
     })
 }
+
