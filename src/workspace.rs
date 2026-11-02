@@ -5316,6 +5316,55 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn graph_commits_expand_to_their_files_and_open_on_double_click(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            sh("echo a > a.txt && git add . && git commit -qm one && mkdir src && echo b > src/b.rs && echo A >> a.txt && git add . && git commit -qm two");
+        });
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
+        cx.run_until_parked();
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let head = git_out(&root, &["rev-parse", "--short", "HEAD"]);
+        let row: &'static str = Box::leak(format!("commit-row-{head}").into_boxed_str());
+        let click = |cx: &mut VisualTestContext, sel: &str, count: usize| {
+            cx.run_until_parked();
+            // Debug selectors are looked up by &'static str.
+            let sel: &'static str = Box::leak(sel.to_string().into_boxed_str());
+            let at = cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} on screen")).center();
+            for n in 1..=count {
+                cx.simulate_event(gpui::MouseDownEvent { position: at, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: n, first_mouse: false });
+                cx.simulate_event(gpui::MouseUpEvent { position: at, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: n });
+            }
+            cx.run_until_parked();
+        };
+        let commit_tab = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.tabs.iter().any(|t| matches!(t.kind, TabKind::Commit(_))));
+        let diff_shown = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.active.and_then(|ix| match &ws.tabs[ix].kind {
+            TabKind::Diff(d) => Some(d.read(cx).spec.path.clone()),
+            _ => None,
+        }));
+
+        assert!(cx.debug_bounds("commit-file-src/b.rs").is_none(), "closed at first");
+        click(cx, row, 1);
+        assert!(cx.debug_bounds("commit-file-src/b.rs").is_some(), "one click lists the files it changed");
+        assert!(cx.debug_bounds("commit-file-a.txt").is_some());
+        assert!(!commit_tab(cx), "and doesn't open the commit page");
+
+        click(cx, "commit-file-src/b.rs", 1);
+        assert_eq!(diff_shown(cx).as_deref(), Some("src/b.rs"), "a file shows that commit's diff");
+
+        // Rows that go away keep their old debug bounds, so ask the panel what's open.
+        let open = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.git_panel.read(cx).expanded_count());
+        click(cx, row, 1);
+        assert_eq!(open(cx), 0, "another click folds it");
+        click(cx, row, 2);
+        assert!(commit_tab(cx), "a double-click opens the commit page");
+        assert_eq!(open(cx), 0, "without unfolding it");
+    }
+
+    #[gpui::test]
     fn folders_in_the_changes_tree_can_be_discarded(cx: &mut TestAppContext) {
         let (ws, cx) = setup_with(cx, |dir| {
             let sh = |cmd: &str| {

@@ -12,7 +12,7 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
 
-actions!(git_panel, [Down, Up, Open, ToggleStage, Discard, OpenFile, FocusCommit, Refresh, Top, Bottom]);
+actions!(git_panel, [Down, Up, Open, ToggleStage, Discard, OpenFile, FocusCommit, Refresh, Top, Bottom, Expand, Collapse]);
 
 pub fn bind_keys() {
     // Not while typing a commit message: s, d, c… are letters there.
@@ -31,6 +31,9 @@ pub fn bind_keys() {
         crate::keybindings::kb("r", Refresh, c),
         crate::keybindings::kb("g", Top, c),
         crate::keybindings::kb("shift-g", Bottom, c),
+        // A commit in the graph: show or hide the files it changed.
+        crate::keybindings::kb("right", Expand, c),
+        crate::keybindings::kb("left", Collapse, c),
     ]);
 }
 
@@ -38,6 +41,8 @@ pub fn bind_keys() {
 enum Item {
     File { staged: bool, path: String },
     Commit(usize),
+    /// A file listed under an expanded commit: (commit, file).
+    CommitFile(usize, usize),
 }
 
 #[derive(Clone)]
@@ -46,6 +51,22 @@ enum ListRow {
     /// `label` is the folder name, or a compacted chain like "src / lib" (VS Code style).
     Folder { staged: bool, key: String, label: String, depth: usize, open: bool, paths: Vec<String> },
     File { staged: bool, change: Change, depth: usize },
+}
+
+/// A row of the graph list: a commit, or one of the files an expanded commit changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphItem {
+    Commit(usize),
+    /// (commit, file index in its `CommitFiles`).
+    File(usize, usize),
+    /// An expanded commit whose files are still being read.
+    Loading(usize),
+}
+
+/// What a commit changed, read when it's first expanded.
+struct CommitFiles {
+    parent: Option<String>,
+    files: Vec<Change>,
 }
 
 /// Which loaded commits the checkout contains (HEAD and its ancestors), plus HEAD's row.
@@ -177,6 +198,8 @@ const MUTED: f32 = 0.38;
 const TREE_LEFT: f32 = 16.;
 const TREE_INDENT: f32 = 12.;
 const GRAPH_ROW_H: f32 = 20.;
+/// The expand arrow in front of each commit.
+const ARROW_W: f32 = 14.;
 /// The repository picker under the title (only with more than one repository).
 const REPO_H: f32 = 30.;
 
@@ -208,6 +231,9 @@ pub struct GitPanel {
     collapsed: std::collections::HashSet<String>,
     /// `in_checkout` for the current log and HEAD, recomputed when either changes.
     reach: std::cell::RefCell<Option<(String, usize, Rc<(Vec<bool>, Option<usize>)>)>>,
+    /// Commits opened in the graph to list their files (by sha), and those files once read.
+    expanded: std::collections::HashSet<String>,
+    commit_files: std::collections::HashMap<String, Rc<CommitFiles>>,
     /// Every repository in the workspace (the picker's choices) and whether the picker is open.
     repos: Vec<Entity<Repo>>,
     repo_menu: bool,
@@ -261,6 +287,8 @@ impl GitPanel {
             last_op: None,
             collapsed: Default::default(),
             reach: Default::default(),
+            expanded: Default::default(),
+            commit_files: Default::default(),
             repo_menu: false,
             drafts: Default::default(),
             repo_sub,
@@ -307,6 +335,8 @@ impl GitPanel {
             self.last_op = None;
             self.amend = false;
             self.collapsed.clear();
+            self.expanded.clear();
+            self.commit_files.clear();
             self.reach.replace(None);
             self.scope_open = false;
             self.branch_menu = None;
@@ -692,7 +722,11 @@ impl GitPanel {
             }
         }
         if self.graph_open {
-            items.extend((0..self.repo.read(cx).commits.len()).map(Item::Commit));
+            items.extend(self.graph_items(cx).into_iter().filter_map(|i| match i {
+                GraphItem::Commit(ix) => Some(Item::Commit(ix)),
+                GraphItem::File(ix, fi) => Some(Item::CommitFile(ix, fi)),
+                GraphItem::Loading(_) => None,
+            }));
         }
         items
     }
@@ -717,11 +751,107 @@ impl GitPanel {
     }
 
     fn select(&mut self, item: Item, cx: &mut Context<Self>) {
-        if let Item::Commit(ix) = item {
-            self.graph_scroll.scroll_to_item(ix, ScrollStrategy::Top);
+        let in_graph = match item {
+            Item::Commit(ix) => Some(GraphItem::Commit(ix)),
+            Item::CommitFile(ix, fi) => Some(GraphItem::File(ix, fi)),
+            Item::File { .. } => None,
+        };
+        if let Some(target) = in_graph
+            && let Some(row) = self.graph_items(cx).iter().position(|i| *i == target)
+        {
+            self.graph_scroll.scroll_to_item(row, ScrollStrategy::Top);
         }
         self.selected = Some(item);
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn expanded_count(&self) -> usize { self.expanded.len() }
+
+    /// The graph's rows: every commit, with an expanded one's files right under it.
+    fn graph_items(&self, cx: &App) -> Vec<GraphItem> {
+        let commits = &self.repo.read(cx).commits;
+        let mut items = Vec::with_capacity(commits.len());
+        for (ix, c) in commits.iter().enumerate() {
+            items.push(GraphItem::Commit(ix));
+            if self.expanded.contains(&c.sha) {
+                match self.commit_files.get(&c.sha) {
+                    Some(f) => items.extend((0..f.files.len()).map(|fi| GraphItem::File(ix, fi))),
+                    None => items.push(GraphItem::Loading(ix)),
+                }
+            }
+        }
+        items
+    }
+
+    /// Opens or closes a commit in the graph; its files are read the first time.
+    fn toggle_commit(&mut self, sha: &str, cx: &mut Context<Self>) {
+        if self.expanded.remove(sha) {
+            return cx.notify();
+        }
+        self.expanded.insert(sha.to_string());
+        if !self.commit_files.contains_key(sha) {
+            let (root, s) = (self.repo.read(cx).root.clone(), sha.to_string());
+            let load = cx.background_executor().spawn(async move { git::commit_details(&root, &s) });
+            let sha = sha.to_string();
+            cx.spawn(async move |panel, cx| {
+                let result = load.await;
+                panel
+                    .update(cx, |p, cx| {
+                        match result {
+                            Ok(d) => {
+                                p.commit_files.insert(sha, Rc::new(CommitFiles { parent: d.parents.first().cloned(), files: d.files }));
+                            }
+                            Err(_) => {
+                                p.expanded.remove(&sha);
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// A file under an expanded commit: its diff against the commit's first parent.
+    fn open_commit_file(&self, ix: usize, fi: usize, preview: bool, cx: &mut Context<Self>) {
+        let Some(sha) = self.repo.read(cx).commits.get(ix).map(|c| c.sha.clone()) else { return };
+        let Some(f) = self.commit_files.get(&sha) else { return };
+        let Some(file) = f.files.get(fi) else { return };
+        let left = match (&f.parent, file.status) {
+            (_, FileStatus::Added) | (None, _) => Rev::Empty,
+            (Some(p), _) => Rev::Commit(p.clone()),
+        };
+        let right = if file.status == FileStatus::Deleted { Rev::Empty } else { Rev::Commit(sha.clone()) };
+        cx.emit(Request::OpenDiff {
+            spec: DiffSpec { path: file.path.clone(), old_path: file.orig_path.clone(), left, right, back: Some(crate::request::Back::Commit(sha)) },
+            preview,
+        });
+    }
+
+    fn expand(&mut self, _: &Expand, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(Item::Commit(ix)) = self.selected
+            && let Some(sha) = self.repo.read(cx).commits.get(ix).map(|c| c.sha.clone())
+            && !self.expanded.contains(&sha)
+        {
+            self.toggle_commit(&sha, cx);
+        }
+    }
+
+    /// On a commit: hide its files. On one of those files: hide them and go back to the commit.
+    fn collapse(&mut self, _: &Collapse, _: &mut Window, cx: &mut Context<Self>) {
+        let ix = match self.selected {
+            Some(Item::Commit(ix) | Item::CommitFile(ix, _)) => ix,
+            _ => return,
+        };
+        if let Some(sha) = self.repo.read(cx).commits.get(ix).map(|c| c.sha.clone())
+            && self.expanded.contains(&sha)
+        {
+            self.toggle_commit(&sha, cx);
+            self.selected = Some(Item::Commit(ix));
+        }
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) { self.move_sel(1, cx) }
@@ -741,6 +871,7 @@ impl GitPanel {
                     cx.emit(Request::OpenCommit(c.sha.clone()));
                 }
             }
+            Some(Item::CommitFile(ix, fi)) => self.open_commit_file(ix, fi, false, cx),
             None => {}
         }
     }
@@ -1539,8 +1670,12 @@ impl GitPanel {
 
         let lane_color = colors[row.color % colors.len()];
         let sha = commit.sha.clone();
+        let sha2 = sha.clone();
+        let open = self.expanded.contains(&commit.sha);
+        let short = commit.short().to_string();
         div()
             .id(("commit", ix))
+            .debug_selector(move || format!("commit-row-{short}"))
             .w_full()
             .overflow_hidden()
             .flex()
@@ -1554,10 +1689,15 @@ impl GitPanel {
             .when(is_head && !selected, |d| d.bg(lane_color.opacity(0.12)))
             .when(selected && focused, |d| d.border_1().border_color(theme::focus_border()))
             .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
-            .on_click(cx.listener(move |panel, _, window, cx| {
+            .on_click(cx.listener(move |panel, ev: &ClickEvent, window, cx| {
                 window.focus(&panel.focus);
                 panel.selected = Some(Item::Commit(ix));
-                cx.emit(Request::OpenCommit(sha.clone()));
+                // One click lists the commit's files under it; the second click of a
+                // double-click puts that back and opens the commit page instead.
+                panel.toggle_commit(&sha, cx);
+                if ev.click_count() >= 2 {
+                    cx.emit(Request::OpenCommit(sha.clone()));
+                }
                 cx.notify();
             }))
             .on_mouse_down(MouseButton::Right, cx.listener(move |panel, ev: &MouseDownEvent, _, cx| {
@@ -1567,6 +1707,23 @@ impl GitPanel {
                 panel.commit_menu = Some((ix, ev.position));
                 cx.notify();
             }))
+            .child(
+                div()
+                    .id(("commit-arrow", ix))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .w(px(ARROW_W))
+                    .h_full()
+                    .on_click(cx.listener(move |panel, _, window, cx| {
+                        cx.stop_propagation();
+                        window.focus(&panel.focus);
+                        panel.selected = Some(Item::Commit(ix));
+                        panel.toggle_commit(&sha2, cx);
+                    }))
+                    .child(ui::small_icon(if open { "chevron-down" } else { "chevron-right" }, theme::fg_dim())),
+            )
             .child(graph)
             .child(
                 div()
@@ -1602,6 +1759,101 @@ impl GitPanel {
                 )
             })
             .child(div().flex().flex_none().gap(px(3.)).children(badges))
+            .into_any_element()
+    }
+
+    /// A row under an expanded commit: one changed file (`file` is None while they're read).
+    /// The graph's lanes run straight through it, so the history stays connected.
+    fn render_commit_file_row(&self, list_ix: usize, ix: usize, file: Option<usize>, row: &GraphRow, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        let reach = self.reachability(cx);
+        let repo = self.repo.read(cx);
+        let Some(commit) = repo.commits.get(ix) else { return div().into_any_element() };
+        let is_head = repo.status.head_oid.as_deref() == Some(commit.sha.as_str());
+        let muted = reach.1.is_some_and(|h| ix < h) && !is_head;
+        let colors = theme::lane_colors();
+        let lanes: Vec<(usize, Hsla)> = row
+            .bottom
+            .iter()
+            .map(|s| {
+                let c = colors[s.color % colors.len()];
+                (s.to, if muted { c.opacity(MUTED) } else { c })
+            })
+            .collect();
+        let graph_w = row.width.max(1) as f32 * LANE_W + 8.;
+        let lines = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                for (lane, color) in &lanes {
+                    let x = bounds.left() + px(6. + *lane as f32 * LANE_W);
+                    let mut pb = PathBuilder::stroke(px(1.6));
+                    pb.move_to(point(x, bounds.top()));
+                    pb.line_to(point(x, bounds.bottom()));
+                    if let Ok(path) = pb.build() {
+                        window.paint_path(path, *color);
+                    }
+                }
+            },
+        )
+        .w(px(graph_w))
+        .h(px(GRAPH_ROW_H))
+        .flex_none();
+
+        let base = div()
+            .w_full()
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .h(px(GRAPH_ROW_H))
+            .pl(px(4.))
+            .pr(px(8.))
+            .gap(px(4.))
+            .child(div().w(px(ARROW_W)).flex_none())
+            .child(lines);
+        let Some(fi) = file else {
+            return base.child(div().pl(px(8.)).text_color(theme::fg_muted()).child("Loading…")).into_any_element();
+        };
+        let Some(change) = self.commit_files.get(&commit.sha).and_then(|f| f.files.get(fi)).cloned() else {
+            return base.into_any_element();
+        };
+        let selected = self.selected == Some(Item::CommitFile(ix, fi));
+        let name = ui::file_name(&change.path).to_string();
+        let dir = ui::file_dir(&change.path).to_string();
+        let selector = format!("commit-file-{}", change.path);
+        base.id(("commit-file", list_ix))
+            .debug_selector(move || selector)
+            .cursor_pointer()
+            .when(selected, |d| {
+                d.bg(if focused { theme::selected_focused() } else { theme::selected() })
+                    .when(focused, |d| d.border_1().border_color(theme::focus_border()))
+            })
+            .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
+            .on_click(cx.listener(move |panel, ev: &ClickEvent, window, cx| {
+                // Like the changes list: one click shows the diff and keeps the keyboard here,
+                // a double-click opens it for editing.
+                window.focus(&panel.focus);
+                panel.selected = Some(Item::CommitFile(ix, fi));
+                panel.open_commit_file(ix, fi, ev.click_count() < 2, cx);
+                cx.notify();
+            }))
+            .child(div().w(px(4.)).flex_none())
+            .child(ui::file_icon(&name))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(6.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(
+                        div()
+                            .text_color(ui::status_color(change.status))
+                            .when(change.status == FileStatus::Deleted, |d| d.line_through())
+                            .child(name),
+                    )
+                    .when(!dir.is_empty(), |d| d.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(dir))),
+            )
+            .child(div().flex_none().text_size(px(11.)).text_color(ui::status_color(change.status)).child(change.status.letter()))
             .into_any_element()
     }
 }
@@ -1712,6 +1964,8 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::on_focus_commit))
             .on_action(cx.listener(Self::refresh))
+            .on_action(cx.listener(Self::expand))
+            .on_action(cx.listener(Self::collapse))
             .on_mouse_move(cx.listener(|p, ev: &MouseMoveEvent, _, cx| {
                 if p.dragging_split {
                     if !ev.dragging() {
@@ -1794,12 +2048,21 @@ impl Render for GitPanel {
                     .when(!self.graph_open, |d| d.flex_none())
                     .child(graph_header)
                     .when(self.graph_open, |d| {
+                        let items = Rc::new(self.graph_items(cx));
                         d.child(
                             uniform_list(
                                 "graph",
-                                graph.len(),
+                                items.len(),
                                 cx.processor(move |panel, range: Range<usize>, _window, cx| {
-                                    range.map(|ix| panel.render_graph_row(ix, &graph[ix], focused, cx)).collect::<Vec<_>>()
+                                    range
+                                        .filter_map(|i| {
+                                            Some(match items[i] {
+                                                GraphItem::Commit(ix) => panel.render_graph_row(ix, graph.get(ix)?, focused, cx),
+                                                GraphItem::File(ix, fi) => panel.render_commit_file_row(i, ix, Some(fi), graph.get(ix)?, focused, cx),
+                                                GraphItem::Loading(ix) => panel.render_commit_file_row(i, ix, None, graph.get(ix)?, focused, cx),
+                                            })
+                                        })
+                                        .collect::<Vec<_>>()
                                 }),
                             )
                             .track_scroll(self.graph_scroll.clone())
