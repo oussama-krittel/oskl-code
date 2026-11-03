@@ -361,6 +361,20 @@ struct OutputLine {
     err: bool,
 }
 
+/// One command's output, kept in the panel's history while the window is open (never on disk).
+struct OutputEntry {
+    title: String,
+    lines: Vec<OutputLine>,
+    /// The command failed.
+    err: bool,
+    /// When it ran (unix seconds).
+    time: i64,
+}
+
+/// The output history's limits: entries, and lines across all of them (oldest go first).
+const OUTPUT_KEEP: usize = 25;
+const OUTPUT_KEEP_LINES: usize = 40_000;
+
 const COMMANDS: &[(&str, &str, bool)] = &[
     ("w", "Save the current file", false),
     ("q", "Close the current tab (q! discards changes)", false),
@@ -442,8 +456,10 @@ pub struct Workspace {
     resizing_side: bool,
     /// Where on the edge the drag started, from its line (real pixels): the edge keeps that offset.
     resize_grab: f32,
-    output: Vec<OutputLine>,
-    output_title: String,
+    /// Outputs of this window's commands, oldest first, and the one shown.
+    outputs: Vec<OutputEntry>,
+    output_shown: usize,
+    output_history_open: bool,
     output_visible: bool,
     output_h: f32,
     resizing_output: bool,
@@ -567,8 +583,9 @@ impl Workspace {
             side_w: 300.,
             resizing_side: false,
             resize_grab: 0.,
-            output: Vec::new(),
-            output_title: String::new(),
+            outputs: Vec::new(),
+            output_shown: 0,
+            output_history_open: false,
             output_visible: false,
             output_h: 220.,
             resizing_output: false,
@@ -821,16 +838,20 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The lines of the output shown.
+    fn output(&self) -> &[OutputLine] {
+        self.outputs.get(self.output_shown).map(|e| e.lines.as_slice()).unwrap_or(&[])
+    }
+
     fn show_output(&mut self, title: String, text: &str, err: bool, cx: &mut Context<Self>) {
-        self.output_title = title;
-        self.output = text
+        let mut lines: Vec<OutputLine> = text
             .lines()
             .take(20_000)
             .map(|l| OutputLine { text: l.to_string().into(), loc: util::parse_location(l), err: false })
             .collect();
         // ESLint's default output lists the file once, then "line:col" rows under it.
         let mut current_file: Option<String> = None;
-        for line in self.output.iter_mut() {
+        for line in lines.iter_mut() {
             let t = line.text.to_string();
             if !t.starts_with(' ') && (t.starts_with('/') || t.contains('.')) && !t.contains(' ') {
                 current_file = Some(t.trim().to_string());
@@ -844,9 +865,19 @@ impl Workspace {
             }
             line.err = err && line.loc.is_none() && !t.trim().is_empty();
         }
-        if self.output.is_empty() {
-            self.output.push(OutputLine { text: "(no output)".into(), loc: None, err: false });
+        if lines.is_empty() {
+            lines.push(OutputLine { text: "(no output)".into(), loc: None, err: false });
         }
+        // The same command with the same result again replaces it rather than piling up.
+        let same = self.outputs.last().is_some_and(|e| e.title == title && e.lines.len() == lines.len() && e.lines.iter().zip(&lines).all(|(a, b)| a.text == b.text));
+        if same {
+            self.outputs.pop();
+        }
+        self.outputs.push(OutputEntry { title, lines, err, time: util::now() });
+        while self.outputs.len() > OUTPUT_KEEP || (self.outputs.len() > 1 && self.outputs.iter().map(|e| e.lines.len()).sum::<usize>() > OUTPUT_KEEP_LINES) {
+            self.outputs.remove(0);
+        }
+        self.output_shown = self.outputs.len() - 1;
         self.output_visible = true;
         self.output_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.output_sel = 0;
@@ -2285,8 +2316,40 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Shows another entry of the output history.
+    fn show_output_entry(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.outputs.len() {
+            self.output_shown = ix;
+            self.output_sel = 0;
+            self.output_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            cx.notify();
+        }
+    }
+
+    /// Takes one entry out of the history (None: all of them).
+    fn remove_output(&mut self, ix: Option<usize>, cx: &mut Context<Self>) {
+        match ix {
+            Some(ix) if ix < self.outputs.len() => {
+                self.outputs.remove(ix);
+                if self.output_shown > ix || self.output_shown >= self.outputs.len() {
+                    self.output_shown = self.output_shown.saturating_sub(1);
+                }
+            }
+            Some(_) => return,
+            None => {
+                self.outputs.clear();
+                self.output_shown = 0;
+            }
+        }
+        self.output_sel = 0;
+        if self.outputs.is_empty() {
+            self.output_history_open = false;
+        }
+        cx.notify();
+    }
+
     fn output_move(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let n = self.output.len();
+        let n = self.output().len();
         if n == 0 {
             return;
         }
@@ -2296,7 +2359,7 @@ impl Workspace {
     }
 
     fn output_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((file, row, _)) = self.output.get(self.output_sel).and_then(|l| l.loc.clone()) else { return };
+        let Some((file, row, _)) = self.output().get(self.output_sel).and_then(|l| l.loc.clone()) else { return };
         let root = self.root(cx);
         self.open_file(resolve(&root, &file), Some(row), false, window, cx);
     }
@@ -4401,8 +4464,10 @@ impl Workspace {
     }
 
     fn render_output(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let count = self.output.len();
+        let count = self.output().len();
         let page = ((self.output_h - 40.) / 18.).max(1.) as isize;
+        let title = self.outputs.get(self.output_shown).map(|e| e.title.clone()).unwrap_or_default();
+        let (shown, total) = (self.output_shown, self.outputs.len());
         div()
             .key_context("Output")
             .track_focus(&self.output_focus)
@@ -4455,12 +4520,41 @@ impl Workspace {
                     .gap(px(8.))
                     .text_size(px(10.5))
                     .child(div().border_b_1().border_color(theme::fg()).child("OUTPUT"))
-                    .child(div().flex_1().text_color(theme::fg_dim()).overflow_hidden().whitespace_nowrap().child(self.output_title.clone()))
+                    .child(div().flex_1().min_w_0().text_color(theme::fg_dim()).overflow_hidden().text_ellipsis().whitespace_nowrap().child(title))
+                    // Earlier commands' output: older / newer, and the whole list.
+                    .when(total > 1, |d| {
+                        d.child(
+                            ui::icon_button("output-older", "chevron-left")
+                                .tooltip(ui::tooltip("Older output"))
+                                .when(shown == 0, |b| b.opacity(0.4))
+                                .on_click(cx.listener(move |ws, _, _, cx| ws.show_output_entry(shown.saturating_sub(1), cx))),
+                        )
+                        .child(div().text_color(theme::fg_muted()).child(format!("{} / {total}", shown + 1)))
+                        .child(
+                            ui::icon_button("output-newer", "chevron-right")
+                                .tooltip(ui::tooltip("Newer output"))
+                                .when(shown + 1 >= total, |b| b.opacity(0.4))
+                                .on_click(cx.listener(move |ws, _, _, cx| ws.show_output_entry(shown + 1, cx))),
+                        )
+                    })
+                    .when(total > 0, |d| {
+                        d.child(
+                            ui::icon_button("output-history", "list-flat")
+                                .debug_selector(|| "output-history".into())
+                                .tooltip(ui::tooltip("Output history: earlier commands in this window"))
+                                .when(self.output_history_open, |b| b.bg(theme::selected()))
+                                .on_click(cx.listener(|ws, _, _, cx| {
+                                    ws.output_history_open = !ws.output_history_open;
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(ui::icon_button("output-close", "close").on_click(cx.listener(|ws, _, _, cx| {
                         ws.output_visible = false;
                         cx.notify();
                     }))),
             )
+            .when(self.output_history_open && total > 0, |d| d.child(deferred(self.render_output_history(cx)).with_priority(2)))
             .child(
                 uniform_list(
                     "output",
@@ -4468,7 +4562,7 @@ impl Workspace {
                     cx.processor(|ws, range: Range<usize>, _window, cx| {
                         range
                             .map(|ix| {
-                                let line = &ws.output[ix];
+                                let Some(line) = ws.output().get(ix) else { return div().id(("out", ix)) };
                                 let loc = line.loc.clone();
                                 let selected = ix == ws.output_sel && ws.output_focus.is_focused(_window);
                                 div()
@@ -4493,6 +4587,85 @@ impl Workspace {
                 )
                 .track_scroll(self.output_scroll.clone())
                 .flex_1(),
+            )
+    }
+
+    /// The output history: newest first, each with when it ran and a ×; Clear all at the bottom.
+    fn render_output_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.outputs.iter().enumerate().rev().map(|(ix, e)| {
+            let on = ix == self.output_shown;
+            let row_sel = format!("output-entry-{ix}");
+            let x_sel = format!("output-remove-{ix}");
+            div()
+                .id(("output-entry", ix))
+                .debug_selector(move || row_sel)
+                .group("output-entry")
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .h(px(24.))
+                .px(px(10.))
+                .mx(px(4.))
+                .rounded(px(3.))
+                .cursor_pointer()
+                .when(on, |d| d.bg(theme::selected_focused()))
+                .when(!on, |d| d.hover(|s| s.bg(theme::hover())))
+                .on_click(cx.listener(move |ws, _, _, cx| {
+                    ws.output_history_open = false;
+                    ws.show_output_entry(ix, cx);
+                }))
+                .child(div().size(px(7.)).rounded(px(4.)).bg(if e.err { theme::git_deleted() } else { theme::git_added() }))
+                .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(if on { theme::fg_bright() } else { theme::fg() }).child(e.title.clone()))
+                .child(div().flex_none().text_color(theme::fg_muted()).child(util::relative_time(e.time)))
+                .child(
+                    ui::icon_button(("output-remove", ix), "close")
+                        .debug_selector(move || x_sel)
+                        .tooltip(ui::tooltip("Remove from the history"))
+                        .on_click(cx.listener(move |ws, _, _, cx| {
+                            cx.stop_propagation();
+                            ws.remove_output(Some(ix), cx);
+                        })),
+                )
+        });
+        div()
+            .id("output-history-list")
+            .occlude()
+            .absolute()
+            .top(px(30.))
+            .right(px(8.))
+            .w(px(380.))
+            .max_h(px((self.output_h - 36.).max(120.)))
+            .py(px(4.))
+            .flex()
+            .flex_col()
+            .bg(theme::bg_popup())
+            .border_1()
+            .border_color(theme::border_input())
+            .rounded(px(6.))
+            .shadow_lg()
+            .text_size(px(11.))
+            .on_mouse_down_out(cx.listener(|ws, _, _, cx| {
+                ws.output_history_open = false;
+                cx.notify();
+            }))
+            .child(div().px(px(14.)).py(px(4.)).text_size(px(10.)).text_color(theme::fg_muted()).child("OUTPUT HISTORY · THIS WINDOW"))
+            .child(div().id("output-history-rows").flex_1().min_h_0().overflow_y_scroll().children(rows))
+            .child(
+                div()
+                    .id("output-clear-all")
+                    .debug_selector(|| "output-clear-all".into())
+                    .mt(px(4.))
+                    .mx(px(4.))
+                    .px(px(10.))
+                    .py(px(5.))
+                    .rounded(px(3.))
+                    .border_t_1()
+                    .border_color(theme::border())
+                    .cursor_pointer()
+                    .text_color(theme::git_deleted())
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(|ws, _, _, cx| ws.remove_output(None, cx)))
+                    .child("Clear all"),
             )
     }
 
@@ -5839,6 +6012,48 @@ mod ui_tests {
         cx.simulate_event(gpui::MouseUpEvent { position: gpui::point(from.x, from.y - gpui::px(80.)), modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: 1 });
         cx.run_until_parked();
         assert!((height(cx) - (h + 80.)).abs() < 2., "output {h} → {}", height(cx));
+    }
+
+    #[gpui::test]
+    fn output_keeps_a_history_you_can_browse_and_clear(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let run = |cx: &mut VisualTestContext, title: &str, text: &str, err: bool| {
+            ws.update(cx, |ws, cx| ws.show_output(title.into(), text, err, cx));
+            cx.run_until_parked();
+        };
+        let titles = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.outputs.iter().map(|e| e.title.clone()).collect::<Vec<_>>());
+        let shown = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| (ws.outputs[ws.output_shown].title.clone(), ws.output()[0].text.to_string()));
+        run(cx, "$ npm test", "1 failing", true);
+        run(cx, "eslint", "clean", false);
+        run(cx, "$ git push", "rejected", true);
+        assert_eq!(titles(cx), ["$ npm test", "eslint", "$ git push"]);
+        assert_eq!(shown(cx).0, "$ git push", "the newest is shown");
+        run(cx, "$ git push", "rejected", true);
+        assert_eq!(titles(cx).len(), 3, "the same result again doesn't pile up");
+
+        let click = |cx: &mut VisualTestContext, sel: &'static str| {
+            let at = cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} on screen")).center();
+            cx.simulate_click(at, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        // The list: pick an old one, it's shown again.
+        click(cx, "output-history");
+        click(cx, "output-entry-0");
+        assert_eq!(shown(cx), ("$ npm test".to_string(), "1 failing".to_string()), "an old command's result");
+        // Remove one from the list, then clear them all.
+        click(cx, "output-history");
+        click(cx, "output-remove-1");
+        assert_eq!(titles(cx), ["$ npm test", "$ git push"]);
+        assert_eq!(shown(cx).0, "$ npm test", "still showing the one picked");
+        click(cx, "output-clear-all");
+        assert!(titles(cx).is_empty());
+
+        // It keeps the last 25.
+        for i in 0..30 {
+            run(cx, &format!("run {i}"), &format!("out {i}"), false);
+        }
+        let t = titles(cx);
+        assert_eq!((t.len(), t[0].as_str(), t[24].as_str()), (25, "run 5", "run 29"));
     }
 
     #[gpui::test]
