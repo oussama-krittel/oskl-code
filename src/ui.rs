@@ -92,7 +92,7 @@ pub fn badge(text: impl Into<SharedString>, bg: Hsla) -> Div {
         .justify_center()
         .rounded(px(9.))
         .bg(bg)
-        .text_color(theme::fg_bright())
+        .text_color(theme::on(bg))
         .text_size(px(10.5))
         .child(text.into())
 }

@@ -975,7 +975,7 @@ impl Workspace {
                 .border_1()
                 .when(main, |d| {
                     let bg = if st.ask.danger { danger } else { theme::accent() };
-                    d.bg(bg).border_color(bg).text_color(theme::c(0xffffff)).hover(|s| s.opacity(0.9))
+                    d.bg(bg).border_color(bg).text_color(theme::on(bg)).hover(|s| s.opacity(0.9))
                 })
                 .when(!main, |d| d.border_color(theme::border_input()).text_color(theme::fg()).hover(|s| s.bg(theme::hover())))
                 .when(selected, |d| d.border_color(theme::focus_border()))
@@ -4370,7 +4370,7 @@ impl Workspace {
                     .py(px(7.))
                     .rounded(px(5.))
                     .bg(theme::c(0x5ee7c4))
-                    .text_color(theme::bg_app())
+                    .text_color(theme::on(theme::c(0x5ee7c4)))
                     .font_weight(FontWeight::BOLD)
                     .cursor_pointer()
                     .hover(|s| s.opacity(0.85))

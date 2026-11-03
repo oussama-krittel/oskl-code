@@ -215,7 +215,7 @@ impl MergeView {
                                 .rounded(px(2.))
                                 .border_1()
                                 .border_color(theme::fg_dim())
-                                .when(on, |d| d.bg(theme::accent()).text_color(theme::c(0xffffff)).child("✓")),
+                                .when(on, |d| d.bg(theme::accent()).text_color(theme::on(theme::accent())).child("✓")),
                         )
                         .child(if incoming { "Accept Incoming" } else { "Accept Current" })
                         .child(div().flex_1())
@@ -280,7 +280,7 @@ impl Render for MergeView {
                 .items_center()
                 .rounded(px(3.))
                 .cursor_pointer()
-                .when(primary, |d| d.bg(theme::accent()).text_color(theme::c(0xffffff)).hover(|s| s.bg(theme::accent_hover())))
+                .when(primary, |d| d.bg(theme::accent()).text_color(theme::on(theme::accent())).hover(|s| s.bg(theme::accent_hover())))
                 .when(!primary, |d| d.border_1().border_color(theme::border_input()).hover(|s| s.bg(theme::hover())))
                 .child(label)
         };

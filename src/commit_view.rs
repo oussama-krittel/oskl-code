@@ -467,9 +467,9 @@ impl Render for CommitView {
                 .h(px(18.))
                 .rounded(px(9.))
                 .bg(color)
-                .text_color(theme::c(0xffffff))
+                .text_color(theme::on(color))
                 .text_size(px(10.5))
-                .child(ui::small_icon(icon, theme::c(0xffffff)))
+                .child(ui::small_icon(icon, theme::on(color)))
                 .child(r.name.clone())
         }));
 

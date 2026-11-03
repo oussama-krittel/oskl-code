@@ -1532,7 +1532,7 @@ impl GitPanel {
                             .h(px(26.))
                             .rounded(px(2.))
                             .bg(theme::accent())
-                            .text_color(theme::c(0xffffff))
+                            .text_color(theme::on(theme::accent()))
                             .child(
                                 div()
                                     .id("commit-button")
@@ -1547,7 +1547,7 @@ impl GitPanel {
                                         let amend = panel.amend;
                                         panel.commit(None, false, amend, window, cx)
                                     }))
-                                    .child(ui::icon("check", theme::c(0xffffff)))
+                                    .child(ui::icon("check", theme::on(theme::accent())))
                                     .child(busy.unwrap_or(commit_label.to_string())),
                             )
                             .child(div().w(px(1.)).my(px(4.)).bg(theme::ca(0xffffff55)))
@@ -1565,7 +1565,7 @@ impl GitPanel {
                                         cx.emit(Request::Message(if panel.amend { "Amend mode on: the next commit amends HEAD".into() } else { "Amend mode off".into() }));
                                         cx.notify();
                                     }))
-                                    .child(ui::small_icon("chevron-down", theme::c(0xffffff))),
+                                    .child(ui::small_icon("chevron-down", theme::on(theme::accent()))),
                             ),
                     )
                     .when(branch.is_empty(), |d| d.child(div().text_color(theme::fg_muted()).child("Not a git repository"))),
@@ -1690,9 +1690,9 @@ impl GitPanel {
                         cx.notify();
                     }))
                     .bg(color)
-                    .text_color(theme::c(0xffffff))
+                    .text_color(theme::on(color))
                     .text_size(px(10.5))
-                    .child(ui::small_icon(icon_name, theme::c(0xffffff)).size(px(12.)))
+                    .child(ui::small_icon(icon_name, theme::on(color)).size(px(12.)))
                     .child(r.name.clone()),
             )
         });
@@ -1746,6 +1746,7 @@ impl GitPanel {
             .child(
                 div()
                     .flex()
+                    .items_center()
                     .flex_1()
                     .min_w_0()
                     .gap(px(6.))
@@ -1761,15 +1762,20 @@ impl GitPanel {
                             .when(is_head, |d| d.font_weight(FontWeight::BOLD))
                             .child(commit.subject.clone()),
                     )
+                    // The author is small and gives way first, so the message stays readable.
                     .child(
                         div()
-                            .flex_shrink_0()
-                            .max_w(relative(0.35))
+                            .min_w_0()
+                            .max_w(relative(0.28))
                             .overflow_hidden()
                             .text_ellipsis()
-                            .text_size(px(11.))
+                            .text_size(px(9.5))
                             .text_color(theme::fg_muted())
                             .when(!contained, |d| d.opacity(0.6))
+                            .map(|mut d| {
+                                d.style().flex_shrink = Some(6.);
+                                d
+                            })
                             .child(commit.author.clone()),
                     ),
             )
