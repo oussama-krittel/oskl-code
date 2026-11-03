@@ -164,6 +164,8 @@ const ACTIVITY_W: f32 = 40.;
 const STATUS_H: f32 = 22.;
 /// Height kept clear for the macOS window buttons (close / minimize / zoom) at the top-left.
 const LIGHTS_H: f32 = 30.;
+/// How wide the sidebar's resize edge is to grab (real pixels, centered on its line).
+const GRAB_W: f32 = 12.;
 /// Width the window buttons take from the left edge.
 const LIGHTS_W: f32 = 76.;
 
@@ -438,6 +440,8 @@ pub struct Workspace {
     side_visible: bool,
     side_w: f32,
     resizing_side: bool,
+    /// Where on the edge the drag started, from its line (real pixels): the edge keeps that offset.
+    resize_grab: f32,
     output: Vec<OutputLine>,
     output_title: String,
     output_visible: bool,
@@ -562,6 +566,7 @@ impl Workspace {
             side_visible: has_project,
             side_w: 300.,
             resizing_side: false,
+            resize_grab: 0.,
             output: Vec::new(),
             output_title: String::new(),
             output_visible: false,
@@ -2460,6 +2465,12 @@ impl Workspace {
     fn show_keys_panel(&mut self, _: &ShowKeysPanel, window: &mut Window, cx: &mut Context<Self>) {
         self.side = Side::Keys;
         self.focus_sidebar(window, cx);
+    }
+
+    /// How far a point is from the window edge the sidebar sits on (real pixels).
+    fn side_edge_distance(&self, p: Point<Pixels>) -> f32 {
+        let b = self.window_bounds.get();
+        if self.settings.sidebar_right { (b.right() - p.x) / gpui::px(1.) } else { (p.x - b.left()) / gpui::px(1.) }
     }
 
     /// ⌘⇧+ / ⌘⇧− / ⌘⇧0: zoom the interface (panels, tabs, bars), leaving code text as it is.
@@ -4408,21 +4419,33 @@ impl Workspace {
             .flex_col()
             .flex_none()
             .h(px(self.output_h))
+            .relative()
             .bg(theme::bg_editor())
             .border_t_1()
             .border_color(theme::border())
-            .child(
+            // Like the sidebar's edge: wide to grab, centered on the line, over what's above.
+            .child(deferred(
                 div()
                     .id("output-resize")
-                    .h(px(4.))
-                    .mt(px(-2.))
+                    .debug_selector(|| "output-resize".into())
+                    .group("output-resize")
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(gpui::px(-GRAB_W / 2.))
+                    .h(gpui::px(GRAB_W))
+                    .flex()
+                    .flex_col()
+                    .justify_center()
                     .cursor(CursorStyle::ResizeUpDown)
-                    .hover(|s| s.bg(theme::focus_border()))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|ws, _, _, cx| {
+                    .on_mouse_down(MouseButton::Left, cx.listener(|ws, ev: &MouseDownEvent, _, cx| {
                         ws.resizing_output = true;
+                        let b = ws.window_bounds.get();
+                        ws.resize_grab = (b.bottom() - ev.position.y) / gpui::px(1.) - (ws.output_h + STATUS_H) * ui::scale();
                         cx.stop_propagation();
-                    })),
-            )
+                    }))
+                    .child(div().h(gpui::px(2.)).w_full().group_hover("output-resize", |s| s.bg(theme::focus_border())).when(self.resizing_output, |d| d.bg(theme::focus_border()))),
+            ))
             .child(
                 div()
                     .flex()
@@ -4823,22 +4846,42 @@ impl Render for Workspace {
             (true, true, _) => LIGHTS_W - 8. * ui::scale(),
         };
         let side_block = self.side_visible.then(|| {
+            // A wide grab area centered on the thin line, drawn over the editor beside it
+            // (deferred), so the edge is easy to catch and always gets the mouse first.
             let handle = div()
                 .id("side-resize")
-                .flex_none()
-                .w(px(4.))
-                .h_full()
-                .when(!right, |d| d.ml(px(-2.)).border_l_1())
-                .when(right, |d| d.mr(px(-2.)).border_r_1())
-                .border_color(theme::border())
+                .debug_selector(|| "side-resize".into())
+                .group("side-resize")
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .w(gpui::px(GRAB_W))
+                .when(!right, |d| d.right(gpui::px(-GRAB_W / 2.)))
+                .when(right, |d| d.left(gpui::px(-GRAB_W / 2.)))
+                .flex()
+                .justify_center()
                 .cursor(CursorStyle::ResizeLeftRight)
-                .hover(|s| s.bg(theme::focus_border()))
-                .on_mouse_down(MouseButton::Left, cx.listener(|ws, _, _, cx| {
+                .on_mouse_down(MouseButton::Left, cx.listener(|ws, ev: &MouseDownEvent, _, cx| {
                     ws.resizing_side = true;
+                    ws.resize_grab = ws.side_edge_distance(ev.position) - (ws.side_w + ACTIVITY_W) * ui::scale();
                     cx.stop_propagation();
-                }));
-            let panel = div().flex_none().w(px(self.side_w)).h_full().min_w_0().overflow_hidden().px(px(5.)).when(!right && lights, |d| d.pt(gpui::px(LIGHTS_H))).text_size(px(11.)).bg(theme::bg_side()).child(sidebar);
-            if right { div().flex().h_full().child(handle).child(panel) } else { div().flex().h_full().child(panel).child(handle) }
+                }))
+                .child(div().w(gpui::px(2.)).h_full().group_hover("side-resize", |s| s.bg(theme::focus_border())).when(self.resizing_side, |d| d.bg(theme::focus_border())));
+            let panel = div()
+                .flex_none()
+                .w(px(self.side_w))
+                .h_full()
+                .min_w_0()
+                .overflow_hidden()
+                .px(px(5.))
+                .when(!right, |d| d.border_r_1())
+                .when(right, |d| d.border_l_1())
+                .border_color(theme::border())
+                .when(!right && lights, |d| d.pt(gpui::px(LIGHTS_H)))
+                .text_size(px(11.))
+                .bg(theme::bg_side())
+                .child(sidebar);
+            div().relative().flex().h_full().child(panel).child(deferred(handle))
         });
         let main = div()
             .flex()
@@ -4990,12 +5033,12 @@ impl Render for Workspace {
                 }
                 let b = ws.window_bounds.get();
                 if ws.resizing_side {
-                    let w = if ws.settings.sidebar_right { (b.right() - ev.position.x) / gpui::px(1.) } else { (ev.position.x - b.left()) / gpui::px(1.) };
+                    let w = ws.side_edge_distance(ev.position) - ws.resize_grab;
                     // The mouse is in real pixels; the width is stored before the interface zoom.
                     ws.side_w = (w / ui::scale() - ACTIVITY_W).clamp(170., 900.);
                 }
                 if ws.resizing_output {
-                    ws.output_h = ((b.bottom() - ev.position.y) / gpui::px(1.) / ui::scale() - STATUS_H).clamp(80., (b.size.height / gpui::px(1.)) / ui::scale() * 0.8);
+                    ws.output_h = (((b.bottom() - ev.position.y) / gpui::px(1.) - ws.resize_grab) / ui::scale() - STATUS_H).clamp(80., (b.size.height / gpui::px(1.)) / ui::scale() * 0.8);
                 }
                 cx.notify();
             }))
@@ -5740,6 +5783,62 @@ mod ui_tests {
         // Saved for next time.
         let saved = std::fs::read_to_string(std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".config/kite/settings")).unwrap();
         assert!(saved.contains("theme = default") && saved.contains("ui_zoom = 1.00"), "{saved}");
+    }
+
+    #[gpui::test]
+    fn the_sidebar_resizes_by_dragging_its_edge(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("a.txt"), None, false, window, cx));
+        cx.run_until_parked();
+        let width = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.side_w);
+        let edge = cx.debug_bounds("side-resize").expect("the edge");
+        let before = width(cx);
+        let drag = |cx: &mut VisualTestContext, from: gpui::Point<gpui::Pixels>, by: f32| {
+            let to = gpui::point(from.x + gpui::px(by), from.y);
+            cx.simulate_event(gpui::MouseDownEvent { position: from, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: 1, first_mouse: false });
+            for i in 1..=4 {
+                let p = gpui::point(from.x + gpui::px(by * i as f32 / 4.), from.y);
+                cx.simulate_event(gpui::MouseMoveEvent { position: p, modifiers: gpui::Modifiers::none(), pressed_button: Some(gpui::MouseButton::Left) });
+            }
+            cx.simulate_event(gpui::MouseUpEvent { position: to, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: 1 });
+            cx.run_until_parked();
+        };
+        // Over the editor, which handles its own mouse moves.
+        drag(cx, edge.center(), 100.);
+        assert!((width(cx) - (before + 100.)).abs() < 2., "dragged 100px: {before} → {}", width(cx));
+        // A few pixels off the line still grabs it.
+        let b = width(cx);
+        let edge = cx.debug_bounds("side-resize").expect("the edge, where it is now");
+        drag(cx, gpui::point(edge.center().x + gpui::px(4.), edge.center().y), -60.);
+        assert!((width(cx) - (b - 60.)).abs() < 2., "grabbed beside the line: {b} → {}", width(cx));
+
+        // On the right, at 120% interface zoom: dragging left widens it, by the zoomed amount.
+        crate::ui::set_scale(1.2);
+        ws.update(cx, |ws, cx| {
+            ws.settings.sidebar_right = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let b = width(cx);
+        let edge = cx.debug_bounds("side-resize").expect("the edge on the right");
+        drag(cx, edge.center(), -120.);
+        assert!((width(cx) - (b + 100.)).abs() < 2., "120px at 120% is 100: {b} → {}", width(cx));
+        crate::ui::set_scale(1.);
+
+        // The output panel's top edge: grabbed a little above its line, dragged up 80px.
+        cx.simulate_keystrokes("cmd-j");
+        cx.run_until_parked();
+        let height = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.output_h);
+        let h = height(cx);
+        let top = cx.debug_bounds("output-resize").expect("the output panel's edge");
+        let from = gpui::point(top.center().x, top.center().y - gpui::px(4.));
+        cx.simulate_event(gpui::MouseDownEvent { position: from, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: 1, first_mouse: false });
+        cx.simulate_event(gpui::MouseMoveEvent { position: gpui::point(from.x, from.y - gpui::px(80.)), modifiers: gpui::Modifiers::none(), pressed_button: Some(gpui::MouseButton::Left) });
+        cx.simulate_event(gpui::MouseUpEvent { position: gpui::point(from.x, from.y - gpui::px(80.)), modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: 1 });
+        cx.run_until_parked();
+        assert!((height(cx) - (h + 80.)).abs() < 2., "output {h} → {}", height(cx));
     }
 
     #[gpui::test]
