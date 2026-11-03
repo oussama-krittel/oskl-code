@@ -22,6 +22,8 @@ use crate::{theme, tools, ui, util};
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::*;
+// Sizes follow the interface zoom.
+use crate::ui::px;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::ops::Range;
@@ -38,6 +40,7 @@ actions!(
         ToggleBlame, ZoomIn, ZoomOut, Quit, GoToLine, RunShell, FocusCommit, ShowKeys, Lint,
         OutputDown, OutputUp, OutputPageDown, OutputPageUp, OutputTop, OutputBottom, OutputOpen, OutputLeave,
         OpenFolder, OpenFolderNewWindow, NextWindow, SearchAll, ShowKeysPanel, ToggleSidebarSide,
+        UiZoomIn, UiZoomOut, UiZoomReset, ShowSettings,
         SplitRight, SplitDown, ClosePane, ZoomPane, FocusLeft, FocusRight, FocusUp, FocusDown,
         NewTerminal, ToggleTerminal, PaneBuffers,
         GoBack, GoForward, TogglePreview, PreviewToSide,
@@ -108,8 +111,12 @@ pub fn bind_keys() {
         crate::keybindings::kb("shift-alt-f", FormatFile, None),
         crate::keybindings::kb("cmd-alt-b", ToggleBlame, None),
         crate::keybindings::kb("cmd-=", ZoomIn, None),
-        crate::keybindings::kb("cmd-+", ZoomIn, None),
         crate::keybindings::kb("cmd--", ZoomOut, None),
+        // ⌘⇧= / ⌘⇧− / ⌘⇧0 reach the app as ⌘+ / ⌘_ / ⌘): the interface, not the code text.
+        crate::keybindings::kb("cmd-+", UiZoomIn, None),
+        crate::keybindings::kb("cmd-_", UiZoomOut, None),
+        crate::keybindings::kb("cmd-)", UiZoomReset, None),
+        crate::keybindings::kb("cmd-,", ShowSettings, None),
         crate::keybindings::kb("cmd-q", Quit, None),
         crate::keybindings::kb("ctrl-g", GoToLine, None),
         crate::keybindings::kb("ctrl-shift-1", RunShell, None),
@@ -165,6 +172,8 @@ enum Side {
     Files,
     Search,
     Git,
+    /// Settings, and its Shortcuts tab (the shortcuts list).
+    Settings,
     Keys,
 }
 
@@ -1221,6 +1230,7 @@ impl Workspace {
                 Side::Files => "files",
                 Side::Search => "search",
                 Side::Git => "git",
+                Side::Settings => "settings",
                 Side::Keys => "keys",
             }
             .into(),
@@ -1310,6 +1320,7 @@ impl Workspace {
             "search" => Side::Search,
             "git" => Side::Git,
             "keys" => Side::Keys,
+            "settings" => Side::Settings,
             _ => Side::Files,
         };
         self.side_visible = saved.side_visible;
@@ -1402,11 +1413,11 @@ impl Workspace {
                 continue;
             }
             let o = b.center();
-            let (ddx, ddy) = ((o.x - c.x) / px(1.), (o.y - c.y) / px(1.));
+            let (ddx, ddy) = ((o.x - c.x) / gpui::px(1.), (o.y - c.y) / gpui::px(1.));
             let ok = (dx > 0 && ddx > 1.) || (dx < 0 && ddx < -1.) || (dy > 0 && ddy > 1.) || (dy < 0 && ddy < -1.);
             // Only splits that line up with this one (share some height for ←→, width for ↑↓):
             // a split that's only diagonal is reached by wrapping instead.
-            let f = |p: Pixels| p / px(1.);
+            let f = |p: Pixels| p / gpui::px(1.);
             let overlap = if dx != 0 {
                 f(cur.bottom()).min(f(b.bottom())) - f(cur.top()).max(f(b.top()))
             } else {
@@ -1430,7 +1441,7 @@ impl Workspace {
     fn adjacent(&self, dx: i32, dy: i32) -> Option<usize> {
         let bounds = self.pane_bounds.borrow().clone();
         let cur = *bounds.get(&self.focused_pane)?;
-        let f = |p: Pixels| p / px(1.);
+        let f = |p: Pixels| p / gpui::px(1.);
         let mut best: Option<(f32, usize)> = None;
         for (id, b) in &bounds {
             if *id == self.focused_pane || self.pane(*id).is_none() {
@@ -1468,7 +1479,7 @@ impl Workspace {
     fn wrap_target(&self, dx: i32, dy: i32) -> Option<usize> {
         let bounds = self.pane_bounds.borrow().clone();
         let cur = *bounds.get(&self.focused_pane)?;
-        let f = |p: Pixels| p / px(1.);
+        let f = |p: Pixels| p / gpui::px(1.);
         let panes: Vec<(usize, Bounds<Pixels>)> = bounds.into_iter().filter(|(id, _)| self.pane(*id).is_some()).collect();
         if panes.len() < 2 {
             return None;
@@ -2235,6 +2246,7 @@ impl Workspace {
                 query.read(cx).focus(window);
             }
             Side::Keys => self.keys.read(cx).focus(window, cx),
+            Side::Settings => window.focus(&self.focus),
         }
         cx.notify();
     }
@@ -2448,6 +2460,203 @@ impl Workspace {
     fn show_keys_panel(&mut self, _: &ShowKeysPanel, window: &mut Window, cx: &mut Context<Self>) {
         self.side = Side::Keys;
         self.focus_sidebar(window, cx);
+    }
+
+    /// ⌘⇧+ / ⌘⇧− / ⌘⇧0: zoom the interface (panels, tabs, bars), leaving code text as it is.
+    fn ui_zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
+        use crate::settings::{UI_ZOOM_MAX, UI_ZOOM_MIN, UI_ZOOM_STEP};
+        let next = if delta == 0. { 1. } else { ((ui::scale() + delta * UI_ZOOM_STEP) * 10.).round() / 10. };
+        ui::set_scale(next.clamp(UI_ZOOM_MIN, UI_ZOOM_MAX));
+        self.settings.save();
+        self.flash(format!("Interface {}%", (ui::scale() * 100.).round()), false, cx);
+        cx.refresh_windows();
+    }
+
+    fn set_theme(&mut self, t: theme::Theme, cx: &mut Context<Self>) {
+        theme::set(t);
+        self.settings.save();
+        cx.refresh_windows();
+    }
+
+    fn show_settings(&mut self, _: &ShowSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.side = Side::Settings;
+        self.focus_sidebar(window, cx);
+    }
+
+    /// General · Shortcuts, at the top of both Settings tabs.
+    fn render_settings_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab = |id: &'static str, label: &'static str, side: Side, ws: &Self, cx: &mut Context<Self>| {
+            let on = ws.side == side;
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .px(px(10.))
+                .py(px(4.))
+                .cursor_pointer()
+                .border_b_2()
+                .border_color(if on { theme::accent() } else { gpui::transparent_black() })
+                .text_color(if on { theme::fg_bright() } else { theme::fg_dim() })
+                .hover(|s| s.text_color(theme::fg_bright()))
+                .on_click(cx.listener(move |ws, _, window, cx| {
+                    ws.side = side;
+                    ws.focus_sidebar(window, cx);
+                }))
+                .child(label)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .child(div().flex().items_center().h(px(35.)).px(px(15.)).text_size(px(10.5)).child("SETTINGS"))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(4.))
+                    .px(px(8.))
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .child(tab("settings-tab-general", "General", Side::Settings, self, cx))
+                    .child(tab("settings-tab-shortcuts", "Shortcuts", Side::Keys, self, cx)),
+            )
+    }
+
+    /// The Settings panel: theme, interface and code zoom, where the sidebar goes.
+    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let section = |title: &str| div().px(px(12.)).pt(px(14.)).pb(px(6.)).text_size(px(10.)).text_color(theme::fg_muted()).child(title.to_uppercase());
+        let current = theme::current();
+        let themes = theme::Theme::ALL.into_iter().map(|t| {
+            let on = t == current;
+            let swatch = |hex: u32| div().size(px(12.)).rounded(px(3.)).border_1().border_color(theme::border_input()).bg(theme::c(hex));
+            let [a, b, c] = theme::preview(t);
+            let selector = format!("theme-{}", t.id());
+            div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector)
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .h(px(26.))
+                .mx(px(6.))
+                .px(px(8.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .when(on, |d| d.bg(theme::selected_focused()))
+                .when(!on, |d| d.hover(|s| s.bg(theme::hover())))
+                .on_click(cx.listener(move |ws, _, _, cx| ws.set_theme(t, cx)))
+                .child(div().w(px(12.)).text_color(theme::accent()).child(if on { "●" } else { "○" }))
+                .child(div().flex_1().text_color(if on { theme::fg_bright() } else { theme::fg() }).child(t.label()))
+                .child(div().flex().gap(px(3.)).child(swatch(a)).child(swatch(b)).child(swatch(c)))
+        }).collect::<Vec<_>>();
+        // A label, then − value + (clicking the value resets it), then its shortcut.
+        let stepper = |id: &'static str, label: &'static str, value: String, keys: &'static str, cx: &mut Context<Self>, f: fn(&mut Self, f32, &mut Context<Self>)| {
+            let button = |sub: &'static str, icon: &'static str, delta: f32, cx: &mut Context<Self>| {
+                let bid = format!("{id}-{sub}");
+                div()
+                    .id(SharedString::from(bid.clone()))
+                    .debug_selector(move || bid)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(22.))
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(theme::border_input())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(move |ws, _, _, cx| f(ws, delta, cx)))
+                    .child(ui::small_icon(icon, theme::fg()))
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .px(px(14.))
+                .py(px(5.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(div().flex_1().text_color(theme::fg()).child(label))
+                        .child(button("minus", "minus", -1., cx))
+                        .child(
+                            div()
+                                .id(id)
+                                .w(px(46.))
+                                .text_center()
+                                .cursor_pointer()
+                                .text_color(theme::fg_bright())
+                                .tooltip(ui::tooltip("Click to reset"))
+                                .on_click(cx.listener(move |ws, _, _, cx| f(ws, 0., cx)))
+                                .child(value),
+                        )
+                        .child(button("plus", "plus", 1., cx)),
+                )
+                .child(div().text_size(px(10.)).text_color(theme::fg_muted()).child(keys))
+        };
+        let right = self.settings.sidebar_right;
+        let side_choice = |id: &'static str, label: &'static str, on: bool, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .flex_1()
+                .py(px(3.))
+                .text_center()
+                .rounded(px(4.))
+                .cursor_pointer()
+                .when(on, |d| d.bg(theme::selected_focused()).text_color(theme::fg_bright()))
+                .when(!on, |d| d.text_color(theme::fg_dim()).hover(|s| s.bg(theme::hover())))
+                .on_click(cx.listener(move |ws, _, w, cx| {
+                    if ws.settings.sidebar_right != (id == "sidebar-right") {
+                        ws.toggle_sidebar_side(&ToggleSidebarSide, w, cx);
+                    }
+                }))
+                .child(label)
+        };
+        div()
+            .id("settings-panel")
+            .flex()
+            .flex_col()
+            .size_full()
+            .overflow_y_scroll()
+            .child(self.render_settings_tabs(cx))
+            .child(section("Theme"))
+            .children(themes)
+            .child(section("Zoom"))
+            .child(stepper("ui-zoom", "Interface", format!("{}%", (ui::scale() * 100.).round()), "Panels, tabs and bars · ⌘⇧+  ⌘⇧−  ⌘⇧0", cx, Self::ui_zoom))
+            .child(stepper("code-zoom", "Code text", format!("{}", self.font_size), "Editors, diffs and terminals · ⌘+  ⌘−", cx, Self::zoom))
+            .child(section("Sidebar"))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(2.))
+                    .mx(px(14.))
+                    .p(px(2.))
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(theme::border_input())
+                    .child(side_choice("sidebar-left", "Left", !right, cx))
+                    .child(side_choice("sidebar-right", "Right", right, cx)),
+            )
+            .child(div().px(px(14.)).pt(px(3.)).text_size(px(10.)).text_color(theme::fg_muted()).child("⌘K ⌘B"))
+            .child(section("Shortcuts"))
+            .child(
+                div()
+                    .id("open-shortcuts")
+                    .mx(px(14.))
+                    .px(px(10.))
+                    .py(px(5.))
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(theme::border_input())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(|ws, _, window, cx| {
+                        ws.side = Side::Keys;
+                        ws.focus_sidebar(window, cx);
+                    }))
+                    .child("Keyboard shortcuts…  (⌘K ⌘S)"),
+            )
     }
 
     fn toggle_sidebar_side(&mut self, _: &ToggleSidebarSide, _: &mut Window, cx: &mut Context<Self>) {
@@ -3700,7 +3909,8 @@ impl Workspace {
                 .child(ui::icon(icon, theme::fg_muted()).size(px(size)))
         };
         let item = |id: &'static str, icon: &'static str, side: Side, tip: &'static str, ws: &Self, cx: &mut Context<Self>| {
-            let active = ws.side_visible && ws.side == side;
+            // The Shortcuts tab belongs to Settings.
+            let active = ws.side_visible && (ws.side == side || (side == Side::Settings && ws.side == Side::Keys));
             div()
                 .id(id)
                 .relative()
@@ -3726,7 +3936,7 @@ impl Workspace {
             .when(!right, |d| d.border_r_1())
             .when(right, |d| d.border_l_1())
             .border_color(theme::border())
-            .when(!right && !window.is_fullscreen(), |d| d.pt(px(LIGHTS_H)))
+            .when(!right && !window.is_fullscreen(), |d| d.pt(gpui::px(LIGHTS_H)))
             .child(tool("act-go-to-file", "go-to-file", "Go to File (⌘P)", 19.).on_click(cx.listener(|ws, _, w, cx| ws.find_file(&FindFile, w, cx))))
             .child(div().mx(px(10.)).my(px(2.)).h(px(1.)).bg(theme::border()))
             .child(item("act-files", "files", Side::Files, "Explorer (⇧⌘E)", self, cx))
@@ -3738,10 +3948,9 @@ impl Workspace {
             .child(tool("tb-open", "folder", "Open Folder here (⌘O)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))))
             .child(tool("tb-add-folder", "new-folder", "Add Folder to Workspace…", 16.).on_click(cx.listener(|ws, _, w, cx| ws.add_folder_prompt(w, cx))))
             .child(tool("tb-open-new", "plus", "Open another project in a new window (⌘⇧N) · ⌘` switches", 16.).on_click(cx.listener(|ws, _, w, cx| ws.pick_folder(true, w, cx))))
-            .child(tool("tb-side", "split", "Move sidebar left/right (⌘K ⌘B)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.toggle_sidebar_side(&ToggleSidebarSide, w, cx))))
             .child(tool("tb-panel", "inline", "Toggle output panel (⌘J)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.toggle_output(&ToggleOutput, w, cx))))
             .child(div().mx(px(10.)).my(px(2.)).h(px(1.)).bg(theme::border()))
-            .child(item("act-keys", "keyboard", Side::Keys, "Shortcuts (⌘K ⌘S)", self, cx))
+            .child(item("act-settings", "settings", Side::Settings, "Settings: theme, zoom, sidebar, shortcuts (⌘,)", self, cx))
     }
 
     /// The pane drawn in the main area's top-left corner (the first child all the way down).
@@ -3850,7 +4059,7 @@ impl Workspace {
             .flex_none()
             .items_center()
             .h(px(24.))
-            .pl(px(8. + if id == self.top_left_pane() { self.lights_pad } else { 0. }))
+            .pl(gpui::px(8. * ui::scale() + if id == self.top_left_pane() { self.lights_pad } else { 0. }))
             .pr(px(4.))
             .gap(px(6.))
             .text_size(px(11.))
@@ -4601,15 +4810,17 @@ impl Render for Workspace {
             Side::Files => self.tree.clone().into_any_element(),
             Side::Git => self.git_panel.clone().into_any_element(),
             Side::Search => self.search.clone().into_any_element(),
-            Side::Keys => self.keys.clone().into_any_element(),
+            Side::Keys => div().flex().flex_col().size_full().child(self.render_settings_tabs(cx)).child(div().flex_1().min_h_0().child(self.keys.clone())).into_any_element(),
+            Side::Settings => self.render_settings(cx).into_any_element(),
         };
         let right = self.settings.sidebar_right;
         // The window buttons sit over the top-left corner: whatever is there makes room for them.
         let lights = !window.is_fullscreen();
         self.lights_pad = match (lights, right, self.side_visible) {
             (false, _, _) | (true, false, true) => 0.,
-            (true, false, false) => LIGHTS_W - ACTIVITY_W,
-            (true, true, _) => LIGHTS_W - 8.,
+            // In real pixels: the window buttons don't zoom, what's beside them does.
+            (true, false, false) => LIGHTS_W - ACTIVITY_W * ui::scale(),
+            (true, true, _) => LIGHTS_W - 8. * ui::scale(),
         };
         let side_block = self.side_visible.then(|| {
             let handle = div()
@@ -4626,7 +4837,7 @@ impl Render for Workspace {
                     ws.resizing_side = true;
                     cx.stop_propagation();
                 }));
-            let panel = div().flex_none().w(px(self.side_w)).h_full().min_w_0().overflow_hidden().px(px(5.)).when(!right && lights, |d| d.pt(px(LIGHTS_H))).text_size(px(11.)).bg(theme::bg_side()).child(sidebar);
+            let panel = div().flex_none().w(px(self.side_w)).h_full().min_w_0().overflow_hidden().px(px(5.)).when(!right && lights, |d| d.pt(gpui::px(LIGHTS_H))).text_size(px(11.)).bg(theme::bg_side()).child(sidebar);
             if right { div().flex().h_full().child(handle).child(panel) } else { div().flex().h_full().child(panel).child(handle) }
         });
         let main = div()
@@ -4742,6 +4953,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_blame))
             .on_action(cx.listener(Self::go_to_line))
             .on_action(cx.listener(Self::on_run_shell))
+            .on_action(cx.listener(|ws, _: &UiZoomIn, _, cx| ws.ui_zoom(1., cx)))
+            .on_action(cx.listener(|ws, _: &UiZoomOut, _, cx| ws.ui_zoom(-1., cx)))
+            .on_action(cx.listener(|ws, _: &UiZoomReset, _, cx| ws.ui_zoom(0., cx)))
+            .on_action(cx.listener(Self::show_settings))
             .on_action(cx.listener(|ws, _: &ZoomIn, _, cx| ws.zoom(1., cx)))
             .on_action(cx.listener(|ws, _: &ZoomOut, _, cx| ws.zoom(-1., cx)))
             .on_action(cx.listener(|ws, _: &ShowKeys, _, cx| ws.show_keys(cx)))
@@ -4775,11 +4990,12 @@ impl Render for Workspace {
                 }
                 let b = ws.window_bounds.get();
                 if ws.resizing_side {
-                    let w = if ws.settings.sidebar_right { (b.right() - ev.position.x) / px(1.) } else { (ev.position.x - b.left()) / px(1.) };
-                    ws.side_w = (w - ACTIVITY_W).clamp(170., 900.);
+                    let w = if ws.settings.sidebar_right { (b.right() - ev.position.x) / gpui::px(1.) } else { (ev.position.x - b.left()) / gpui::px(1.) };
+                    // The mouse is in real pixels; the width is stored before the interface zoom.
+                    ws.side_w = (w / ui::scale() - ACTIVITY_W).clamp(170., 900.);
                 }
                 if ws.resizing_output {
-                    ws.output_h = ((b.bottom() - ev.position.y) / px(1.) - STATUS_H).clamp(80., (b.size.height / px(1.)) * 0.8);
+                    ws.output_h = ((b.bottom() - ev.position.y) / gpui::px(1.) / ui::scale() - STATUS_H).clamp(80., (b.size.height / gpui::px(1.)) / ui::scale() * 0.8);
                 }
                 cx.notify();
             }))
@@ -5468,6 +5684,62 @@ mod ui_tests {
             cx.run_until_parked();
             assert!(is_open(cx), "{section}: folded, anywhere on it opens it");
         }
+    }
+
+    #[gpui::test]
+    fn interface_zoom_themes_and_the_settings_panel(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("a.txt"), None, false, window, cx));
+        cx.run_until_parked();
+        let code = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.font_size);
+        let before = code(cx);
+        let tree_row = |cx: &mut VisualTestContext| cx.debug_bounds("settings-tab-general").map(|b| b.size.height);
+
+        // ⌘⇧+ (it arrives as ⌘+) zooms the interface only; ⌘= still zooms the code.
+        cx.simulate_keystrokes("cmd-+ cmd-+");
+        assert!((crate::ui::scale() - 1.2).abs() < 1e-4, "{}", crate::ui::scale());
+        assert_eq!(code(cx), before, "code text keeps its size");
+        cx.simulate_keystrokes("cmd-)");
+        assert_eq!(crate::ui::scale(), 1.);
+        cx.simulate_keystrokes("cmd-=");
+        assert_eq!(code(cx), before + 1.);
+        assert_eq!(crate::ui::scale(), 1., "and ⌘= leaves the interface alone");
+
+        // ⌘, opens Settings; its buttons do the same, and the interface really grows.
+        cx.simulate_keystrokes("cmd-,");
+        cx.run_until_parked();
+        let small = tree_row(cx).expect("Settings is shown");
+        let click = |cx: &mut VisualTestContext, sel: &'static str| {
+            let at = cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} on screen")).center();
+            cx.simulate_click(at, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        click(cx, "ui-zoom-plus");
+        assert!((crate::ui::scale() - 1.1).abs() < 1e-4);
+        let big = tree_row(cx).unwrap();
+        assert!(big > small, "the tabs got bigger: {small:?} → {big:?}");
+        click(cx, "ui-zoom-minus");
+        assert_eq!(crate::ui::scale(), 1.);
+
+        click(cx, "theme-light");
+        assert_eq!(crate::theme::current(), crate::theme::Theme::Light);
+        assert_eq!(crate::theme::bg_editor(), crate::theme::c(0xffffff));
+        click(cx, "theme-default");
+        assert_eq!(crate::theme::bg_editor(), crate::theme::c(0x111318), "Default is the original look");
+
+        click(cx, "sidebar-right");
+        assert!(ws.read_with(cx, |ws, _| ws.settings.sidebar_right));
+        click(cx, "sidebar-left");
+        assert!(!ws.read_with(cx, |ws, _| ws.settings.sidebar_right));
+
+        click(cx, "settings-tab-shortcuts");
+        assert!(ws.read_with(cx, |ws, _| ws.side == super::Side::Keys), "the shortcuts list is a tab of Settings");
+
+        // Saved for next time.
+        let saved = std::fs::read_to_string(std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".config/kite/settings")).unwrap();
+        assert!(saved.contains("theme = default") && saved.contains("ui_zoom = 1.00"), "{saved}");
     }
 
     #[gpui::test]

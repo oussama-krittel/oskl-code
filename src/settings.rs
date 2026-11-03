@@ -21,6 +21,11 @@ impl Default for Settings {
     }
 }
 
+/// Interface zoom range and step (⌘⇧+ / ⌘⇧−).
+pub const UI_ZOOM_MIN: f32 = 0.7;
+pub const UI_ZOOM_MAX: f32 = 1.6;
+pub const UI_ZOOM_STEP: f32 = 0.1;
+
 fn path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/kite/settings"))
 }
@@ -42,6 +47,9 @@ impl Settings {
                 "checks" => s.checks = v != "off",
                 "formatonsave" => s.format_on_save = v != "off",
                 "wrap" => s.word_wrap = v == "on",
+                // App-wide, so kept where every window reads them (not per window).
+                "theme" => crate::theme::set(crate::theme::Theme::from_id(v)),
+                "ui_zoom" => crate::ui::set_scale(v.parse::<f32>().unwrap_or(1.).clamp(UI_ZOOM_MIN, UI_ZOOM_MAX)),
                 "recent" => s.recent_folders.push(PathBuf::from(v)),
                 _ => {}
             }
@@ -59,7 +67,7 @@ impl Settings {
             std::fs::create_dir_all(dir).ok();
         }
         let mut out = format!(
-            "v = 2\nsidebar = {}\nfont_size = {}\nblame = {}\nautosave = {}\nchecks = {}\nformatonsave = {}\nwrap = {}\n",
+            "v = 2\nsidebar = {}\nfont_size = {}\nblame = {}\nautosave = {}\nchecks = {}\nformatonsave = {}\nwrap = {}\ntheme = {}\nui_zoom = {:.2}\n",
             if self.sidebar_right { "right" } else { "left" },
             self.font_size,
             if self.blame_default { "on" } else { "off" },
@@ -67,6 +75,8 @@ impl Settings {
             if self.checks { "on" } else { "off" },
             if self.format_on_save { "on" } else { "off" },
             if self.word_wrap { "on" } else { "off" },
+            crate::theme::current().id(),
+            crate::ui::scale(),
         );
         for r in &self.recent_folders {
             out.push_str(&format!("recent = {}\n", r.display()));

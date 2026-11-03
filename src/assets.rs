@@ -51,6 +51,7 @@ fn icon_body(name: &str) -> Option<&'static str> {
         "inline" => r#"<rect x="1.5" y="2.5" width="13" height="11" rx="1"/><path d="M1.5 8h13"/>"#,
         "copy" => r#"<rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M3.5 10.5h-1v-8h8v1"/>"#,
         "commit" => r#"<circle cx="8" cy="8" r="2.8"/><path d="M1 8h4.2M10.8 8H15"/>"#,
+        "settings" => r#"<circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4"/><circle cx="8" cy="8" r="4.6"/>"#,
         "keyboard" => r#"<rect x="1.5" y="4" width="13" height="8.5" rx="1.2"/><path d="M4 6.6h.01M6.5 6.6h.01M9 6.6h.01M11.5 6.6h.01M4 9h.01M11.5 9h.01M6 10.3h4"/>"#,
         "error" => r#"<circle cx="8" cy="8" r="6"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/>"#,
         "list-tree" => r#"<path d="M2.5 3h4M5 6.5h4M5 10h4M5 13.5h4M3.5 3v10.5M3.5 6.5H5M3.5 10H5M3.5 13.5H5"/><path d="M10.5 6.5h3M10.5 10h3M10.5 13.5h3"/>"#,

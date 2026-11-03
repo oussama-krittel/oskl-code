@@ -8,6 +8,8 @@ use crate::request::{DiffSpec, Request};
 use crate::{theme, ui};
 use gpui::prelude::*;
 use gpui::*;
+// Sizes follow the interface zoom.
+use crate::ui::px;
 use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
@@ -445,7 +447,7 @@ impl GitPanel {
 
     #[cfg(test)]
     pub fn changes_scroll_max(&self) -> f32 {
-        self.changes_scroll.max_offset().height / px(1.)
+        self.changes_scroll.max_offset().height / gpui::px(1.)
     }
 
     pub fn focus(&self, window: &mut Window) {
@@ -1179,7 +1181,8 @@ impl GitPanel {
         let repo = self.repo.read(cx);
         let (all, only) = (repo.graph_all, repo.graph_only.clone());
         let auto = !all && only.is_empty();
-        let top = self.panel_bounds.get().size.height / px(1.) * if self.changes_open && self.graph_open { self.split } else { 0. } + self.head_h() + 25.;
+        // Real pixels: the measured height plus the zoomed header.
+        let top = self.panel_bounds.get().size.height / gpui::px(1.) * if self.changes_open && self.graph_open { self.split } else { 0. } + (self.head_h() + 25.) * ui::scale();
         let option = |id: &'static str, label: &str, on: bool| {
             div()
                 .id(id)
@@ -1199,7 +1202,7 @@ impl GitPanel {
             .id("graph-scope-popup")
             .occlude()
             .absolute()
-            .top(px(top))
+            .top(gpui::px(top))
             .right(px(8.))
             .w(px(270.))
             .py(px(4.))
@@ -2040,10 +2043,10 @@ impl Render for GitPanel {
                         return;
                     }
                     let b = p.panel_bounds.get();
-                    let h = b.size.height / px(1.);
+                    let h = b.size.height / gpui::px(1.);
                     if h > 0. {
-                        let head = p.head_h();
-                        p.split = (((ev.position.y - b.top()) / px(1.) - head) / (h - head)).clamp(0.12, 0.88);
+                        let head = p.head_h() * ui::scale();
+                        p.split = (((ev.position.y - b.top()) / gpui::px(1.) - head) / (h - head)).clamp(0.12, 0.88);
                         cx.notify();
                     }
                 }

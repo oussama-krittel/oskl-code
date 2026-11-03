@@ -6,6 +6,8 @@ use crate::request::Request;
 use crate::{theme, ui};
 use gpui::prelude::*;
 use gpui::*;
+// Sizes follow the interface zoom.
+use crate::ui::px;
 use regex::{Regex, RegexBuilder};
 use std::collections::HashSet;
 use std::ops::Range;

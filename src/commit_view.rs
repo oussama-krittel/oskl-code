@@ -5,6 +5,8 @@ use crate::request::{Back, DiffSpec, Request};
 use crate::{theme, ui, util};
 use gpui::prelude::*;
 use gpui::*;
+// Sizes follow the interface zoom.
+use crate::ui::px;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

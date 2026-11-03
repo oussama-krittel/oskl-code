@@ -5,6 +5,34 @@ use crate::git::FileStatus;
 use crate::theme;
 use gpui::prelude::*;
 use gpui::*;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Interface zoom (⌘⇧+ / ⌘⇧−), 1.0 = 100%: panels, tabs, bars and popups, not code text.
+/// App-wide; in tests, per thread, so tests running side by side don't zoom each other.
+#[cfg(not(test))]
+static SCALE: AtomicU32 = AtomicU32::new(0x3f80_0000);
+#[cfg(test)]
+thread_local!(static SCALE: AtomicU32 = const { AtomicU32::new(0x3f80_0000) });
+
+pub fn scale() -> f32 {
+    #[cfg(not(test))]
+    return f32::from_bits(SCALE.load(Ordering::Relaxed));
+    #[cfg(test)]
+    return SCALE.with(|s| f32::from_bits(s.load(Ordering::Relaxed)));
+}
+
+pub fn set_scale(s: f32) {
+    #[cfg(not(test))]
+    SCALE.store(s.to_bits(), Ordering::Relaxed);
+    #[cfg(test)]
+    SCALE.with(|x| x.store(s.to_bits(), Ordering::Relaxed));
+}
+
+/// `gpui::px` times the interface zoom. The interface's files use this one (it shadows gpui's);
+/// editors, diffs and terminals keep gpui's, so code text follows only ⌘+ / ⌘−.
+pub fn px(v: f32) -> Pixels {
+    gpui::px(v * scale())
+}
 
 pub fn icon(name: &str, color: Hsla) -> Svg {
     svg().path(icon_path(name)).size(px(16.)).flex_none().text_color(color)

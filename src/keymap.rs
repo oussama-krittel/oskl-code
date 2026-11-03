@@ -5,6 +5,8 @@ use crate::keybindings as kb;
 use crate::{theme, ui};
 use gpui::prelude::*;
 use gpui::*;
+// Sizes follow the interface zoom.
+use crate::ui::px;
 
 /// (section, keys, what it does)
 pub const KEYS: &[(&str, &str, &str)] = &[
@@ -26,7 +28,7 @@ pub const KEYS: &[(&str, &str, &str)] = &[
     ("General", "⌃⇧G", "Show source control"),
     ("General", "⌘K ⌘S", "Show this shortcuts manual"),
     ("General", "⌘B", "Toggle sidebar"),
-    ("General", "⌘K ⌘B  ·  activity bar ◫", "Move sidebar left / right  ·  :sidebar left|right"),
+    ("General", "⌘K ⌘B  ·  Settings", "Move sidebar left / right  ·  :sidebar left|right"),
     ("General", "⌘J", "Toggle output panel (lint/format/git output); it gets keyboard focus"),
     ("Output panel", "j  ·  k  ·  ↑  ·  ↓", "Move line by line"),
     ("Output panel", "Space  ·  PgDn  ·  PgUp", "Page down / up"),
@@ -64,7 +66,9 @@ pub const KEYS: &[(&str, &str, &str)] = &[
     ("Terminal", "⇧⌘↑  ·  ⇧⌘↓  (⇧Home / ⇧End)", "Top / bottom of the history"),
     ("Terminal", "exit  ·  ⌃D", "Closes the terminal (and its pane if empty)"),
     ("General", "⌃G", "Go to line"),
-    ("General", "⌘=  ·  ⌘-", "Zoom editor font"),
+    ("General", "⌘=  ·  ⌘-", "Zoom code text (editors, diffs, terminals)"),
+    ("General", "⌘⇧+  ·  ⌘⇧−  ·  ⌘⇧0", "Zoom the interface: panels, tabs, bars (code text stays)"),
+    ("General", "⌘,", "Settings: theme, zoom, sidebar left / right, shortcuts"),
     ("General", "⌘Q", "Quit"),
     ("Editing", "Type / ⌫ / ⌦", "Insert / delete (⌫ in indentation removes one indent level)"),
     ("Editing", "Enter", "New line keeping indentation; between {} opens a block"),

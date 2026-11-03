@@ -577,14 +577,9 @@ fn block_shape(c: char) -> Option<Vec<(f32, f32, f32, f32, f32)>> {
 
 // ---------------------------------------------------------------- colors
 
-const ANSI: [u32; 16] = [
-    0x1d1f21, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xd7dae0,
-    0x5c6370, 0xff7a85, 0xb5e890, 0xffd68a, 0x82c4ff, 0xde9bf0, 0x7fd4dd, 0xffffff,
-];
-
 fn palette(ix: usize) -> Rgb {
     let hex = match ix {
-        0..16 => ANSI[ix],
+        0..16 => theme::ansi(ix),
         16..232 => {
             let i = ix - 16;
             let level = |v: usize| if v == 0 { 0 } else { 55 + v as u32 * 40 };
@@ -594,10 +589,10 @@ fn palette(ix: usize) -> Rgb {
             let v = 8 + (ix as u32 - 232) * 10;
             (v << 16) | (v << 8) | v
         }
-        256 => theme::TERM_FG,
-        257 => theme::TERM_BG,
+        256 => theme::term_fg(),
+        257 => theme::term_bg(),
         258 => 0xaeafad,
-        _ => theme::TERM_FG,
+        _ => theme::term_fg(),
     };
     Rgb { r: (hex >> 16) as u8, g: (hex >> 8) as u8, b: hex as u8 }
 }
@@ -720,7 +715,7 @@ impl TerminalView {
         let content = term.renderable_content();
         let offset = content.display_offset as i32;
         let colors = content.colors;
-        let default_bg = theme::c(theme::TERM_BG);
+        let default_bg = theme::c(theme::term_bg());
         let mut quads = vec![fill(bounds, default_bg)];
         let mut rows_runs: Vec<Vec<Run>> = (0..rows).map(|_| Vec::new()).collect();
         let selection = content.selection;

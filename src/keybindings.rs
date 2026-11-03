@@ -132,6 +132,10 @@ fn describe(name: &str, ctx: Option<&str>) -> String {
         "GoBack" => "Go back (what this split showed before)",
         "GoForward" => "Go forward",
         "ShowKeysPanel" => "Show shortcuts",
+        "ShowSettings" => "Settings: theme, zoom, sidebar",
+        "UiZoomIn" => "Zoom the interface in (panels, tabs, bars)",
+        "UiZoomOut" => "Zoom the interface out",
+        "UiZoomReset" => "Interface back to 100%",
         "ToggleSidebarSide" => "Move sidebar left / right",
         "OpenFolderNewWindow" => "Open a project in a new window",
         "NextWindow" => "Switch project window",
@@ -356,7 +360,6 @@ pub fn reserved(keys: &str) -> Option<&'static str> {
         "cmd-alt-d" => "macOS show/hide Dock",
         "ctrl-up" | "ctrl-down" | "ctrl-left" | "ctrl-right" => "macOS Mission Control / Spaces",
         "cmd-shift-/" => "macOS Help menu",
-        "cmd-," => "macOS app settings",
         "cmd-q" => "Quit",
         _ => return None,
     })

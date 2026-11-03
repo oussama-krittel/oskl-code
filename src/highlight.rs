@@ -6,7 +6,6 @@ use std::path::Path;
 use std::sync::OnceLock;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
-use crate::theme::c;
 
 /// Capture names we color, in priority order of specificity.
 const NAMES: &[&str] = &[
@@ -25,24 +24,25 @@ pub fn name(ix: u8) -> &'static str {
 pub fn color(ix: u8) -> Hsla {
     let name = NAMES.get(ix as usize).copied().unwrap_or("");
     let base = name.split('.').next().unwrap_or("");
-    c(match (name, base) {
-        ("comment", _) => 0x5c6370,
-        ("variable.builtin", _) | ("constant.builtin", _) => 0xe5c07b,
-        ("variable.parameter", _) => 0xd19a66,
-        ("function.builtin", _) => 0x56b6c2,
-        ("punctuation.special", _) => 0xc678dd,
-        ("string.special", _) | ("escape", _) => 0x56b6c2,
-        ("type.builtin", _) => 0xe5c07b,
-        (_, "keyword") => 0xc678dd,
-        (_, "string") | (_, "character") | (_, "text") => 0x98c379,
-        (_, "number") | (_, "boolean") | (_, "constant") => 0xd19a66,
-        (_, "function") | (_, "method") => 0x61afef,
-        (_, "type") | (_, "constructor") | (_, "module") | (_, "namespace") => 0xe5c07b,
-        (_, "property") | (_, "field") | (_, "tag") | (_, "label") => 0xe06c75,
-        (_, "attribute") => 0xd19a66,
-        (_, "operator") => 0x56b6c2,
-        (_, "punctuation") => 0x8b919c,
-        _ => 0xc8ccd4,
+    use crate::theme::Syntax::*;
+    crate::theme::syntax(match (name, base) {
+        ("comment", _) => Comment,
+        ("variable.builtin", _) | ("constant.builtin", _) => Builtin,
+        ("variable.parameter", _) => Param,
+        ("function.builtin", _) => FnBuiltin,
+        ("punctuation.special", _) => PunctSpecial,
+        ("string.special", _) | ("escape", _) => StringSpecial,
+        ("type.builtin", _) => Builtin,
+        (_, "keyword") => Keyword,
+        (_, "string") | (_, "character") | (_, "text") => String,
+        (_, "number") | (_, "boolean") | (_, "constant") => Number,
+        (_, "function") | (_, "method") => Function,
+        (_, "type") | (_, "constructor") | (_, "module") | (_, "namespace") => Type,
+        (_, "property") | (_, "field") | (_, "tag") | (_, "label") => Property,
+        (_, "attribute") => Attribute,
+        (_, "operator") => Operator,
+        (_, "punctuation") => Punct,
+        _ => Plain,
     })
 }
 
