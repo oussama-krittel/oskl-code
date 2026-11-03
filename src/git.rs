@@ -795,6 +795,64 @@ pub fn branches(root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Local and remote branches for the graph's filter, most useful first: the current branch,
+/// then the repo's default (what GitHub shows first: origin/HEAD, else main/master/develop/dev),
+/// then the rest by name. Remote branches list origin's before other remotes'.
+pub fn branches_split(root: &Path) -> (Vec<String>, Vec<String>) {
+    let current = run(root, &["symbolic-ref", "--short", "-q", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
+    let remotes = remotes(root);
+    let default = default_branch(root, &remotes);
+    let refs = run(root, &["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"]).unwrap_or_default();
+    let mut local = Vec::new();
+    let mut remote = Vec::new();
+    for r in refs.lines() {
+        if let Some(b) = r.strip_prefix("refs/heads/") {
+            local.push(b.to_string());
+        } else if let Some(b) = r.strip_prefix("refs/remotes/")
+            && !b.ends_with("/HEAD")
+        {
+            remote.push(b.to_string());
+        }
+    }
+    order_branches(&mut local, &mut remote, &current, default.as_deref(), &remotes);
+    (local, remote)
+}
+
+/// The repo's main branch name ("main"), as its remote says, else a usual name that exists here.
+fn default_branch(root: &Path, remotes: &[String]) -> Option<String> {
+    let first = remotes.iter().find(|r| *r == "origin").or(remotes.first());
+    if let Some(remote) = first
+        && let Ok(head) = run(root, &["symbolic-ref", "--short", "-q", &format!("refs/remotes/{remote}/HEAD")])
+        && let Some(name) = head.trim().strip_prefix(&format!("{remote}/"))
+    {
+        return Some(name.to_string());
+    }
+    ["main", "master", "develop", "dev"]
+        .into_iter()
+        .find(|n| run(root, &["rev-parse", "--verify", "-q", &format!("refs/heads/{n}")]).is_ok())
+        .map(String::from)
+}
+
+fn order_branches(local: &mut [String], remote: &mut [String], current: &str, default: Option<&str>, remotes: &[String]) {
+    let rank = |name: &str| if name == current { 0 } else if Some(name) == default { 1 } else { 2 };
+    local.sort_by(|a, b| (rank(a), a.as_str()).cmp(&(rank(b), b.as_str())));
+    // "origin/main" → remote "origin", branch "main" (remotes are matched, since names can hold "/").
+    let split = |full: &str| -> (usize, String) {
+        let pos = remotes.iter().position(|r| full.starts_with(&format!("{r}/")));
+        let name = pos.map(|p| full[remotes[p].len() + 1..].to_string()).unwrap_or(full.to_string());
+        let order = match pos {
+            Some(p) if remotes[p] == "origin" => 0,
+            Some(p) => 1 + p,
+            None => usize::MAX,
+        };
+        (order, name)
+    };
+    remote.sort_by(|a, b| {
+        let ((ra, na), (rb, nb)) = (split(a), split(b));
+        (ra, rank(&na), na, a.as_str()).cmp(&(rb, rank(&nb), nb, b.as_str()))
+    });
+}
+
 pub fn list_files(root: &Path) -> Vec<String> {
     run(root, &["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
         .map(|s| {
@@ -808,6 +866,32 @@ pub fn list_files(root: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn filter_reads_local_and_remote_branches_of_a_repo() {
+        let base = std::env::temp_dir().join(format!("kite-branches-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let sh = |cmd: &str| {
+            std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(&base).output().unwrap();
+        };
+        sh("git init -q -b main up && cd up && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m one && git branch alpha && git branch zed");
+        sh("git clone -q up work && cd work && git switch -qc topic");
+        let (local, remote) = super::branches_split(&base.join("work"));
+        assert_eq!(local, ["topic", "main"]);
+        assert_eq!(remote, ["origin/main", "origin/alpha", "origin/zed"], "origin/HEAD is left out, the default comes first");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn filter_lists_current_then_default_then_the_rest_origin_first() {
+        let mut local: Vec<String> = ["zeta", "main", "auth", "feature"].map(String::from).to_vec();
+        let mut remote: Vec<String> = ["upstream/main", "origin/auth", "origin/feature", "origin/main", "fork/x"].map(String::from).to_vec();
+        let remotes: Vec<String> = ["fork", "origin", "upstream"].map(String::from).to_vec();
+        super::order_branches(&mut local, &mut remote, "feature", Some("main"), &remotes);
+        assert_eq!(local, ["feature", "main", "auth", "zeta"]);
+        assert_eq!(remote, ["origin/feature", "origin/main", "origin/auth", "fork/x", "upstream/main"]);
+    }
+
     use super::*;
 
     #[test]

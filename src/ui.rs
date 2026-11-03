@@ -70,9 +70,27 @@ pub fn badge(text: impl Into<SharedString>, bg: Hsla) -> Div {
 }
 
 /// Collapsible section header (e.g. "CHANGES", "GRAPH").
-pub fn section_header(id: impl Into<ElementId>, title: &str, open: bool) -> Stateful<Div> {
-    div()
+/// A foldable section's header. Open, only its arrow and title fold it (so a missed click on
+/// the buttons or counts beside them doesn't); folded, clicking anywhere on it opens it.
+pub fn section_header(id: impl Into<ElementId>, title: &str, open: bool, toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Stateful<Div> {
+    let id: ElementId = id.into();
+    let title_id = ElementId::NamedChild(Box::new(id.clone()), "title".into());
+    let (sel, title_sel) = (format!("section-{}", title.to_lowercase()), format!("section-{}-title", title.to_lowercase()));
+    let label = div()
+        .id(title_id)
+        .debug_selector(move || title_sel)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(2.))
+        .h_full()
+        .pr(px(6.))
+        .cursor_pointer()
+        .child(small_icon(if open { "chevron-down" } else { "chevron-right" }, theme::fg()))
+        .child(title.to_uppercase());
+    let header = div()
         .id(id)
+        .debug_selector(move || sel)
         .flex()
         .flex_none()
         .items_center()
@@ -80,11 +98,13 @@ pub fn section_header(id: impl Into<ElementId>, title: &str, open: bool) -> Stat
         .pl(px(2.))
         .pr(px(6.))
         .gap(px(2.))
-        .cursor_pointer()
         .font_weight(FontWeight::BOLD)
-        .text_size(px(10.5))
-        .child(small_icon(if open { "chevron-down" } else { "chevron-right" }, theme::fg()))
-        .child(div().flex_1().child(title.to_uppercase()))
+        .text_size(px(10.5));
+    if open {
+        header.child(label.on_click(toggle)).child(div().flex_1())
+    } else {
+        header.cursor_pointer().on_click(toggle).child(label).child(div().flex_1())
+    }
 }
 
 pub fn file_name(path: &str) -> &str {

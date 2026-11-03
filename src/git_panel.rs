@@ -221,8 +221,9 @@ pub struct GitPanel {
     branch_menu: Option<(git::Ref, Point<Pixels>)>,
     commit_menu: Option<(usize, Point<Pixels>)>,
     scope_open: bool,
-    scope_branches: Vec<String>,
-    scope_remotes: Vec<String>,
+    /// The filter's choices: local and remote branches, most useful first.
+    scope_local: Vec<String>,
+    scope_remote: Vec<String>,
     /// Last operation seen, to prefill the message once when one starts.
     last_op: Option<git::OpState>,
     /// Collapsed folders in the changes tree ("section:dir").
@@ -280,8 +281,8 @@ impl GitPanel {
             branch_menu: None,
             commit_menu: None,
             scope_open: false,
-            scope_branches: Vec::new(),
-            scope_remotes: Vec::new(),
+            scope_local: Vec::new(),
+            scope_remote: Vec::new(),
             last_op: None,
             collapsed: Default::default(),
             reach: Default::default(),
@@ -763,6 +764,10 @@ impl GitPanel {
         cx.notify();
     }
 
+    /// (changes, graph) sections open (tests).
+    #[cfg(test)]
+    pub fn sections_open(&self) -> (bool, bool) { (self.changes_open, self.graph_open) }
+
     #[cfg(test)]
     pub fn expanded_count(&self) -> usize { self.expanded.len() }
 
@@ -1197,14 +1202,12 @@ impl GitPanel {
             .top(px(top))
             .right(px(8.))
             .w(px(270.))
-            .max_h(px(420.))
             .py(px(4.))
             .bg(theme::bg_popup())
             .border_1()
             .border_color(theme::border_input())
             .rounded(px(6.))
             .shadow_lg()
-            .overflow_y_scroll()
             .on_mouse_down_out(cx.listener(|p, _, _, cx| {
                 p.scope_open = false;
                 cx.notify();
@@ -1226,38 +1229,63 @@ impl GitPanel {
                 });
                 cx.notify();
             })))
-            .child(div().mt(px(4.)).border_t_1().border_color(theme::border()).px(px(14.)).py(px(4.)).text_color(theme::fg_muted()).child("OR PICK BRANCHES"))
-            .children(self.scope_branches.iter().enumerate().map(|(ix, b)| {
-                let on = only.contains(b);
-                let is_remote = self.scope_remotes.iter().any(|r| b.starts_with(&format!("{r}/")));
-                let name = b.clone();
+            .child(self.render_scope_list("scope-local", "Local", &self.scope_local, false, &only, cx))
+            .child(self.render_scope_list("scope-remote", "Remote", &self.scope_remote, true, &only, cx))
+    }
+
+    /// One part of the filter (local or remote branches): a title and its own scrolling list.
+    fn render_scope_list(&self, id: &'static str, title: &str, names: &[String], remote: bool, only: &[String], cx: &mut Context<Self>) -> impl IntoElement {
+        let (icon, color) = if remote { ("cloud", theme::ref_remote()) } else { ("git", theme::ref_local()) };
+        div()
+            .flex()
+            .flex_col()
+            .mt(px(4.))
+            .border_t_1()
+            .border_color(theme::border())
+            .child(
                 div()
-                    .id(("scope-branch", ix))
                     .flex()
-                    .items_center()
                     .gap(px(6.))
-                    .h(px(22.))
-                    .px(px(10.))
-                    .mx(px(4.))
-                    .rounded(px(3.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::selected_focused()))
-                    .on_click(cx.listener(move |p, _, _, cx| {
-                        let name = name.clone();
-                        p.repo.update(cx, |r, cx| {
-                            if let Some(i) = r.graph_only.iter().position(|x| *x == name) {
-                                r.graph_only.remove(i);
-                            } else {
-                                r.graph_only.push(name);
-                            }
-                            r.refresh_log(cx);
-                        });
-                        cx.notify();
-                    }))
-                    .child(div().w(px(12.)).text_color(theme::frame_focused()).child(if on { "☑" } else { "☐" }))
-                    .child(ui::small_icon(if is_remote { "cloud" } else { "git" }, if is_remote { theme::ref_remote() } else { theme::ref_local() }).size(px(12.)))
-                    .child(div().overflow_hidden().whitespace_nowrap().child(b.clone()))
-            }))
+                    .px(px(14.))
+                    .py(px(4.))
+                    .text_color(theme::fg_muted())
+                    .child(title.to_uppercase())
+                    .child(div().text_color(theme::fg_dim()).child(names.len().to_string())),
+            )
+            .child(
+                div().id(id).max_h(px(150.)).overflow_y_scroll().children(names.iter().enumerate().map(|(ix, b)| {
+                    let on = only.contains(b);
+                    let name = b.clone();
+                    let selector = format!("{id}-{b}");
+                    div()
+                        .id((id, ix))
+                        .debug_selector(move || selector)
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .h(px(22.))
+                        .px(px(10.))
+                        .mx(px(4.))
+                        .rounded(px(3.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::selected_focused()))
+                        .on_click(cx.listener(move |p, _, _, cx| {
+                            let name = name.clone();
+                            p.repo.update(cx, |r, cx| {
+                                if let Some(i) = r.graph_only.iter().position(|x| *x == name) {
+                                    r.graph_only.remove(i);
+                                } else {
+                                    r.graph_only.push(name);
+                                }
+                                r.refresh_log(cx);
+                            });
+                            cx.notify();
+                        }))
+                        .child(div().w(px(12.)).text_color(theme::frame_focused()).child(if on { "☑" } else { "☐" }))
+                        .child(ui::small_icon(icon, color).size(px(12.)))
+                        .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(b.clone()))
+                })),
+            )
     }
 
     // ------------------------------------------------------------ rendering
@@ -1916,12 +1944,11 @@ impl Render for GitPanel {
         let graph_only_empty = repo.graph_only.is_empty();
         let bounds_cell = self.panel_bounds.clone();
 
-        let changes_header = ui::section_header("changes-header", "Changes", self.changes_open)
-            .group("changes-header")
-            .on_click(cx.listener(|p, _, _, cx| {
+        let changes_header = ui::section_header("changes-header", "Changes", self.changes_open, cx.listener(|p, _, _, cx| {
                 p.changes_open = !p.changes_open;
                 cx.notify();
             }))
+            .group("changes-header")
             .child(
                 div()
                     .flex()
@@ -1937,8 +1964,7 @@ impl Render for GitPanel {
                     }))),
             );
 
-        let graph_header = ui::section_header("graph-header", "Graph", self.graph_open)
-            .on_click(cx.listener(|p, _, _, cx| {
+        let graph_header = ui::section_header("graph-header", "Graph", self.graph_open, cx.listener(|p, _, _, cx| {
                 p.graph_open = !p.graph_open;
                 cx.notify();
             }))
@@ -1967,8 +1993,7 @@ impl Render for GitPanel {
                                 p.scope_open = !p.scope_open;
                                 if p.scope_open {
                                     let root = p.repo.read(cx).root.clone();
-                                    p.scope_branches = git::branches(&root);
-                                    p.scope_remotes = git::remotes(&root);
+                                    (p.scope_local, p.scope_remote) = git::branches_split(&root);
                                 }
                                 cx.notify();
                             })),

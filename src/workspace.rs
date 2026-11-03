@@ -5444,6 +5444,33 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn section_headers_fold_from_their_title_and_open_from_anywhere(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            std::process::Command::new("sh").arg("-c").arg("git init -q -b main").current_dir(dir).output().unwrap();
+        });
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
+        cx.run_until_parked();
+        let open = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.git_panel.read(cx).sections_open());
+        for (section, which) in [("graph", 1), ("changes", 0)] {
+            let header: &'static str = Box::leak(format!("section-{section}").into_boxed_str());
+            let title: &'static str = Box::leak(format!("section-{section}-title").into_boxed_str());
+            let is_open = |cx: &mut VisualTestContext| { let o = open(cx); if which == 0 { o.0 } else { o.1 } };
+            let t = cx.debug_bounds(title).expect("title");
+            // Beside the title (the item count, a missed button): stays open.
+            cx.simulate_click(gpui::point(t.right() + gpui::px(30.), t.center().y), gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert!(is_open(cx), "{section}: a click beside the title doesn't fold it");
+            cx.simulate_click(t.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert!(!is_open(cx), "{section}: the title folds it");
+            let h = cx.debug_bounds(header).expect("header");
+            cx.simulate_click(gpui::point(t.right() + gpui::px(30.), h.center().y), gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert!(is_open(cx), "{section}: folded, anywhere on it opens it");
+        }
+    }
+
+    #[gpui::test]
     fn folders_in_the_changes_tree_can_be_discarded(cx: &mut TestAppContext) {
         let (ws, cx) = setup_with(cx, |dir| {
             let sh = |cmd: &str| {
