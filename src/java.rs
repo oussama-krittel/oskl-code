@@ -103,10 +103,7 @@ pub fn javac_check(root: &Path, file: &Path) -> Result<(String, Vec<Diag>), Stri
     let src = source_root(file, &text).unwrap_or_else(|| root.to_path_buf());
     let mut sourcepath = vec![src.clone()];
     sourcepath.extend(source_roots(root).into_iter().filter(|r| *r != src));
-    let mut classpath: Vec<PathBuf> = ["target/classes", "build/classes/java/main", "out/production", "bin"].iter().map(|p| root.join(p)).filter(|p| p.is_dir()).collect();
-    if let Ok(rd) = std::fs::read_dir(root.join("lib")) {
-        classpath.extend(rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "jar")));
-    }
+    let classpath = classpath(root, file);
     let out_dir = std::env::temp_dir().join(format!("kite-javac-{}", std::process::id()));
     let join = |v: &[PathBuf]| v.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join(":");
     let mut c = Command::new(&javac);
@@ -123,9 +120,12 @@ pub fn javac_check(root: &Path, file: &Path) -> Result<(String, Vec<Diag>), Stri
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut diags = parse_javac(&stderr, file, root);
     if build_file(file, root) {
-        // Libraries come from Maven/Gradle, which javac alone doesn't know about.
-        diags.retain(|d| !is_missing_dependency(&d.message));
+        // Libraries that aren't downloaded: hide what comes from them, and only that.
+        let known = Known::new(&sourcepath, &classpath);
+        let lombok = module_dirs(file, root).iter().any(|d| build_text(d).contains("lombok"));
+        drop_library_noise(&mut diags, &text, &known, lombok);
     }
+    widen(&mut diags, &text);
     if !output.status.success() && diags.is_empty() && !stderr.contains("error") {
         let line = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("exited with an error");
         return Err(format!("javac failed: {line}"));
@@ -133,9 +133,253 @@ pub fn javac_check(root: &Path, file: &Path) -> Result<(String, Vec<Diag>), Stri
     Ok(("javac".into(), diags))
 }
 
-fn is_missing_dependency(msg: &str) -> bool {
-    let m = msg.to_lowercase();
-    m.starts_with("cannot find symbol") || (m.starts_with("package ") && m.contains("does not exist")) || m.starts_with("cannot access") || m.contains("method does not override")
+/// What javac can compile against: the project's compiled classes, `lib/*.jar`, and the
+/// dependencies its pom.xml / build.gradle declare that are already downloaded.
+fn classpath(root: &Path, file: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in module_dirs(file, root) {
+        for p in ["target/classes", "target/test-classes", "build/classes/java/main", "build/classes/java/test", "out/production", "bin"] {
+            let p = dir.join(p);
+            if p.is_dir() && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir(dir.join("lib")) {
+            out.extend(rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "jar")));
+        }
+        for jar in declared_jars(&dir) {
+            if !out.contains(&jar) {
+                out.push(jar);
+            }
+        }
+    }
+    out
+}
+
+/// The file's module folder and the ones above it, up to the project (multi-module builds).
+fn module_dirs(file: &Path, root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = file.ancestors().skip(1).take_while(|d| d.starts_with(root)).filter(|d| d == &root || !build_text(d).is_empty()).map(Path::to_path_buf).collect();
+    if dirs.is_empty() {
+        dirs.push(root.to_path_buf());
+    }
+    dirs
+}
+
+/// pom.xml and build.gradle(.kts) of a folder, as text ("" if none).
+fn build_text(dir: &Path) -> String {
+    ["pom.xml", "build.gradle", "build.gradle.kts"].iter().filter_map(|f| std::fs::read_to_string(dir.join(f)).ok()).collect::<Vec<_>>().join("\n")
+}
+
+/// `group:artifact:version` of each declared dependency (version may be empty: managed elsewhere).
+fn declared_deps(dir: &Path) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    if let Ok(pom) = std::fs::read_to_string(dir.join("pom.xml")) {
+        let tag = |block: &str, t: &str| re(&format!(r"<{t}>\s*([^<]*?)\s*</{t}>")).captures(block).map(|c| c[1].to_string());
+        let props: std::collections::HashMap<String, String> = pom
+            .split_once("<properties>")
+            .and_then(|(_, r)| r.split_once("</properties>"))
+            .map(|(p, _)| re(r"<([\w.\-]+)>\s*([^<]*?)\s*</[\w.\-]+>").captures_iter(p).map(|c| (c[1].to_string(), c[2].to_string())).collect())
+            .unwrap_or_default();
+        let expand = |v: String| re(r"\$\{([^}]+)\}").replace_all(&v, |c: &regex::Captures| props.get(&c[1]).cloned().unwrap_or_default()).to_string();
+        for block in re(r"(?s)<dependency>(.*?)</dependency>").captures_iter(&pom) {
+            if let (Some(g), Some(a)) = (tag(&block[1], "groupId"), tag(&block[1], "artifactId")) {
+                out.push((expand(g), expand(a), expand(tag(&block[1], "version").unwrap_or_default())));
+            }
+        }
+    }
+    for f in ["build.gradle", "build.gradle.kts"] {
+        if let Ok(g) = std::fs::read_to_string(dir.join(f)) {
+            for c in re(r#"["']([\w.\-]+):([\w.\-]+)(?::([\w.\-]+))?["']"#).captures_iter(&g) {
+                out.push((c[1].to_string(), c[2].to_string(), c.get(3).map(|m| m.as_str().to_string()).unwrap_or_default()));
+            }
+        }
+    }
+    out
+}
+
+/// The downloaded jars of a folder's declared dependencies (`~/.m2`, Gradle's cache).
+fn declared_jars(dir: &Path) -> Vec<PathBuf> {
+    std::env::var_os("HOME").map(|h| declared_jars_in(dir, &PathBuf::from(h))).unwrap_or_default()
+}
+
+fn declared_jars_in(dir: &Path, home: &Path) -> Vec<PathBuf> {
+    // Without a version (a BOM or parent manages it), the newest one downloaded.
+    let version_dir = |base: PathBuf, v: &str| -> Option<PathBuf> {
+        if !v.is_empty() {
+            return Some(base.join(v)).filter(|d| d.is_dir());
+        }
+        let mut vs: Vec<PathBuf> = std::fs::read_dir(&base).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        vs.sort();
+        vs.pop()
+    };
+    let mut out = Vec::new();
+    for (g, a, v) in declared_deps(dir) {
+        let m2 = home.join(".m2/repository").join(g.replace('.', "/")).join(&a);
+        if let Some(vd) = version_dir(m2, &v) {
+            let ver = vd.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let jar = vd.join(format!("{a}-{ver}.jar"));
+            if jar.is_file() {
+                out.push(jar);
+                continue;
+            }
+        }
+        let gradle = home.join(".gradle/caches/modules-2/files-2.1").join(&g).join(&a);
+        if let Some(vd) = version_dir(gradle, &v) {
+            let ver = vd.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let want = format!("{a}-{ver}.jar");
+            if let Some(jar) = std::fs::read_dir(&vd).into_iter().flatten().flatten().map(|h| h.path().join(&want)).find(|j| j.is_file()) {
+                out.push(jar);
+            }
+        }
+    }
+    out
+}
+
+/// Which packages exist: the project's folders, the JDK (its src.zip) and the classpath.
+struct Known {
+    dirs: Vec<PathBuf>,
+    jars: std::collections::HashSet<String>,
+}
+
+impl Known {
+    fn new(sourcepath: &[PathBuf], classpath: &[PathBuf]) -> Self {
+        let mut jars = std::collections::HashSet::new();
+        for jar in classpath.iter().filter(|p| p.is_file()) {
+            if let Some(dir) = cache_dir().map(|c| c.join(format!("jar-{}", short_hash(&jar.to_string_lossy()))))
+                && let Some(list) = listing(jar, &dir)
+            {
+                jars.extend(list.lines().filter(|l| l.ends_with(".class")).filter_map(|l| l.rsplit_once('/')).map(|(p, _)| p.replace('/', ".")));
+            }
+        }
+        let dirs = sourcepath.iter().chain(classpath.iter().filter(|p| p.is_dir())).cloned().collect();
+        Self { dirs, jars }
+    }
+
+    fn package(&self, pkg: &str) -> bool {
+        // java.* can only be the JDK's, so an error about one is real (a typo like java.utl).
+        if pkg == "java" || pkg.starts_with("java.") || jdk_packages().is_some_and(|jdk| jdk.contains(pkg)) {
+            return true;
+        }
+        let rel = pkg.replace('.', "/");
+        self.jars.contains(pkg) || self.dirs.iter().any(|d| d.join(&rel).is_dir())
+    }
+}
+
+/// The JDK's packages, from the entries of its src.zip (`java.base/java/util/List.java`).
+fn jdk_packages() -> Option<&'static std::collections::HashSet<String>> {
+    static PKGS: OnceLock<Option<std::collections::HashSet<String>>> = OnceLock::new();
+    PKGS.get_or_init(|| {
+        let zip = java_home()?.join("lib/src.zip");
+        let dir = cache_dir()?.join(format!("jdk-{}", short_hash(&zip.to_string_lossy())));
+        let list = listing(&zip, &dir)?;
+        Some(list.lines().filter(|l| l.ends_with(".java")).filter_map(|l| l.split_once('/').map(|(_, r)| r)).filter_map(|l| l.rsplit_once('/')).map(|(p, _)| p.replace('/', ".")).collect())
+    })
+    .as_ref()
+}
+
+/// `org.lib.Outer.Inner` → `org.lib`: packages are the lower-case names before the first type.
+fn package_part(path: &str) -> String {
+    path.split('.').take_while(|s| s.chars().next().is_some_and(|c| c.is_lowercase())).collect::<Vec<_>>().join(".")
+}
+
+/// Removes errors that only say a library isn't there (not downloaded, or Maven/Gradle not run):
+/// its packages, the names imported from them, what a class gets from extending one, and what
+/// Lombok would generate. Everything else stays: typos in your own names, a misspelled JDK
+/// package, a wrong method on a known type.
+fn drop_library_noise(diags: &mut Vec<Diag>, text: &str, known: &Known, lombok: bool) {
+    let imports = imports(text);
+    let missing = |path: &str| !known.package(&package_part(path));
+    // Simple names that can only come from a missing library.
+    let mut lib_types = std::collections::HashSet::new();
+    let mut lib_members = std::collections::HashSet::new();
+    let (mut open_types, mut open_members) = (false, false);
+    for i in &imports {
+        if !missing(&i.path) {
+            continue;
+        }
+        let last = i.path.rsplit('.').next().unwrap_or("").to_string();
+        match (i.is_static, i.wildcard) {
+            (false, false) => {
+                lib_types.insert(last);
+            }
+            (false, true) => open_types = true,
+            (true, false) => {
+                lib_members.insert(last);
+            }
+            (true, true) => open_members = true,
+        }
+    }
+    let symbol = |d: &Diag| d.message.lines().find_map(|l| l.trim().strip_prefix("symbol:")).map(|s| s.trim().to_string()).unwrap_or_default();
+    let location = |d: &Diag| d.message.lines().find_map(|l| l.trim().strip_prefix("location:")).map(|s| s.trim().to_string()).unwrap_or_default();
+    let first = |d: &Diag| d.message.lines().next().unwrap_or("").to_string();
+    let class_name = |s: &str| s.strip_prefix("class ").map(|n| n.split('<').next().unwrap_or(n).trim().to_string());
+    let is_lib_type = |n: &str| lib_types.contains(n) || open_types;
+    // Types this file extends or implements; if one is a library's, its members are unknown too.
+    let supers: Vec<String> = re(r"(?s)\b(?:extends|implements)\s+([^{;]+)\{")
+        .captures_iter(text)
+        .flat_map(|c| c[1].split(|ch: char| !is_ident(ch) && ch != '.').filter(|w| !w.is_empty()).map(|w| w.rsplit('.').next().unwrap_or(w).to_string()).collect::<Vec<_>>())
+        .collect();
+    let extends_lib = diags.iter().any(|d| first(d) == "cannot find symbol" && class_name(&symbol(d)).is_some_and(|n| supers.contains(&n) && is_lib_type(&n)));
+    let lines: Vec<&str> = text.lines().collect();
+    diags.retain(|d| {
+        let msg = first(d);
+        if let Some(pkg) = msg.strip_prefix("package ").and_then(|r| r.strip_suffix(" does not exist")) {
+            return known.package(pkg);
+        }
+        if msg.starts_with("static import only from classes") {
+            let line = lines.get(d.row).copied().unwrap_or("");
+            return !imports.iter().any(|i| i.is_static && line.contains(&i.path) && missing(&i.path));
+        }
+        if msg.starts_with("cannot access") {
+            return false;
+        }
+        if msg.starts_with("method does not override") {
+            return !extends_lib;
+        }
+        if lombok && msg.starts_with("constructor ") && msg.contains("cannot be applied") {
+            return false;
+        }
+        if msg != "cannot find symbol" {
+            return true;
+        }
+        let sym = symbol(d);
+        if let Some(name) = class_name(&sym) {
+            return !is_lib_type(&name);
+        }
+        let member = sym.strip_prefix("method ").or_else(|| sym.strip_prefix("variable ")).map(|m| m.split('(').next().unwrap_or(m).trim().to_string());
+        let Some(member) = member else { return true };
+        if lombok {
+            return false;
+        }
+        // Unqualified, in this class: maybe statically imported or inherited from a library.
+        let here = ["class ", "interface ", "enum ", "record "].iter().any(|k| location(d).starts_with(k));
+        !(here && (lib_members.contains(&member) || open_members || extends_lib))
+    });
+}
+
+/// javac points at one character; underline the whole name there (or the import's path).
+fn widen(diags: &mut [Diag], text: &str) {
+    let lines: Vec<Vec<char>> = text.lines().map(|l| l.chars().collect()).collect();
+    for d in diags.iter_mut().filter(|d| d.end_row == d.row && d.end_col == d.col) {
+        let Some(line) = lines.get(d.row) else { continue };
+        let s: String = line.iter().collect();
+        if let Some(rest) = s.trim_start().strip_prefix("import ") {
+            let start = line.len() - s.trim_start().len() + "import ".len() + rest.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+            let end = s.rfind(';').map(|e| s[..e].chars().count()).unwrap_or(line.len());
+            if end > start {
+                (d.col, d.end_col) = (start, end);
+            }
+            continue;
+        }
+        // `m.sizee()`: javac points at the dot before the name.
+        if line.get(d.col) == Some(&'.') && line.get(d.col + 1).copied().is_some_and(is_ident) {
+            d.col += 1;
+        }
+        if line.get(d.col).copied().is_some_and(is_ident) {
+            let end = (d.col..line.len()).find(|&i| !is_ident(line[i])).unwrap_or(line.len());
+            d.end_col = end;
+        }
+    }
 }
 
 /// `Foo.java:12: error: ';' expected` + the source line + a caret line (+ `symbol:` details).
@@ -599,7 +843,85 @@ mod tests {
         assert_eq!(diags.len(), 1, "only this file's");
         assert_eq!((diags[0].row, diags[0].col, diags[0].severity), (2, 4, Severity::Error));
         assert_eq!(diags[0].message, "cannot find symbol\n  symbol: method foo()\n  location: class A");
-        assert!(is_missing_dependency(&diags[0].message));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn hides_only_what_missing_libraries_cause() {
+        if javac().is_none() {
+            return;
+        }
+        let d = tmp("noise");
+        let java = d.join("src/main/java/app");
+        std::fs::create_dir_all(&java).unwrap();
+        std::fs::write(d.join("pom.xml"), "<project><dependencies><dependency><groupId>org.lib</groupId><artifactId>lib</artifactId><version>1</version></dependency></dependencies></project>").unwrap();
+        std::fs::write(java.join("Model.java"), "package app;\npublic class Model {\n    public int size() { return 0; }\n}\n").unwrap();
+        let check = |name: &str, text: &str| {
+            let file = java.join(name);
+            std::fs::write(&file, text).unwrap();
+            let (_, diags) = javac_check(&d, &file).unwrap();
+            diags.into_iter().map(|d| (d.row + 1, d.message.lines().next().unwrap().to_string(), d.message.lines().nth(1).unwrap_or("").trim().to_string(), d.end_col - d.col)).collect::<Vec<_>>()
+        };
+        // Uses a library, extends nothing: everything that isn't the library's shows.
+        let uses = check(
+            "Uses.java",
+            "package app;\n\nimport java.utl.Map;\nimport org.lib.Thing;\n\npublic class Uses {\n    void run(Model m) {\n        Thing t = new Thing();\n        t.go();\n        Strng s = \"x\";\n        int count = 0;\n        System.out.println(cont);\n        m.sizee();\n        undefined();\n    }\n}\n",
+        );
+        let lines: Vec<usize> = uses.iter().map(|u| u.0).collect();
+        assert_eq!(lines, [3, 10, 12, 13, 14], "{uses:#?}");
+        assert_eq!(uses[0].1, "package java.utl does not exist", "a misspelled JDK package is real");
+        assert_eq!((uses[1].2.as_str(), uses[1].3), ("symbol: class Strng", 5), "the whole name is underlined");
+        assert_eq!(uses[3].2, "symbol: method sizee()", "a wrong method on your own class");
+
+        // Extends a library class: what it might inherit is unknown, so only sure errors show.
+        let extends = check(
+            "Child.java",
+            "package app;\n\nimport org.lib.Base;\nimport static org.junit.Assert.assertEquals;\n\npublic class Child extends Base {\n    @Override\n    void run(Model m) {\n        helper();\n        assertEquals(1, 2);\n        m.sizee();\n    }\n}\n",
+        );
+        assert_eq!(extends.iter().map(|u| (u.0, u.2.clone())).collect::<Vec<_>>(), [(11, "symbol: method sizee()".to_string())], "{extends:#?}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_library_that_is_there_is_checked_for_real() {
+        if javac().is_none() {
+            return;
+        }
+        let d = tmp("jar");
+        // A tiny library jar in lib/: org.lib.Thing with go().
+        let lib = d.join("libsrc/org/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("Thing.java"), "package org.lib;\npublic class Thing { public void go() {} }\n").unwrap();
+        std::fs::create_dir_all(d.join("lib")).unwrap();
+        let sh = |cmd: &str| assert!(Command::new("sh").arg("-c").arg(cmd).current_dir(&d).status().unwrap().success(), "{cmd}");
+        sh(&format!("{} -d libout libsrc/org/lib/Thing.java && cd libout && /usr/bin/zip -qr ../lib/thing.jar org", javac().unwrap().display()));
+        let java = d.join("src/main/java/app");
+        std::fs::create_dir_all(&java).unwrap();
+        std::fs::write(d.join("pom.xml"), "<project/>").unwrap();
+        let file = java.join("App.java");
+        std::fs::write(&file, "package app;\n\nimport org.lib.Thing;\nimport org.lib.Thingg;\n\npublic class App {\n    void run() {\n        new Thing().go();\n        new Thing().goo();\n    }\n}\n").unwrap();
+        let (_, diags) = javac_check(&d, &file).unwrap();
+        let got: Vec<(usize, String)> = diags.iter().map(|d| (d.row + 1, d.message.lines().nth(1).unwrap_or("").trim().to_string())).collect();
+        assert_eq!(got, [(4, "symbol: class Thingg".to_string()), (9, "symbol: method goo()".to_string())], "its package exists, so a wrong name in it is a real error");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn finds_downloaded_dependencies() {
+        let d = tmp("deps");
+        let home = d.join("home");
+        let m2 = home.join(".m2/repository/com/acme/core/2.1");
+        std::fs::create_dir_all(&m2).unwrap();
+        std::fs::write(m2.join("core-2.1.jar"), "").unwrap();
+        let gradle = home.join(".gradle/caches/modules-2/files-2.1/org.x/util/1.0/abc123");
+        std::fs::create_dir_all(&gradle).unwrap();
+        std::fs::write(gradle.join("util-1.0.jar"), "").unwrap();
+        let module = d.join("app");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("pom.xml"), "<project><properties><core.version>2.1</core.version></properties><dependencies><dependency><groupId>com.acme</groupId><artifactId>core</artifactId><version>${core.version}</version></dependency><dependency><groupId>not</groupId><artifactId>here</artifactId></dependency></dependencies></project>").unwrap();
+        std::fs::write(module.join("build.gradle"), "dependencies {\n  implementation 'org.x:util:1.0'\n}\n").unwrap();
+        let jars = declared_jars_in(&module, &home);
+        assert_eq!(jars, [m2.join("core-2.1.jar"), gradle.join("util-1.0.jar")]);
         std::fs::remove_dir_all(&d).ok();
     }
 
