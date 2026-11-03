@@ -459,6 +459,9 @@ pub struct Workspace {
     font_size: f32,
     blame_default: bool,
     window_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// This window's display, size and full-screen state, saved with the session.
+    place: Option<crate::session::WindowPlace>,
+    window_handle: AnyWindowHandle,
     tool_task: Option<Task<()>>,
     format_save_task: Option<Task<()>>,
     watch_task: Option<Task<()>>,
@@ -579,6 +582,8 @@ impl Workspace {
             blame_default: settings.blame_default,
             settings,
             window_bounds: Rc::new(Cell::new(Bounds::default())),
+            place: Some(window_place(window, cx)),
+            window_handle: window.window_handle(),
             tool_task: None,
             format_save_task: None,
             watch_task: None,
@@ -632,6 +637,8 @@ impl Workspace {
                 ws.save_session(cx);
                 async {}
             }));
+            // Moved, resized, sent to another display, full screen: remembered for next time.
+            ws.extra_subs.push(cx.observe_window_bounds(window, |ws, window, cx| ws.place = Some(window_place(window, cx))));
         }
         register_workspace(cx.entity().downgrade());
         ws.tree.read(cx).focus(window);
@@ -1220,6 +1227,7 @@ impl Workspace {
             side_visible: self.side_visible,
             side_w: self.side_w,
             folders: self.folders.iter().map(|f| f.read(cx).root.clone()).collect(),
+            window: self.place.clone(),
         }
     }
 
@@ -6290,15 +6298,25 @@ fn register_workspace(ws: WeakEntity<Workspace>) {
 }
 
 /// Roots of the project windows currently open (for reopening them next launch).
+/// The open project windows, back to front (reopening them in this order stacks them the same).
 pub fn open_project_roots(cx: &App) -> Vec<PathBuf> {
-    WORKSPACES.with(|w| {
+    let stack = cx.window_stack().unwrap_or_default();
+    let mut roots: Vec<(usize, PathBuf)> = WORKSPACES.with(|w| {
         w.borrow()
             .iter()
             .filter_map(|ws| ws.upgrade())
             .map(|ws| ws.read(cx))
             .filter(|ws| ws.has_project())
-            .map(|ws| ws.repo.read(cx).root.clone())
+            .map(|ws| (stack.iter().position(|h| *h == ws.window_handle).unwrap_or(usize::MAX), ws.repo.read(cx).root.clone()))
             .collect()
-    })
+    });
+    // The stack is front to back; unknown windows go to the back.
+    roots.sort_by_key(|(pos, _)| std::cmp::Reverse(*pos));
+    roots.into_iter().map(|(_, r)| r).collect()
+}
+
+fn window_place(window: &Window, cx: &App) -> crate::session::WindowPlace {
+    let display = window.display(cx).and_then(|d| d.uuid().ok()).map(|u| u.to_string());
+    crate::session::WindowPlace::new(window.window_bounds(), display)
 }
 

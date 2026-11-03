@@ -52,9 +52,20 @@ pub fn open_window(root: PathBuf, cx: &mut App) {
 
 /// Opens a project window, optionally showing a file right away (`kite <folder> <file>` / `kite <file>`).
 pub fn open_window_with(root: PathBuf, file: Option<PathBuf>, cx: &mut App) {
-    let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
+    // Where this project's window was last time: same display, size, maximized or full screen.
+    let place = (root != workspace::no_project_dir()).then(|| session::load(&root)).flatten().and_then(|s| s.window);
+    let display = place.as_ref().and_then(|p| p.display.as_ref()).and_then(|uuid| {
+        cx.displays().into_iter().find(|d| d.uuid().ok().is_some_and(|u| u.to_string() == *uuid))
+    });
+    let (window_bounds, display_id) = match (&place, &display) {
+        (Some(p), Some(d)) => (p.bounds(), Some(d.id())),
+        // That display is unplugged: keep the size, centered on the main one.
+        (Some(p), None) => (WindowBounds::Windowed(Bounds::centered(None, size(px(p.w), px(p.h)), cx)), None),
+        (None, _) => (WindowBounds::Windowed(Bounds::centered(None, size(px(1400.), px(900.)), cx)), None),
+    };
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_bounds: Some(window_bounds),
+        display_id,
         titlebar: Some(TitlebarOptions {
             title: Some("OSKL Code".into()),
             appears_transparent: true,
