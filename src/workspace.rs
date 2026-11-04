@@ -413,6 +413,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("sidebar", "Sidebar side: sidebar left | right", true),
     ("autosave", "Auto save: autosave on | off (default on)", true),
     ("wrap", "Word wrap: wrap on | off (⌥Z)", true),
+    ("minimap", "Minimap beside code files: minimap on | off", true),
     ("formatonsave", "Format on ⌘S: formatonsave on | off (default on)", true),
     ("problems", "List lint and TypeScript problems (click to jump)", false),
     ("check", "Lint/type-check on save: check on | off | now", true),
@@ -550,6 +551,7 @@ impl Workspace {
         let has_project = root_is_project(&repo.read(cx).root);
         let mut settings = Settings::load();
         crate::editor::set_word_wrap(settings.word_wrap);
+        crate::editor::set_minimap(settings.minimap);
         if has_project {
             settings.add_recent(repo.read(cx).root.clone());
             settings.save();
@@ -2872,6 +2874,15 @@ impl Workspace {
         cx.refresh_windows();
     }
 
+    /// The minimap beside code files (all windows).
+    fn set_minimap(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.minimap = on;
+        self.settings.save();
+        crate::editor::set_minimap(on);
+        self.flash(format!("Minimap {}", if on { "on" } else { "off" }), false, cx);
+        cx.refresh_windows();
+    }
+
     fn toggle_word_wrap(&mut self, _: &ToggleWordWrap, _: &mut Window, cx: &mut Context<Self>) {
         let on = !crate::editor::word_wrap();
         self.set_word_wrap(on, cx);
@@ -3662,6 +3673,14 @@ impl Workspace {
                     _ => !crate::editor::word_wrap(),
                 };
                 self.set_word_wrap(on, cx);
+            }
+            "minimap" => {
+                let on = match rest {
+                    "on" => true,
+                    "off" => false,
+                    _ => !crate::editor::minimap(),
+                };
+                self.set_minimap(on, cx);
             }
             "formatonsave" | "fos" => {
                 self.settings.format_on_save = match rest {
@@ -4830,6 +4849,17 @@ impl Workspace {
                 .on_click(cx.listener(|ws, _, _, cx| {
                     let on = !crate::editor::word_wrap();
                     ws.set_word_wrap(on, cx);
+                }))
+        })
+        .child({
+            let on = crate::editor::minimap();
+            item("status-minimap")
+                .tooltip(ui::tooltip("Minimap beside code files: the part on screen is shaded, click or drag to scroll (:minimap on|off)"))
+                .child(ui::small_icon(if on { "check" } else { "close" }, if on { theme::git_added() } else { theme::fg_muted() }))
+                .child("Minimap")
+                .on_click(cx.listener(|ws, _, _, cx| {
+                    let on = !crate::editor::minimap();
+                    ws.set_minimap(on, cx);
                 }))
         })
         .child({
@@ -6054,6 +6084,59 @@ mod ui_tests {
         }
         let t = titles(cx);
         assert_eq!((t.len(), t[0].as_str(), t[24].as_str()), (25, "run 5", "run 29"));
+    }
+
+    #[gpui::test]
+    fn minimap_shows_beside_code_scrolls_on_click_and_turns_off(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            sh("for i in $(seq 1 400); do echo \"let value_$i = $i;\"; done > long.rs && git add . && git commit -qm one && echo changed >> long.rs");
+        });
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("long.rs"), None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).unwrap();
+        let view = |cx: &mut VisualTestContext| ed.read_with(cx, |e, _| e.minimap_view());
+        let (mini, top) = view(cx).expect("a minimap beside the code");
+        assert_eq!(top, 0);
+
+        // A click near its bottom brings that part of the file into view.
+        let at = gpui::point(mini.center().x, mini.top() + gpui::px(300. * 2.));
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let (_, top) = view(cx).unwrap();
+        assert!(top > 200, "line 300 is on screen now (first line shown: {top})");
+        // Dragging up follows the pointer.
+        cx.simulate_event(gpui::MouseDownEvent { position: at, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: 1, first_mouse: false });
+        let up = gpui::point(at.x, mini.top() + gpui::px(10.));
+        cx.simulate_event(gpui::MouseMoveEvent { position: up, modifiers: gpui::Modifiers::none(), pressed_button: Some(gpui::MouseButton::Left) });
+        cx.simulate_event(gpui::MouseUpEvent { position: up, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: 1 });
+        cx.run_until_parked();
+        assert_eq!(view(cx).unwrap().1, 0, "dragged back to the top");
+
+        // Off from the status bar, saved; the code gets the room back.
+        let at = cx.debug_bounds("status-minimap").expect("Minimap in the status bar").center();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(view(cx).is_none(), "no minimap when it's off");
+        let saved = std::fs::read_to_string(std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".config/kite/settings")).unwrap();
+        assert!(saved.contains("minimap = off"), "{saved}");
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(view(cx).is_some(), "and back on");
+
+        // Not in diffs.
+        let spec = crate::request::DiffSpec { path: "long.rs".into(), old_path: None, left: crate::git::Rev::Index, right: crate::git::Rev::Working, back: None };
+        ws.update_in(cx, |ws, window, cx| ws.handle_request(&crate::request::Request::OpenDiff { spec, preview: false }, window, cx));
+        cx.run_until_parked();
+        let right = ws.read_with(cx, |ws, cx| ws.active.and_then(|ix| match &ws.tabs[ix].kind {
+            TabKind::DiffEdit(d) => Some(d.read(cx).right.clone()),
+            _ => None,
+        })).expect("a diff");
+        assert!(right.read_with(cx, |e, _| e.minimap_view()).is_none(), "diffs have no minimap");
     }
 
     #[gpui::test]

@@ -225,6 +225,24 @@ pub fn set_word_wrap(on: bool) {
     WORD_WRAP.with(|w| w.set(on));
 }
 
+thread_local! {
+    /// The minimap beside code files (status bar → Minimap). Per UI thread, like word wrap.
+    static MINIMAP: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub fn minimap() -> bool {
+    MINIMAP.with(|m| m.get())
+}
+
+pub fn set_minimap(on: bool) {
+    MINIMAP.with(|m| m.set(on));
+}
+
+/// The minimap's width, the height of one line in it, and the width of one character.
+const MINI_W: f32 = 96.;
+const MINI_LINE_H: f32 = 2.;
+const MINI_CHAR_W: f32 = 0.85;
+
 /// Where each line is soft-wrapped, for the current text, width and folds.
 pub struct WrapData {
     key: (u64, usize, Vec<(usize, usize)>),
@@ -280,6 +298,13 @@ struct ScrollbarGeom {
     max_scroll: f32,
 }
 
+/// Where the minimap is: its area and the line its top shows.
+#[derive(Clone, Copy)]
+struct MinimapGeom {
+    bounds: Bounds<Pixels>,
+    first_row: usize,
+}
+
 struct Layout {
     bounds: Bounds<Pixels>,
     text_left: f32,
@@ -290,6 +315,7 @@ struct Layout {
     pad_top: f32,
     lines: Vec<(usize, ShapedLine, Vec<usize>)>,
     scrollbar: Option<ScrollbarGeom>,
+    minimap: Option<MinimapGeom>,
 }
 
 pub struct HoverCard {
@@ -343,6 +369,9 @@ pub struct Editor {
     layout: Option<Layout>,
     drag: Option<DragMode>,
     scroll_drag: Option<f32>,
+    /// Dragging in the minimap: the view follows the pointer.
+    minimap_drag: bool,
+    layout_minimap: Option<MinimapGeom>,
     last_mouse: Point<Pixels>,
     autoscroll_task: Option<Task<()>>,
     marked: Option<Range<usize>>,
@@ -420,6 +449,8 @@ impl Editor {
             layout: None,
             drag: None,
             scroll_drag: None,
+            minimap_drag: false,
+            layout_minimap: None,
             last_mouse: Point::default(),
             autoscroll_task: None,
             marked: None,
@@ -884,6 +915,11 @@ impl Editor {
     }
 
     // ------------------------------------------------------------ word wrap
+
+    /// The minimap: plain code files only (not diffs, previews of other versions, or inputs).
+    fn minimap_active(&self) -> bool {
+        minimap() && self.mode == EditorMode::Full && self.decor.is_none() && self.diff_role == DiffRole::None && self.path.is_some() && !self.read_only
+    }
 
     fn wrap_active(&self) -> bool {
         word_wrap() && self.mode == EditorMode::Full && self.decor.is_none()
@@ -1747,6 +1783,13 @@ impl Editor {
         }
         let Some(l) = &self.layout else { return };
         let x = ev.position.x / px(1.);
+        if let Some(m) = l.minimap
+            && m.bounds.contains(&ev.position)
+        {
+            self.minimap_drag = true;
+            self.scroll_to_minimap(ev.position.y);
+            return cx.notify();
+        }
         if let Some(sb) = &l.scrollbar
             && sb.track.contains(&ev.position)
         {
@@ -1828,6 +1871,23 @@ impl Editor {
         cx.notify();
     }
 
+    /// Where the minimap was drawn, and the first line on screen (tests).
+    #[cfg(test)]
+    pub fn minimap_view(&self) -> Option<(Bounds<Pixels>, usize)> {
+        let l = self.layout.as_ref()?;
+        Some((l.minimap?.bounds, l.lines.first().map(|x| x.0).unwrap_or(0)))
+    }
+
+    /// Centers the view on the minimap's line under `y`.
+    fn scroll_to_minimap(&mut self, y: Pixels) {
+        let Some(l) = &self.layout else { return };
+        let Some(m) = l.minimap else { return };
+        let i = ((y - m.bounds.top()) / px(1.) / MINI_LINE_H).max(0.) as usize;
+        let row = (m.first_row + i).min(self.buf.line_count().saturating_sub(1));
+        let height = l.bounds.size.height / px(1.);
+        self.scroll_y = (self.disp_of(row) as f32 * l.line_h - height / 2.).max(0.);
+    }
+
     fn drag_scrollbar(&mut self, y: Pixels) {
         let (Some(grab), Some(l)) = (self.scroll_drag, &self.layout) else { return };
         let Some(sb) = &l.scrollbar else { return };
@@ -1875,9 +1935,14 @@ impl Editor {
         if !ev.dragging() {
             self.drag = None;
             self.scroll_drag = None;
+            self.minimap_drag = false;
             self.hover_problems(ev.position, cx);
             self.hover_word(ev.position, window, cx);
             return;
+        }
+        if self.minimap_drag {
+            self.scroll_to_minimap(ev.position.y);
+            return cx.notify();
         }
         if self.scroll_drag.is_some() {
             self.drag_scrollbar(ev.position.y);
@@ -1918,9 +1983,12 @@ impl Editor {
         }
     }
 
-    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.drag = None;
         self.scroll_drag = None;
+        if std::mem::take(&mut self.minimap_drag) {
+            cx.notify();
+        }
     }
 
     fn scroll_wheel(&mut self, ev: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -2015,7 +2083,9 @@ impl Editor {
         // Room between the numbers and the text for the fold chevrons.
         let text_pad = if full { 18. } else { 2. };
         let text_left = left + blame_w + numbers_w + text_pad;
-        let text_w = (width - blame_w - numbers_w - text_pad - 10.).max(10.);
+        let mini = self.minimap_active() && width > 400.;
+        let mini_w = if mini { MINI_W } else { 0. };
+        let text_w = (width - blame_w - numbers_w - text_pad - 10. - mini_w).max(10.);
         let pad_top = if self.mode == EditorMode::SingleLine { ((height - line_h) / 2.).max(0.) } else { 0. };
 
         // Word wrap at the editor's width (monospace: a column count).
@@ -2176,7 +2246,8 @@ impl Editor {
 
         let mut p = EditorPaint::default();
         p.bounds = bounds;
-        p.text_clip = Bounds::new(point(px(text_left - text_pad / 2.), bounds.top()), size(px(width - (text_left - left) + text_pad / 2.), bounds.size.height));
+        // Text stops where the minimap starts.
+        p.text_clip = Bounds::new(point(px(text_left - text_pad / 2.), bounds.top()), size(px(width - (text_left - left) + text_pad / 2. - if mini { mini_w + 12. } else { 0. }), bounds.size.height));
         p.line_h = px(line_h);
 
         if full {
@@ -2596,6 +2667,70 @@ impl Editor {
                 p.text.push((point(px(ex + char_w * 4.), px(ey)), shaped_label));
             }
 
+            // Minimap: each line's words as small bars in their colors, the part on screen
+            // shaded. Taller files than it can show scroll inside it along with the view.
+            self.layout_minimap = None;
+            if mini {
+                let mini_left = left + width - 12. - mini_w;
+                let mini_bounds = Bounds::new(point(px(mini_left), bounds.top()), size(px(mini_w), bounds.size.height));
+                p.quads_over.push(fill(mini_bounds, theme::bg_editor()));
+                p.quads_over.push(fill(Bounds::new(point(px(mini_left), bounds.top()), size(px(1.), bounds.size.height)), theme::border().opacity(0.6)));
+                let rows_fit = (height / MINI_LINE_H).floor().max(1.) as usize;
+                let first_vis = lines.first().map(|l| l.0).unwrap_or(0);
+                let last_vis = lines.last().map(|l| l.0).unwrap_or(first_vis);
+                let frac = if max_scroll > 0. { self.scroll_y / max_scroll } else { 0. };
+                let first_row = (line_count.saturating_sub(rows_fit) as f32 * frac).round() as usize;
+                let cols = ((mini_w - 8.) / MINI_CHAR_W) as usize;
+                for (i, row) in (first_row..line_count.min(first_row + rows_fit)).enumerate() {
+                    let y = top + i as f32 * MINI_LINE_H;
+                    let text = self.buf.line(row);
+                    let spans = self.spans.as_ref().and_then(|s| s.get(row));
+                    let color_at = |col: usize| {
+                        spans.and_then(|sp| sp.iter().find(|(r, _)| r.contains(&col))).map(|(_, h)| highlight::color(*h)).unwrap_or(theme::fg())
+                    };
+                    let mut col = 0usize;
+                    let mut run: Option<(usize, Hsla)> = None;
+                    let mut flush = |start: usize, end: usize, color: Hsla, p: &mut EditorPaint| {
+                        let x = mini_left + 4. + start as f32 * MINI_CHAR_W;
+                        p.quads_over.push(fill(Bounds::new(point(px(x), px(y)), size(px((end - start) as f32 * MINI_CHAR_W), px(MINI_LINE_H - 0.5))), color.opacity(0.75)));
+                    };
+                    // `col`: where it's drawn (tabs are 4 wide); `ci`: the char, for its color.
+                    for (ci, ch) in text.chars().enumerate() {
+                        if col >= cols {
+                            break;
+                        }
+                        let w = if ch == '\t' { 4 } else { 1 };
+                        if ch.is_whitespace() {
+                            if let Some((s, c)) = run.take() {
+                                flush(s, col, c, &mut p);
+                            }
+                        } else {
+                            let c = color_at(ci);
+                            match run {
+                                Some((_, rc)) if rc == c => {}
+                                Some((s, rc)) => {
+                                    flush(s, col, rc, &mut p);
+                                    run = Some((col, c));
+                                }
+                                None => run = Some((col, c)),
+                            }
+                        }
+                        col += w;
+                    }
+                    if let Some((s, c)) = run {
+                        flush(s, col.min(cols), c, &mut p);
+                    }
+                }
+                // The lines on screen.
+                if last_vis + 1 > first_row {
+                    let a = first_vis.saturating_sub(first_row) as f32 * MINI_LINE_H;
+                    let b = ((last_vis + 1).saturating_sub(first_row) as f32 * MINI_LINE_H).max(a + MINI_LINE_H);
+                    let shade = if self.minimap_drag { 0.16 } else { 0.09 };
+                    p.quads_over.push(fill(Bounds::new(point(px(mini_left + 1.), px(top + a)), size(px(mini_w - 1.), px((b - a).min(height - a)))), theme::fg().opacity(shade)));
+                }
+                self.layout_minimap = Some(MinimapGeom { bounds: mini_bounds, first_row });
+            }
+
             // Scrollbar.
             if max_scroll > 0. {
                 let track = Bounds::new(point(px(left + width - 12.), bounds.top()), size(px(12.), bounds.size.height));
@@ -2622,6 +2757,7 @@ impl Editor {
             pad_top,
             lines,
             scrollbar: self.layout_scrollbar.take(),
+            minimap: self.layout_minimap.take(),
         });
         p
     }

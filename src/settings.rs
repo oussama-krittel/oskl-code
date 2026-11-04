@@ -12,12 +12,14 @@ pub struct Settings {
     pub format_on_save: bool,
     /// Soft-wrap long lines in code editors (⌥Z).
     pub word_wrap: bool,
+    /// The minimap beside code files.
+    pub minimap: bool,
     pub recent_folders: Vec<PathBuf>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { sidebar_right: false, font_size: 12., blame_default: false, autosave: true, checks: true, format_on_save: true, word_wrap: false, recent_folders: Vec::new() }
+        Self { sidebar_right: false, font_size: 12., blame_default: false, autosave: true, checks: true, format_on_save: true, word_wrap: false, minimap: true, recent_folders: Vec::new() }
     }
 }
 
@@ -47,6 +49,7 @@ impl Settings {
                 "checks" => s.checks = v != "off",
                 "formatonsave" => s.format_on_save = v != "off",
                 "wrap" => s.word_wrap = v == "on",
+                "minimap" => s.minimap = v != "off",
                 // App-wide, so kept where every window reads them (not per window).
                 "theme" => crate::theme::set(crate::theme::Theme::from_id(v)),
                 "ui_zoom" => crate::ui::set_scale(v.parse::<f32>().unwrap_or(1.).clamp(UI_ZOOM_MIN, UI_ZOOM_MAX)),
@@ -67,7 +70,7 @@ impl Settings {
             std::fs::create_dir_all(dir).ok();
         }
         let mut out = format!(
-            "v = 2\nsidebar = {}\nfont_size = {}\nblame = {}\nautosave = {}\nchecks = {}\nformatonsave = {}\nwrap = {}\ntheme = {}\nui_zoom = {:.2}\n",
+            "v = 2\nsidebar = {}\nfont_size = {}\nblame = {}\nautosave = {}\nchecks = {}\nformatonsave = {}\nwrap = {}\nminimap = {}\ntheme = {}\nui_zoom = {:.2}\n",
             if self.sidebar_right { "right" } else { "left" },
             self.font_size,
             if self.blame_default { "on" } else { "off" },
@@ -75,6 +78,7 @@ impl Settings {
             if self.checks { "on" } else { "off" },
             if self.format_on_save { "on" } else { "off" },
             if self.word_wrap { "on" } else { "off" },
+            if self.minimap { "on" } else { "off" },
             crate::theme::current().id(),
             crate::ui::scale(),
         );
