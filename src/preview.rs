@@ -218,8 +218,12 @@ impl PreviewView {
                     .justify_center()
                     .child(
                         div()
-                            .w_full()
-                            .max_w(px(860.))
+                            .debug_selector(|| "preview-page".into())
+                            // 860 wide, narrower when the pane is: a definite width either way,
+                            // so tables (sized against it) stay as wide as the page.
+                            .w(px(860.))
+                            .max_w(relative(1.))
+                            .flex_shrink_0()
                             .px(px(32.))
                             .py(px(28.))
                             .flex()
@@ -663,7 +667,8 @@ impl Renderer {
             len,
             font: f,
             color: if st.link { theme::accent() } else if st.code { highlight::color(string_index()) } else { self.color },
-            background_color: st.code.then(|| theme::ca(0xffffff14)),
+            // A tint of the text color, so code stands out on light themes as well as dark.
+            background_color: st.code.then(|| theme::fg().opacity(0.1)),
             underline: st.link.then(|| UnderlineStyle { thickness: px(1.), color: Some(theme::accent().opacity(0.6)), wavy: false }),
             strikethrough: st.strike.then(|| StrikethroughStyle { thickness: px(1.), color: Some(theme::fg_dim()) }),
         }
@@ -739,30 +744,75 @@ impl Renderer {
             }
             Block::Rule => div().my(px(6.)).h(px(1.)).bg(theme::border()).into_any_element(),
             Block::Table(align, rows) => {
+                // Columns share the width by how much they hold (like a browser's table), every
+                // row the same, and text wraps inside its cell. Too many columns to fit: the
+                // table keeps a readable width per column and scrolls sideways.
+                let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+                let weights = column_weights(rows, cols);
+                let table_id = self.id();
                 let mut out = Vec::new();
                 for (r, row) in rows.iter().enumerate() {
                     let mut cells = Vec::new();
-                    for (c, cell) in row.iter().enumerate() {
+                    for (c, weight) in weights.iter().enumerate() {
                         let a = align.get(c).copied().unwrap_or(Alignment::None);
-                        let text = self.inline(cell, r == 0);
+                        let text = row.get(c).map(|cell| self.inline(cell, r == 0));
+                        let selector = format!("md-cell-{table_id}-{r}-{c}");
+                        let text_sel = format!("md-cell-text-{table_id}-{r}-{c}");
                         cells.push(
                             div()
-                                .flex_1()
-                                .min_w(px(60.))
+                                .debug_selector(move || selector)
+                                .flex_basis(px(0.))
+                                .min_w(px(MIN_COL_W))
                                 .px(px(10.))
                                 .py(px(5.))
-                                .flex()
+                                .overflow_hidden()
                                 .when(c > 0, |d| d.border_l_1())
                                 .border_color(theme::border())
-                                .when(a == Alignment::Center, |d| d.justify_center())
-                                .when(a == Alignment::Right, |d| d.justify_end())
-                                .child(text)
+                                .map(|mut d| {
+                                    d.style().flex_grow = Some(*weight);
+                                    d.style().flex_shrink = Some(*weight);
+                                    d
+                                })
+                                .child(
+                                    div()
+                                        .debug_selector(move || text_sel)
+                                        .w_full()
+                                        .min_w_0()
+                                        .line_height(relative(1.45))
+                                        .when(a == Alignment::Center, |d| d.text_center())
+                                        .when(a == Alignment::Right, |d| d.text_right())
+                                        .children(text),
+                                )
                                 .into_any_element(),
                         );
                     }
-                    out.push(div().flex().when(r > 0, |d| d.border_t_1()).border_color(theme::border()).when(r == 0, |d| d.bg(theme::ca(0xffffff08))).children(cells).into_any_element());
+                    out.push(
+                        div()
+                            .flex()
+                            .w_full()
+                            .when(r > 0, |d| d.border_t_1())
+                            .border_color(theme::border())
+                            .when(r == 0, |d| d.bg(theme::fg().opacity(0.05)))
+                            .children(cells)
+                            .into_any_element(),
+                    );
                 }
-                div().flex().flex_col().border_1().border_color(theme::border()).rounded(px(4.)).overflow_hidden().children(out).into_any_element()
+                div()
+                    .id(("md-table", table_id))
+                    .w_full()
+                    .overflow_x_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .min_w(px(cols as f32 * MIN_COL_W))
+                            .border_1()
+                            .border_color(theme::border())
+                            .rounded(px(4.))
+                            .overflow_hidden()
+                            .children(out),
+                    )
+                    .into_any_element()
             }
             Block::Image(url, alt) => self.image(url, alt),
             Block::Html(text) => div().font_family(theme::MONO_FONT).text_size(px(12.)).text_color(theme::fg_muted()).child(text.trim().to_string()).into_any_element(),
@@ -791,6 +841,20 @@ impl Renderer {
     }
 }
 
+/// The narrowest a table column gets before the table scrolls sideways instead.
+const MIN_COL_W: f32 = 90.;
+
+/// How much of a table's width each column gets: its longest cell, within limits, so a column
+/// of short dates doesn't take as much as one of sentences (and long ones wrap).
+fn column_weights(rows: &[Vec<Inline>], cols: usize) -> Vec<f32> {
+    (0..cols)
+        .map(|c| {
+            let longest = rows.iter().filter_map(|r| r.get(c)).map(|cell| cell.text.chars().count()).max().unwrap_or(0);
+            (longest as f32).clamp(6., 60.)
+        })
+        .collect()
+}
+
 fn string_index() -> u8 {
     (0..u8::MAX).find(|i| highlight::name(*i) == "string").unwrap_or(0)
 }
@@ -808,7 +872,7 @@ fn code_block(id: usize, text: &str, spans: Option<&LineSpans>) -> AnyElement {
     div()
         .id(("md-code", id))
         .rounded(px(6.))
-        .bg(theme::ca(0xffffff0a))
+        .bg(theme::fg().opacity(0.05))
         .border_1()
         .border_color(theme::border())
         .px(px(14.))

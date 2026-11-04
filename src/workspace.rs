@@ -6140,6 +6140,24 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn change_names_use_the_buttons_room_until_hovered(cx: &mut TestAppContext) {
+        let long = "sprint-new-features-and-mobile-screens-sync-with-backend-2026.md";
+        let (ws, cx) = setup_with(cx, |dir| {
+            std::process::Command::new("sh").arg("-c").arg(format!("git init -q -b main && echo x > {long}")).current_dir(dir).output().unwrap();
+        });
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
+        cx.run_until_parked();
+        let name: &'static str = Box::leak(format!("change-name-{long}").into_boxed_str());
+        let row: &'static str = Box::leak(format!("change-row-{long}").into_boxed_str());
+        let wide = cx.debug_bounds(name).expect("the file's name").size.width;
+        let at = cx.debug_bounds(row).expect("its row").center();
+        cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let hovered = cx.debug_bounds(name).unwrap().size.width;
+        assert!(wide > hovered + gpui::px(30.), "not hovered, the name has the buttons' room: {wide:?} vs {hovered:?} hovered");
+    }
+
+    #[gpui::test]
     fn folders_in_the_changes_tree_can_be_discarded(cx: &mut TestAppContext) {
         let (ws, cx) = setup_with(cx, |dir| {
             let sh = |cmd: &str| {
@@ -6450,6 +6468,83 @@ mod ui_tests {
         cx.simulate_click(at, gpui::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(git_out(&root, &["rev-list", "--count", "HEAD"]), "2", "Commit Anyway commits");
+    }
+
+    #[gpui::test]
+    fn markdown_tables_wrap_inside_their_cells(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let md = "| Service | Status | What was added |\n|---|---|---|\n\
+| `finbloom-admin` | Updated | Stored KYC fields shown on the customer page, with the review history and who approved each change |\n\
+| `finbloom-app`, `finbloom-banking`, `finbloom-custody`, `finbloom-infra`, `finbloom-ledger` | ✅ No change | — |\n\
+| Tue 17 Nov | Done | Withdrawal fee and spread settings |\n";
+        std::fs::write(root.join("README.md"), md).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("README.md"), None, false, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-shift-v");
+        cx.run_until_parked();
+        let b = |cx: &mut VisualTestContext, s: String| cx.debug_bounds(Box::leak(s.into_boxed_str())).unwrap_or_else(|| panic!("table cell on screen"));
+        for r in 0..4 {
+            for c in 0..3 {
+                let cell = b(cx, format!("md-cell-1-{r}-{c}"));
+                let text = b(cx, format!("md-cell-text-1-{r}-{c}"));
+                assert!(text.right() <= cell.right() + gpui::px(0.5), "row {r} col {c}: text stays in its cell ({text:?} in {cell:?})");
+                // Every row's columns line up.
+                let first = b(cx, format!("md-cell-1-0-{c}"));
+                assert!((cell.left() - first.left()).abs() < gpui::px(0.5), "row {r} col {c} lines up with the header");
+            }
+        }
+        let row_h = |cx: &mut VisualTestContext, r: usize| b(cx, format!("md-cell-text-1-{r}-0")).size.height;
+        assert!(row_h(cx, 2) > row_h(cx, 3) * 1.5, "the long list of names wraps onto more lines");
+        let width = |cx: &mut VisualTestContext, c: usize| b(cx, format!("md-cell-1-0-{c}")).size.width;
+        assert!(width(cx, 1) < width(cx, 2), "a short column takes less room than a long one");
+
+        // Wide enough that the page stops at its readable width: the table still fills it.
+        for w in [1100., 1600., 2400.] {
+            cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(900.)));
+            cx.run_until_parked();
+            let table: f32 = (0..3).map(|c| width(cx, c) / gpui::px(1.)).sum();
+            let page = cx.debug_bounds("preview-page").unwrap().size.width / gpui::px(1.) - 64.;
+            assert!(table > page - 6., "at {w}px the table spans the page ({table} of {page}px), not its narrowest");
+            let last = b(cx, "md-cell-1-3-0".into());
+            let page = cx.debug_bounds("preview-markdown").unwrap();
+            assert!(last.bottom() < page.bottom(), "at {w}px every row is shown, none cut off");
+        }
+    }
+
+    #[gpui::test]
+    fn markdown_tables_keep_their_width_beside_an_editor_at_any_width(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let md = "CHECKPOINT, (tracking starts here)\n\n# Sync Report\n\n**Pulled:** 2026-11-02 15:36:52 UTC (updated from the 09:30 pull) · all twelve `shop-*` repositories fast-forwarded to `origin` (nothing ahead).\n\n\
+| Repository | Branch | Before → After | New commits |\n|---|---|---|---|\n\
+| shop-retail | dev | d9a1f4d → f02532f | 1 (+ 1 merge) |\n| shop-shared | dev | 3f71b28 → fdbf457 | 1 (+ 1 merge) |\n\
+| shop-banking | dev | a8e334d → 08d0e26 | 3 (+ 1 merge) |\n| shop-ledger | dev | 348c44f → 08c9f74 | 2 (+ 1 merge) |\n\n\
+No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing` on either `main` or `dev`.\n\nStill not merged:\n\n\
+| Repository | Branch | What |\n|---|---|---|\n\
+| shop-tracker | ETA-Completion | Target dates for the remaining scope (updated today, still a branch) |\n\
+| shop-infra | chore/US-DEP-FIAT-001-dev-banking-zand-uat | Dev banking on the sandbox, webhook IP allowlist |\n\
+| shop-ledger | feature/history-fee-rows | Fee recorded per trade and withdrawal, including zero fees (updated today, 1947634) |\n\n---\n\n## 1. Balances (`shop-retail`)\n\n* **Read from the ledger.** The web routes the balances request to the ledger.\n";
+        std::fs::write(root.join("report.md"), md).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("report.md"), None, false, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-k v");
+        cx.run_until_parked();
+        let b = |cx: &mut VisualTestContext, s: String| cx.debug_bounds(Box::leak(s.into_boxed_str()));
+        let mut w = 1300.;
+        while w <= 2300. {
+            cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(1000.)));
+            cx.run_until_parked();
+            let page = b(cx, "preview-page".into()).expect("the preview").size.width / gpui::px(1.) - 64.;
+            for (table, cols, rows) in [(1, 4, 5), (2, 3, 4)] {
+                let width: f32 = (0..cols).map(|c| b(cx, format!("md-cell-{table}-0-{c}")).unwrap_or_else(|| panic!("table {table}")).size.width / gpui::px(1.)).sum();
+                assert!(width > page - 6. || width >= cols as f32 * 90. && page < cols as f32 * 90., "window {w}: table {table} is {width}px on a {page}px page");
+                let last = b(cx, format!("md-cell-{table}-{}-0", rows - 1)).unwrap();
+                let text = b(cx, format!("md-cell-text-{table}-{}-0", rows - 1)).unwrap();
+                assert!(text.bottom() <= last.bottom() + gpui::px(0.5), "window {w}: table {table}'s last row isn't cut off");
+            }
+            w += 37.;
+        }
     }
 
     #[gpui::test]

@@ -230,6 +230,9 @@ pub struct GitPanel {
     last_op: Option<git::OpState>,
     /// Collapsed folders in the changes tree ("section:dir").
     collapsed: std::collections::HashSet<String>,
+    /// The changes row under the mouse: only it shows its buttons (the others' names get
+    /// that room). Tracked here, since a hover style can't change layout.
+    hovered_row: Option<String>,
     /// `in_checkout` for the current log and HEAD, recomputed when either changes.
     reach: std::cell::RefCell<Option<(String, usize, Rc<(Vec<bool>, Option<usize>)>)>>,
     /// Commits opened in the graph to list their files (by sha), and those files once read.
@@ -287,6 +290,7 @@ impl GitPanel {
             scope_remote: Vec::new(),
             last_op: None,
             collapsed: Default::default(),
+            hovered_row: None,
             reach: Default::default(),
             expanded: Default::default(),
             commit_files: Default::default(),
@@ -665,6 +669,18 @@ impl GitPanel {
                 Ok(format!("Discarded {n} file{}", if n == 1 { "" } else { "s" }))
             })
         });
+    }
+
+    fn set_hovered_row(&mut self, key: &str, on: bool, cx: &mut Context<Self>) {
+        if on {
+            if self.hovered_row.as_deref() != Some(key) {
+                self.hovered_row = Some(key.to_string());
+                cx.notify();
+            }
+        } else if self.hovered_row.as_deref() == Some(key) {
+            self.hovered_row = None;
+            cx.notify();
+        }
     }
 
     fn open_change(&self, staged: bool, change: &Change, preview: bool, cx: &mut Context<Self>) {
@@ -1351,12 +1367,15 @@ impl GitPanel {
             }
             ListRow::Folder { staged, key, label, depth, open, paths } => {
                 let (staged, paths, open, key) = (*staged, paths.clone(), *open, key.clone());
+                let hover_key = format!("folder:{key}");
+                let hovered = self.hovered_row.as_deref() == Some(hover_key.as_str());
                 let name = label.rsplit(" / ").next().unwrap_or(label).to_string();
                 let row_selector = format!("folder-row-{name}");
                 div()
                     .id(("folder", ix))
                     .debug_selector(move || row_selector)
                     .group("folder")
+                    .on_hover(cx.listener(move |p, on: &bool, _, cx| p.set_hovered_row(&hover_key, *on, cx)))
                     .flex()
                     .items_center()
                     .h(theme::row_h())
@@ -1380,8 +1399,8 @@ impl GitPanel {
                         div()
                             .flex()
                             .gap(px(1.))
-                            .invisible()
-                            .group_hover("folder", |s| s.visible())
+                            // Out of the way until hovered, so the name gets the room.
+                            .when(!hovered, |d| d.hidden())
                             // Discard everything in the folder (asks first, like a file), like VS Code.
                             .when(!staged, |d| {
                                 d.child(
@@ -1422,6 +1441,10 @@ impl GitPanel {
                     .id(("file", ix))
                     .debug_selector(move || selector)
                     .group("file")
+                    .on_hover(cx.listener({
+                        let k = format!("file:{staged}:{}", change.path);
+                        move |p, on: &bool, _, cx| p.set_hovered_row(&k, *on, cx)
+                    }))
                     .flex()
                     .items_center()
                     .h(theme::row_h())
@@ -1451,20 +1474,26 @@ impl GitPanel {
                             .gap(px(6.))
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(
+                            .child({
+                                let name_sel = format!("change-name-{}", change.path);
                                 div()
+                                    .debug_selector(move || name_sel)
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
                                     .text_color(color)
                                     .when(change.status == FileStatus::Deleted, |d| d.line_through())
-                                    .child(name),
-                            )
+                                    .child(name)
+                            })
                             .when(*depth == 0 && !dir.is_empty(), |d| d.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(dir))),
                     )
                     .child(
                         div()
                             .flex()
                             .gap(px(1.))
-                            .invisible()
-                            .group_hover("file", |s| s.visible())
+                            // Out of the way until hovered (or picked with the keyboard),
+                            // so the name gets the room.
+                            .when(!selected && self.hovered_row.as_deref() != Some(&format!("file:{staged}:{}", change.path)), |d| d.hidden())
                             .child(ui::icon_button(("open", ix), "open").on_click(cx.listener(move |_, _, _, cx| {
                                 cx.stop_propagation();
                                 cx.emit(Request::OpenFile { path: path_open.clone(), line: None, preview: false });
