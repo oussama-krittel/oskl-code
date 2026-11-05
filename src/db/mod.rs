@@ -420,8 +420,164 @@ pub struct Grid {
     pub more: bool,
     /// What happened when there are no rows ("3 rows affected", "OK").
     pub note: String,
-    /// MongoDB: each row's whole document, as mongosh prints it.
-    pub docs: Option<Vec<String>>,
+    /// MongoDB: each row's whole document, with its values' types.
+    pub trees: Option<Vec<Tree>>,
+}
+
+/// A document's value with its type, to show it as MongoDB tools do.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Tree {
+    Null,
+    Bool(bool),
+    /// An Int32, as written.
+    Num(String),
+    Str(String),
+    /// A typed value: ("Double", as written), ("ObjectId", hex), ("Date", ISO text), ("Long", digits), ("Decimal128",
+    /// …), ("UUID", …), ("Regex", /…/), ("Binary", base64), ("Timestamp", …).
+    Typed(&'static str, String),
+    Array(Vec<Tree>),
+    Object(Vec<(String, Tree)>),
+}
+
+/// How a tree is written as text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextStyle {
+    /// Like mongosh: bare keys, 'strings', ObjectId('…'), ISODate('…').
+    Shell,
+    /// Extended JSON: "keys", {"$oid": "…"}, {"$date": "…"}.
+    Json,
+}
+
+impl Tree {
+    /// The type's name, as MongoDB Compass shows it in a table's header.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Tree::Null => "Null",
+            Tree::Bool(_) => "Boolean",
+            Tree::Num(_) => "Int32",
+            Tree::Str(_) => "String",
+            Tree::Typed("Date", _) => "Date",
+            Tree::Typed("Long", _) => "Int64",
+            Tree::Typed(t, _) => t,
+            Tree::Array(_) => "Array",
+            Tree::Object(_) => "Object",
+        }
+    }
+
+    /// One line, for a table cell: scalars as written; arrays "[] 7 elements", objects
+    /// "{} 3 fields".
+    pub fn short(&self, style: TextStyle) -> String {
+        match self {
+            Tree::Array(a) => format!("[] {} element{}", a.len(), if a.len() == 1 { "" } else { "s" }),
+            Tree::Object(f) => format!("{{}} {} field{}", f.len(), if f.len() == 1 { "" } else { "s" }),
+            other => {
+                let mut s = String::new();
+                other.write(&mut s, style, 0, false);
+                s
+            }
+        }
+    }
+
+    /// The whole value, indented two spaces a level (cut past 200 KB).
+    pub fn text(&self, style: TextStyle) -> String {
+        let mut s = String::new();
+        self.write(&mut s, style, 0, true);
+        if s.len() > 200_000 {
+            let mut cut = 200_000;
+            while !s.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            s.truncate(cut);
+            s.push_str("\n… (cut: longer)");
+        }
+        s
+    }
+
+    /// A key as written: bare when it can be (mongosh), else quoted.
+    pub fn key(k: &str, style: TextStyle) -> String {
+        let bare = k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$') && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        match style {
+            TextStyle::Shell if bare => k.to_string(),
+            TextStyle::Shell => quote(k, '\''),
+            TextStyle::Json => quote(k, '"'),
+        }
+    }
+
+    fn write(&self, out: &mut String, style: TextStyle, depth: usize, deep: bool) {
+        let pad = |n: usize| "  ".repeat(n);
+        match (self, style) {
+            (Tree::Null, _) => out.push_str("null"),
+            (Tree::Bool(b), _) => out.push_str(&b.to_string()),
+            (Tree::Num(n), _) => out.push_str(n),
+            (Tree::Str(s), TextStyle::Shell) => out.push_str(&quote(s, '\'')),
+            (Tree::Str(s), TextStyle::Json) => out.push_str(&quote(s, '"')),
+            (Tree::Typed("Regex" | "Double", r), _) => out.push_str(r),
+            (Tree::Typed(t, v), TextStyle::Shell) => {
+                let name = match *t {
+                    "Date" => "ISODate",
+                    t => t,
+                };
+                out.push_str(&format!("{name}('{v}')"));
+            }
+            (Tree::Typed(t, v), TextStyle::Json) => {
+                let key = match *t {
+                    "ObjectId" => "$oid",
+                    "Date" => "$date",
+                    "Long" => "$numberLong",
+                    "Decimal128" => "$numberDecimal",
+                    "UUID" => "$uuid",
+                    "Binary" => "$binary",
+                    _ => "$value",
+                };
+                out.push_str(&format!("{{\"{key}\": {}}}", quote(v, '"')));
+            }
+            (Tree::Array(a), _) if a.is_empty() => out.push_str("[]"),
+            (Tree::Object(f), _) if f.is_empty() => out.push_str("{}"),
+            (Tree::Array(a), _) if !deep => out.push_str(&format!("[…{}]", a.len())),
+            (Tree::Object(_), _) if !deep => out.push_str("{…}"),
+            (Tree::Array(a), _) => {
+                out.push_str("[\n");
+                for (i, x) in a.iter().enumerate() {
+                    out.push_str(&pad(depth + 1));
+                    x.write(out, style, depth + 1, true);
+                    out.push_str(if i + 1 < a.len() { ",\n" } else { "\n" });
+                }
+                out.push_str(&pad(depth));
+                out.push(']');
+            }
+            (Tree::Object(f), _) => {
+                out.push_str("{\n");
+                for (i, (k, v)) in f.iter().enumerate() {
+                    out.push_str(&pad(depth + 1));
+                    out.push_str(&Tree::key(k, style));
+                    out.push_str(": ");
+                    v.write(out, style, depth + 1, true);
+                    out.push_str(if i + 1 < f.len() { ",\n" } else { "\n" });
+                }
+                out.push_str(&pad(depth));
+                out.push('}');
+            }
+        }
+    }
+}
+
+/// `s` between quotes `q`, with q, \ and newlines escaped.
+fn quote(s: &str, q: char) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(q);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c if c == q => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(q);
+    out
 }
 
 impl Grid {
@@ -601,6 +757,7 @@ mod live {
         assert!(wait(engine::test(c.clone(), "wrong".into())).unwrap_err().contains("password"), "a wrong password says so");
         let dbs = wait(engine::children(c.clone(), vec![])).unwrap();
         assert!(labels(&dbs).contains(&"crm".into()), "{dbs:?}");
+        wait(engine::query(c.clone(), Scope { database: Some("crm".into()), collection: None }, "CREATE OR REPLACE VIEW public.cheap AS SELECT * FROM fruit_order WHERE qty < 10".into())).unwrap();
         let schemas = wait(engine::children(c.clone(), vec!["crm".into()])).unwrap();
         assert_eq!(labels(&schemas), ["public", "sales"], "public first");
         let rels = wait(engine::children(c.clone(), vec!["crm".into(), "public".into()])).unwrap();
@@ -618,9 +775,9 @@ mod live {
         assert_eq!(big.grid.rows.len(), 50);
         assert!(big.estimate && big.total.unwrap() > 200_000, "a big table's count is the server's estimate: {:?}", big.total);
         let scope = Scope { database: Some("crm".into()), collection: None };
-        let r = wait(engine::query(c.clone(), scope.clone(), "UPDATE fruit_order SET qty = 7 WHERE name = 'Kiwi'; SELECT name, qty FROM fruit_order WHERE name = 'Kiwi'; SELECT * FROM sales.big".into())).unwrap();
+        let r = wait(engine::query(c.clone(), scope.clone(), "UPDATE fruit_order SET qty = 6 WHERE name = 'Kiwi'; SELECT name, qty FROM fruit_order WHERE name = 'Kiwi'; SELECT * FROM sales.big".into())).unwrap();
         assert_eq!(r[0].note, "1 row affected");
-        assert_eq!(r[1].rows, vec![vec![Some("Kiwi".into()), Some("7".into())]]);
+        assert_eq!(r[1].rows, vec![vec![Some("Kiwi".into()), Some("6".into())]]);
         assert_eq!((r[2].rows.len(), r[2].more), (MAX_ROWS, true), "a huge result keeps only the first rows");
         let e = wait(engine::query(c.clone(), scope, "SELECT nope FROM fruit_order".into())).unwrap_err();
         assert!(e.contains("column \"nope\" does not exist"), "{e}");
@@ -634,29 +791,33 @@ mod live {
         if !live() {
             return;
         }
-        let c = conn(Kind::Redis, 56379, "", "redispw", "0");
+        // Database 15: the server's own data (database 0…) is left alone.
+        let c = conn(Kind::Redis, 56379, "", "redispw", "15");
         assert!(wait(engine::test(c.clone(), "redispw".into())).unwrap().starts_with("Redis "));
         let r = wait(engine::query(
             c.clone(),
             Scope::default(),
-            "FLUSHDB\nSET user:1 \"Ann Lee\"\nHSET session:abc ip 1.2.3.4 agent \"Safari 18\"\nRPUSH jobs a b c\nZADD rank 3 x 1 y\nEXPIRE user:1 600\nGET user:1".into(),
+            "FLUSHDB\nSET user:1 \"Ann Lee\"\nHSET session:abc ip 1.2.3.4 agent \"Safari 18\"\nRPUSH jobs a b c\nZADD rank 3 x 1 y\nEXPIRE user:1 600\nSET user:2 Bob\nGET user:1".into(),
         ))
         .unwrap();
         assert_eq!(r.last().unwrap().rows, vec![vec![Some("Ann Lee".into())]]);
         let dbs = wait(engine::children(c.clone(), vec![])).unwrap();
-        assert_eq!(dbs[0].label, "db0");
-        assert_eq!(dbs[0].detail, "4");
-        let keys = wait(engine::children(c.clone(), vec!["db0".into()])).unwrap();
-        assert_eq!(labels(&keys), ["jobs", "rank", "session:abc", "user:1"]);
-        let h = wait(engine::page(c.clone(), vec!["db0".into(), "session:abc".into()], spec(25))).unwrap();
+        let db = dbs.iter().find(|d| d.label == "db15").expect("db15 listed");
+        assert_eq!(db.detail, "5");
+        let keys = wait(engine::children(c.clone(), vec!["db15".into()])).unwrap();
+        assert_eq!(labels(&keys), ["user", "jobs", "rank", "session:abc"], "keys sharing a prefix in a folder, first");
+        assert_eq!(keys.iter().map(|k| k.detail.as_str()).collect::<Vec<_>>(), ["2", "list", "zset", "hash"], "the folder's count, the keys' types");
+        let users = wait(engine::children(c.clone(), keys[0].path.clone())).unwrap();
+        assert_eq!(users.iter().map(|k| (k.label.as_str(), k.detail.as_str())).collect::<Vec<_>>(), [("user:1", "string"), ("user:2", "string")]);
+        let h = wait(engine::page(c.clone(), vec!["db15".into(), "session:abc".into()], spec(25))).unwrap();
         assert_eq!(h.grid.columns, ["field", "value"]);
         assert_eq!(h.grid.rows.len(), 2);
         assert!(h.grid.note.starts_with("hash · no expiry"), "{}", h.grid.note);
-        let z = wait(engine::page(c.clone(), vec!["db0".into(), "rank".into()], spec(25))).unwrap();
+        let z = wait(engine::page(c.clone(), vec!["db15".into(), "rank".into()], spec(25))).unwrap();
         assert_eq!(z.grid.rows, vec![vec![Some("y".into()), Some("1".into())], vec![Some("x".into()), Some("3".into())]]);
-        let l = wait(engine::page(c.clone(), vec!["db0".into(), "jobs".into()], PageSpec { offset: 1, limit: 1, ..Default::default() })).unwrap();
+        let l = wait(engine::page(c.clone(), vec!["db15".into(), "jobs".into()], PageSpec { offset: 1, limit: 1, ..Default::default() })).unwrap();
         assert_eq!((l.grid.rows.clone(), l.total), (vec![vec![Some("1".into()), Some("b".into())]], Some(3)));
-        let s = wait(engine::page(c.clone(), vec!["db0".into(), "user:1".into()], spec(25))).unwrap();
+        let s = wait(engine::page(c.clone(), vec!["db15".into(), "user:1".into()], spec(25))).unwrap();
         assert!(s.grid.note.contains("expires in"), "{}", s.grid.note);
         assert!(wait(engine::query(c.clone(), Scope::default(), "NOSUCH x".into())).unwrap_err().contains("NOSUCH"));
     }
@@ -668,7 +829,7 @@ mod live {
         }
         let c = conn(Kind::MongoDb, 57017, "root", "mongopw", "admin");
         assert!(wait(engine::test(c.clone(), "mongopw".into())).unwrap().starts_with("MongoDB 7"));
-        let scope = Scope { database: Some("shop".into()), collection: None };
+        let scope = Scope { database: Some("kite_test".into()), collection: None };
         let r = wait(engine::query(
             c.clone(),
             scope.clone(),
@@ -684,16 +845,17 @@ mod live {
         assert_eq!(r[3].rows[0][2].as_deref(), Some("2024-05-01T00:00:00Z"));
         assert_eq!(r[4].rows, vec![vec![Some("3".into())]]);
         let dbs = wait(engine::children(c.clone(), vec![])).unwrap();
-        assert_eq!(dbs[0].label, "shop", "your databases before admin/config/local");
-        let colls = wait(engine::children(c.clone(), vec!["shop".into()])).unwrap();
-        assert_eq!(labels(&colls), ["users"]);
-        let path: Vec<String> = vec!["shop".into(), "users".into()];
+        let at = |n: &str| dbs.iter().position(|d| d.label == n);
+        assert!(at("kite_test").unwrap() < at("admin").unwrap(), "your databases before admin/config/local");
+        let colls = wait(engine::children(c.clone(), vec!["kite_test".into()])).unwrap();
+        assert!(labels(&colls).contains(&"users".to_string()), "{colls:?}");
+        let path: Vec<String> = vec!["kite_test".into(), "users".into()];
         let p = wait(engine::page(c.clone(), path.clone(), PageSpec { limit: 2, sort: Some(("age".into(), false)), ..Default::default() })).unwrap();
         assert_eq!((p.total, p.grid.rows.len()), (Some(3), 2));
         assert_eq!(p.grid.columns[0], "_id");
         let p = wait(engine::page(c.clone(), path.clone(), PageSpec { limit: 25, search: "bo".into(), ..Default::default() })).unwrap();
         assert_eq!(p.total, Some(1), "searched in any field");
-        let in_coll = Scope { database: Some("shop".into()), collection: Some("users".into()) };
+        let in_coll = Scope { database: Some("kite_test".into()), collection: Some("users".into()) };
         let r = wait(engine::query(c.clone(), in_coll.clone(), "{name: 'Ann'}".into())).unwrap();
         assert_eq!(r[0].rows.len(), 1, "a bare filter in a collection's tab finds");
         let r = wait(engine::query(c.clone(), in_coll, "[{$group: {_id: null, avg: {$avg: '$age'}}}]".into())).unwrap();
@@ -713,10 +875,10 @@ mod live {
         wait(engine::query(
             c.clone(),
             Scope::default(),
-            "IF DB_ID('crm') IS NULL CREATE DATABASE crm;".into(),
+            "IF DB_ID('kite_test') IS NULL CREATE DATABASE kite_test;".into(),
         ))
         .unwrap();
-        let scope = Scope { database: Some("crm".into()), collection: None };
+        let scope = Scope { database: Some("kite_test".into()), collection: None };
         let r = wait(engine::query(
             c.clone(),
             scope.clone(),
@@ -731,12 +893,13 @@ mod live {
         assert_eq!(g.rows[0], vec![Some("Apple".into()), Some("10".into()), Some("1.25".into()), Some("2024-03-04 05:06:07.891".into()), Some("2024-03-04".into()), Some("C56A4180-65AA-42EC-A945-5FD21DEC0538".into())]);
         assert_eq!(g.rows[1][2], None, "NULL");
         let dbs = wait(engine::children(c.clone(), vec![])).unwrap();
-        assert_eq!(dbs[0].label, "crm", "your databases before the system ones");
-        let schemas = wait(engine::children(c.clone(), vec!["crm".into()])).unwrap();
+        let at = |n: &str| dbs.iter().position(|d| d.label == n);
+        assert!(at("kite_test").unwrap() < at("master").unwrap(), "your databases before the system ones");
+        let schemas = wait(engine::children(c.clone(), vec!["kite_test".into()])).unwrap();
         assert_eq!(labels(&schemas), ["dbo"]);
-        let tables = wait(engine::children(c.clone(), vec!["crm".into(), "dbo".into()])).unwrap();
+        let tables = wait(engine::children(c.clone(), vec!["kite_test".into(), "dbo".into()])).unwrap();
         assert_eq!(labels(&tables), ["fruit"]);
-        let path: Vec<String> = vec!["crm".into(), "dbo".into(), "fruit".into()];
+        let path: Vec<String> = vec!["kite_test".into(), "dbo".into(), "fruit".into()];
         let p = wait(engine::page(c.clone(), path.clone(), PageSpec { limit: 2, offset: 1, sort: Some(("qty".into(), true)), ..Default::default() })).unwrap();
         assert_eq!(p.total, Some(3));
         assert_eq!(p.grid.rows.iter().map(|r| r[1].clone().unwrap()).collect::<Vec<_>>(), ["Mango", "Apple"], "page 2 of qty descending");
@@ -755,17 +918,17 @@ mod live {
         let r = wait(engine::query(
             c.clone(),
             Scope::default(),
-            "PUT /api/queues/%2F/orders\n{\"durable\": true}\nPOST /api/exchanges/%2F/amq.default/publish\n{\"properties\": {}, \"routing_key\": \"orders\", \"payload\": \"hello\", \"payload_encoding\": \"string\"}".into(),
+            "PUT /api/queues/%2F/kite-test-orders\n{\"durable\": true}\nPOST /api/exchanges/%2F/amq.default/publish\n{\"properties\": {}, \"routing_key\": \"kite-test-orders\", \"payload\": \"hello\", \"payload_encoding\": \"string\"}".into(),
         ))
         .unwrap();
         assert_eq!(r[1].rows, vec![vec![Some("routed".into()), Some("true".into())]]);
         let top = wait(engine::children(c.clone(), vec![])).unwrap();
         assert_eq!(labels(&top), ["Queues", "Exchanges"]);
         let qs = wait(engine::children(c.clone(), vec!["Queues".into()])).unwrap();
-        assert!(labels(&qs).contains(&"orders".into()), "{qs:?}");
+        assert!(labels(&qs).contains(&"kite-test-orders".into()), "{qs:?}");
         let ex = wait(engine::children(c.clone(), vec!["Exchanges".into()])).unwrap();
         assert!(labels(&ex).contains(&"(AMQP default)".into()));
-        let q = wait(engine::page(c.clone(), vec!["Queues".into(), "/".into(), "orders".into()], spec(25))).unwrap();
+        let q = wait(engine::page(c.clone(), vec!["Queues".into(), "/".into(), "kite-test-orders".into()], spec(25))).unwrap();
         assert_eq!(q.grid.rows[0][0].as_deref(), Some("state"));
         let bad = conn(Kind::RabbitMq, 15673, "guest", "nope", "/");
         assert!(wait(engine::test(bad, "nope".into())).unwrap_err().contains("wrong user name or password"));
@@ -819,8 +982,8 @@ mod live_memory {
         for c in &conns {
             let path = match c.kind {
                 Kind::Postgres => vec!["crm".to_string(), "public".into()],
-                Kind::SqlServer => vec!["crm".to_string(), "dbo".into()],
-                Kind::MongoDb => vec!["shop".to_string()],
+                Kind::SqlServer => vec!["master".to_string()],
+                Kind::MongoDb => vec!["admin".to_string()],
                 Kind::Redis => vec!["db0".to_string()],
                 Kind::RabbitMq => vec!["Queues".to_string()],
             };

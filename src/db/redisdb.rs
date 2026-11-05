@@ -69,9 +69,74 @@ pub async fn children(c: &mut MultiplexedConnection, conn: &Conn, path: &[String
                 .map(|(n, keys)| Node { label: format!("db{n}"), detail: super::short_count(keys.parse().unwrap_or(0)), kind: NodeKind::Database, path: vec![format!("db{n}")] })
                 .collect()
         }
-        [db] => scan(c, "*").await?.into_iter().map(|k| Node { label: k.clone(), detail: String::new(), kind: NodeKind::Key, path: vec![db.clone(), k] }).collect(),
+        [db] => level(c, db, "").await?,
+        [db, folder] => match folder.strip_prefix(FOLDER) {
+            Some(prefix) => level(c, db, prefix).await?,
+            None => Vec::new(),
+        },
         _ => Vec::new(),
     })
+}
+
+/// Marks a folder's path part (a key prefix, not a key).
+const FOLDER: &str = "\u{2}";
+
+/// The keys under `prefix`: those sharing their next part (up to a `:`) as one folder (when
+/// two or more do, like other Redis tools), the rest as keys with their types.
+async fn level(c: &mut MultiplexedConnection, db: &str, prefix: &str) -> Result<Vec<Node>> {
+    let keys = scan(c, &format!("{}*", glob_escape(prefix))).await?;
+    let groups = group(&keys, prefix);
+    let leaves: Vec<&String> = groups.iter().filter_map(|g| if let Group::Key(k) = g { Some(k) } else { None }).collect();
+    // Their types, in one round trip.
+    let mut pipe = redis::pipe();
+    for k in &leaves {
+        pipe.cmd("TYPE").arg(k.as_str());
+    }
+    let types: Vec<String> = if leaves.is_empty() { Vec::new() } else { pipe.query_async(c).await? };
+    let mut types = types.into_iter();
+    let capped = keys.len() >= MAX_KEYS;
+    Ok(groups
+        .into_iter()
+        .map(|g| match g {
+            Group::Folder(name, n) => Node {
+                label: name.clone(),
+                detail: format!("{n}{}", if capped { "+" } else { "" }),
+                kind: NodeKind::Folder,
+                path: vec![db.to_string(), format!("{FOLDER}{prefix}{name}:")],
+            },
+            Group::Key(k) => Node { label: k.clone(), detail: types.next().unwrap_or_default(), kind: NodeKind::Key, path: vec![db.to_string(), k] },
+        })
+        .collect())
+}
+
+#[derive(Debug, PartialEq)]
+enum Group {
+    Folder(String, usize),
+    Key(String),
+}
+
+/// Folders first (by name), then keys.
+fn group(keys: &[String], prefix: &str) -> Vec<Group> {
+    let mut parts: std::collections::BTreeMap<String, Vec<&String>> = Default::default();
+    let mut singles = Vec::new();
+    for k in keys {
+        let rest = k.strip_prefix(prefix).unwrap_or(k);
+        match rest.split_once(':') {
+            Some((head, _)) => parts.entry(head.to_string()).or_default().push(k),
+            None => singles.push(k.clone()),
+        }
+    }
+    let mut out = Vec::new();
+    for (head, ks) in parts {
+        if ks.len() >= 2 {
+            out.push(Group::Folder(head, ks.len()));
+        } else {
+            singles.extend(ks.into_iter().cloned());
+        }
+    }
+    singles.sort();
+    out.extend(singles.into_iter().map(Group::Key));
+    out
 }
 
 /// Up to MAX_KEYS key names matching `pattern`, sorted.
@@ -311,6 +376,18 @@ mod tests {
         assert_eq!(quote("a b"), "\"a b\"");
         assert_eq!(quote("user:1"), "user:1");
         assert_eq!(enc("p@ss:w/rd"), "p%40ss%3Aw%2Frd");
+    }
+
+    #[test]
+    fn keys_sharing_a_prefix_become_folders() {
+        let keys: Vec<String> = ["user:1", "user:2", "config:maintenance", "leaderboard", "cache:page:1", "cache:page:2", "cache:x"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            group(&keys, ""),
+            [Group::Folder("cache".into(), 3), Group::Folder("user".into(), 2), Group::Key("config:maintenance".into()), Group::Key("leaderboard".into())],
+            "one key with a prefix stays a key"
+        );
+        let under: Vec<String> = keys.iter().filter(|k| k.starts_with("cache:")).cloned().collect();
+        assert_eq!(group(&under, "cache:"), [Group::Folder("page".into(), 2), Group::Key("cache:x".into())]);
     }
 
     #[test]

@@ -15,6 +15,7 @@ fn icon_body(name: &str) -> Option<&'static str> {
         "db-mongodb" => r#"<path fill="black" stroke="none" fill-rule="evenodd" d="M8 .6c.4 1.3 1.3 2.1 2.3 3.2 1.4 1.5 2.1 3.3 1.9 5.3-.2 2.4-1.7 4.1-3.3 4.9-.3.2-.5.5-.5.9V16h-.8v-1.1c0-.4-.2-.7-.5-.9C5.5 13.2 4 11.5 3.8 9.1 3.6 7.1 4.3 5.3 5.7 3.8 6.7 2.7 7.6 1.9 8 .6zM7.75 4.2h.5v9.2h-.5z"/>"#,
         "db-redis" => r#"<path fill="black" stroke="none" fill-rule="evenodd" d="M8 1.6l6 2.5L8 6.6 2 4.1zM2 6.6l6 2.5 6-2.5v1.7L8 10.8 2 8.3zM2 10.4l6 2.5 6-2.5v1.7L8 14.6 2 12.1z"/>"#,
         "db-rabbitmq" => r#"<path fill="black" stroke="none" fill-rule="evenodd" d="M2.5 1.5h2.7v5.2h1.5V1.5h2.7v5.2h3.1c.8 0 1.5.7 1.5 1.5v5.3c0 .8-.7 1.5-1.5 1.5H4c-.8 0-1.5-.7-1.5-1.5zM10.3 9.2h2.1v2.1h-2.1z"/>"#,
+        "braces" => r#"<path d="M5.5 2.5c-1.5 0-2 .7-2 2v1.6c0 .9-.5 1.4-1.5 1.9 1 .5 1.5 1 1.5 1.9v1.6c0 1.3.5 2 2 2"/><path d="M10.5 2.5c1.5 0 2 .7 2 2v1.6c0 .9.5 1.4 1.5 1.9-1 .5-1.5 1-1.5 1.9v1.6c0 1.3-.5 2-2 2"/>"#,
         "trash" => r#"<path d="M2.5 4h11"/><path d="M6 4V2.5h4V4"/><path d="M3.8 4l.7 9.5h7l.7-9.5"/><path d="M6.5 6.5v4.5M9.5 6.5v4.5"/>"#,
         "database" => r#"<ellipse cx="8" cy="3.8" rx="5" ry="2"/><path d="M3 3.8v8.4c0 1.1 2.2 2 5 2s5-.9 5-2V3.8"/><path d="M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>"#,
         "table" => r#"<rect x="2" y="2.5" width="12" height="11" rx="1"/><path d="M2 6h12M2 9.5h12M6.5 6v7.5"/>"#,

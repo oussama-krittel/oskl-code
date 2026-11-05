@@ -7734,18 +7734,27 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         crate::db::save(&c, Some("mongopw")).unwrap();
         let id = c.id.clone();
         crate::db::engine::open(&c.id);
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["shop".into(), "users".into()] }, window, cx));
+        // Its own documents, in its own database.
+        let seed = crate::db::engine::run(crate::db::engine::query(
+            c.clone(),
+            crate::db::Scope { database: Some("kite_test".into()), collection: None },
+            "db.ui_users.drop()\ndb.ui_users.insertMany([{name: 'Ann', age: 34, tags: ['a'], addr: {city: 'Oslo'}}, {name: 'Bob', age: 25}])".into(),
+        ));
+        futures::executor::block_on(seed).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["kite_test".into(), "ui_users".into()] }, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
-        let grid = cx.debug_bounds("db-grid").unwrap();
-        cx.simulate_click(gpui::point(grid.left() + gpui::px(80.), grid.top() + gpui::px(28. + 13.)), gpui::Modifiers::none());
-        cx.run_until_parked();
-        click_on(cx, "db-detail-json");
-        let (open, row, json) = tab.read_with(cx, |t, cx| t.detail_state(cx));
-        assert!(open && row == Some(0));
-        let json = json.expect("the JSON");
-        assert!(json.starts_with("{\n  _id: ObjectId('"), "{json}");
-        assert!(json.contains("name: '"), "{json}");
+        // Like Compass: cards of fields at first; JSON and Table a click away.
+        assert_eq!(tab.read_with(cx, |t, cx| t.detail_state(cx)).2, Some(crate::db_view::DocMode::List));
+        assert!(cx.debug_bounds("db-card-0").is_some(), "documents as cards");
+        click_on(cx, "db-mode-json");
+        assert_eq!(tab.read_with(cx, |t, cx| t.detail_state(cx)).2, Some(crate::db_view::DocMode::Json));
+        let json = tab.read_with(cx, |t, _| t.doc_text(0, crate::db::TextStyle::Json)).expect("a document");
+        assert!(json.starts_with("{\n  \"_id\": {\"$oid\": \""), "{json}");
+        let shell = tab.read_with(cx, |t, _| t.doc_text(0, crate::db::TextStyle::Shell)).unwrap();
+        assert!(shell.starts_with("{\n  _id: ObjectId('"), "{shell}");
+        click_on(cx, "db-mode-table");
+        assert!(cx.debug_bounds("db-col-0").is_some(), "a table, with its columns");
     }
 
     /// With the test PostgreSQL server running (KITE_DB_LIVE=1, port 55432).

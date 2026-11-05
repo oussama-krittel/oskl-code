@@ -1,17 +1,17 @@
 //! Database tabs: the connect form, a table's (collection's, key's, queue's) Data View and
 //! Query, and query tabs. Results show in a grid that draws only the rows on screen.
 
-use crate::db::{self, Conn, Grid, Kind, Page, PageSpec, Scope, engine};
+use crate::db::{self, Conn, Grid, Kind, Page, PageSpec, Scope, TextStyle, Tree, engine};
+use std::collections::HashSet;
 use crate::editor::{Editor, EditorEvent, EditorMode};
 use crate::request::Request;
 use crate::theme;
 use crate::ui::{self, px};
 use gpui::prelude::*;
 use gpui::{
-    App, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ListHorizontalSizingBehavior, MouseButton, ScrollHandle, SharedString, Subscription, Task,
-    UniformListScrollHandle, Window, actions, div, uniform_list,
+    App, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, MouseButton, ScrollHandle, SharedString, Subscription, Task,
+    ListAlignment, ListState, Window, actions, deferred, div, list,
 };
-use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -119,12 +119,16 @@ struct Data {
     query_task: Option<Task<()>>,
     tick: Option<Task<()>>,
     exporting: bool,
-    /// The selected row's panel: open, and showing MongoDB's JSON (else the fields).
-    detail: bool,
-    detail_json: bool,
-    /// The JSON shown (read-only, to select and copy from), and which row it's of.
-    json_view: Entity<Editor>,
-    json_of: Option<(Option<usize>, usize)>,
+    /// How MongoDB documents show.
+    doc_mode: DocMode,
+}
+
+/// MongoDB documents as cards of fields (like Compass's List), as JSON, or as a table.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DocMode {
+    List,
+    Json,
+    Table,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -133,26 +137,38 @@ enum Menu {
     Sizes,
 }
 
-/// A grid on screen: the rows, column widths, scroll and the selected cell.
+/// A grid on screen: the rows, column widths, scroll, the selected cell, the open row and
+/// the unfolded parts of its documents.
 struct GridView {
     grid: Arc<Grid>,
     widths: Vec<f32>,
-    scroll: UniformListScrollHandle,
+    types: Vec<String>,
+    list: ListState,
     hscroll: ScrollHandle,
     sel: Option<(usize, usize)>,
+    open: Option<usize>,
+    /// "<row>/<field>/…" of nested values shown open.
+    unfolded: HashSet<String>,
 }
 
 impl GridView {
     fn new(grid: Grid) -> GridView {
         // Wide enough for the longest of the first rows' values (capped), at ~7px a character.
-        let widths = (0..grid.columns.len())
+        let widths: Vec<f32> = (0..grid.columns.len())
             .map(|c| {
                 let longest = grid.rows.iter().take(200).map(|r| r.get(c).and_then(|v| v.as_ref()).map(|v| v.chars().count()).unwrap_or(4)).max().unwrap_or(0);
                 let chars = longest.max(grid.columns[c].chars().count() + 2).min(48);
                 (chars as f32 * 7.9 + 26.).clamp(64., 420.)
             })
             .collect();
-        GridView { grid: Arc::new(grid), widths, scroll: UniformListScrollHandle::new(), hscroll: ScrollHandle::new(), sel: None }
+        let types = column_types(&grid);
+        // The header shows the name and (MongoDB) its type: room for both.
+        let widths = widths.into_iter().enumerate().map(|(c, w): (usize, f32)| {
+            let head = grid.columns[c].chars().count() + types.get(c).map(|t| t.len() + 1).unwrap_or(0) + 3;
+            w.max((head as f32 * 7.6 + 26.).min(420.))
+        }).collect();
+        let list = ListState::new(grid.rows.len(), ListAlignment::Top, gpui::px(600.));
+        GridView { grid: Arc::new(grid), widths, types, list, hscroll: ScrollHandle::new(), sel: None, open: None, unfolded: HashSet::new() }
     }
 
     fn selected_text(&self) -> Option<(String, Option<String>)> {
@@ -219,14 +235,7 @@ impl DbView {
                         query_task: None,
                         tick: None,
                         exporting: false,
-                        detail: false,
-                        detail_json: false,
-                        json_view: cx.new(|cx| {
-                            let mut ed = Editor::new(EditorMode::Full, cx);
-                            ed.read_only = true;
-                            ed
-                        }),
-                        json_of: None,
+                        doc_mode: DocMode::List,
                     };
                     Body::Data(Box::new(data))
                 }
@@ -529,62 +538,52 @@ impl DbView {
         cx.notify();
     }
 
-    /// Selects a row (and cell) of a grid (None: the Data View's; Some(i): result i) and shows
-    /// it in the panel.
-    fn select(&mut self, which: Option<usize>, row: usize, col: Option<usize>, cx: &mut Context<Self>) {
-        let Body::Data(d) = &mut self.body else { return };
-        let gv = match which {
-            Some(i) => d.results.get_mut(i),
-            None => d.grid.as_mut(),
-        };
-        let Some(gv) = gv else { return };
-        if row >= gv.grid.rows.len() {
-            return;
-        }
-        let col = col.or(gv.sel.map(|s| s.1)).unwrap_or(0);
-        gv.sel = Some((row, col));
-        gv.scroll.scroll_to_item(row, gpui::ScrollStrategy::Top);
-        let doc = gv.grid.docs.as_ref().and_then(|j| j.get(row).cloned());
-        d.detail = true;
-        if let Some(doc) = doc
-            && d.json_of != Some((which, row))
-        {
-            d.json_of = Some((which, row));
-            d.json_view.update(cx, |e, cx| e.set_text(&doc, cx));
-        }
-        cx.notify();
-    }
-
-    /// The grid on show: (which, its selected row).
+    /// The grid on show: (which, its open row).
     fn shown_grid(&self) -> Option<(Option<usize>, Option<usize>)> {
         let Body::Data(d) = &self.body else { return None };
         match d.inner {
-            Inner::DataView => d.grid.as_ref().map(|g| (None, g.sel.map(|s| s.0))),
-            Inner::Query => d.results.get(d.result_ix).map(|g| (Some(d.result_ix), g.sel.map(|s| s.0))),
+            Inner::DataView => d.grid.as_ref().map(|g| (None, g.open)),
+            Inner::Query => d.results.get(d.result_ix).map(|g| (Some(d.result_ix), g.open)),
         }
     }
 
     fn row_up(&mut self, _: &RowUp, _: &mut Window, cx: &mut Context<Self>) {
         if let Some((which, Some(r))) = self.shown_grid() {
-            self.select(which, r.saturating_sub(1), None, cx);
+            self.open_row(which, r.saturating_sub(1), cx);
         }
     }
 
     fn row_down(&mut self, _: &RowDown, _: &mut Window, cx: &mut Context<Self>) {
         match self.shown_grid() {
-            Some((which, Some(r))) => self.select(which, r + 1, None, cx),
-            Some((which, None)) => self.select(which, 0, None, cx),
+            Some((which, Some(r))) => self.open_row(which, r + 1, cx),
+            Some((which, None)) => self.open_row(which, 0, cx),
             None => {}
         }
     }
 
+    /// Esc: closes the menu, else the open row.
     fn close_detail(&mut self, _: &CloseDetail, _: &mut Window, cx: &mut Context<Self>) {
-        if let Body::Data(d) = &mut self.body {
-            if d.menu.take().is_none() {
-                d.detail = false;
-            }
+        let Body::Data(d) = &mut self.body else { return };
+        if d.menu.take().is_some() {
+            return cx.notify();
+        }
+        if let Some((which, Some(r))) = self.shown_grid()
+            && let Some(gv) = self.grid_of_mut(which)
+        {
+            gv.open = None;
+            gv.list.splice(r..r + 1, 1);
             cx.notify();
         }
+    }
+
+    /// MongoDB: List, JSON or Table (every grid's rows are measured again).
+    fn set_doc_mode(&mut self, mode: DocMode, cx: &mut Context<Self>) {
+        let Body::Data(d) = &mut self.body else { return };
+        d.doc_mode = mode;
+        for gv in d.grid.iter_mut().chain(d.results.iter_mut()) {
+            gv.list.reset(gv.grid.rows.len());
+        }
+        cx.notify();
     }
 
     fn copy_cell(&mut self, _: &CopyCell, _: &mut Window, cx: &mut Context<Self>) {
@@ -664,13 +663,18 @@ impl DbView {
         Some(Ok((g.grid.columns.clone(), g.grid.rows.len())))
     }
 
-    /// The row panel: open, its row, and the JSON it shows (when it does).
-    pub fn detail_state(&self, cx: &App) -> (bool, Option<usize>, Option<String>) {
+    /// The open row, and how documents show.
+    pub fn detail_state(&self, _cx: &App) -> (bool, Option<usize>, Option<DocMode>) {
         let Body::Data(d) = &self.body else { return (false, None, None) };
         let gv = if d.inner == Inner::Query { d.results.get(d.result_ix) } else { d.grid.as_ref() };
-        let row = gv.and_then(|g| g.sel.map(|s| s.0));
-        let json = (d.detail && d.detail_json).then(|| d.json_view.read(cx).text());
-        (d.detail, row, json)
+        let open = gv.and_then(|g| g.open);
+        (open.is_some(), open, gv.filter(|g| g.grid.trees.is_some()).map(|_| d.doc_mode))
+    }
+
+    /// A shown document's text (MongoDB), as copied from its card.
+    pub fn doc_text(&self, row: usize, style: TextStyle) -> Option<String> {
+        let Body::Data(d) = &self.body else { return None };
+        d.grid.as_ref()?.grid.trees.as_ref()?.get(row).map(|t| t.text(style))
     }
 
     pub fn search_for(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -1121,14 +1125,22 @@ impl DbView {
                                 .items_start()
                                 .text_color(if ok { theme::git_added() } else { theme::git_deleted() })
                                 .child(ui::small_icon(if ok { "check" } else { "error" }, if ok { theme::git_added() } else { theme::git_deleted() }))
-                                .child(div().flex_1().child(text)),
+                                // Long errors wrap, within the form.
+                                .child(div().flex_1().min_w_0().child(text)),
                         )
                     }),
             )
             .into_any_element()
     }
 
+    /// A grid of rows (Table) or, for MongoDB documents, cards (List / JSON). Rows open in
+    /// place when clicked; only what's on screen is drawn.
     fn render_grid(&self, which: Option<usize>, gv: &GridView, sortable: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mode = self.doc_mode(gv);
+        let body = list(gv.list.clone(), cx.processor(move |v: &mut DbView, ix: usize, _w, cx| v.render_item(which, ix, cx))).with_sizing_behavior(gpui::ListSizingBehavior::Auto).flex_1();
+        if mode != DocMode::Table {
+            return div().id(SharedString::from(format!("db-docs-{}", which.map(|i| i.to_string()).unwrap_or_default()))).debug_selector(|| "db-grid".into()).flex().flex_col().flex_1().min_h_0().child(body).into_any_element();
+        }
         let g = gv.grid.clone();
         let total_w: f32 = gv.widths.iter().sum::<f32>() + 44.;
         let sort = match &self.body {
@@ -1152,31 +1164,24 @@ impl DbView {
                 };
                 let col = c.clone();
                 let id = format!("db-col-{i}");
+                let ty = gv.types.get(i).cloned().unwrap_or_default();
                 div()
                     .id(SharedString::from(id.clone()))
                     .debug_selector(move || id.clone())
-                    .w(px(gv.widths[i]))
-                    .flex_none()
+                    .flex_basis(px(gv.widths[i]))
+                    .flex_grow()
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
+                    .gap(px(5.))
                     .px(px(8.))
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::fg_bright())
                     .when(sortable, |d| d.cursor_pointer().hover(|s| s.bg(theme::hover())).on_click(cx.listener(move |v, _, _, cx| v.sort_by(col.clone(), cx))))
-                    .child(div().min_w_0().overflow_hidden().text_ellipsis().child(c.clone()))
+                    .child(div().min_w_0().overflow_hidden().text_ellipsis().font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(c.clone()))
+                    .when(!ty.is_empty(), |d| d.child(div().flex_none().text_size(px(11.)).text_color(theme::fg_muted()).child(ty)))
                     .child(div().flex_none().text_color(theme::fg_muted()).child(arrow))
             }));
-        let rows = g.rows.len();
-        let list = uniform_list(
-            SharedString::from(format!("db-grid-{}", which.map(|i| i.to_string()).unwrap_or_default())),
-            rows,
-            cx.processor(move |v, range: Range<usize>, _, cx| v.grid_rows(which, range, cx)),
-        )
-        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-        .track_scroll(gv.scroll.clone())
-        .flex_1();
         div()
             .id(SharedString::from(format!("db-hscroll-{}", which.map(|i| i.to_string()).unwrap_or_default())))
             .debug_selector(|| "db-grid".into())
@@ -1184,168 +1189,288 @@ impl DbView {
             .min_h_0()
             .overflow_x_scroll()
             .track_scroll(&gv.hscroll)
-            .child(div().w(px(total_w)).h_full().flex().flex_col().text_size(px(12.5)).child(header).child(list))
+            // At least as wide as the pane: few columns share its width.
+            .child(div().min_w(px(total_w)).w_full().h_full().flex().flex_col().text_size(px(12.5)).child(header).child(body))
             .into_any_element()
     }
 
-    fn grid_rows(&mut self, which: Option<usize>, range: Range<usize>, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let Body::Data(d) = &self.body else { return Vec::new() };
-        let gv = match which {
-            Some(i) => d.results.get(i),
-            None => d.grid.as_ref(),
-        };
-        let Some(gv) = gv else { return Vec::new() };
-        let first = if which.is_none() { d.spec.offset } else { 0 };
-        let (grid, widths, sel) = (gv.grid.clone(), gv.widths.clone(), gv.sel);
-        range
-            .filter_map(|r| {
-                let row = grid.rows.get(r)?;
-                Some(
-                    div()
-                        .flex()
-                        .h(px(26.))
-                        .border_b_1()
-                        .border_color(theme::border())
-                        .when(sel.is_some_and(|(sr, _)| sr == r), |d| d.bg(theme::selected()))
-                        .hover(|s| s.bg(theme::hover()))
-                        .child(div().w(px(44.)).flex_none().flex().items_center().justify_end().pr(px(8.)).text_color(theme::fg_muted()).text_size(px(11.)).child((first + r + 1).to_string()))
-                        .children(row.iter().enumerate().map(|(c, v)| {
-                            let on = sel == Some((r, c));
-                            let text = match v {
-                                Some(s) => s.replace(['\n', '\r', '\t'], " "),
-                                None => "NULL".into(),
-                            };
-                            div()
-                                .id(("db-cell", r * 1000 + c))
-                                .w(px(widths.get(c).copied().unwrap_or(100.)))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .px(px(8.))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .cursor_pointer()
-                                .when(on, |d| d.bg(theme::selected_focused()).border_1().border_color(theme::focus_border()))
-                                .text_color(if v.is_none() { theme::fg_muted() } else { theme::fg() })
-                                .when(v.is_none(), |d| d.italic())
-                                .on_click(cx.listener(move |v, _: &ClickEvent, window, cx| {
-                                    window.focus(&v.focus);
-                                    v.select(which, r, Some(c), cx);
-                                }))
-                                .child(div().min_w_0().overflow_hidden().text_ellipsis().child(text))
-                        }))
-                        .into_any_element(),
-                )
-            })
-            .collect()
+    /// How a grid's rows show: MongoDB documents as chosen, the rest as a table.
+    fn doc_mode(&self, gv: &GridView) -> DocMode {
+        match &self.body {
+            Body::Data(d) if gv.grid.trees.is_some() => d.doc_mode,
+            _ => DocMode::Table,
+        }
     }
 
-    /// The selected row, every field one under another (or, for MongoDB, its document as
-    /// JSON), beside the grid.
-    fn render_detail(&self, d: &Data, which: Option<usize>, gv: &GridView, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        if !d.detail {
-            return None;
+    fn grid_of(&self, which: Option<usize>) -> Option<&GridView> {
+        let Body::Data(d) = &self.body else { return None };
+        match which {
+            Some(i) => d.results.get(i),
+            None => d.grid.as_ref(),
         }
-        let (r, _) = gv.sel?;
-        let row = gv.grid.rows.get(r)?;
-        let first = if which.is_none() { d.spec.offset } else { 0 };
-        let has_json = gv.grid.docs.as_ref().is_some_and(|j| j.get(r).is_some());
-        let json = has_json && d.detail_json;
-        let mode = |id: &'static str, text: &'static str, on: bool, to_json: bool, cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .debug_selector(move || id.to_string())
-                .px(px(8.))
-                .py(px(2.))
-                .rounded(px(3.))
-                .text_size(px(11.))
-                .cursor_pointer()
-                .when(on, |d| d.bg(theme::accent()).text_color(theme::on(theme::accent())))
-                .when(!on, |d| d.text_color(theme::fg_dim()).hover(|s| s.bg(theme::hover())))
-                .on_click(cx.listener(move |v, _, _, cx| {
-                    if let Body::Data(d) = &mut v.body {
-                        d.detail_json = to_json;
-                    }
-                    cx.notify();
-                }))
-                .child(text)
+    }
+
+    fn grid_of_mut(&mut self, which: Option<usize>) -> Option<&mut GridView> {
+        let Body::Data(d) = &mut self.body else { return None };
+        match which {
+            Some(i) => d.results.get_mut(i),
+            None => d.grid.as_mut(),
+        }
+    }
+
+    /// Opens a row in place (or closes it, if it's the open one).
+    fn toggle_row(&mut self, which: Option<usize>, row: usize, col: Option<usize>, cx: &mut Context<Self>) {
+        let Some(gv) = self.grid_of_mut(which) else { return };
+        if row >= gv.grid.rows.len() {
+            return;
+        }
+        let before = gv.open;
+        gv.open = if before == Some(row) && col == gv.sel.map(|s| s.1) { None } else { Some(row) };
+        gv.sel = Some((row, col.or(gv.sel.map(|s| s.1)).unwrap_or(0)));
+        for r in [before, gv.open].into_iter().flatten() {
+            gv.list.splice(r..r + 1, 1);
+        }
+        cx.notify();
+    }
+
+    /// Opens another row (↑ ↓), keeping it in view.
+    fn open_row(&mut self, which: Option<usize>, row: usize, cx: &mut Context<Self>) {
+        let Some(gv) = self.grid_of_mut(which) else { return };
+        if row >= gv.grid.rows.len() {
+            return;
+        }
+        let before = gv.open;
+        gv.open = Some(row);
+        gv.sel = Some((row, gv.sel.map(|s| s.1).unwrap_or(0)));
+        for r in [before, gv.open].into_iter().flatten() {
+            gv.list.splice(r..r + 1, 1);
+        }
+        gv.list.scroll_to_reveal_item(row);
+        cx.notify();
+    }
+
+    /// Folds or unfolds a nested value of a document.
+    fn toggle_fold(&mut self, which: Option<usize>, row: usize, path: String, cx: &mut Context<Self>) {
+        let Some(gv) = self.grid_of_mut(which) else { return };
+        if !gv.unfolded.remove(&path) {
+            gv.unfolded.insert(path);
+        }
+        gv.list.splice(row..row + 1, 1);
+        cx.notify();
+    }
+
+    fn render_item(&mut self, which: Option<usize>, ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(gv) = self.grid_of(which) else { return div().into_any_element() };
+        match self.doc_mode(gv) {
+            DocMode::Table => self.render_row(which, ix, cx),
+            mode => self.render_card(which, ix, mode == DocMode::Json, cx),
+        }
+    }
+
+    fn render_row(&mut self, which: Option<usize>, r: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(gv) = self.grid_of(which) else { return div().into_any_element() };
+        let first = match (&self.body, which) {
+            (Body::Data(d), None) => d.spec.offset,
+            _ => 0,
         };
-        let body: gpui::AnyElement = if json {
-            div().flex_1().min_h_0().child(d.json_view.clone()).into_any_element()
-        } else {
-            let fields = gv.grid.columns.iter().zip(row.iter()).enumerate().map(|(i, (col, val))| {
-                let copy = val.clone().unwrap_or_else(|| "NULL".into());
+        let (grid, widths, sel, open) = (gv.grid.clone(), gv.widths.clone(), gv.sel, gv.open);
+        let Some(row) = grid.rows.get(r) else { return div().into_any_element() };
+        let tree = grid.trees.as_ref().and_then(|t| t.get(r));
+        let fields: Option<&Vec<(String, Tree)>> = match tree {
+            Some(Tree::Object(f)) => Some(f),
+            _ => None,
+        };
+        let line = div()
+            .flex()
+            .w_full()
+            .h(px(26.))
+            .border_b_1()
+            .border_color(theme::border())
+            .when(open == Some(r), |d| d.bg(theme::selected()))
+            .hover(|s| s.bg(theme::hover()))
+            .child(div().w(px(44.)).flex_none().flex().items_center().justify_end().pr(px(8.)).text_color(theme::fg_muted()).text_size(px(11.)).child((first + r + 1).to_string()))
+            .children(row.iter().enumerate().map(|(c, v)| {
+                let on = sel == Some((r, c));
+                // MongoDB: the value with its type (colored); else the text.
+                let typed = fields.and_then(|f| f.iter().find(|(k, _)| Some(k) == grid.columns.get(c)).map(|(_, t)| t));
+                let (text, color, italic) = match (typed, v) {
+                    (Some(t), _) => (table_text(t), tree_color(t), matches!(t, Tree::Null)),
+                    (None, Some(s)) => (s.replace(['\n', '\r', '\t'], " "), theme::fg(), false),
+                    (None, None) => ("NULL".into(), theme::fg_muted(), true),
+                };
+                let text = if fields.is_some() && typed.is_none() { String::new() } else { text };
                 div()
-                    .id(("db-field", i))
-                    .group("db-field")
+                    .id(("db-cell", r * 1000 + c))
+                    .flex_basis(px(widths.get(c).copied().unwrap_or(100.)))
+                    .flex_grow()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .px(px(8.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .cursor_pointer()
+                    .when(on, |d| d.border_1().border_color(theme::focus_border()))
+                    .text_color(color)
+                    .when(italic, |d| d.italic())
+                    .on_click(cx.listener(move |v, _: &ClickEvent, window, cx| {
+                        window.focus(&v.focus);
+                        v.toggle_row(which, r, Some(c), cx);
+                    }))
+                    .child(div().min_w_0().overflow_hidden().text_ellipsis().child(text))
+            }));
+        if open != Some(r) {
+            return line.into_any_element();
+        }
+        // Open: every field one under another; long values stay on one line and scroll.
+        let detail: Vec<gpui::AnyElement> = match tree {
+            Some(t @ Tree::Object(_)) => self.tree_lines(which, r, t, false, cx),
+            _ => grid
+                .columns
+                .iter()
+                .zip(row.iter())
+                .enumerate()
+                .map(|(i, (col, val))| {
+                    let copy = val.clone().unwrap_or_else(|| "NULL".into());
+                    div()
+                        .id(("db-field", i))
+                        .group("db-field")
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .h(px(24.))
+                        .child(div().w(px(200.)).flex_none().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_dim()).child(col.clone()))
+                        .child(one_line(("db-field-value", i), match val {
+                            Some(v) => div().text_color(theme::fg_bright()).child(v.replace(['\n', '\r'], " ⏎ ")),
+                            None => div().italic().text_color(theme::fg_muted()).child("NULL"),
+                        }))
+                        .child(copy_button(("db-field-copy", i), copy))
+                        .into_any_element()
+                })
+                .collect(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .child(line)
+            .child(
+                div()
+                    .debug_selector(|| "db-fields".into())
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
-                    .px(px(12.))
-                    .py(px(6.))
+                    .w_full()
+                    .px(px(52.))
+                    .py(px(8.))
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.))
-                            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.)).text_color(theme::fg_dim()).child(col.clone()))
-                            .child(
-                                div()
-                                    .id(("db-field-copy", i))
-                                    .invisible()
-                                    .group_hover("db-field", |s| s.visible())
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(18.))
-                                    .rounded(px(3.))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::hover()))
-                                    .tooltip(ui::tooltip("Copy value"))
-                                    .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone())))
-                                    .child(ui::small_icon("copy", theme::fg_dim())),
-                            ),
-                    )
-                    .child(match val {
-                        Some(v) => div().text_size(px(12.5)).text_color(theme::fg_bright()).child(v.clone()),
-                        None => div().text_size(px(12.5)).italic().text_color(theme::fg_muted()).child("NULL"),
-                    })
-            });
-            div().id("db-fields").debug_selector(|| "db-fields".into()).flex_1().min_h_0().overflow_y_scroll().children(fields).into_any_element()
-        };
-        Some(
-            div()
-                .debug_selector(|| "db-detail".into())
-                .w(px(380.))
-                .flex_none()
-                .flex()
-                .flex_col()
-                .min_h_0()
-                .rounded(px(4.))
-                .border_1()
-                .border_color(theme::border_input())
-                .bg(theme::bg_side())
-                .child(
+                    .bg(theme::bg_side())
+                    .text_size(px(12.5))
+                    .children(detail),
+            )
+            .into_any_element()
+    }
+
+    /// A MongoDB document as a card: its fields one per line (List), or as JSON.
+    fn render_card(&mut self, which: Option<usize>, r: usize, json: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(gv) = self.grid_of(which) else { return div().into_any_element() };
+        let Some(t) = gv.grid.trees.as_ref().and_then(|t| t.get(r)).cloned() else { return div().into_any_element() };
+        let copy = t.text(if json { TextStyle::Json } else { TextStyle::Shell });
+        let lines = self.tree_lines(which, r, &t, json, cx);
+        div()
+            .pb(px(8.))
+            .pr(px(4.))
+            .child(
+                div()
+                    .id(("db-card", r))
+                    .debug_selector(move || format!("db-card-{r}"))
+                    .group("db-card")
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .px(px(14.))
+                    .py(px(10.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(theme::border_input())
+                    .bg(theme::bg_side())
+                    .font_family(theme::MONO_FONT)
+                    .text_size(px(12.5))
+                    .children(lines)
+                    .child(div().absolute().top(px(6.)).right(px(8.)).invisible().group_hover("db-card", |s| s.visible()).child(copy_button(("db-card-copy", r), copy))),
+            )
+            .into_any_element()
+    }
+
+    /// A document's fields as lines: `key: value`, nested objects and arrays folded until
+    /// clicked (List), or as JSON with its brackets.
+    fn tree_lines(&self, which: Option<usize>, row: usize, t: &Tree, json: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let Some(gv) = self.grid_of(which) else { return Vec::new() };
+        let style = if json { TextStyle::Json } else { TextStyle::Shell };
+        let mut out = Vec::new();
+        let mut n = 0usize;
+        fn walk(v: &DbView, which: Option<usize>, row: usize, entries: Vec<(String, &Tree)>, path: &str, depth: usize, json: bool, style: TextStyle, unfolded: &HashSet<String>, out: &mut Vec<gpui::AnyElement>, n: &mut usize, cx: &mut Context<DbView>) {
+            let count = entries.len();
+            for (i, (key, val)) in entries.into_iter().enumerate() {
+                let p = format!("{path}/{key}");
+                let container = matches!(val, Tree::Array(a) if !a.is_empty()) || matches!(val, Tree::Object(f) if !f.is_empty());
+                let open = container && unfolded.contains(&format!("{row}{p}"));
+                let comma = if json && i + 1 < count { "," } else { "" };
+                let key_text = match key.strip_prefix('\u{1}') {
+                    // An array item's index (List): as is.
+                    Some(i) => i.to_string(),
+                    None if key.starts_with('\u{0}') => String::new(),
+                    None => Tree::key(&key, if json { TextStyle::Json } else { TextStyle::Shell }),
+                };
+                let (summary, color) = match val {
+                    Tree::Array(a) if container && !open => (if json { format!("[…{}]{comma}", a.len()) } else { format!("Array ({})", a.len()) }, theme::fg_dim()),
+                    Tree::Object(f) if container && !open => (if json { format!("{{…}}{comma}") } else { format!("Object ({} field{})", f.len(), if f.len() == 1 { "" } else { "s" }) }, theme::fg_dim()),
+                    Tree::Array(_) if open => (if json { "[".into() } else { String::new() }, theme::fg_dim()),
+                    Tree::Object(_) if open => (if json { "{".into() } else { String::new() }, theme::fg_dim()),
+                    other => (format!("{}{comma}", other.short(style)), tree_color(other)),
+                };
+                let fold = format!("{row}{p}");
+                *n += 1;
+                let id = *n;
+                out.push(
                     div()
+                        .id(("db-tree-line", id))
                         .flex()
-                        .flex_none()
                         .items_center()
-                        .gap(px(6.))
-                        .h(px(32.))
-                        .px(px(10.))
-                        .border_b_1()
-                        .border_color(theme::border())
-                        .child(div().flex_1().text_size(px(12.)).text_color(theme::fg_bright()).child(format!("Row {}", first + r + 1)))
-                        .when(has_json, |el| el.child(div().flex().p(px(2.)).rounded(px(4.)).border_1().border_color(theme::border_input()).child(mode("db-detail-fields", "Fields", !json, false, cx)).child(mode("db-detail-json", "JSON", json, true, cx))))
-                        .child(ui::icon_button("db-row-up", "arrow-up").tooltip(ui::tooltip("Previous row (↑)")).on_click(cx.listener(|v, _, w, cx| v.row_up(&RowUp, w, cx))))
-                        .child(ui::icon_button("db-row-down", "arrow-down").tooltip(ui::tooltip("Next row (↓)")).on_click(cx.listener(|v, _, w, cx| v.row_down(&RowDown, w, cx))))
-                        .child(ui::icon_button("db-detail-close", "close").tooltip(ui::tooltip("Close (Esc)")).on_click(cx.listener(|v, _, w, cx| v.close_detail(&CloseDetail, w, cx)))),
-                )
-                .child(body)
-                .into_any_element(),
-        )
+                        .h(px(21.))
+                        .pl(px(depth as f32 * 18.))
+                        .whitespace_nowrap()
+                        .when(container, |d| d.cursor_pointer().on_click(cx.listener(move |v, _, _, cx| v.toggle_fold(which, row, fold.clone(), cx))))
+                        .child(div().w(px(14.)).flex_none().text_color(theme::fg_muted()).child(if container { if open { "▾" } else { "▸" } } else { "" }))
+                        .when(!key_text.is_empty(), |d| d.child(div().flex_none().font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(format!("{key_text}: "))))
+                        .child(one_line(("db-tree-value", id), div().text_color(color).child(summary)))
+                        .into_any_element(),
+                );
+                if open {
+                    let children: Vec<(String, &Tree)> = match val {
+                        // Array items by index (no key shown in JSON).
+                        Tree::Array(a) => a.iter().enumerate().map(|(i, x)| (if json { format!("\u{0}{i}") } else { format!("\u{1}{i}") }, x)).collect(),
+                        Tree::Object(f) => f.iter().map(|(k, x)| (k.clone(), x)).collect(),
+                        _ => Vec::new(),
+                    };
+                    walk(v, which, row, children, &p, depth + 1, json, style, unfolded, out, n, cx);
+                    if json {
+                        *n += 1;
+                        out.push(div().h(px(21.)).pl(px(depth as f32 * 18. + 14.)).text_color(theme::fg_dim()).child(format!("{}{comma}", if matches!(val, Tree::Array(_)) { "]" } else { "}" })).into_any_element());
+                    }
+                }
+            }
+        }
+        let Tree::Object(fields) = t else { return out };
+        let unfolded = gv.unfolded.clone();
+        if json {
+            out.push(div().h(px(21.)).text_color(theme::fg_dim()).child("{").into_any_element());
+        }
+        walk(self, which, row, fields.iter().map(|(k, v)| (k.clone(), v)).collect(), "", if json { 1 } else { 0 }, json, style, &unfolded, &mut out, &mut n, cx);
+        if json {
+            out.push(div().h(px(21.)).text_color(theme::fg_dim()).child("}").into_any_element());
+        }
+        out
     }
 
     fn render_data_view(&self, d: &Data, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1436,7 +1561,7 @@ impl DbView {
                             .child(text),
                     );
                 }
-                Some(
+                Some(deferred(
                     div()
                         .id("db-menu")
                         .debug_selector(|| "db-menu".into())
@@ -1454,19 +1579,12 @@ impl DbView {
                         .border_color(theme::border_input())
                         .shadow_lg()
                         .children(list),
-                )
+                ).with_priority(1))
             }
         };
         let body: gpui::AnyElement = match (&d.page, &d.grid) {
-            (Some(Err(e)), _) => div().p(px(14.)).text_color(theme::git_deleted()).child(e.clone()).into_any_element(),
-            (_, Some(gv)) if !gv.grid.columns.is_empty() => div()
-                .flex()
-                .flex_1()
-                .min_h_0()
-                .gap(px(10.))
-                .child(div().flex().flex_col().flex_1().min_w_0().child(self.render_grid(None, gv, kind != Kind::RabbitMq && kind != Kind::Redis, cx)))
-                .children(self.render_detail(d, None, gv, cx))
-                .into_any_element(),
+            (Some(Err(e)), _) => div().p(px(14.)).min_w_0().text_color(theme::git_deleted()).child(e.clone()).into_any_element(),
+            (_, Some(gv)) if !gv.grid.columns.is_empty() => div().flex().flex_col().flex_1().min_h_0().child(self.render_grid(None, gv, kind != Kind::RabbitMq && kind != Kind::Redis, cx)).into_any_element(),
             (_, Some(gv)) => div().p(px(14.)).text_color(theme::fg_dim()).child(gv.grid.note.clone()).into_any_element(),
             _ => div().into_any_element(),
         };
@@ -1502,7 +1620,21 @@ impl DbView {
                         .children(menu),
                 )
             })
-            .when(!matches!(d.page, Some(Err(_))), |el| el.child(div().flex().items_center().gap(px(10.)).text_size(px(12.)).text_color(theme::fg_dim()).child(showing).when_some(note, |d, n| d.child(div().text_color(theme::fg_muted()).child(format!("· {n}"))))))
+            .when(!matches!(d.page, Some(Err(_))), |el| {
+                let docs = d.grid.as_ref().is_some_and(|g| g.grid.trees.is_some());
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .text_size(px(12.))
+                        .text_color(theme::fg_dim())
+                        .child(showing)
+                        .when_some(note, |d, n| d.child(div().text_color(theme::fg_muted()).child(format!("· {n}"))))
+                        .child(div().flex_1())
+                        .when(docs, |el| el.child(mode_switch(d.doc_mode, cx))),
+                )
+            })
             .child(body)
             .when(pageable && pages.is_some_and(|p| p > 1), |el| {
                 let pages = pages.unwrap_or(1);
@@ -1563,7 +1695,6 @@ impl DbView {
                         .child(self.render_grid(Some(d.result_ix), gv, false, cx))
                         .when(gv.grid.more, |el| el.child(div().px(px(10.)).py(px(4.)).text_size(px(11.)).text_color(theme::fg_muted()).child(format!("Showing the first {} rows; add a LIMIT (or a filter) for others.", db::MAX_ROWS)))),
                 )
-                .children(self.render_detail(d, Some(d.result_ix), gv, cx))
                 .into_any_element(),
             (_, Some(gv)) => div().debug_selector(|| "db-query-note".into()).p(px(12.)).text_color(theme::fg()).child(gv.grid.note.clone()).into_any_element(),
             _ => div().p(px(12.)).text_color(theme::fg_muted()).child("Run a query with ⌘↵").into_any_element(),
@@ -1587,6 +1718,7 @@ impl DbView {
                     .child(div().text_size(px(11.)).text_color(theme::fg_muted()).child("⌘↵"))
                     .child(div().text_size(px(12.)).text_color(theme::fg_dim()).child(format!("on {where_}")))
                     .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.)).text_color(theme::fg_muted()).child(hint))
+                    .when(d.results.get(d.result_ix).is_some_and(|g| g.grid.trees.is_some()), |el| el.child(mode_switch(d.doc_mode, cx)))
                     .child(div().debug_selector(|| "db-query-status".into()).text_size(px(12.)).text_color(if d.query_error.is_some() { theme::git_deleted() } else { theme::fg_dim() }).child(status)),
             )
             .when(d.results.len() > 1, |el| {
@@ -1614,6 +1746,112 @@ impl DbView {
             .child(results)
             .into_any_element()
     }
+}
+
+/// A value in a table cell, the way MongoDB Compass shows it.
+fn table_text(t: &Tree) -> String {
+    match t {
+        Tree::Str(s) => format!("\"{}\"", s.replace(['\n', '\r', '\t'], " ")),
+        other => other.short(TextStyle::Shell),
+    }
+}
+
+/// A value's color, by its type (the theme's syntax colors).
+fn tree_color(t: &Tree) -> gpui::Hsla {
+    use crate::theme::Syntax;
+    match t {
+        Tree::Str(_) => theme::syntax(Syntax::String),
+        Tree::Num(_) | Tree::Typed("Double" | "Long" | "Decimal128", _) => theme::syntax(Syntax::Number),
+        Tree::Typed("Date" | "Timestamp", _) => theme::syntax(Syntax::Type),
+        Tree::Typed(_, _) => theme::syntax(Syntax::Function),
+        Tree::Bool(_) | Tree::Null => theme::syntax(Syntax::Keyword),
+        Tree::Array(_) | Tree::Object(_) => theme::fg_dim(),
+    }
+}
+
+/// A long value on one line: it scrolls sideways in its own box instead of wrapping.
+fn one_line(id: impl Into<gpui::ElementId>, child: gpui::Div) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_1()
+        .min_w_0()
+        .overflow_x_scroll()
+        .whitespace_nowrap()
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .child(child)
+}
+
+fn copy_button(id: impl Into<gpui::ElementId>, text: String) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(20.))
+        .rounded(px(3.))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::hover()))
+        .tooltip(ui::tooltip("Copy"))
+        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone())))
+        .child(ui::small_icon("copy", theme::fg_dim()))
+}
+
+/// Each column's type, from the documents (Mixed when they differ, Null ones aside).
+fn column_types(g: &Grid) -> Vec<String> {
+    let Some(trees) = &g.trees else { return Vec::new() };
+    g.columns
+        .iter()
+        .map(|c| {
+            let mut ty: Option<&str> = None;
+            for t in trees {
+                if let Tree::Object(f) = t
+                    && let Some((_, v)) = f.iter().find(|(k, _)| k == c)
+                    && !matches!(v, Tree::Null)
+                {
+                    match ty {
+                        None => ty = Some(v.type_name()),
+                        Some(prev) if prev != v.type_name() => return "Mixed".to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            ty.unwrap_or("Null").to_string()
+        })
+        .collect()
+}
+
+/// List · JSON · Table, for MongoDB documents.
+fn mode_switch(current: DocMode, cx: &mut Context<DbView>) -> gpui::Div {
+    let item = |id: &'static str, icon: &'static str, tip: &'static str, mode: DocMode, cx: &mut Context<DbView>| {
+        let on = current == mode;
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(30.))
+            .h(px(22.))
+            .rounded(px(3.))
+            .cursor_pointer()
+            .tooltip(ui::tooltip(tip))
+            .when(on, |d| d.bg(theme::accent()))
+            .when(!on, |d| d.hover(|s| s.bg(theme::hover())))
+            .on_click(cx.listener(move |v, _, _, cx| v.set_doc_mode(mode, cx)))
+            .child(ui::small_icon(icon, if on { theme::on(theme::accent()) } else { theme::fg_dim() }))
+    };
+    div()
+        .flex()
+        .flex_none()
+        .gap(px(2.))
+        .p(px(2.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(theme::border_input())
+        .child(item("db-mode-list", "list-flat", "List", DocMode::List, cx))
+        .child(item("db-mode-json", "braces", "JSON", DocMode::Json, cx))
+        .child(item("db-mode-table", "table", "Table", DocMode::Table, cx))
 }
 
 fn group_digits(n: u64) -> String {

@@ -2,7 +2,7 @@
 //! `db.users.find({age: {$gt: 30}}).sort({name: 1})`, or as a command document; arguments
 //! use the shell's relaxed syntax (bare keys, 'quotes', ObjectId(…), ISODate(…), /regex/).
 
-use super::{Conn, Grid, Node, NodeKind, Page, PageSpec, Scope, cell};
+use super::{Conn, Grid, Node, NodeKind, Page, PageSpec, Scope, Tree, cell};
 use anyhow::{Result, anyhow, bail};
 use futures::TryStreamExt;
 use mongodb::Client;
@@ -13,7 +13,17 @@ const COUNT_CAP: u64 = 100_000;
 
 pub async fn connect(conn: &Conn, secret: &str) -> Result<Client> {
     let mut opts = if conn.use_url {
-        ClientOptions::parse(secret).await.map_err(|e| anyhow!("connection string: {e}"))?
+        match ClientOptions::parse(secret).await {
+            Ok(o) => o,
+            // mongodb+srv:// looks the servers up in DNS. The driver can't read some system DNS
+            // settings (an IPv6 link-local server like fe80::…%en0, common on home routers):
+            // then a public resolver finds them (cluster names, e.g. Atlas's, are public).
+            Err(e) if e.to_string().contains("DNS") => ClientOptions::parse(secret)
+                .resolver_config(mongodb::options::ResolverConfig::cloudflare())
+                .await
+                .map_err(|e2| anyhow!("connection string: {e2} (and with the system's DNS: {e})"))?,
+            Err(e) => return Err(anyhow!("connection string: {e}")),
+        }
     } else {
         let mut o = ClientOptions::builder().hosts(vec![ServerAddress::Tcp { host: conn.host.clone(), port: Some(conn.port) }]).build();
         if !conn.user.is_empty() {
@@ -139,132 +149,49 @@ fn columns(docs: &[Document]) -> Vec<String> {
 
 fn grid(docs: &[Document]) -> Grid {
     let mut g = Grid { columns: columns(docs), ..Default::default() };
-    let mut json = Vec::new();
+    let mut trees = Vec::new();
     for d in docs {
         let row = g.columns.iter().map(|c| d.get(c).and_then(show)).collect();
         if g.push(row) {
-            json.push(shell_json(d));
+            trees.push(tree(&Bson::Document(d.clone())));
         }
     }
-    g.docs = Some(json);
+    g.trees = Some(trees);
     g
 }
 
-/// The longest a document's JSON is kept (longer ones end with a note).
-const MAX_DOC: usize = 200_000;
+/// The longest a string in a tree is kept.
+const MAX_TREE_STR: usize = 100_000;
 
-/// A document as mongosh prints it: bare keys, 'strings', ObjectId('…'), ISODate('…'),
-/// two-space indents.
-pub fn shell_json(d: &Document) -> String {
-    let mut out = String::new();
-    write_doc(&mut out, d, 0);
-    if out.len() > MAX_DOC {
-        let mut cut = MAX_DOC;
-        while !out.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        out.truncate(cut);
-        out.push_str("\n… (cut: the document is longer)");
-    }
-    out
-}
-
-fn write_doc(out: &mut String, d: &Document, depth: usize) {
-    if d.is_empty() {
-        out.push_str("{}");
-        return;
-    }
-    out.push_str("{\n");
-    let n = d.len();
-    for (i, (k, v)) in d.iter().enumerate() {
-        if out.len() > MAX_DOC {
-            break;
-        }
-        out.push_str(&"  ".repeat(depth + 1));
-        let bare = k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$') && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
-        if bare {
-            out.push_str(k);
-        } else {
-            out.push_str(&quote(k));
-        }
-        out.push_str(": ");
-        write_value(out, v, depth + 1);
-        if i + 1 < n {
-            out.push(',');
-        }
-        out.push('\n');
-    }
-    out.push_str(&"  ".repeat(depth));
-    out.push('}');
-}
-
-fn write_value(out: &mut String, v: &Bson, depth: usize) {
+/// A value with its type, for the List / JSON views (strings past MAX_TREE_STR are cut).
+pub fn tree(v: &Bson) -> Tree {
     match v {
-        Bson::Document(d) => write_doc(out, d, depth),
-        Bson::Array(a) if a.is_empty() => out.push_str("[]"),
-        Bson::Array(a) => {
-            // Short arrays of scalars on one line, like mongosh.
-            let simple = a.len() <= 6 && a.iter().all(|x| !matches!(x, Bson::Document(_) | Bson::Array(_)));
-            if simple {
-                out.push_str("[ ");
-                for (i, x) in a.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    write_value(out, x, depth);
-                }
-                out.push_str(" ]");
-                return;
+        Bson::Document(d) => Tree::Object(d.iter().map(|(k, v)| (k.clone(), tree(v))).collect()),
+        Bson::Array(a) => Tree::Array(a.iter().map(tree).collect()),
+        Bson::String(s) if s.len() > MAX_TREE_STR => {
+            let mut cut = MAX_TREE_STR;
+            while !s.is_char_boundary(cut) {
+                cut -= 1;
             }
-            out.push_str("[\n");
-            for (i, x) in a.iter().enumerate() {
-                if out.len() > MAX_DOC {
-                    break;
-                }
-                out.push_str(&"  ".repeat(depth + 1));
-                write_value(out, x, depth + 1);
-                if i + 1 < a.len() {
-                    out.push(',');
-                }
-                out.push('\n');
-            }
-            out.push_str(&"  ".repeat(depth));
-            out.push(']');
+            Tree::Str(format!("{}…", &s[..cut]))
         }
-        Bson::String(s) => out.push_str(&quote(s)),
-        Bson::Int32(n) => out.push_str(&n.to_string()),
-        Bson::Int64(n) => out.push_str(&format!("Long('{n}')")),
-        Bson::Double(f) => out.push_str(&if f.fract() == 0. && f.is_finite() && f.abs() < 1e15 { format!("{f:.0}") } else { f.to_string() }),
-        Bson::Decimal128(d) => out.push_str(&format!("Decimal128('{d}')")),
-        Bson::Boolean(b) => out.push_str(&b.to_string()),
-        Bson::Null => out.push_str("null"),
-        Bson::Undefined => out.push_str("undefined"),
-        Bson::ObjectId(o) => out.push_str(&format!("ObjectId('{}')", o.to_hex())),
-        Bson::DateTime(d) => out.push_str(&format!("ISODate('{}')", d.try_to_rfc3339_string().unwrap_or_else(|_| d.timestamp_millis().to_string()))),
-        Bson::RegularExpression(r) => out.push_str(&format!("/{}/{}", r.pattern, r.options)),
-        Bson::Timestamp(t) => out.push_str(&format!("Timestamp({{ t: {}, i: {} }})", t.time, t.increment)),
-        Bson::Binary(b) if b.subtype == mongodb::bson::spec::BinarySubtype::Uuid => match b.to_uuid() {
-            Ok(u) => out.push_str(&format!("UUID('{u}')")),
-            Err(_) => out.push_str(&v.clone().into_relaxed_extjson().to_string()),
+        Bson::String(s) => Tree::Str(s.clone()),
+        Bson::Int32(n) => Tree::Num(n.to_string()),
+        Bson::Double(f) => Tree::Typed("Double", if f.fract() == 0. && f.is_finite() && f.abs() < 1e15 { format!("{f:.0}") } else { f.to_string() }),
+        Bson::Int64(n) => Tree::Typed("Long", n.to_string()),
+        Bson::Decimal128(d) => Tree::Typed("Decimal128", d.to_string()),
+        Bson::Boolean(b) => Tree::Bool(*b),
+        Bson::Null | Bson::Undefined => Tree::Null,
+        Bson::ObjectId(o) => Tree::Typed("ObjectId", o.to_hex()),
+        Bson::DateTime(d) => Tree::Typed("Date", d.try_to_rfc3339_string().unwrap_or_else(|_| d.timestamp_millis().to_string())),
+        Bson::RegularExpression(r) => Tree::Typed("Regex", format!("/{}/{}", r.pattern, r.options)),
+        Bson::Timestamp(t) => Tree::Typed("Timestamp", format!("{}:{}", t.time, t.increment)),
+        Bson::Binary(b) => match b.to_uuid() {
+            Ok(u) if b.subtype == mongodb::bson::spec::BinarySubtype::Uuid => Tree::Typed("UUID", u.to_string()),
+            _ => Tree::Typed("Binary", b.to_string()),
         },
-        other => out.push_str(&other.clone().into_relaxed_extjson().to_string()),
+        other => Tree::Str(other.clone().into_relaxed_extjson().to_string()),
     }
-}
-
-/// 'text', with ' and \ escaped.
-fn quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        match c {
-            '\'' => out.push_str("\\'"),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            c => out.push(c),
-        }
-    }
-    out.push('\'');
-    out
 }
 
 /// A value as text: plain for scalars, compact JSON for documents and arrays. None: null
@@ -872,15 +799,23 @@ mod tests {
     }
 
     #[test]
-    fn documents_print_like_mongosh() {
+    fn documents_print_like_mongosh_and_as_json() {
+        use super::super::TextStyle;
         let id = ObjectId::parse_str("64b7f0c2a1b2c3d4e5f60718").unwrap();
-        let d = doc! { "_id": id, "name": "Ann's", "n": 3, "big": 5_000_000_000i64, "x": 2.5, "at": mongodb::bson::DateTime::from_millis(0), "tags": ["a", "b"], "addr": { "city": "Oslo" }, "bad key": Bson::Null, "list": [{ "a": 1 }] };
+        let d = doc! { "_id": id, "name": "Ann's", "n": 3, "big": 5_000_000_000i64, "x": 2.5, "w": 3.0, "at": mongodb::bson::DateTime::from_millis(0), "tags": ["a", "b"], "addr": { "city": "Oslo" }, "bad key": Bson::Null };
+        let t = tree(&Bson::Document(d.clone()));
         assert_eq!(
-            shell_json(&d),
-            "{\n  _id: ObjectId('64b7f0c2a1b2c3d4e5f60718'),\n  name: 'Ann\\'s',\n  n: 3,\n  big: Long('5000000000'),\n  x: 2.5,\n  at: ISODate('1970-01-01T00:00:00Z'),\n  tags: [ 'a', 'b' ],\n  addr: {\n    city: 'Oslo'\n  },\n  'bad key': null,\n  list: [\n    {\n      a: 1\n    }\n  ]\n}"
+            t.text(TextStyle::Shell),
+            "{\n  _id: ObjectId('64b7f0c2a1b2c3d4e5f60718'),\n  name: 'Ann\\'s',\n  n: 3,\n  big: Long('5000000000'),\n  x: 2.5,\n  w: 3,\n  at: ISODate('1970-01-01T00:00:00Z'),\n  tags: [\n    'a',\n    'b'\n  ],\n  addr: {\n    city: 'Oslo'\n  },\n  'bad key': null\n}"
         );
+        assert!(t.text(TextStyle::Json).starts_with("{\n  \"_id\": {\"$oid\": \"64b7f0c2a1b2c3d4e5f60718\"},\n  \"name\": \"Ann's\","), "{}", t.text(TextStyle::Json));
+        let Tree::Object(f) = &t else { panic!() };
+        let types: Vec<_> = f.iter().map(|(_, v)| v.type_name()).collect();
+        assert_eq!(types, ["ObjectId", "String", "Int32", "Int64", "Double", "Double", "Date", "Array", "Object", "Null"]);
+        assert_eq!(f[7].1.short(TextStyle::Shell), "[] 2 elements");
+        assert_eq!(f[8].1.short(TextStyle::Shell), "{} 1 field");
         let g = grid(&[d]);
-        assert_eq!(g.docs.as_ref().map(|d| d.len()), Some(1), "each row keeps its document");
+        assert_eq!(g.trees.as_ref().map(|d| d.len()), Some(1), "each row keeps its document");
     }
 
     #[test]
@@ -893,3 +828,4 @@ mod tests {
         assert_eq!(shell_name("my-coll"), "getCollection(\"my-coll\")");
     }
 }
+
