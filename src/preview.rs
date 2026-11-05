@@ -61,6 +61,8 @@ pub struct PreviewView {
     light: bool,
     /// The file changed on disk; reloaded on the next draw.
     stale: bool,
+    /// The theme the page was built in: diagrams are redrawn in a new one's colors.
+    theme: theme::Theme,
     info: String,
     scroll: ScrollHandle,
     refresh_task: Option<Task<()>>,
@@ -107,6 +109,7 @@ impl PreviewView {
             snapshot: None,
             light: false,
             stale: false,
+            theme: theme::current(),
             info: String::new(),
             scroll: ScrollHandle::new(),
             refresh_task: None,
@@ -165,7 +168,23 @@ impl PreviewView {
         self.version = self.source.as_ref().map(|e| e.read(cx).buf.version());
         match self.kind {
             Kind::Markdown => {
+                self.theme = theme::current();
+                // Each diagram's stand-in is kept until the diagram itself has loaded.
+                let ready = self.ready.borrow();
+                let prev = diagram_order(&self.blocks)
+                    .into_iter()
+                    .map(|d| d.map(|mut d| {
+                        if ready.contains_key(&d.path) {
+                            d.stand_in = None;
+                        }
+                        d
+                    }))
+                    .collect();
+                drop(ready);
+                PREVIOUS.with(|p| *p.borrow_mut() = prev);
                 self.blocks = Rc::new(parse(&self.text(cx)));
+                PREVIOUS.with(|p| p.borrow_mut().clear());
+                self.draw_pending_diagrams(cx);
                 let now = diagram_files(&self.blocks);
                 for old in self.diagrams.iter().filter(|p| !now.contains(p)) {
                     forget_diagram(old, window, cx);
@@ -248,6 +267,18 @@ impl PreviewView {
 
     /// How many diagram pictures are decoded now (tests).
     #[cfg(test)]
+    /// Diagrams shown as a placeholder, waiting to be drawn (tests).
+    #[cfg(test)]
+    pub fn diagrams_waiting(&self) -> usize {
+        diagram_order(&self.blocks).iter().filter(|d| d.is_none()).count()
+    }
+
+    /// The diagram files on the page (tests).
+    #[cfg(test)]
+    pub fn diagrams_shown(&self) -> Vec<PathBuf> {
+        self.diagrams.clone()
+    }
+
     pub fn pictures_decoded(&self) -> usize {
         self.decoded.len()
     }
@@ -273,6 +304,19 @@ impl PreviewView {
         self.sharp_zoom = 1.;
         self.locked_w = None;
         cx.notify();
+    }
+
+    /// Draws the diagrams the page is waiting for off the main thread, several at once, so
+    /// the page opens at once; it's rebuilt with each one as it's ready.
+    fn draw_pending_diagrams(&mut self, cx: &mut Context<Self>) {
+        for job in PENDING.with(|p| std::mem::take(&mut *p.borrow_mut())) {
+            let draw = cx.background_executor().spawn(async move { job.draw() });
+            cx.spawn(async move |this, cx| {
+                draw.await;
+                this.update(cx, |v, cx| v.mark_stale(cx)).ok();
+            })
+            .detach();
+        }
     }
 
     pub fn mark_stale(&mut self, cx: &mut Context<Self>) {
@@ -493,7 +537,8 @@ impl Focusable for PreviewView {
 
 impl Render for PreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if std::mem::take(&mut self.stale) {
+        let new_theme = self.kind == Kind::Markdown && self.theme != theme::current();
+        if std::mem::take(&mut self.stale) || new_theme {
             self.refresh(window, cx);
         }
         let body = match self.kind {
@@ -552,13 +597,62 @@ pub fn clean_old_temp_files() {
 
 // ---------------------------------------------------------------- Mermaid
 
+/// Diagrams drawn, by their text and colors: unchanged ones aren't drawn again while typing.
+static DIAGRAMS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, Result<Diagram, String>>>> = std::sync::LazyLock::new(Default::default);
+/// Diagrams being drawn now (so a page rebuilt meanwhile doesn't start them again).
+static DRAWING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u64>>> = std::sync::LazyLock::new(Default::default);
+
 thread_local! {
-    /// Diagrams drawn, by their text and colors: unchanged ones aren't drawn again while typing.
-    static DIAGRAMS: std::cell::RefCell<std::collections::HashMap<u64, Result<Diagram, String>>> = Default::default();
+    /// Diagrams the page being built waits for: the preview draws them in the background.
+    static PENDING: std::cell::RefCell<Vec<DiagramJob>> = Default::default();
+    /// The page's diagrams before this rebuild, in order: each stands in for the one in its
+    /// place until that one is drawn and loaded.
+    static PREVIOUS: std::cell::RefCell<Vec<Option<Diagram>>> = Default::default();
 }
 
-/// Draws a Mermaid diagram to an SVG file in the theme's colors (pure Rust, no browser).
-fn mermaid(src: &str) -> Result<Diagram, String> {
+/// A diagram to draw: its text, and the theme's colors (taken on the main thread).
+struct DiagramJob {
+    key: u64,
+    src: String,
+    opts: mermaid_rs_renderer::RenderOptions,
+}
+
+impl DiagramJob {
+    /// Draws it to an SVG file (pure Rust, no browser), keeps the result, and returns it.
+    fn draw(self) -> Result<Diagram, String> {
+        let key = self.key;
+        // A diagram the renderer can't handle shows its source, never takes the app down.
+        let svg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mermaid_rs_renderer::render_with_options(&self.src, self.opts)))
+            .map_err(|_| "the renderer couldn't draw this diagram".to_string())
+            .and_then(|r| r.map_err(|e| e.to_string().lines().next().unwrap_or("not valid Mermaid").to_string()));
+        let result = svg.and_then(|svg| {
+            let svg = outline_text(&emoji_in_emoji_font(&svg)).unwrap_or(svg);
+            let (w, h) = svg_size(&svg).ok_or("the drawing has no size")?;
+            let path = std::env::temp_dir().join(format!("kite-mermaid-{}-{key:x}.svg", std::process::id()));
+            std::fs::write(&path, &svg).map_err(|e| e.to_string())?;
+            Ok(Diagram { path, w, h, stand_in: None })
+        });
+        DIAGRAMS.lock().unwrap().insert(key, result.clone());
+        DRAWING.lock().unwrap().remove(&key);
+        result
+    }
+}
+
+/// A Mermaid diagram in the theme's colors, if it's drawn already; otherwise it's queued
+/// for the preview to draw in the background, and the page shows a placeholder meanwhile.
+fn mermaid(src: &str) -> Option<Result<Diagram, String>> {
+    let job = match mermaid_job(src) {
+        Ok(job) => job,
+        Err(key) => return DIAGRAMS.lock().unwrap().get(&key).cloned(),
+    };
+    if DRAWING.lock().unwrap().insert(job.key) {
+        PENDING.with(|p| p.borrow_mut().push(job));
+    }
+    None
+}
+
+/// The job to draw a diagram, or its key when it's drawn already.
+fn mermaid_job(src: &str) -> Result<DiagramJob, u64> {
     let bg = theme::bg_editor().to_rgb();
     let dark = 0.2126 * bg.r + 0.7152 * bg.g + 0.0722 * bg.b < 0.5;
     let hex = |c: Hsla| {
@@ -566,24 +660,21 @@ fn mermaid(src: &str) -> Result<Diagram, String> {
         format!("#{:02x}{:02x}{:02x}", (c.r * 255.).round() as u8, (c.g * 255.).round() as u8, (c.b * 255.).round() as u8)
     };
     let key = hash(&format!("{src}\u{0}{}\u{0}{}\u{0}{}", hex(theme::bg_editor()), hex(theme::fg()), hex(theme::accent())));
-    if let Some(done) = DIAGRAMS.with(|d| d.borrow().get(&key).cloned()) {
-        return done;
+    if DIAGRAMS.lock().unwrap().contains_key(&key) {
+        return Err(key);
     }
     let mut opts = mermaid_rs_renderer::RenderOptions::modern();
     opts.theme = diagram_theme(dark, &hex);
-    // A diagram the renderer can't handle shows its source, never takes the app down.
-    let svg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mermaid_rs_renderer::render_with_options(src, opts)))
-        .map_err(|_| "the renderer couldn't draw this diagram".to_string())
-        .and_then(|r| r.map_err(|e| e.to_string().lines().next().unwrap_or("not valid Mermaid").to_string()));
-    let result = svg.and_then(|svg| {
-        let svg = outline_text(&emoji_in_emoji_font(&svg)).unwrap_or(svg);
-        let (w, h) = svg_size(&svg).ok_or("the drawing has no size")?;
-        let path = std::env::temp_dir().join(format!("kite-mermaid-{}-{key:x}.svg", std::process::id()));
-        std::fs::write(&path, &svg).map_err(|e| e.to_string())?;
-        Ok(Diagram { path, w, h })
-    });
-    DIAGRAMS.with(|d| d.borrow_mut().insert(key, result.clone()));
-    result
+    Ok(DiagramJob { key, src: src.to_string(), opts })
+}
+
+/// A diagram drawn right away (tests).
+#[cfg(test)]
+fn mermaid_now(src: &str) -> Result<Diagram, String> {
+    match mermaid_job(src) {
+        Ok(job) => job.draw(),
+        Err(key) => DIAGRAMS.lock().unwrap()[&key].clone(),
+    }
 }
 
 /// Diagram colors from the theme's own: its background and text, nodes tinted with its
@@ -817,9 +908,25 @@ fn svg_size(svg: &str) -> Option<(f32, f32)> {
 }
 
 /// A page's diagram drawn to `file`.
+/// The page's diagrams in order (none where one failed or is still being drawn).
+fn diagram_order(blocks: &[Block]) -> Vec<Option<Diagram>> {
+    let mut out = Vec::new();
+    for b in blocks {
+        match b {
+            Block::Mermaid(d, _) => out.push(d.as_ref().ok().cloned()),
+            Block::MermaidPending(_) => out.push(None),
+            Block::Quote(inner) => out.extend(diagram_order(inner)),
+            Block::List(_, items) => out.extend(items.iter().flat_map(|i| diagram_order(&i.blocks))),
+            _ => {}
+        }
+    }
+    out
+}
+
 fn find_diagram(blocks: &[Block], file: &Path) -> Option<Diagram> {
     blocks.iter().find_map(|b| match b {
         Block::Mermaid(Ok(d), _) if d.path == file => Some(d.clone()),
+        Block::Mermaid(Ok(d), _) if d.stand_in.as_ref().is_some_and(|s| s.path == file) => d.stand_in.as_deref().cloned(),
         Block::Quote(inner) => find_diagram(inner, file),
         Block::List(_, items) => items.iter().find_map(|i| find_diagram(&i.blocks, file)),
         _ => None,
@@ -831,7 +938,10 @@ fn diagram_files(blocks: &[Block]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for b in blocks {
         match b {
-            Block::Mermaid(Ok(d), _) => out.push(d.path.clone()),
+            Block::Mermaid(Ok(d), _) => {
+                out.push(d.path.clone());
+                out.extend(d.stand_in.as_ref().map(|s| s.path.clone()));
+            }
             Block::Quote(inner) => out.extend(diagram_files(inner)),
             Block::List(_, items) => out.extend(items.iter().flat_map(|i| diagram_files(&i.blocks))),
             _ => {}
@@ -854,7 +964,7 @@ fn forget_diagram(path: &Path, window: &mut Window, cx: &mut App) {
             }
         }
     }
-    DIAGRAMS.with(|d| d.borrow_mut().retain(|_, v| v.as_ref().map(|x| x.path.as_path() != path).unwrap_or(true)));
+    DIAGRAMS.lock().unwrap().retain(|_, v| v.as_ref().map(|x| x.path.as_path() != path).unwrap_or(true));
 }
 
 fn hash(s: &str) -> u64 {
@@ -970,6 +1080,8 @@ enum Block {
     Html(String),
     /// A ```mermaid fence: the drawn diagram, or why it couldn't be (and its source).
     Mermaid(Result<Diagram, String>, String),
+    /// A diagram still being drawn (in the background), by its text.
+    MermaidPending(String),
 }
 
 /// A Mermaid diagram drawn to an SVG file (temporary, freed when no longer shown).
@@ -978,6 +1090,10 @@ struct Diagram {
     path: PathBuf,
     w: f32,
     h: f32,
+    /// The picture this one replaces (another theme's colors, the text before an edit): it
+    /// stays on screen, at this one's size, until this one has loaded, so nothing moves or
+    /// goes blank meanwhile.
+    stand_in: Option<Box<Diagram>>,
 }
 
 enum Frame {
@@ -990,6 +1106,8 @@ enum Frame {
 #[derive(Default)]
 struct Builder {
     out: Vec<Block>,
+    /// Diagrams met so far.
+    diagrams: usize,
     stack: Vec<Frame>,
     inline: Option<Inline>,
     heading: Option<u8>,
@@ -1123,7 +1241,19 @@ impl Builder {
                     if let Some((lang, text)) = self.code.take() {
                         if lang.as_deref().is_some_and(|l| l.eq_ignore_ascii_case("mermaid")) {
                             let src = text.trim_end().to_string();
-                            self.push_block(Block::Mermaid(mermaid(&src), src));
+                            let prev = PREVIOUS.with(|p| p.borrow().get(self.diagrams).cloned().flatten());
+                            self.diagrams += 1;
+                            self.push_block(match (mermaid(&src), prev) {
+                                // Drawn: the one it replaces covers for it until it has loaded.
+                                (Some(Ok(mut d)), Some(p)) => {
+                                    d.stand_in = if p.path == d.path { p.stand_in } else { Some(Box::new(Diagram { stand_in: None, ..p })) };
+                                    Block::Mermaid(Ok(d), src)
+                                }
+                                (Some(d), _) => Block::Mermaid(d, src),
+                                // Being drawn: the one before shows meanwhile, else a placeholder.
+                                (None, Some(p)) => Block::Mermaid(Ok(p), src),
+                                (None, None) => Block::MermaidPending(src),
+                            });
                             return;
                         }
                         let text = text.trim_end_matches('\n').replace('\t', "    ");
@@ -1464,14 +1594,16 @@ impl Renderer {
                     self.wanted.push((d.path.clone(), step, want.iter().map(|t| t.path.clone()).collect()));
                     // On screen only tiles that have loaded: the last full set, stretched, while
                     // the next one loads out of sight (GPUI draws nothing while an image loads).
-                    let ready = self.ready.borrow().get(&d.path).copied().map(|s| (s, tiles(d, s))).filter(|(_, t)| t.iter().all(|t| self.decoded.contains(&t.path)));
-                    let first_load = ready.is_none();
-                    let (show_step, show) = ready.unwrap_or((step, want.clone()));
+                    let ready_of = |x: &Diagram| self.ready.borrow().get(&x.path).copied().map(|s| (s, tiles(x, s))).filter(|(_, t)| t.iter().all(|t| self.decoded.contains(&t.path)));
+                    // Its own loaded picture, else the one it replaces (stretched to its size).
+                    let shown_by = ready_of(d).map(|r| (d, r)).or_else(|| d.stand_in.as_deref().and_then(|o| ready_of(o).map(|r| (o, r))));
+                    let first_load = shown_by.is_none();
+                    let (by, (show_step, show)) = shown_by.unwrap_or((d, (step, want.clone())));
                     self.shown.extend(show.iter().map(|t| t.path.clone()));
-                    if show_step != step {
+                    if show_step != step || by.path != d.path {
                         self.shown.extend(want.iter().map(|t| t.path.clone()));
                     }
-                    let (rw, rh) = (d.w * show_step, d.h * show_step);
+                    let (rw, rh) = (by.w * show_step, by.h * show_step);
                     let mut layer = div().relative().w(w).h(h);
                     for (k, t) in show.into_iter().enumerate() {
                         // A hair of overlap so no seam shows between tiles.
@@ -1497,6 +1629,22 @@ impl Renderer {
                     .justify_center()
                     .py(px(4.))
                     .child(div().relative().flex_none().w(w).h(h).child(body).child(measure))
+                    .into_any_element()
+            }
+            Block::MermaidPending(_) => {
+                let id = self.id();
+                div()
+                    .debug_selector(move || format!("md-mermaid-pending-{id}"))
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .h(px(120.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(theme::border())
+                    .text_size(px(12.))
+                    .text_color(theme::fg_muted())
+                    .child("Drawing diagram…")
                     .into_any_element()
             }
             Block::Mermaid(Err(e), src) => {
@@ -1606,7 +1754,7 @@ fn code_runs(line: &str, spans: Option<&Vec<(Range<usize>, u8)>>) -> Vec<TextRun
 
 #[cfg(test)]
 mod tests {
-    use super::{Block, Diagram, TILE, crop_svg, emoji_in_emoji_font, image_size, outline_text, mermaid, parse, tiles};
+    use super::{Block, Diagram, PENDING, PREVIOUS, TILE, crop_svg, emoji_in_emoji_font, image_size, mermaid_now, outline_text, parse, tiles};
 
     #[test]
     fn big_diagrams_are_drawn_in_tiles_that_cover_them_exactly() {
@@ -1614,7 +1762,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("d.svg");
         std::fs::write(&path, r#"<svg xmlns="http://www.w3.org/2000/svg" width="800" height="2600" viewBox="0 0 400 1300"><rect width="400" height="1300"/></svg>"#).unwrap();
-        let d = Diagram { path: path.clone(), w: 800., h: 2600. };
+        let d = Diagram { path: path.clone(), w: 800., h: 2600., stand_in: None };
         // At 1.5x: 1200 x 3900 pixels, so 2 x 4 tiles, none past TILE.
         let t = tiles(&d, 1.5);
         assert_eq!(t.len(), 8);
@@ -1640,6 +1788,25 @@ mod tests {
             "text only, never inside tags; joined emoji stay one"
         );
         assert_eq!(emoji_in_emoji_font("<text>a → b ✓</text>"), "<text>a → b ✓</text>", "arrows and plain marks stay in the text's font");
+    }
+
+    #[test]
+    fn a_diagram_being_redrawn_keeps_showing_the_one_before() {
+        let old = mermaid_now("flowchart LR\n  Old --> Pic").unwrap();
+        // The text changed (or the theme): the new one is queued, the old one shows meanwhile.
+        PREVIOUS.with(|p| *p.borrow_mut() = vec![Some(old.clone())]);
+        let edited = "```mermaid\nflowchart LR\n  New --> Pic\n```\n";
+        let b = parse(edited);
+        assert!(matches!(&b[0], Block::Mermaid(Ok(d), _) if *d == old), "{:?}", b[0]);
+        // Drawn: it's shown, with the old one standing in until it has loaded.
+        for j in PENDING.with(|p| std::mem::take(&mut *p.borrow_mut())) {
+            j.draw().ok();
+        }
+        let b = parse(edited);
+        let Block::Mermaid(Ok(d), _) = &b[0] else { panic!("{:?}", b[0]) };
+        assert_ne!(d.path, old.path);
+        assert_eq!(d.stand_in.as_deref(), Some(&old));
+        PREVIOUS.with(|p| p.borrow_mut().clear());
     }
 
     #[test]
@@ -1670,15 +1837,25 @@ mod tests {
             ("gantt", "gantt\n  title Plan\n  dateFormat YYYY-MM-DD\n  section A\n  Task :a1, 2026-01-01, 3d"),
             ("pie", "pie title Pets\n  \"Dogs\" : 386\n  \"Cats\" : 85"),
         ] {
-            let d = mermaid(src).unwrap_or_else(|e| panic!("{kind}: {e}"));
+            let d = mermaid_now(src).unwrap_or_else(|e| panic!("{kind}: {e}"));
             assert!(d.w > 10. && d.h > 10., "{kind}: {d:?}");
             assert!(std::fs::read_to_string(&d.path).unwrap().contains("<svg"), "{kind}");
-            assert_eq!(mermaid(src).unwrap(), d, "{kind}: drawn once, then reused");
+            assert_eq!(mermaid_now(src).unwrap(), d, "{kind}: drawn once, then reused");
             std::fs::remove_file(&d.path).ok();
         }
         eprintln!("[mermaid] memory {before:.1} MB -> {:.1} MB after drawing 7 diagrams", rss());
-        assert!(mermaid("flowchart LR\n  A --> ").is_err() || mermaid("this is not mermaid").is_err(), "nonsense is an error, not a panic");
-        let b = parse("Before\n\n```mermaid\ngraph TD; A-->B\n```\n\n```mermaid\nnot a diagram at all\n```\n");
+        assert!(mermaid_now("flowchart LR\n  A --> ").is_err() || mermaid_now("this is not mermaid").is_err(), "nonsense is an error, not a panic");
+        let md = "Before\n\n```mermaid\ngraph TD; A-->B\n```\n\n```mermaid\nnot a diagram at all\n```\n";
+        let b = parse(md);
+        assert!(matches!(&b[1], Block::MermaidPending(_)) && matches!(&b[2], Block::MermaidPending(_)), "not drawn while the page is built: {:?}", &b[1..]);
+        let jobs = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        assert_eq!(jobs.len(), 2, "both queued to draw");
+        for j in jobs {
+            j.draw().ok();
+        }
+        assert_eq!(parse(md).len(), b.len());
+        assert!(PENDING.with(|p| p.borrow().is_empty()), "drawn ones aren't queued again");
+        let b = parse(md);
         assert!(matches!(&b[1], Block::Mermaid(Ok(_), _)), "{:?}", b[1]);
         assert!(matches!(&b[2], Block::Mermaid(Err(_), src) if src == "not a diagram at all"), "the source stays, to show with the error");
     }

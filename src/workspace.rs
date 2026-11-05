@@ -6604,6 +6604,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
 
     #[gpui::test]
     fn markdown_preview_draws_mermaid_diagrams(cx: &mut TestAppContext) {
+        use crate::theme;
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));
         std::fs::write(root.join("flow.md"), "```mermaid\nflowchart LR\n  A[Order] --> B{Paid?}\n  B -->|yes| C[Ship]\n```\n").unwrap();
@@ -6629,6 +6630,37 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         cx.executor().advance_clock(std::time::Duration::from_millis(300));
         cx.run_until_parked();
         assert!(cx.debug_bounds("md-mermaid-1").is_some(), "a sequence diagram now");
+
+        // Another theme while the preview is open: the diagram is drawn again in its colors.
+        let preview = ws.read_with(cx, |ws, _| ws.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Preview(v) => Some(v.clone()),
+            _ => None,
+        })).expect("the preview");
+        let old = preview.read_with(cx, |v, _| v.diagrams_shown());
+        let old_bg = theme::bg_editor();
+        let other = if theme::current() == theme::Theme::Light { theme::Theme::Default } else { theme::Theme::Light };
+        ws.update(cx, |ws, cx| ws.set_theme(other, cx));
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = cx;
+        });
+        preview.update_in(cx, |v, window, cx| v.refresh(window, cx));
+        assert_eq!(preview.read_with(cx, |v, _| (v.diagrams_waiting(), v.diagrams_shown())), (0, old.clone()), "while the new one is drawn, the old one shows");
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.update(|window, _| window.refresh());
+        }
+        cx.run_until_parked();
+        let new = preview.read_with(cx, |v, _| v.diagrams_shown());
+        assert!(theme::bg_editor() != old_bg);
+        assert_eq!(old.len(), 1);
+        assert_ne!(new[0], old[0], "a new picture, in the new theme's colors");
+        // Until it has loaded, the old one stays to cover for it (nothing moves meanwhile).
+        assert!(new.len() == 1 || new[1] == old[0], "{new:?}");
+        assert_eq!(preview.read_with(cx, |v, _| v.diagrams_waiting()), 0, "never the placeholder once a picture was shown");
+        let bg = theme::bg_editor().to_rgb();
+        let hex = format!("#{:02x}{:02x}{:02x}", (bg.r * 255.).round() as u8, (bg.g * 255.).round() as u8, (bg.b * 255.).round() as u8);
+        assert!(std::fs::read_to_string(&new[0]).unwrap().contains(&hex), "on the new background {hex}");
     }
 
     #[gpui::test]
