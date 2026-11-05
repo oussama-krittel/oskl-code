@@ -39,7 +39,7 @@ actions!(
         ToggleOutput, FocusEditor, FocusSidebar, Save, CloseTab, NextTab, PrevTab, FormatFile,
         ToggleBlame, ZoomIn, ZoomOut, Quit, GoToLine, RunShell, FocusCommit, ShowKeys, Lint,
         OutputDown, OutputUp, OutputPageDown, OutputPageUp, OutputTop, OutputBottom, OutputOpen, OutputLeave,
-        OpenFolder, OpenFolderNewWindow, NextWindow, SearchAll, ShowKeysPanel, ToggleSidebarSide,
+        OpenFolder, OpenFolderNewWindow, CloseFolder, NextWindow, SearchAll, ShowKeysPanel, ToggleSidebarSide,
         UiZoomIn, UiZoomOut, UiZoomReset, ShowSettings,
         SplitRight, SplitDown, ClosePane, ZoomPane, FocusLeft, FocusRight, FocusUp, FocusDown,
         NewTerminal, ToggleTerminal, PaneBuffers,
@@ -124,6 +124,7 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-o", OpenFolder, None),
         crate::keybindings::kb("cmd-shift-v", TogglePreview, None),
         crate::keybindings::kb("cmd-k v", PreviewToSide, None),
+        crate::keybindings::kb("cmd-k f", CloseFolder, None),
         crate::keybindings::kb("cmd-shift-n", OpenFolderNewWindow, None),
         crate::keybindings::kb("ctrl--", GoBack, None),
         crate::keybindings::kb("ctrl-shift--", GoForward, None),
@@ -937,6 +938,15 @@ impl Workspace {
                 }
                 cx.notify();
             }
+            Request::Db(crate::db_view::DbRequest::Connected(id)) => {
+                for t in &self.tabs {
+                    if let TabKind::Db(v) = &t.kind
+                        && v.read(cx).conn_id().as_deref() == Some(id.as_str())
+                    {
+                        v.update(cx, |v, cx| v.reconnected(cx));
+                    }
+                }
+            }
             // Only a tab sends this (handled where it's subscribed).
             Request::Db(crate::db_view::DbRequest::Close) => {}
             Request::MarkResolved(rel) => {
@@ -1041,7 +1051,7 @@ impl Workspace {
         let danger = theme::c(0xc74e39);
         let buttons = Self::ask_order(n).into_iter().map(|ix| {
             let main = ix == 0;
-            let label = if ix == n { "Cancel".to_string() } else { st.ask.buttons[ix].clone() };
+            let label = if ix == n { st.ask.cancel_label.unwrap_or("Cancel").to_string() } else { st.ask.buttons[ix].clone() };
             let selected = ix == st.sel;
             let selector = format!("dialog-button-{label}");
             div()
@@ -2209,7 +2219,17 @@ impl Workspace {
         if let TabKind::Preview(v) = &self.tabs[ix].kind {
             v.clone().update(cx, |v, cx| v.release(window, cx));
         }
+        let db_conn = match &self.tabs[ix].kind {
+            TabKind::Db(v) => v.read(cx).conn_id(),
+            _ => None,
+        };
         self.drop_tab(id);
+        // A connection's last tab closed: it's disconnected (connect again from the panel).
+        if let Some(conn) = db_conn
+            && !self.tabs.iter().any(|t| matches!(&t.kind, TabKind::Db(v) if v.read(cx).conn_id().as_deref() == Some(conn.as_str())))
+        {
+            self.db_panel.update(cx, |p, cx| p.disconnect(&conn, cx));
+        }
         if let Some(p) = pane {
             if self.pane(p).is_some_and(|p| p.items.is_empty()) && self.panes.len() > 1 {
                 return self.close_pane(p, window, cx);
@@ -2865,6 +2885,14 @@ impl Workspace {
 
     fn open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
         self.pick_folder(false, window, cx);
+    }
+
+    /// ⌘K F: closes the folder; the window stays, empty, ready to open another.
+    fn close_folder(&mut self, _: &CloseFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if !root_is_project(&self.repo.read(cx).root) {
+            return self.flash("No folder open".into(), false, cx);
+        }
+        self.switch_project(no_project_dir(), window, cx);
     }
 
     /// ⌘⇧N: another project, side by side in its own window.
@@ -4468,6 +4496,23 @@ impl Workspace {
             .when(active_ix.is_none() && self.panes.len() > 1, |d| {
                 d.child(glyph("close-pane", "close", "Close pane (⌘⇧W)").on_click(cx.listener(move |ws, _, w, cx| ws.close_pane(id, w, cx))))
             });
+        // The window buttons over this pane's corner (the sidebar is hidden): the frame steps
+        // around them, like a title bar, instead of running underneath.
+        let notch = (id == self.top_left_pane() && self.lights_pad > 0.).then(|| {
+            let w = gpui::px(self.lights_pad + 6.);
+            let h = px(24.) - gpui::px(1.);
+            div()
+                .absolute()
+                .top(gpui::px(-1.))
+                .left(gpui::px(-1.))
+                .w(w)
+                .h(h + gpui::px(1.))
+                .bg(theme::bg_editor())
+                .border_b_1()
+                .border_r_1()
+                .border_color(frame)
+                .rounded_br(px(6.))
+        });
         div()
             .size_full()
             .p(px(2.))
@@ -4478,10 +4523,12 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .rounded(px(6.))
+                    .when(notch.is_some(), |d| d.rounded_tl(gpui::px(0.)))
                     .border_1()
                     .border_color(frame)
                     .bg(theme::bg_editor())
                     .overflow_hidden()
+                    .children(notch)
                     .capture_any_mouse_down(cx.listener(move |ws, _, _, cx| {
                         if ws.focused_pane != id {
                             ws.set_focused_pane(id);
@@ -5321,6 +5368,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_keys_panel))
             .on_action(cx.listener(Self::toggle_sidebar_side))
             .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::close_folder))
             .on_action(cx.listener(Self::toggle_preview))
             .on_action(cx.listener(Self::preview_to_side))
             .on_action(cx.listener(Self::open_folder_new_window))
@@ -6383,6 +6431,7 @@ mod ui_tests {
             buttons: vec!["Discard All 34 Files".into(), "Discard 28 Tracked Files".into()],
             danger: true,
             cancel_default: false,
+            cancel_label: None,
             on_answer: std::rc::Rc::new(|_, _, _| {}),
         };
         ws.update_in(cx, |ws, window, cx| ws.open_ask(ask, window, cx));
@@ -7624,6 +7673,9 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(cx.debug_bounds("db-conn-Cache").is_some(), "shown in the panel");
         click_on(cx, "db-connect");
         assert!(db_tab(&ws, cx).is_none(), "Connect closes the form");
+        // Nothing runs on that port: the popup says so.
+        wait_for(cx, "the failure popup", |cx| ws.read_with(cx, |ws, _| ws.ask.is_some()));
+        click_on(cx, "dialog-button-Close");
         // Deleting asks first.
         let row = cx.debug_bounds("db-conn-Cache").unwrap();
         cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
@@ -7633,6 +7685,68 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         click_on(cx, "dialog-button-Delete");
         assert!(crate::db::load().is_empty(), "deleted");
         assert_eq!(crate::db::secret(&c.id), "", "with its password");
+    }
+
+    #[gpui::test]
+    fn closing_the_folder_leaves_an_empty_window(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("a.txt"), None, false, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-k f");
+        cx.run_until_parked();
+        let now = cx.update(|window, cx| window.root::<Workspace>().flatten().map(|w| w.read(cx).root(cx)));
+        assert_eq!(now, Some(super::no_project_dir()), "the window shows no folder");
+    }
+
+    #[gpui::test]
+    fn a_failed_connection_says_so_in_a_popup(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let mut c = crate::db::Conn::new(crate::db::Kind::Redis);
+        c.name = "Nowhere".into();
+        c.port = 1; // nothing listens there
+        crate::db::save(&c, Some("x")).unwrap();
+        ws.update_in(cx, |ws, window, cx| {
+            ws.db_panel.update(cx, |p, cx| p.reload_and_expand(None, cx));
+            ws.select_side(super::Side::Databases, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("db-connect-0").is_some(), "not connected: Connect shows");
+        click_on(cx, "db-connect-0");
+        wait_for(cx, "the popup", |cx| ws.read_with(cx, |ws, _| ws.ask.is_some()));
+        assert!(cx.debug_bounds("dialog-button-Retry").is_some() && cx.debug_bounds("dialog-button-Close").is_some(), "Retry and Close");
+        assert!(!crate::db::engine::connected(&c.id), "left disconnected");
+        click_on(cx, "dialog-button-Close");
+        assert!(ws.read_with(cx, |ws, _| ws.ask.is_none()));
+    }
+
+    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    #[gpui::test]
+    fn a_mongodb_document_shows_as_json(cx: &mut TestAppContext) {
+        if std::env::var_os("KITE_DB_LIVE").is_none() {
+            return;
+        }
+        let (ws, cx) = setup(cx);
+        let mut c = crate::db::Conn::new(crate::db::Kind::MongoDb);
+        c.name = "Mongo".into();
+        c.port = 57017;
+        c.user = "root".into();
+        crate::db::save(&c, Some("mongopw")).unwrap();
+        let id = c.id.clone();
+        crate::db::engine::open(&c.id);
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["shop".into(), "users".into()] }, window, cx));
+        let tab = db_tab(&ws, cx).expect("a data tab");
+        wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
+        let grid = cx.debug_bounds("db-grid").unwrap();
+        cx.simulate_click(gpui::point(grid.left() + gpui::px(80.), grid.top() + gpui::px(28. + 13.)), gpui::Modifiers::none());
+        cx.run_until_parked();
+        click_on(cx, "db-detail-json");
+        let (open, row, json) = tab.read_with(cx, |t, cx| t.detail_state(cx));
+        assert!(open && row == Some(0));
+        let json = json.expect("the JSON");
+        assert!(json.starts_with("{\n  _id: ObjectId('"), "{json}");
+        assert!(json.contains("name: '"), "{json}");
     }
 
     /// With the test PostgreSQL server running (KITE_DB_LIVE=1, port 55432).
@@ -7666,6 +7780,16 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(cx.debug_bounds("db-grid").is_some());
         tab.update(cx, |t, cx| t.search_for("an", cx));
         wait_for(cx, "the search", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 3));
+        // A row clicked: its fields, one under another, beside the grid; ↓ the next; Esc closes.
+        let cell = cx.debug_bounds("db-grid").unwrap();
+        cx.simulate_click(gpui::point(cell.left() + gpui::px(80.), cell.top() + gpui::px(28. + 13.)), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(tab.read_with(cx, |t, cx| t.detail_state(cx)), (true, Some(0), None));
+        assert!(cx.debug_bounds("db-fields").is_some(), "the fields are listed");
+        cx.simulate_keystrokes("down");
+        assert_eq!(tab.read_with(cx, |t, cx| t.detail_state(cx)).1, Some(1));
+        cx.simulate_keystrokes("escape");
+        assert!(!tab.read_with(cx, |t, cx| t.detail_state(cx)).0, "closed");
         click_on(cx, "db-col-1");
         click_on(cx, "db-tab-query");
         cx.simulate_keystrokes("cmd-enter");
@@ -7675,6 +7799,12 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         click_on(cx, "db-node-fruit_order");
         assert_eq!(db_tab(&ws, cx), Some(tab));
         assert_eq!(ws.read_with(cx, |ws, _| ws.tabs.iter().filter(|t| matches!(t.kind, TabKind::Db(_))).count()), 1);
+        // Its last tab closed: disconnected, and it says so (Connect is shown again).
+        assert!(crate::db::engine::connected(&c.id));
+        cx.simulate_keystrokes("cmd-w");
+        cx.run_until_parked();
+        assert!(!crate::db::engine::connected(&c.id), "closing the last tab disconnects");
+        assert!(cx.debug_bounds("db-connect-0").is_some(), "Connect is shown");
     }
 }
 

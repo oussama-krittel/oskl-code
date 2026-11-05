@@ -139,11 +139,132 @@ fn columns(docs: &[Document]) -> Vec<String> {
 
 fn grid(docs: &[Document]) -> Grid {
     let mut g = Grid { columns: columns(docs), ..Default::default() };
+    let mut json = Vec::new();
     for d in docs {
         let row = g.columns.iter().map(|c| d.get(c).and_then(show)).collect();
-        g.push(row);
+        if g.push(row) {
+            json.push(shell_json(d));
+        }
     }
+    g.docs = Some(json);
     g
+}
+
+/// The longest a document's JSON is kept (longer ones end with a note).
+const MAX_DOC: usize = 200_000;
+
+/// A document as mongosh prints it: bare keys, 'strings', ObjectId('…'), ISODate('…'),
+/// two-space indents.
+pub fn shell_json(d: &Document) -> String {
+    let mut out = String::new();
+    write_doc(&mut out, d, 0);
+    if out.len() > MAX_DOC {
+        let mut cut = MAX_DOC;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("\n… (cut: the document is longer)");
+    }
+    out
+}
+
+fn write_doc(out: &mut String, d: &Document, depth: usize) {
+    if d.is_empty() {
+        out.push_str("{}");
+        return;
+    }
+    out.push_str("{\n");
+    let n = d.len();
+    for (i, (k, v)) in d.iter().enumerate() {
+        if out.len() > MAX_DOC {
+            break;
+        }
+        out.push_str(&"  ".repeat(depth + 1));
+        let bare = k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$') && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        if bare {
+            out.push_str(k);
+        } else {
+            out.push_str(&quote(k));
+        }
+        out.push_str(": ");
+        write_value(out, v, depth + 1);
+        if i + 1 < n {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str(&"  ".repeat(depth));
+    out.push('}');
+}
+
+fn write_value(out: &mut String, v: &Bson, depth: usize) {
+    match v {
+        Bson::Document(d) => write_doc(out, d, depth),
+        Bson::Array(a) if a.is_empty() => out.push_str("[]"),
+        Bson::Array(a) => {
+            // Short arrays of scalars on one line, like mongosh.
+            let simple = a.len() <= 6 && a.iter().all(|x| !matches!(x, Bson::Document(_) | Bson::Array(_)));
+            if simple {
+                out.push_str("[ ");
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    write_value(out, x, depth);
+                }
+                out.push_str(" ]");
+                return;
+            }
+            out.push_str("[\n");
+            for (i, x) in a.iter().enumerate() {
+                if out.len() > MAX_DOC {
+                    break;
+                }
+                out.push_str(&"  ".repeat(depth + 1));
+                write_value(out, x, depth + 1);
+                if i + 1 < a.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&"  ".repeat(depth));
+            out.push(']');
+        }
+        Bson::String(s) => out.push_str(&quote(s)),
+        Bson::Int32(n) => out.push_str(&n.to_string()),
+        Bson::Int64(n) => out.push_str(&format!("Long('{n}')")),
+        Bson::Double(f) => out.push_str(&if f.fract() == 0. && f.is_finite() && f.abs() < 1e15 { format!("{f:.0}") } else { f.to_string() }),
+        Bson::Decimal128(d) => out.push_str(&format!("Decimal128('{d}')")),
+        Bson::Boolean(b) => out.push_str(&b.to_string()),
+        Bson::Null => out.push_str("null"),
+        Bson::Undefined => out.push_str("undefined"),
+        Bson::ObjectId(o) => out.push_str(&format!("ObjectId('{}')", o.to_hex())),
+        Bson::DateTime(d) => out.push_str(&format!("ISODate('{}')", d.try_to_rfc3339_string().unwrap_or_else(|_| d.timestamp_millis().to_string()))),
+        Bson::RegularExpression(r) => out.push_str(&format!("/{}/{}", r.pattern, r.options)),
+        Bson::Timestamp(t) => out.push_str(&format!("Timestamp({{ t: {}, i: {} }})", t.time, t.increment)),
+        Bson::Binary(b) if b.subtype == mongodb::bson::spec::BinarySubtype::Uuid => match b.to_uuid() {
+            Ok(u) => out.push_str(&format!("UUID('{u}')")),
+            Err(_) => out.push_str(&v.clone().into_relaxed_extjson().to_string()),
+        },
+        other => out.push_str(&other.clone().into_relaxed_extjson().to_string()),
+    }
+}
+
+/// 'text', with ' and \ escaped.
+fn quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        match c {
+            '\'' => out.push_str("\\'"),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// A value as text: plain for scalars, compact JSON for documents and arrays. None: null
@@ -748,6 +869,18 @@ mod tests {
         let s = statements("db.a.find({x: ';'})\ndb.b.insertOne({\n  y: 1\n});\n// a comment\nshow collections");
         assert_eq!(s.iter().map(|s| s.trim()).collect::<Vec<_>>(), ["db.a.find({x: ';'})", "db.b.insertOne({\n  y: 1\n})", "show collections"]);
         assert!(is_command(&doc! { "ping": 1 }) && !is_command(&doc! { "name": "x" }));
+    }
+
+    #[test]
+    fn documents_print_like_mongosh() {
+        let id = ObjectId::parse_str("64b7f0c2a1b2c3d4e5f60718").unwrap();
+        let d = doc! { "_id": id, "name": "Ann's", "n": 3, "big": 5_000_000_000i64, "x": 2.5, "at": mongodb::bson::DateTime::from_millis(0), "tags": ["a", "b"], "addr": { "city": "Oslo" }, "bad key": Bson::Null, "list": [{ "a": 1 }] };
+        assert_eq!(
+            shell_json(&d),
+            "{\n  _id: ObjectId('64b7f0c2a1b2c3d4e5f60718'),\n  name: 'Ann\\'s',\n  n: 3,\n  big: Long('5000000000'),\n  x: 2.5,\n  at: ISODate('1970-01-01T00:00:00Z'),\n  tags: [ 'a', 'b' ],\n  addr: {\n    city: 'Oslo'\n  },\n  'bad key': null,\n  list: [\n    {\n      a: 1\n    }\n  ]\n}"
+        );
+        let g = grid(&[d]);
+        assert_eq!(g.docs.as_ref().map(|d| d.len()), Some(1), "each row keeps its document");
     }
 
     #[test]

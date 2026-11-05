@@ -541,6 +541,7 @@ impl GitPanel {
             buttons: vec!["Commit Anyway".into()],
             danger: true,
             cancel_default: true,
+            cancel_label: None,
             on_answer: Rc::new(move |_, window, cx| {
                 let message = message.clone();
                 panel.update(cx, |p, cx| p.commit_with(Some(message), false, amend, true, window, cx)).ok();
@@ -644,6 +645,7 @@ impl GitPanel {
         let choices = ask.buttons.clone();
         cx.emit(Request::Ask(crate::dialog::Ask {
             cancel_default: false,
+            cancel_label: None,
             title: ask.message,
             detail: ask.detail,
             buttons: ask.buttons.into_iter().map(|(label, _)| label).collect(),

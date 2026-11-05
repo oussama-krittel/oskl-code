@@ -224,7 +224,12 @@ pub fn delete(id: &str) -> Result<(), String> {
 
 // ---------------------------------------------------------------- Keychain
 
-const KEYCHAIN_SERVICE: &str = "OSKL Code database";
+/// Passwords are kept in the login Keychain through macOS's `security` tool: the entries
+/// belong to that tool, which never changes, so macOS doesn't ask again each time this app
+/// is updated (entries made by the app itself are tied to its exact build).
+const KEYCHAIN_SERVICE: &str = "OSKL Code connections";
+/// Where earlier builds kept them (moved over when first read).
+const OLD_KEYCHAIN_SERVICE: &str = "OSKL Code database";
 
 #[cfg(test)]
 static TEST_SECRETS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = std::sync::LazyLock::new(Default::default);
@@ -234,7 +239,21 @@ pub fn secret(id: &str) -> String {
     #[cfg(test)]
     return TEST_SECRETS.lock().unwrap().get(id).cloned().unwrap_or_default();
     #[cfg(not(test))]
-    security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, id).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default()
+    {
+        if let Some(s) = keychain::read(KEYCHAIN_SERVICE, id) {
+            return s;
+        }
+        // Saved by an earlier build: read it the old way (macOS may ask this once), move it.
+        match security_framework::passwords::get_generic_password(OLD_KEYCHAIN_SERVICE, id).ok().and_then(|b| String::from_utf8(b).ok()) {
+            Some(old) => {
+                if keychain::write(KEYCHAIN_SERVICE, id, &old).is_ok() {
+                    security_framework::passwords::delete_generic_password(OLD_KEYCHAIN_SERVICE, id).ok();
+                }
+                old
+            }
+            None => String::new(),
+        }
+    }
 }
 
 fn set_secret(id: &str, secret: &str) -> Result<(), String> {
@@ -250,12 +269,98 @@ fn set_secret(id: &str, secret: &str) -> Result<(), String> {
     }
     #[cfg(not(test))]
     {
-        use security_framework::passwords::{delete_generic_password, set_generic_password};
+        security_framework::passwords::delete_generic_password(OLD_KEYCHAIN_SERVICE, id).ok();
         if secret.is_empty() {
-            delete_generic_password(KEYCHAIN_SERVICE, id).ok();
+            keychain::delete(KEYCHAIN_SERVICE, id);
             Ok(())
         } else {
-            set_generic_password(KEYCHAIN_SERVICE, id, secret.as_bytes()).map_err(|e| format!("Keychain: {e}"))
+            keychain::write(KEYCHAIN_SERVICE, id, secret)
+        }
+    }
+}
+
+/// The `security` tool. Secrets are stored hex-encoded (always plain ASCII, nothing to
+/// quote) and are passed on its standard input, never on a command line others can see.
+mod keychain {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    const TOOL: &str = "/usr/bin/security";
+
+    pub fn encode(s: &str) -> String {
+        let mut out = String::from("x");
+        for b in s.as_bytes() {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    }
+
+    pub fn decode(s: &str) -> Option<String> {
+        let hex = s.strip_prefix('x')?;
+        if !hex.len().is_multiple_of(2) {
+            return None;
+        }
+        let bytes: Option<Vec<u8>> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect();
+        String::from_utf8(bytes?).ok()
+    }
+
+    /// Only names we make (an id, the service): no quotes or backslashes in them.
+    fn safe(s: &str) -> bool {
+        !s.contains(['"', '\\', '\n'])
+    }
+
+    pub fn read(service: &str, id: &str) -> Option<String> {
+        let out = Command::new(TOOL).args(["find-generic-password", "-s", service, "-a", id, "-w"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        decode(String::from_utf8_lossy(&out.stdout).trim())
+    }
+
+    pub fn write(service: &str, id: &str, secret: &str) -> Result<(), String> {
+        if !safe(service) || !safe(id) {
+            return Err("Keychain: unexpected name".into());
+        }
+        let mut child = Command::new(TOOL).arg("-i").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|e| format!("Keychain: {e}"))?;
+        let line = format!("add-generic-password -U -s \"{service}\" -a \"{id}\" -l \"{service}\" -w \"{}\"\n", encode(secret));
+        child.stdin.take().ok_or("Keychain: no input")?.write_all(line.as_bytes()).map_err(|e| format!("Keychain: {e}"))?;
+        let out = child.wait_with_output().map_err(|e| format!("Keychain: {e}"))?;
+        let err = String::from_utf8_lossy(&out.stderr);
+        if out.status.success() && !err.contains("error") {
+            Ok(())
+        } else {
+            Err(format!("Keychain: {}", err.trim()))
+        }
+    }
+
+    pub fn delete(service: &str, id: &str) {
+        Command::new(TOOL).args(["delete-generic-password", "-s", service, "-a", id]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().ok();
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn secrets_are_stored_as_plain_ascii() {
+            for s in ["p@ss \"quoted\" w0rd", "naïve ✓", "", "a\\b"] {
+                let e = super::encode(s);
+                assert!(e.chars().all(|c| c.is_ascii_alphanumeric()), "{e}");
+                assert_eq!(super::decode(&e).as_deref(), Some(s));
+            }
+            assert_eq!(super::decode("plain"), None);
+        }
+
+        /// The real Keychain (KITE_DB_LIVE=1): written, read back without asking, deleted.
+        #[test]
+        fn the_keychain_round_trip() {
+            if std::env::var_os("KITE_DB_LIVE").is_none() {
+                return;
+            }
+            let (svc, id) = ("OSKL Code test", "round-trip");
+            super::write(svc, id, "p@ss \"x\" ✓").unwrap();
+            super::write(svc, id, "changed").unwrap();
+            assert_eq!(super::read(svc, id).as_deref(), Some("changed"), "updated in place");
+            super::delete(svc, id);
+            assert_eq!(super::read(svc, id), None);
         }
     }
 }
@@ -315,6 +420,8 @@ pub struct Grid {
     pub more: bool,
     /// What happened when there are no rows ("3 rows affected", "OK").
     pub note: String,
+    /// MongoDB: each row's whole document, as mongosh prints it.
+    pub docs: Option<Vec<String>>,
 }
 
 impl Grid {
@@ -467,6 +574,7 @@ mod live {
         c.user = user.into();
         c.database = db.into();
         set_secret(&c.id, pw).unwrap();
+        engine::open(&c.id);
         c
     }
 
@@ -694,6 +802,7 @@ mod live_memory {
             c.user = user.into();
             c.database = db.into();
             set_secret(&c.id, pw).unwrap();
+            engine::open(&c.id);
             c
         };
         let conns = [

@@ -99,10 +99,7 @@ impl DbPanel {
             self.forget_tree(&id);
         }
         if let Some(id) = expand {
-            self.forget_tree(&id);
-            self.open.insert(key(&id, &[]));
-            self.selected = Some(key(&id, &[]));
-            self.load(&id, Vec::new(), cx);
+            self.connect(&id, cx);
         }
         self.rebuild();
         cx.notify();
@@ -186,11 +183,25 @@ impl DbPanel {
             cx.spawn(async move |this, cx| {
                 let r = work.await;
                 this.update(cx, |p, cx| {
-                    p.loaded.insert(kk.clone(), match r {
-                        Ok(n) => Loaded::Ready(n),
-                        Err(e) => Loaded::Failed(e),
-                    });
                     p.tasks.remove(&kk);
+                    let root = !kk.contains('\u{1f}');
+                    match r {
+                        Ok(n) => {
+                            p.loaded.insert(kk.clone(), Loaded::Ready(n));
+                            if root {
+                                // Connected: tabs waiting for it load now.
+                                cx.emit(Request::Db(DbRequest::Connected(kk.clone())));
+                            }
+                        }
+                        // The connection itself failed: closed again, and said in a popup.
+                        Err(e) if root => {
+                            p.disconnect(&kk, cx);
+                            p.connect_failed(&kk, e, cx);
+                        }
+                        Err(e) => {
+                            p.loaded.insert(kk.clone(), Loaded::Failed(e));
+                        }
+                    }
                     p.rebuild();
                     cx.notify();
                 })
@@ -201,7 +212,41 @@ impl DbPanel {
         cx.notify();
     }
 
+    /// Connects (opens it and lists what's in it); a failure says so in a popup.
+    pub fn connect(&mut self, conn_id: &str, cx: &mut Context<Self>) {
+        engine::open(conn_id);
+        self.forget_tree(conn_id);
+        let k = key(conn_id, &[]);
+        self.open.insert(k.clone());
+        self.selected = Some(k);
+        self.load(conn_id, Vec::new(), cx);
+    }
+
+    fn connect_failed(&mut self, conn_id: &str, error: String, cx: &mut Context<Self>) {
+        let name = self.conns.iter().find(|c| c.id == conn_id).map(|c| c.title()).unwrap_or_default();
+        let id = conn_id.to_string();
+        let weak = cx.entity().downgrade();
+        cx.emit(Request::Ask(crate::dialog::Ask {
+            title: format!("Couldn't connect to {name}"),
+            detail: error,
+            buttons: vec!["Retry".into()],
+            danger: false,
+            cancel_default: false,
+            cancel_label: Some("Close"),
+            on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
+                if let Some(p) = weak.upgrade() {
+                    let id = id.clone();
+                    p.update(cx, |p, cx| p.connect(&id, cx));
+                }
+            }),
+        }));
+    }
+
     fn toggle(&mut self, conn_id: &str, path: Vec<String>, cx: &mut Context<Self>) {
+        // A connection not connected: connecting is what opening it does.
+        if path.is_empty() && !engine::connected(conn_id) {
+            return self.connect(conn_id, cx);
+        }
         let k = key(conn_id, &path);
         if !self.open.remove(&k) {
             self.open.insert(k.clone());
@@ -214,6 +259,9 @@ impl DbPanel {
     }
 
     fn refresh(&mut self, conn_id: &str, path: Vec<String>, cx: &mut Context<Self>) {
+        if !engine::connected(conn_id) {
+            return self.connect(conn_id, cx);
+        }
         let k = key(conn_id, &path);
         // Everything under it is loaded again when opened.
         self.loaded.retain(|kk, _| kk != &k && !kk.starts_with(&format!("{k}\u{1f}")));
@@ -221,7 +269,7 @@ impl DbPanel {
         self.load(conn_id, path, cx);
     }
 
-    fn disconnect(&mut self, conn_id: &str, cx: &mut Context<Self>) {
+    pub fn disconnect(&mut self, conn_id: &str, cx: &mut Context<Self>) {
         engine::forget(conn_id);
         let k = key(conn_id, &[]);
         self.open.retain(|o| o != &k && !o.starts_with(&format!("{k}\u{1f}")));
@@ -240,6 +288,7 @@ impl DbPanel {
             buttons: vec!["Delete".into()],
             danger: true,
             cancel_default: false,
+            cancel_label: None,
             on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
                 db::delete(&id).ok();
                 if let Some(p) = weak.upgrade() {
@@ -339,6 +388,28 @@ impl DbPanel {
                     .child(name(title, theme::fg_bright()))
                     .when(c.project.is_some(), |d| d.child(div().text_size(px(10.)).text_color(theme::fg_muted()).child("workspace")))
                     .when(live, |d| d.child(ui::small_icon("dot", theme::git_added()).size(px(9.))))
+                    .when(!live, |d| {
+                        let id = id.clone();
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("db-connect-{ci}")))
+                                .debug_selector(move || format!("db-connect-{ci}"))
+                                .flex_none()
+                                .px(px(6.))
+                                .rounded(px(3.))
+                                .text_size(px(11.))
+                                .text_color(theme::accent())
+                                .border_1()
+                                .border_color(theme::border_input())
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::hover()))
+                                .on_click(cx.listener(move |p, _, _, cx| {
+                                    cx.stop_propagation();
+                                    p.connect(&id, cx);
+                                }))
+                                .child("Connect"),
+                        )
+                    })
                     .child(actions().child(hover_button(format!("db-query-{ci}"), "terminal", "New query").on_click(cx.listener(move |_, _, _, cx| {
                         cx.stop_propagation();
                         cx.emit(Request::Db(DbRequest::Open(Open::Query { conn: i2.clone(), path: Vec::new() })));

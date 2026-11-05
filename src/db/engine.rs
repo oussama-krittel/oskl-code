@@ -80,8 +80,18 @@ async fn close_idle() {
     }
 }
 
-/// Closes a connection's sessions (it was changed, deleted, or disconnected).
+/// Connections the user connected (from the panel). Only these are used: a tab never
+/// connects on its own. One that closed while idle opens again when used.
+static CONNECTED: LazyLock<Mutex<std::collections::HashSet<String>>> = LazyLock::new(Default::default);
+
+/// The user connected it.
+pub fn open(id: &str) {
+    CONNECTED.lock().unwrap().insert(id.to_string());
+}
+
+/// Closes a connection (it was changed, deleted, or disconnected).
 pub fn forget(id: &str) {
+    CONNECTED.lock().unwrap().remove(id);
     let gone: Vec<Session> = {
         let mut s = SESSIONS.lock().unwrap();
         let keys: Vec<_> = s.keys().filter(|k| k.0 == id).cloned().collect();
@@ -98,13 +108,19 @@ pub async fn secret(id: String) -> Result<String> {
     Ok(tokio::task::spawn_blocking(move || super::secret(&id)).await?)
 }
 
-/// Whether the connection is open now.
+/// Whether the user has it connected.
 pub fn connected(id: &str) -> bool {
-    SESSIONS.lock().unwrap().keys().any(|k| k.0 == id)
+    CONNECTED.lock().unwrap().contains(id)
 }
+
+/// Said when a tab needs a connection that isn't connected.
+pub const NOT_CONNECTED: &str = "Not connected. Connect from the Databases panel.";
 
 /// The open session for `conn` on `sub`, connecting if there's none (or it broke).
 async fn session(conn: &Conn, sub: &str) -> Result<Arc<Client>> {
+    if !connected(&conn.id) {
+        return Err(anyhow!(NOT_CONNECTED));
+    }
     let key = (conn.id.clone(), sub.to_string());
     if let Some(s) = SESSIONS.lock().unwrap().get_mut(&key) {
         let alive = match &*s.client {

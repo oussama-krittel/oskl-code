@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-actions!(db_view, [RunQuery, CopyCell, RefreshData]);
+actions!(db_view, [RunQuery, CopyCell, RefreshData, RowUp, RowDown, CloseDetail]);
 
 pub fn bind_keys() {
     crate::keybindings::collect([
@@ -24,6 +24,9 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-enter", RunQuery, Some("DbView > Editor")),
         crate::keybindings::kb("cmd-c", CopyCell, Some("DbView")),
         crate::keybindings::kb("cmd-r", RefreshData, Some("DbView")),
+        crate::keybindings::kb("up", RowUp, Some("DbView")),
+        crate::keybindings::kb("down", RowDown, Some("DbView")),
+        crate::keybindings::kb("escape", CloseDetail, Some("DbView")),
     ]);
 }
 
@@ -45,6 +48,8 @@ pub enum DbRequest {
     Open(Open),
     /// Saved connections changed (expand this one in the panel, if any).
     Changed { expand: Option<String> },
+    /// This connection was connected (from the panel): its tabs load.
+    Connected(String),
     /// Close this tab.
     Close,
 }
@@ -114,6 +119,12 @@ struct Data {
     query_task: Option<Task<()>>,
     tick: Option<Task<()>>,
     exporting: bool,
+    /// The selected row's panel: open, and showing MongoDB's JSON (else the fields).
+    detail: bool,
+    detail_json: bool,
+    /// The JSON shown (read-only, to select and copy from), and which row it's of.
+    json_view: Entity<Editor>,
+    json_of: Option<(Option<usize>, usize)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -208,6 +219,14 @@ impl DbView {
                         query_task: None,
                         tick: None,
                         exporting: false,
+                        detail: false,
+                        detail_json: false,
+                        json_view: cx.new(|cx| {
+                            let mut ed = Editor::new(EditorMode::Full, cx);
+                            ed.read_only = true;
+                            ed
+                        }),
+                        json_of: None,
                     };
                     Body::Data(Box::new(data))
                 }
@@ -271,6 +290,22 @@ impl DbView {
             Body::Form(f) => Some(f.conn.kind),
             Body::Data(d) => Some(d.conn.kind),
             Body::Missing(_) => None,
+        }
+    }
+
+    /// The connection it uses (data and query tabs).
+    pub fn conn_id(&self) -> Option<String> {
+        match &self.body {
+            Body::Data(d) => Some(d.conn.id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Its connection was connected: loads what it shows.
+    pub fn reconnected(&mut self, cx: &mut Context<Self>) {
+        let waiting = matches!(&self.body, Body::Data(d) if d.page.as_ref().is_none_or(|p| p.is_err()));
+        if waiting {
+            self.load(cx);
         }
     }
 
@@ -494,6 +529,64 @@ impl DbView {
         cx.notify();
     }
 
+    /// Selects a row (and cell) of a grid (None: the Data View's; Some(i): result i) and shows
+    /// it in the panel.
+    fn select(&mut self, which: Option<usize>, row: usize, col: Option<usize>, cx: &mut Context<Self>) {
+        let Body::Data(d) = &mut self.body else { return };
+        let gv = match which {
+            Some(i) => d.results.get_mut(i),
+            None => d.grid.as_mut(),
+        };
+        let Some(gv) = gv else { return };
+        if row >= gv.grid.rows.len() {
+            return;
+        }
+        let col = col.or(gv.sel.map(|s| s.1)).unwrap_or(0);
+        gv.sel = Some((row, col));
+        gv.scroll.scroll_to_item(row, gpui::ScrollStrategy::Top);
+        let doc = gv.grid.docs.as_ref().and_then(|j| j.get(row).cloned());
+        d.detail = true;
+        if let Some(doc) = doc
+            && d.json_of != Some((which, row))
+        {
+            d.json_of = Some((which, row));
+            d.json_view.update(cx, |e, cx| e.set_text(&doc, cx));
+        }
+        cx.notify();
+    }
+
+    /// The grid on show: (which, its selected row).
+    fn shown_grid(&self) -> Option<(Option<usize>, Option<usize>)> {
+        let Body::Data(d) = &self.body else { return None };
+        match d.inner {
+            Inner::DataView => d.grid.as_ref().map(|g| (None, g.sel.map(|s| s.0))),
+            Inner::Query => d.results.get(d.result_ix).map(|g| (Some(d.result_ix), g.sel.map(|s| s.0))),
+        }
+    }
+
+    fn row_up(&mut self, _: &RowUp, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some((which, Some(r))) = self.shown_grid() {
+            self.select(which, r.saturating_sub(1), None, cx);
+        }
+    }
+
+    fn row_down(&mut self, _: &RowDown, _: &mut Window, cx: &mut Context<Self>) {
+        match self.shown_grid() {
+            Some((which, Some(r))) => self.select(which, r + 1, None, cx),
+            Some((which, None)) => self.select(which, 0, None, cx),
+            None => {}
+        }
+    }
+
+    fn close_detail(&mut self, _: &CloseDetail, _: &mut Window, cx: &mut Context<Self>) {
+        if let Body::Data(d) = &mut self.body {
+            if d.menu.take().is_none() {
+                d.detail = false;
+            }
+            cx.notify();
+        }
+    }
+
     fn copy_cell(&mut self, _: &CopyCell, _: &mut Window, cx: &mut Context<Self>) {
         let Body::Data(d) = &self.body else { return };
         let gv = if d.inner == Inner::Query { d.results.get(d.result_ix) } else { d.grid.as_ref() };
@@ -569,6 +662,15 @@ impl DbView {
         }
         let g = d.results.get(d.result_ix)?;
         Some(Ok((g.grid.columns.clone(), g.grid.rows.len())))
+    }
+
+    /// The row panel: open, its row, and the JSON it shows (when it does).
+    pub fn detail_state(&self, cx: &App) -> (bool, Option<usize>, Option<String>) {
+        let Body::Data(d) = &self.body else { return (false, None, None) };
+        let gv = if d.inner == Inner::Query { d.results.get(d.result_ix) } else { d.grid.as_ref() };
+        let row = gv.and_then(|g| g.sel.map(|s| s.0));
+        let json = (d.detail && d.detail_json).then(|| d.json_view.read(cx).text());
+        (d.detail, row, json)
     }
 
     pub fn search_for(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -1079,6 +1181,7 @@ impl DbView {
                         .h(px(26.))
                         .border_b_1()
                         .border_color(theme::border())
+                        .when(sel.is_some_and(|(sr, _)| sr == r), |d| d.bg(theme::selected()))
                         .hover(|s| s.bg(theme::hover()))
                         .child(div().w(px(44.)).flex_none().flex().items_center().justify_end().pr(px(8.)).text_color(theme::fg_muted()).text_size(px(11.)).child((first + r + 1).to_string()))
                         .children(row.iter().enumerate().map(|(c, v)| {
@@ -1102,16 +1205,7 @@ impl DbView {
                                 .when(v.is_none(), |d| d.italic())
                                 .on_click(cx.listener(move |v, _: &ClickEvent, window, cx| {
                                     window.focus(&v.focus);
-                                    if let Body::Data(d) = &mut v.body {
-                                        let gv = match which {
-                                            Some(i) => d.results.get_mut(i),
-                                            None => d.grid.as_mut(),
-                                        };
-                                        if let Some(gv) = gv {
-                                            gv.sel = Some((r, c));
-                                        }
-                                    }
-                                    cx.notify();
+                                    v.select(which, r, Some(c), cx);
                                 }))
                                 .child(div().min_w_0().overflow_hidden().text_ellipsis().child(text))
                         }))
@@ -1121,25 +1215,110 @@ impl DbView {
             .collect()
     }
 
-    /// The selected cell's full value, under the grid.
-    fn render_cell_bar(&self, gv: &GridView, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let (col, val) = gv.selected_text()?;
+    /// The selected row, every field one under another (or, for MongoDB, its document as
+    /// JSON), beside the grid.
+    fn render_detail(&self, d: &Data, which: Option<usize>, gv: &GridView, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !d.detail {
+            return None;
+        }
+        let (r, _) = gv.sel?;
+        let row = gv.grid.rows.get(r)?;
+        let first = if which.is_none() { d.spec.offset } else { 0 };
+        let has_json = gv.grid.docs.as_ref().is_some_and(|j| j.get(r).is_some());
+        let json = has_json && d.detail_json;
+        let mode = |id: &'static str, text: &'static str, on: bool, to_json: bool, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .px(px(8.))
+                .py(px(2.))
+                .rounded(px(3.))
+                .text_size(px(11.))
+                .cursor_pointer()
+                .when(on, |d| d.bg(theme::accent()).text_color(theme::on(theme::accent())))
+                .when(!on, |d| d.text_color(theme::fg_dim()).hover(|s| s.bg(theme::hover())))
+                .on_click(cx.listener(move |v, _, _, cx| {
+                    if let Body::Data(d) = &mut v.body {
+                        d.detail_json = to_json;
+                    }
+                    cx.notify();
+                }))
+                .child(text)
+        };
+        let body: gpui::AnyElement = if json {
+            div().flex_1().min_h_0().child(d.json_view.clone()).into_any_element()
+        } else {
+            let fields = gv.grid.columns.iter().zip(row.iter()).enumerate().map(|(i, (col, val))| {
+                let copy = val.clone().unwrap_or_else(|| "NULL".into());
+                div()
+                    .id(("db-field", i))
+                    .group("db-field")
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .px(px(12.))
+                    .py(px(6.))
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.)).text_color(theme::fg_dim()).child(col.clone()))
+                            .child(
+                                div()
+                                    .id(("db-field-copy", i))
+                                    .invisible()
+                                    .group_hover("db-field", |s| s.visible())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(18.))
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::hover()))
+                                    .tooltip(ui::tooltip("Copy value"))
+                                    .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone())))
+                                    .child(ui::small_icon("copy", theme::fg_dim())),
+                            ),
+                    )
+                    .child(match val {
+                        Some(v) => div().text_size(px(12.5)).text_color(theme::fg_bright()).child(v.clone()),
+                        None => div().text_size(px(12.5)).italic().text_color(theme::fg_muted()).child("NULL"),
+                    })
+            });
+            div().id("db-fields").debug_selector(|| "db-fields".into()).flex_1().min_h_0().overflow_y_scroll().children(fields).into_any_element()
+        };
         Some(
             div()
-                .flex()
+                .debug_selector(|| "db-detail".into())
+                .w(px(380.))
                 .flex_none()
-                .items_start()
-                .gap(px(8.))
-                .max_h(px(90.))
-                .px(px(10.))
-                .py(px(5.))
-                .border_t_1()
-                .border_color(theme::border())
+                .flex()
+                .flex_col()
+                .min_h_0()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(theme::border_input())
                 .bg(theme::bg_side())
-                .text_size(px(12.))
-                .child(div().flex_none().text_color(theme::fg_dim()).child(format!("{col}:")))
-                .child(div().id("db-cell-value").flex_1().min_w_0().max_h(px(80.)).overflow_y_scroll().text_color(if val.is_some() { theme::fg_bright() } else { theme::fg_muted() }).child(val.unwrap_or_else(|| "NULL".into())))
-                .child(ui::icon_button("db-copy-cell", "copy").tooltip(ui::tooltip("Copy value (⌘C)")).on_click(cx.listener(|v, _, w, cx| v.copy_cell(&CopyCell, w, cx))))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(6.))
+                        .h(px(32.))
+                        .px(px(10.))
+                        .border_b_1()
+                        .border_color(theme::border())
+                        .child(div().flex_1().text_size(px(12.)).text_color(theme::fg_bright()).child(format!("Row {}", first + r + 1)))
+                        .when(has_json, |el| el.child(div().flex().p(px(2.)).rounded(px(4.)).border_1().border_color(theme::border_input()).child(mode("db-detail-fields", "Fields", !json, false, cx)).child(mode("db-detail-json", "JSON", json, true, cx))))
+                        .child(ui::icon_button("db-row-up", "arrow-up").tooltip(ui::tooltip("Previous row (↑)")).on_click(cx.listener(|v, _, w, cx| v.row_up(&RowUp, w, cx))))
+                        .child(ui::icon_button("db-row-down", "arrow-down").tooltip(ui::tooltip("Next row (↓)")).on_click(cx.listener(|v, _, w, cx| v.row_down(&RowDown, w, cx))))
+                        .child(ui::icon_button("db-detail-close", "close").tooltip(ui::tooltip("Close (Esc)")).on_click(cx.listener(|v, _, w, cx| v.close_detail(&CloseDetail, w, cx)))),
+                )
+                .child(body)
                 .into_any_element(),
         )
     }
@@ -1255,7 +1434,14 @@ impl DbView {
         };
         let body: gpui::AnyElement = match (&d.page, &d.grid) {
             (Some(Err(e)), _) => div().p(px(14.)).text_color(theme::git_deleted()).child(e.clone()).into_any_element(),
-            (_, Some(gv)) if !gv.grid.columns.is_empty() => div().flex().flex_col().flex_1().min_h_0().child(self.render_grid(None, gv, kind != Kind::RabbitMq && kind != Kind::Redis, cx)).children(self.render_cell_bar(gv, cx)).into_any_element(),
+            (_, Some(gv)) if !gv.grid.columns.is_empty() => div()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .gap(px(10.))
+                .child(div().flex().flex_col().flex_1().min_w_0().child(self.render_grid(None, gv, kind != Kind::RabbitMq && kind != Kind::Redis, cx)))
+                .children(self.render_detail(d, None, gv, cx))
+                .into_any_element(),
             (_, Some(gv)) => div().p(px(14.)).text_color(theme::fg_dim()).child(gv.grid.note.clone()).into_any_element(),
             _ => div().into_any_element(),
         };
@@ -1341,12 +1527,18 @@ impl DbView {
             (Some(e), _) => div().debug_selector(|| "db-query-error".into()).p(px(12.)).text_color(theme::git_deleted()).child(e.clone()).into_any_element(),
             (_, Some(gv)) if !gv.grid.columns.is_empty() => div()
                 .flex()
-                .flex_col()
                 .flex_1()
                 .min_h_0()
-                .child(self.render_grid(Some(d.result_ix), gv, false, cx))
-                .when(gv.grid.more, |el| el.child(div().px(px(10.)).py(px(4.)).text_size(px(11.)).text_color(theme::fg_muted()).child(format!("Showing the first {} rows; add a LIMIT (or a filter) for others.", db::MAX_ROWS))))
-                .children(self.render_cell_bar(gv, cx))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.render_grid(Some(d.result_ix), gv, false, cx))
+                        .when(gv.grid.more, |el| el.child(div().px(px(10.)).py(px(4.)).text_size(px(11.)).text_color(theme::fg_muted()).child(format!("Showing the first {} rows; add a LIMIT (or a filter) for others.", db::MAX_ROWS)))),
+                )
+                .children(self.render_detail(d, Some(d.result_ix), gv, cx))
                 .into_any_element(),
             (_, Some(gv)) => div().debug_selector(|| "db-query-note".into()).p(px(12.)).text_color(theme::fg()).child(gv.grid.note.clone()).into_any_element(),
             _ => div().p(px(12.)).text_color(theme::fg_muted()).child("Run a query with ⌘↵").into_any_element(),
@@ -1480,6 +1672,9 @@ impl Render for DbView {
             .on_action(cx.listener(Self::run))
             .on_action(cx.listener(Self::copy_cell))
             .on_action(cx.listener(Self::refresh_data))
+            .on_action(cx.listener(Self::row_up))
+            .on_action(cx.listener(Self::row_down))
+            .on_action(cx.listener(Self::close_detail))
             .on_mouse_down(MouseButton::Left, cx.listener(|v, _, _, cx| {
                 if let Body::Data(d) = &mut v.body
                     && d.menu.is_some()

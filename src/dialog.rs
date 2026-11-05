@@ -32,6 +32,8 @@ pub struct Ask {
     pub danger: bool,
     /// Enter means Cancel until another button is picked (for warnings you should read).
     pub cancel_default: bool,
+    /// What the Cancel button says (None: "Cancel").
+    pub cancel_label: Option<&'static str>,
     pub on_answer: Answer,
 }
 

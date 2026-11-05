@@ -138,6 +138,7 @@ fn describe(name: &str, ctx: Option<&str>) -> String {
         "UiZoomReset" => "Interface back to 100%",
         "ToggleSidebarSide" => "Move sidebar left / right",
         "OpenFolderNewWindow" => "Open a project in a new window",
+        "CloseFolder" => "Close the folder (the window stays, empty)",
         "NextWindow" => "Switch project window",
         "SearchAll" => "Search in all files",
         "GoToLine" => "Go to line",
