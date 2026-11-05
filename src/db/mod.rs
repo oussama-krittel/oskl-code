@@ -83,14 +83,14 @@ impl Kind {
         }
     }
 
-    /// The brand color of its icon.
+    /// Its icon's color (brand colors, a little brighter so they read on dark themes).
     pub fn color(self) -> u32 {
         match self {
-            Kind::Postgres => 0x336791,
-            Kind::SqlServer => 0xcc2927,
-            Kind::MongoDb => 0x47a248,
-            Kind::Redis => 0xdc382d,
-            Kind::RabbitMq => 0xff6600,
+            Kind::Postgres => 0x5b9bd5,
+            Kind::SqlServer => 0xd4415f,
+            Kind::MongoDb => 0x4faa41,
+            Kind::Redis => 0xe8473a,
+            Kind::RabbitMq => 0xff7a1a,
         }
     }
 }

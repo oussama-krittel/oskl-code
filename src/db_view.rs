@@ -265,6 +265,15 @@ impl DbView {
     }
 
 
+    /// Its type (the form's follows the type chosen).
+    pub fn kind(&self) -> Option<Kind> {
+        match &self.body {
+            Body::Form(f) => Some(f.conn.kind),
+            Body::Data(d) => Some(d.conn.kind),
+            Body::Missing(_) => None,
+        }
+    }
+
     /// Whether this tab shows `open` (to switch to it instead of opening another).
     pub fn shows(&self, open: &Open) -> bool {
         matches!(open, Open::Edit(_) | Open::Data { .. }) && &self.open == open
@@ -780,27 +789,9 @@ fn label(text: &str) -> gpui::Div {
     div().w(px(130.)).flex_none().text_color(theme::fg_dim()).child(text.to_string())
 }
 
-/// The badge with a type's color and initials.
-pub fn kind_badge(kind: Kind) -> gpui::Div {
-    let text = match kind {
-        Kind::Postgres => "Pg",
-        Kind::SqlServer => "Ms",
-        Kind::MongoDb => "Mg",
-        Kind::Redis => "Rd",
-        Kind::RabbitMq => "Rb",
-    };
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(px(16.))
-        .rounded(px(3.))
-        .bg(theme::c(kind.color()))
-        .text_color(theme::c(0xffffff))
-        .text_size(px(8.5))
-        .font_weight(FontWeight::BOLD)
-        .child(text)
+/// A type's icon, in its color.
+pub fn kind_badge(kind: Kind) -> gpui::Svg {
+    ui::icon(&format!("db-{}", kind.id()), theme::c(kind.color()))
 }
 
 impl DbView {

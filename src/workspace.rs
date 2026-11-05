@@ -2249,7 +2249,8 @@ impl Workspace {
                 let v = v.read(cx);
                 (v.title(), v.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), false)
             }
-            TabKind::Db(v) => (v.read(cx).title().0, String::new(), false),
+            // "db:<type>" names the type's icon for the tab.
+            TabKind::Db(v) => (v.read(cx).title().0, v.read(cx).kind().map(|k| format!("db:{}", k.id())).unwrap_or_default(), false),
         }
     }
 
@@ -4316,7 +4317,10 @@ impl Workspace {
                                 }
                             }))
                             .child(div().text_color(if active { theme::frame_focused() } else { theme::fg_muted() }).child(if i < 9 { format!("{}", i + 1) } else { "·".into() }))
-                            .child(if term { ui::small_icon("terminal", theme::frame_focused()).size(px(12.)) } else { ui::file_icon(&icon_name).size(px(12.)) })
+                            .child(if term { ui::small_icon("terminal", theme::frame_focused()).size(px(12.)) } else { match icon_name.strip_prefix("db:") {
+                                Some(kind) => ui::icon(&format!("db-{kind}"), theme::c(crate::db::Kind::ALL.into_iter().find(|k| k.id() == kind).map(|k| k.color()).unwrap_or(0x888888))).size(px(12.)),
+                                None => ui::file_icon(&icon_name).size(px(12.)),
+                            } })
                             .child(div().max_w(px(180.)).overflow_hidden().whitespace_nowrap().when(preview, |d| d.italic()).child(title.clone()))
                             .when(dirty, |d| d.child(div().text_color(theme::git_modified()).child("●")))
                             .child(
