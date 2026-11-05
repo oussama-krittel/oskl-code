@@ -677,6 +677,13 @@ impl DbView {
         d.grid.as_ref()?.grid.trees.as_ref()?.get(row).map(|t| t.text(style))
     }
 
+    pub fn set_query(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Body::Data(d) = &self.body {
+            let q = d.query.clone();
+            q.update(cx, |e, cx| e.set_text(text, cx));
+        }
+    }
+
     pub fn search_for(&mut self, text: &str, cx: &mut Context<Self>) {
         if let Body::Data(d) = &self.body {
             let s = d.search.clone();
@@ -1240,12 +1247,20 @@ impl DbView {
             return;
         }
         let before = gv.open;
+        let top = gv.list.logical_scroll_top();
         gv.open = Some(row);
         gv.sel = Some((row, gv.sel.map(|s| s.1).unwrap_or(0)));
         for r in [before, gv.open].into_iter().flatten() {
             gv.list.splice(r..r + 1, 1);
         }
-        gv.list.scroll_to_reveal_item(row);
+        match before {
+            // The open section stays where it is on screen; the rows move through it.
+            Some(b) if b != row => {
+                let item_ix = (top.item_ix as isize + row as isize - b as isize).clamp(0, gv.grid.rows.len().saturating_sub(1) as isize) as usize;
+                gv.list.scroll_to(gpui::ListOffset { item_ix, offset_in_item: top.offset_in_item });
+            }
+            _ => gv.list.scroll_to_reveal_item(row),
+        }
         cx.notify();
     }
 

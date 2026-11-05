@@ -169,6 +169,10 @@ const LIGHTS_H: f32 = 30.;
 const GRAB_W: f32 = 12.;
 /// Width the window buttons take from the left edge.
 const LIGHTS_W: f32 = 76.;
+/// Room between the window buttons and the frame's step around them (real pixels).
+const NOTCH_GAP: f32 = 10.;
+/// The step's curves.
+const NOTCH_R: f32 = 7.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
@@ -688,6 +692,9 @@ impl Workspace {
             // Moved, resized, sent to another display, full screen: remembered for next time.
             ws.extra_subs.push(cx.observe_window_bounds(window, |ws, window, cx| ws.place = Some(window_place(window, cx))));
         }
+        // Full screen on or off: the window buttons come or go, and what's beside them makes room
+        // (or takes it back) at once, not on the next click.
+        ws.extra_subs.push(cx.observe_window_bounds(window, |_, _, cx| cx.notify()));
         register_workspace(cx.entity().downgrade());
         ws.tree.read(cx).focus(window);
         ws
@@ -4176,7 +4183,10 @@ impl Workspace {
             .w(px(ACTIVITY_W))
             .h_full()
             .bg(theme::bg_side())
-            .when(!right, |d| d.border_r_1())
+            // Beside the window buttons (sidebar hidden) its edge waits until under them: they
+            // sit on one surface with the corner of the pane.
+            .when(!right && self.lights_pad == 0., |d| d.border_r_1())
+            .when(!right && self.lights_pad > 0., |d| d.relative().child(div().absolute().right_0().top(px(24.) + gpui::px(2. + NOTCH_R)).bottom_0().w(gpui::px(1.)).bg(theme::border())))
             .when(right, |d| d.border_l_1())
             .border_color(theme::border())
             .when(!right && !window.is_fullscreen(), |d| d.pt(gpui::px(LIGHTS_H)))
@@ -4304,13 +4314,13 @@ impl Workspace {
             .flex_none()
             .items_center()
             .h(px(24.))
-            .pl(gpui::px(8. * ui::scale() + if id == self.top_left_pane() { self.lights_pad } else { 0. }))
+            .pl(gpui::px(8. * ui::scale() + if id == self.top_left_pane() && self.lights_pad > 0. { self.lights_pad + NOTCH_GAP + NOTCH_R * ui::scale() } else { 0. }))
             .pr(px(4.))
             .gap(px(6.))
             .text_size(px(11.))
             .border_b_1()
             .border_color(frame)
-            .child(div().text_color(frame).child("─"))
+            .when(!(id == self.top_left_pane() && self.lights_pad > 0.), |d| d.child(div().text_color(frame).child("─")))
             .child(
                 // tmux-style list of what's open in this pane: "1 app.ts  2 $ zsh" (⌘1…⌘9 or click).
                 // It scrolls sideways (trackpad, or the wheel), and the selected tab is kept in view.
@@ -4496,20 +4506,64 @@ impl Workspace {
             .when(active_ix.is_none() && self.panes.len() > 1, |d| {
                 d.child(glyph("close-pane", "close", "Close pane (⌘⇧W)").on_click(cx.listener(move |ws, _, w, cx| ws.close_pane(id, w, cx))))
             });
-        // The window buttons over this pane's corner (the sidebar is hidden): no frame there,
-        // only a line beside and one under them, so the frame runs around them like a title bar.
-        let notch = (id == self.top_left_pane() && self.lights_pad > 0.).then(|| (gpui::px(self.lights_pad + 6.), px(24.)));
-        let notch_lines = notch.map(|(w, h)| {
-            let line = || div().absolute().bg(frame);
-            vec![
-                // Under the buttons, and beside them (a small rounded step between).
-                div().absolute().top_0().left_0().w(w).h(h).border_b_1().border_r_1().border_color(frame).rounded_br(px(6.)).into_any_element(),
-                // The frame's top, from the step on; its left side, from under the buttons down.
-                line().top_0().left(w - px(1.)).right_0().h(gpui::px(1.)).into_any_element(),
-                line().left_0().top(h - px(1.)).bottom_0().w(gpui::px(1.)).into_any_element(),
-            ]
+        // The window buttons over this pane's corner (the sidebar is hidden): they sit on the
+        // activity bar's color, which flows into the corner, and the frame's outline sweeps
+        // around them in one smooth curve, like a tab meeting its bar.
+        let notch = (id == self.top_left_pane() && self.lights_pad > 0.).then(|| (gpui::px(self.lights_pad + NOTCH_GAP), px(24.)));
+        let outline = notch.map(|(w, h)| {
+            let (side, line) = (theme::bg_side(), frame);
+            canvas(
+                |_, _, _| {},
+                move |b, _, window, _| {
+                    let one = gpui::px(1.);
+                    let pad = px(2.);
+                    let (r, corner) = (px(NOTCH_R), px(6.));
+                    // The frame, half a pixel in so its line is crisp.
+                    let (x0, y0) = (b.left() + pad + one / 2., b.top() + pad + one / 2.);
+                    let (x1, y1) = (b.right() - pad - one / 2., b.bottom() - pad - one / 2.);
+                    let (nx, ny) = (x0 + w, y0 + h);
+                    // The corner's surface, from the window's edge to the outline.
+                    let mut fill = gpui::PathBuilder::fill();
+                    fill.move_to(point(b.left(), b.top()));
+                    fill.line_to(point(nx + r, b.top()));
+                    fill.line_to(point(nx + r, y0));
+                    fill.curve_to(point(nx, y0 + r), point(nx, y0));
+                    fill.line_to(point(nx, ny - r));
+                    fill.curve_to(point(nx - r, ny), point(nx, ny));
+                    fill.line_to(point(x0 + r, ny));
+                    fill.curve_to(point(x0, ny + r), point(x0, ny));
+                    fill.line_to(point(b.left(), ny + r));
+                    fill.close();
+                    if let Ok(p) = fill.build() {
+                        window.paint_path(p, side);
+                    }
+                    // The outline: three rounded corners, and the step around the buttons.
+                    let mut edge = gpui::PathBuilder::stroke(one);
+                    edge.move_to(point(x0, ny + r));
+                    edge.curve_to(point(x0 + r, ny), point(x0, ny));
+                    edge.line_to(point(nx - r, ny));
+                    edge.curve_to(point(nx, ny - r), point(nx, ny));
+                    edge.line_to(point(nx, y0 + r));
+                    edge.curve_to(point(nx + r, y0), point(nx, y0));
+                    edge.line_to(point(x1 - corner, y0));
+                    edge.curve_to(point(x1, y0 + corner), point(x1, y0));
+                    edge.line_to(point(x1, y1 - corner));
+                    edge.curve_to(point(x1 - corner, y1), point(x1, y1));
+                    edge.line_to(point(x0 + corner, y1));
+                    edge.curve_to(point(x0, y1 - corner), point(x0, y1));
+                    edge.line_to(point(x0, ny + r));
+                    if let Ok(p) = edge.build() {
+                        window.paint_path(p, line);
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
         });
         div()
+            .relative()
             .size_full()
             .p(px(2.))
             .child(
@@ -4519,13 +4573,11 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .rounded(px(6.))
+                    // With the buttons over it, the outline is drawn (over it) instead.
                     .when(notch.is_none(), |d| d.border_1())
-                    // Its top and left are drawn as lines that leave the buttons' corner open.
-                    .when(notch.is_some(), |d| d.rounded_tl(gpui::px(0.)).rounded_tr(gpui::px(0.)).rounded_bl(gpui::px(0.)).border_r_1().border_b_1())
                     .border_color(frame)
                     .bg(theme::bg_editor())
                     .overflow_hidden()
-                    .children(notch_lines.into_iter().flatten())
                     .capture_any_mouse_down(cx.listener(move |ws, _, _, cx| {
                         if ws.focused_pane != id {
                             ws.set_focused_pane(id);
@@ -4567,6 +4619,7 @@ impl Workspace {
                         d.child(overlay)
                     }),
             )
+            .children(outline)
             .into_any_element()
     }
 
@@ -7803,6 +7856,23 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         cx.simulate_keystrokes("cmd-enter");
         wait_for(cx, "the query", |cx| tab.read_with(cx, |t, _| t.query_result()).is_some());
         assert_eq!(tab.read_with(cx, |t, _| t.query_result()), Some(Ok((vec!["name".into(), "qty".into(), "note".into(), "at".into()], 11))));
+        // A long result: moving between rows with ↓ keeps the open section in place on screen.
+        tab.update(cx, |t, cx| t.set_query("SELECT * FROM sales.big LIMIT 300", cx));
+        cx.simulate_keystrokes("cmd-enter");
+        wait_for(cx, "the long result", |cx| tab.read_with(cx, |t, _| t.query_result()) == Some(Ok((vec!["id".into(), "h".into()], 300))));
+        let grid = cx.debug_bounds("db-grid").unwrap();
+        cx.simulate_click(gpui::point(grid.left() + gpui::px(80.), grid.top() + gpui::px(28. + 26. * 5. + 13.)), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(tab.read_with(cx, |t, cx| t.detail_state(cx)).1, Some(5));
+        let at = cx.debug_bounds("db-fields").unwrap().top();
+        for _ in 0..3 {
+            cx.simulate_keystrokes("down");
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+        assert_eq!(tab.read_with(cx, |t, cx| t.detail_state(cx)).1, Some(8));
+        let moved = (cx.debug_bounds("db-fields").unwrap().top() - at).abs();
+        assert!(moved < gpui::px(2.), "the open section stays in place ({moved:?}); the rows move through it");
         // Clicking it again shows the same tab.
         click_on(cx, "db-node-fruit_order");
         assert_eq!(db_tab(&ws, cx), Some(tab));
