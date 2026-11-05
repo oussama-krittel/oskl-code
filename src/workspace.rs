@@ -538,6 +538,8 @@ pub struct Workspace {
     _quit_sub: Option<Subscription>,
     drop_hint: Option<(usize, DropZone)>,
     extra_subs: Vec<Subscription>,
+    /// Each pane's row of tabs: its scroll, and the tab last scrolled into view.
+    tab_rows: std::cell::RefCell<HashMap<usize, (ScrollHandle, Option<usize>)>>,
 }
 
 impl Workspace {
@@ -663,6 +665,7 @@ impl Workspace {
             _quit_sub: None,
             drop_hint: None,
             extra_subs: Vec::new(),
+            tab_rows: Default::default(),
         };
         ws.start_watcher(cx);
         ws.refresh_repos(window, cx);
@@ -4282,7 +4285,42 @@ impl Workspace {
             .child(div().text_color(frame).child("─"))
             .child(
                 // tmux-style list of what's open in this pane: "1 app.ts  2 $ zsh" (⌘1…⌘9 or click).
-                div().flex().items_center().gap(px(2.)).min_w_0().overflow_hidden().children(pane.items.iter().enumerate().filter_map(|(i, tid)| {
+                // It scrolls sideways (trackpad, or the wheel), and the selected tab is kept in view.
+                {
+                    let shown: Vec<usize> = pane.items.iter().copied().filter(|t| self.tab_ix(*t).is_some()).collect();
+                    let (handle, last) = self.tab_rows.borrow_mut().entry(id).or_insert_with(|| (ScrollHandle::new(), None)).clone();
+                    if pane.active != last {
+                        if let Some(pos) = pane.active.and_then(|a| shown.iter().position(|t| *t == a)) {
+                            handle.scroll_to_item(pos);
+                        }
+                        self.tab_rows.borrow_mut().insert(id, (handle.clone(), pane.active));
+                    }
+                    let wheel = handle.clone();
+                    div()
+                        .id(SharedString::from(format!("chips-{id}")))
+                        .debug_selector(move || format!("tab-row-{id}"))
+                        .flex()
+                        .items_center()
+                        .gap(px(2.))
+                        .min_w_0()
+                        .overflow_x_scroll()
+                        .track_scroll(&handle)
+                        .on_scroll_wheel(move |ev, window, cx| {
+                            // An up/down wheel moves the row sideways (a sideways swipe already does).
+                            let d = ev.delta.pixel_delta(window.line_height());
+                            if d.y.abs() > d.x.abs() {
+                                let max = wheel.max_offset().width;
+                                let off = wheel.offset();
+                                let x = (off.x + d.y).clamp(-max, gpui::px(0.));
+                                if x != off.x {
+                                    wheel.set_offset(point(x, off.y));
+                                    cx.stop_propagation();
+                                    window.refresh();
+                                }
+                            }
+                        })
+                }
+                .children(pane.items.iter().enumerate().filter_map(|(i, tid)| {
                     let ix = self.tab_ix(*tid)?;
                     let (title, icon_name, dirty) = self.tab_title(&self.tabs[ix], cx);
                     let active = pane.active == Some(*tid);
@@ -4291,6 +4329,7 @@ impl Workspace {
                     Some(
                         div()
                             .id(SharedString::from(format!("chip-{id}-{tid}")))
+                            .when(active, |d| d.debug_selector(move || format!("chip-sel-{id}-{tid}")))
                             .flex()
                             .flex_none()
                             .items_center()
@@ -7487,6 +7526,38 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
             });
             assert_eq!(a, Some((2, 0)), "cursor line restored");
         });
+    }
+
+    #[gpui::test]
+    fn the_selected_tab_is_always_in_view(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        for i in 0..24 {
+            let p = root.join(format!("a-rather-long-file-name-number-{i:02}.txt"));
+            std::fs::write(&p, "x").unwrap();
+            ws.update_in(cx, |ws, window, cx| ws.open_file(p, None, false, window, cx));
+        }
+        cx.run_until_parked();
+        let pane = ws.read_with(cx, |ws, _| ws.focused_pane);
+        let inside = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            let row = cx.debug_bounds(Box::leak(format!("tab-row-{pane}").into_boxed_str())).expect("the tab row");
+            let tid = ws.read_with(cx, |ws, _| ws.pane(pane).unwrap().active.unwrap());
+            let chip = cx.debug_bounds(Box::leak(format!("chip-sel-{pane}-{tid}").into_boxed_str())).expect("the selected tab");
+            (row, chip)
+        };
+        let (row, chip) = inside(cx);
+        assert!(chip.right() <= row.right() + gpui::px(1.) && chip.left() >= row.left() - gpui::px(1.), "the last opened is in view: {chip:?} in {row:?}");
+        // The first: scrolled back to it.
+        cx.simulate_keystrokes("cmd-1");
+        let (row, chip) = inside(cx);
+        assert!(chip.left() >= row.left() - gpui::px(1.) && chip.right() <= row.right() + gpui::px(1.), "the first is in view: {chip:?} in {row:?}");
+        // The wheel moves the row sideways.
+        let before = chip.left();
+        cx.simulate_event(gpui::ScrollWheelEvent { position: row.center(), delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-200.))), ..Default::default() });
+        let (_, chip) = inside(cx);
+        assert!(chip.left() < before, "scrolled: {before:?} → {:?}", chip.left());
     }
 
     /// The open database tab.
