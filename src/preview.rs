@@ -74,10 +74,14 @@ pub struct PreviewView {
     area: Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// Where each diagram was last drawn (by its file), to draw only those near the screen.
     boxes: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, Bounds<Pixels>>>>,
-    /// The picture each diagram showed last (covering while a sharper one loads), and the
-    /// pictures decoded now: any not shown any more is freed.
-    last: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, PathBuf>>>,
+    /// Each diagram's last step whose tiles all finished loading (shown until a new one has),
+    /// and the tile pictures decoded now: any not shown any more is freed.
+    ready: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, f32>>>,
     decoded: std::collections::HashSet<PathBuf>,
+    /// The zoom diagram pictures are drawn for: it follows the zoom once a pinch pauses, so
+    /// pinching only stretches what's there (smooth) and a sharp one is drawn after.
+    sharp_zoom: f32,
+    settle: Option<Task<()>>,
     /// Hands freed memory back to macOS a moment after pictures come and go.
     relief: Option<Task<()>>,
     /// The page's pictures (diagrams, images), decoded here rather than in GPUI's app-wide
@@ -112,8 +116,10 @@ impl PreviewView {
             page_w: Default::default(),
             area: Default::default(),
             boxes: Default::default(),
-            last: Default::default(),
+            ready: Default::default(),
             decoded: Default::default(),
+            sharp_zoom: 1.,
+            settle: None,
             relief: None,
             images: RetainAllImageCache::new(cx),
             _sub: sub,
@@ -163,7 +169,7 @@ impl PreviewView {
                 let now = diagram_files(&self.blocks);
                 for old in self.diagrams.iter().filter(|p| !now.contains(p)) {
                     forget_diagram(old, window, cx);
-                    self.last.borrow_mut().remove(old);
+                    self.ready.borrow_mut().remove(old);
                     self.boxes.borrow_mut().remove(old);
                 }
                 self.diagrams = now;
@@ -208,6 +214,15 @@ impl PreviewView {
         // The page is laid out centered at 100%: where it starts then, to scroll from there.
         let lead = if old <= 1. { ((area.size.width / gpui::px(1.) - self.page_w.get()) / 2.).max(0.) } else { 0. };
         self.zoom = new;
+        // Sharp pictures for this zoom once the fingers pause.
+        self.settle = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(180)).await;
+            this.update(cx, |v, cx| {
+                v.sharp_zoom = v.zoom;
+                cx.notify();
+            })
+            .ok();
+        }));
         // The spot under the fingers stays there: it moves out by the zoom, the scroll follows.
         let off = self.scroll.offset();
         let k = new / old;
@@ -255,6 +270,7 @@ impl PreviewView {
         let off = self.scroll.offset();
         self.scroll.set_offset(point(gpui::px(0.), off.y / self.zoom));
         self.zoom = 1.;
+        self.sharp_zoom = 1.;
         self.locked_w = None;
         cx.notify();
     }
@@ -318,12 +334,34 @@ impl PreviewView {
 
     /// Frees the diagram pictures the page stopped showing (scrolled far away, zoomed past,
     /// edited), then gives the memory back to macOS once decoding has settled.
+    /// Remembers the pictures that have finished loading: each covers for its diagram until
+    /// the next one has, so a diagram is never blank while a sharper picture loads.
+    fn note_loaded(&mut self, wanted: Vec<(PathBuf, f32, Vec<PathBuf>)>, window: &mut Window, cx: &mut Context<Self>) {
+        for (diagram, step, tiles) in wanted {
+            if self.ready.borrow().get(&diagram) == Some(&step) {
+                continue;
+            }
+            let mut all = true;
+            for t in &tiles {
+                let res = Resource::Path(Arc::from(t.as_path()));
+                let state = self.images.update(cx, |c, cx| c.load(&res, window, cx));
+                all &= state.is_some_and(|r| r.is_ok());
+            }
+            if all {
+                self.ready.borrow_mut().insert(diagram, step);
+                cx.notify();
+            }
+        }
+    }
+
     fn keep_pictures(&mut self, shown: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let shown: std::collections::HashSet<PathBuf> = shown.into_iter().collect();
         if shown == self.decoded {
             return;
         }
         let gone: Vec<PathBuf> = self.decoded.difference(&shown).cloned().collect();
+        let blocks = self.blocks.clone();
+        self.ready.borrow_mut().retain(|d, step| find_diagram(&blocks, d).is_some_and(|dd| tiles(&dd, *step).iter().all(|t| !gone.contains(&t.path))));
         self.images.update(cx, |c, cx| {
             for p in gone {
                 c.remove(&Resource::Path(Arc::from(p.as_path())), window, cx);
@@ -336,7 +374,7 @@ impl PreviewView {
         }));
     }
 
-    fn render_markdown(&self, cx: &mut Context<Self>) -> (AnyElement, Vec<PathBuf>) {
+    fn render_markdown(&self, cx: &mut Context<Self>) -> (AnyElement, Vec<PathBuf>, Vec<(PathBuf, f32, Vec<PathBuf>)>) {
         let blocks = self.blocks.clone();
         // Every size on the page follows the zoom while it's built (see `px`).
         PAGE_SCALE.with(|s| s.set(self.zoom));
@@ -347,16 +385,16 @@ impl PreviewView {
             color: theme::fg(),
             zoom: self.zoom,
             boxes: self.boxes.clone(),
-            last: self.last.clone(),
+            ready: self.ready.clone(),
             decoded: self.decoded.clone(),
+            sharp_zoom: self.sharp_zoom,
+            wanted: Vec::new(),
             images: self.images.clone(),
             shown: Vec::new(),
-            near: {
-                let area = self.area.get();
-                // A screen above and below: drawn before they scroll in, freed once far away.
-                let reach = area.size.height;
-                Bounds::new(point(area.left(), area.top() - reach), size(area.size.width, area.size.height + reach * 2.))
-            },
+            // Drawn a screen and a half before they scroll in; kept until four screens away, so
+            // scrolling back and forth never waits for a diagram to be drawn again.
+            near: around(self.area.get(), 1.5),
+            keep: around(self.area.get(), 4.),
             paras: 0,
         };
         let children: Vec<AnyElement> = blocks.iter().map(|b| r.block(b)).collect();
@@ -435,7 +473,7 @@ impl PreviewView {
                 )
             })
             .into_any_element();
-        (el, r.shown)
+        (el, r.shown, r.wanted)
     }
 }
 
@@ -460,7 +498,8 @@ impl Render for PreviewView {
         }
         let body = match self.kind {
             Kind::Markdown => {
-                let (page, shown) = self.render_markdown(cx);
+                let (page, shown, wanted) = self.render_markdown(cx);
+                self.note_loaded(wanted, window, cx);
                 self.keep_pictures(shown, window, cx);
                 page
             }
@@ -478,6 +517,7 @@ fn release(path: &Path, window: &mut Window, cx: &mut App) {
     }
     ImageSource::Resource(resource).remove_asset(cx);
 }
+
 
 // ---------------------------------------------------------------- memory
 
@@ -525,17 +565,18 @@ fn mermaid(src: &str) -> Result<Diagram, String> {
         let c = c.to_rgb();
         format!("#{:02x}{:02x}{:02x}", (c.r * 255.).round() as u8, (c.g * 255.).round() as u8, (c.b * 255.).round() as u8)
     };
-    let key = hash(&format!("{src}\u{0}{}\u{0}{}", hex(theme::bg_editor()), hex(theme::fg())));
+    let key = hash(&format!("{src}\u{0}{}\u{0}{}\u{0}{}", hex(theme::bg_editor()), hex(theme::fg()), hex(theme::accent())));
     if let Some(done) = DIAGRAMS.with(|d| d.borrow().get(&key).cloned()) {
         return done;
     }
-    let mut opts = if dark { mermaid_rs_renderer::RenderOptions { theme: mermaid_rs_renderer::Theme::dark(), ..Default::default() } } else { mermaid_rs_renderer::RenderOptions::modern() };
-    opts.theme.background = hex(theme::bg_editor());
+    let mut opts = mermaid_rs_renderer::RenderOptions::modern();
+    opts.theme = diagram_theme(dark, &hex);
     // A diagram the renderer can't handle shows its source, never takes the app down.
     let svg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mermaid_rs_renderer::render_with_options(src, opts)))
         .map_err(|_| "the renderer couldn't draw this diagram".to_string())
         .and_then(|r| r.map_err(|e| e.to_string().lines().next().unwrap_or("not valid Mermaid").to_string()));
     let result = svg.and_then(|svg| {
+        let svg = outline_text(&emoji_in_emoji_font(&svg)).unwrap_or(svg);
         let (w, h) = svg_size(&svg).ok_or("the drawing has no size")?;
         let path = std::env::temp_dir().join(format!("kite-mermaid-{}-{key:x}.svg", std::process::id()));
         std::fs::write(&path, &svg).map_err(|e| e.to_string())?;
@@ -543,6 +584,122 @@ fn mermaid(src: &str) -> Result<Diagram, String> {
     });
     DIAGRAMS.with(|d| d.borrow_mut().insert(key, result.clone()));
     result
+}
+
+/// Diagram colors from the theme's own: its background and text, nodes tinted with its
+/// accent, notes with its yellow, and the theme's hues for charts.
+fn diagram_theme(dark: bool, hex: &dyn Fn(Hsla) -> String) -> mermaid_rs_renderer::Theme {
+    let bg = theme::bg_editor();
+    let mix = |a: Hsla, t: f32| {
+        let (a, b) = (a.to_rgb(), bg.to_rgb());
+        hex(gpui::Rgba { r: b.r + (a.r - b.r) * t, g: b.g + (a.g - b.g) * t, b: b.b + (a.b - b.b) * t, a: 1. }.into())
+    };
+    let accent = theme::accent();
+    let (fill, edge) = if dark { (0.2, 0.65) } else { (0.1, 0.55) };
+    let mut t = if dark { mermaid_rs_renderer::Theme::dark() } else { mermaid_rs_renderer::Theme::modern() };
+    t.font_family = mermaid_rs_renderer::Theme::modern().font_family;
+    t.font_size = 14.;
+    t.background = hex(bg);
+    t.primary_color = mix(accent, fill);
+    t.primary_border_color = mix(accent, edge);
+    t.primary_text_color = hex(theme::fg_bright());
+    t.text_color = hex(theme::fg());
+    t.line_color = hex(theme::fg_dim());
+    t.secondary_color = mix(theme::git_added(), fill);
+    t.tertiary_color = mix(theme::git_modified(), fill);
+    t.edge_label_background = hex(bg);
+    t.cluster_background = mix(theme::fg(), if dark { 0.05 } else { 0.04 });
+    t.cluster_border = hex(theme::border_input());
+    t.sequence_actor_fill = t.primary_color.clone();
+    t.sequence_actor_border = t.primary_border_color.clone();
+    t.sequence_actor_line = hex(theme::fg_muted());
+    t.sequence_note_fill = mix(theme::git_modified(), fill);
+    t.sequence_note_border = mix(theme::git_modified(), edge);
+    t.sequence_activation_fill = mix(accent, fill * 1.6);
+    t.sequence_activation_border = t.primary_border_color.clone();
+    let hues = theme::lane_colors();
+    let more = [accent, theme::git_added(), theme::git_modified(), theme::git_deleted(), theme::ref_remote(), theme::fg_dim()];
+    t.pie_colors = std::array::from_fn(|i| if i < 6 { mix(hues[i], 0.85) } else { mix(more[i - 6], 0.6) });
+    t.pie_title_text_color = hex(theme::fg_bright());
+    t.pie_section_text_color = hex(theme::fg_bright());
+    t.pie_legend_text_color = hex(theme::fg());
+    t.pie_stroke_color = hex(bg);
+    t.pie_outer_stroke_color = hex(theme::border_input());
+    t
+}
+
+/// Puts each emoji in a span of Apple's emoji font, so it's drawn from that font even where
+/// the text's font, shaping the whole label, gives up on it.
+fn emoji_in_emoji_font(svg: &str) -> String {
+    let joins = |c: char| matches!(c as u32, 0xFE0F | 0x200D | 0x20E3 | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F);
+    let is_emoji = |c: char, next: Option<char>| {
+        let u = c as u32;
+        ((0x1F000..=0x1FAFF).contains(&u) && !(0x1F3FB..=0x1F3FF).contains(&u))
+            || matches!(u, 0x231A | 0x231B | 0x23E9..=0x23EC | 0x23F0 | 0x23F3 | 0x25FD | 0x25FE | 0x2614 | 0x2615 | 0x2648..=0x2653 | 0x267F | 0x2693 | 0x26A1 | 0x26AA | 0x26AB | 0x26BD | 0x26BE | 0x26C4 | 0x26C5 | 0x26CE | 0x26D4 | 0x26EA | 0x26F2 | 0x26F3 | 0x26F5 | 0x26FA | 0x26FD | 0x2705 | 0x270A | 0x270B | 0x2728 | 0x274C | 0x274E | 0x2753..=0x2755 | 0x2757 | 0x2795..=0x2797 | 0x27B0 | 0x27BF | 0x2B1B | 0x2B1C | 0x2B50 | 0x2B55)
+            || (u > 0x7F && next == Some('\u{FE0F}'))
+    };
+    let mut out = String::with_capacity(svg.len());
+    let mut chars = svg.chars().peekable();
+    let mut in_tag = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ => {}
+        }
+        if in_tag || !is_emoji(c, chars.peek().copied()) {
+            out.push(c);
+            continue;
+        }
+        out.push_str("<tspan font-family=\"Apple Color Emoji\">");
+        out.push(c);
+        while let Some(&n) = chars.peek().filter(|&&n| joins(n)) {
+            out.push(n);
+            chars.next();
+            if n == '\u{200D}' {
+                if let Some(m) = chars.next() {
+                    out.push(m);
+                }
+            }
+        }
+        out.push_str("</tspan>");
+    }
+    out
+}
+
+/// The system's fonts, for drawing diagrams' text (loaded the first time one is drawn).
+static DIAGRAM_FONTS: std::sync::LazyLock<Arc<usvg::fontdb::Database>> = std::sync::LazyLock::new(|| {
+    let mut db = usvg::fontdb::Database::new();
+    db.load_system_fonts();
+    db.set_sans_serif_family("Helvetica");
+    Arc::new(db)
+});
+
+/// The diagram with its text turned into shapes (emoji into their pictures), so it draws the
+/// same anywhere. GPUI's SVG drawing, missing a character in the text's font (an emoji),
+/// takes the first font that has it: macOS's last-resort font, which has a box for every
+/// character, so the whole label became boxes. Here the fallback skips the system's hidden
+/// fonts (named with a dot) and tries Apple's emoji font first.
+fn outline_text(svg: &str) -> Option<String> {
+    let fallback = usvg::FontResolver::default_fallback_selector();
+    let options = usvg::Options {
+        fontdb: DIAGRAM_FONTS.clone(),
+        font_resolver: usvg::FontResolver {
+            select_font: usvg::FontResolver::default_font_selector(),
+            select_fallback: Box::new(move |c, used, db| {
+                let named = |db: &usvg::fontdb::Database, keep: &dyn Fn(&str) -> bool| -> Vec<usvg::fontdb::ID> {
+                    db.faces().filter(|f| !f.families.iter().any(|(n, _)| keep(n))).map(|f| f.id).collect()
+                };
+                // The emoji font if it has it, else any font that isn't a hidden one.
+                let not_emoji = named(db, &|n| n == "Apple Color Emoji");
+                let hidden = named(db, &|n| !n.starts_with('.'));
+                fallback(c, &[used, &not_emoji].concat(), db).or_else(|| fallback(c, &[used, &hidden].concat(), db))
+            }),
+        },
+        ..Default::default()
+    };
+    let tree = usvg::Tree::from_str(svg, &options).ok()?;
+    Some(tree.to_string(&usvg::WriteOptions::default()))
 }
 
 /// The page's text width.
@@ -565,43 +722,82 @@ fn px(v: f32) -> Pixels {
     gpui::px(v * PAGE_SCALE.with(|s| s.get()))
 }
 
-/// The diagram redrawn for a display scale: twice the size for Retina screens, in steps so
-/// pinching doesn't make a new picture every frame, and no bigger than MAX_SHARP_PIXELS.
-fn sharp_file(d: &Diagram, scale: f32) -> PathBuf {
+/// The scale a diagram is drawn at for a display scale: twice for Retina screens, in steps so
+/// pinching doesn't make a new picture every frame, within the pixel budget.
+fn sharp_step(d: &Diagram, scale: f32) -> f32 {
     const STEPS: [f32; 12] = [0.5, 0.75, 1., 1.5, 2., 3., 4., 6., 8., 12., 16., 24.];
     let max = if scale > (PAGE_W / d.w).min(1.) + 0.01 { MAX_SHARP_PIXELS_ZOOMED } else { MAX_SHARP_PIXELS };
     let cap = (max / (d.w * d.h).max(1.)).sqrt();
     let want = (scale * 2.).min(cap);
     // The largest step within the cap (a diagram too big even at the smallest gets the cap).
-    let step = STEPS.iter().copied().filter(|s| *s <= cap).find(|s| *s >= want).or_else(|| STEPS.iter().copied().filter(|s| *s <= cap).last()).unwrap_or(cap);
-    let path = d.path.with_extension(format!("x{}.svg", (step * 100.).round() as u32));
-    if !path.exists()
-        && let Ok(svg) = std::fs::read_to_string(&d.path)
-    {
-        std::fs::write(&path, resize_svg(&svg, d.w, d.h, step)).ok();
-    }
-    if path.exists() { path } else { d.path.clone() }
+    STEPS.iter().copied().filter(|s| *s <= cap).find(|s| *s >= want).or_else(|| STEPS.iter().copied().filter(|s| *s <= cap).last()).unwrap_or(cap)
 }
 
-/// The same SVG at `step` times its size (its own coordinates kept through the viewBox).
-fn resize_svg(svg: &str, w: f32, h: f32, step: f32) -> String {
+/// The visible area grown by `screens` of its height above and below.
+fn around(area: Bounds<Pixels>, screens: f32) -> Bounds<Pixels> {
+    let reach = area.size.height * screens;
+    Bounds::new(point(area.left(), area.top() - reach), size(area.size.width, area.size.height + reach * 2.))
+}
+
+/// One tile of a diagram drawn at some step: its file, and where it sits in the drawing (pixels).
+#[derive(Clone)]
+struct Tile {
+    path: PathBuf,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+/// Tiles are at most this many pixels a side, within GPUI's standard 1024-pixel textures.
+const TILE: f32 = 1024.;
+
+/// A diagram drawn at `step`, as tiles of at most TILE pixels (each an SVG of its part, written
+/// once); a diagram that fits is one tile.
+fn tiles(d: &Diagram, step: f32) -> Vec<Tile> {
+    let (rw, rh) = ((d.w * step).max(1.).ceil(), (d.h * step).max(1.).ceil());
+    let (cols, rows) = ((rw / TILE).ceil() as usize, (rh / TILE).ceil() as usize);
+    let mut svg: Option<Option<String>> = None;
+    let mut out = Vec::with_capacity(cols * rows);
+    for r in 0..rows {
+        for c in 0..cols {
+            let (x, y) = (c as f32 * TILE, r as f32 * TILE);
+            let (w, h) = ((rw - x).min(TILE), (rh - y).min(TILE));
+            let path = d.path.with_extension(format!("x{}.t{c}-{r}.svg", (step * 100.).round() as u32));
+            if !path.exists()
+                && let Some(text) = svg.get_or_insert_with(|| std::fs::read_to_string(&d.path).ok())
+            {
+                std::fs::write(&path, crop_svg(text, d.w, d.h, step, (x, y, w, h))).ok();
+            }
+            out.push(Tile { path, x, y, w, h });
+        }
+    }
+    out
+}
+
+/// The part (x, y, w, h, in pixels at `step`) of an SVG `w0` x `h0` drawn at `step` times its
+/// size, as an SVG of its own: the same drawing seen through a smaller viewBox.
+fn crop_svg(svg: &str, w0: f32, h0: f32, step: f32, (x, y, w, h): (f32, f32, f32, f32)) -> String {
     let Some(end) = svg.find('>') else { return svg.to_string() };
     let Some(start) = svg[..end].find("<svg") else { return svg.to_string() };
     let mut head = svg[start..end].to_string();
-    let drop_attr = |head: &mut String, name: &str| {
+    let attr = |head: &str, name: &str| -> Option<String> {
+        let at = head.find(&format!(" {name}=\""))? + name.len() + 3;
+        head[at..].split('"').next().map(String::from)
+    };
+    let vb: Vec<f32> = attr(&head, "viewBox").map(|v| v.split([' ', ',']).filter_map(|n| n.parse().ok()).collect()).unwrap_or_default();
+    let (vx, vy, vw, vh) = if vb.len() == 4 { (vb[0], vb[1], vb[2], vb[3]) } else { (0., 0., w0, h0) };
+    // SVG units per pixel at this step.
+    let (ux, uy) = (vw / (w0 * step), vh / (h0 * step));
+    for name in ["width", "height", "viewBox", "preserveAspectRatio", "style"] {
         if let Some(at) = head.find(&format!(" {name}=\"")) {
             let rest = at + name.len() + 3;
             if let Some(close) = head[rest..].find('"') {
                 head.replace_range(at..rest + close + 1, "");
             }
         }
-    };
-    drop_attr(&mut head, "width");
-    drop_attr(&mut head, "height");
-    if !head.contains("viewBox=") {
-        head.push_str(&format!(" viewBox=\"0 0 {w} {h}\""));
     }
-    head.push_str(&format!(" width=\"{}\" height=\"{}\"", w * step, h * step));
+    head.push_str(&format!(" viewBox=\"{} {} {} {}\" width=\"{w}\" height=\"{h}\" preserveAspectRatio=\"none\"", vx + x * ux, vy + y * uy, w * ux, h * uy));
     format!("{}{}{}", &svg[..start], head, &svg[end..])
 }
 
@@ -618,6 +814,16 @@ fn svg_size(svg: &str) -> Option<(f32, f32)> {
     }
     let vb: Vec<f32> = attr("viewBox")?.split([' ', ',']).filter_map(|v| v.parse().ok()).collect();
     (vb.len() == 4).then(|| (vb[2], vb[3]))
+}
+
+/// A page's diagram drawn to `file`.
+fn find_diagram(blocks: &[Block], file: &Path) -> Option<Diagram> {
+    blocks.iter().find_map(|b| match b {
+        Block::Mermaid(Ok(d), _) if d.path == file => Some(d.clone()),
+        Block::Quote(inner) => find_diagram(inner, file),
+        Block::List(_, items) => items.iter().find_map(|i| find_diagram(&i.blocks, file)),
+        _ => None,
+    })
 }
 
 /// The diagram files a page shows (in lists and quotes too).
@@ -1026,12 +1232,18 @@ struct Renderer {
     /// The page zoom, and the picture each diagram showed last (covering while a sharper loads).
     zoom: f32,
     boxes: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, Bounds<Pixels>>>>,
-    last: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, PathBuf>>>,
+    ready: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, f32>>>,
     decoded: std::collections::HashSet<PathBuf>,
+    sharp_zoom: f32,
+    /// Each diagram on show, the step it wants and that step's tiles: checked after drawing,
+    /// to know when all of them have loaded.
+    wanted: Vec<(PathBuf, f32, Vec<PathBuf>)>,
     images: Entity<RetainAllImageCache>,
     /// Pictures this page shows now, and the part of the window near the screen.
     shown: Vec<PathBuf>,
     near: Bounds<Pixels>,
+    /// Diagrams that have a picture keep it while they're within this.
+    keep: Bounds<Pixels>,
     /// Paragraphs drawn so far (for their test names).
     paras: usize,
 }
@@ -1227,7 +1439,8 @@ impl Renderer {
                 // shows, stretched to fit.
                 let fit = (PAGE_W / d.w).min(1.);
                 let (w, h) = (px(d.w * fit), px(d.h * fit));
-                let near = self.boxes.borrow().get(&d.path).is_some_and(|b| b.intersects(&self.near));
+                let drawn = self.ready.borrow().contains_key(&d.path);
+                let near = self.boxes.borrow().get(&d.path).is_some_and(|b| b.intersects(&self.near) || (drawn && b.intersects(&self.keep)));
                 let id = self.id();
                 let boxes = self.boxes.clone();
                 let key = d.path.clone();
@@ -1244,24 +1457,37 @@ impl Renderer {
                 .absolute()
                 .size_full();
                 let body: AnyElement = if near {
-                    let sharp = sharp_file(d, fit * self.zoom);
-                    let prev = self.last.borrow_mut().insert(d.path.clone(), sharp.clone()).filter(|p| *p != sharp && self.decoded.contains(p));
-                    self.shown.push(sharp.clone());
-                    if let Some(p) = &prev {
-                        self.shown.push(p.clone());
+                    // Drawn in tiles of at most TILE pixels: GPUI keeps pictures in 1024-pixel
+                    // textures, and bigger ones (long diagrams, zoomed in) went missing on screen.
+                    let step = sharp_step(d, fit * self.sharp_zoom);
+                    let want = tiles(d, step);
+                    self.wanted.push((d.path.clone(), step, want.iter().map(|t| t.path.clone()).collect()));
+                    // On screen only tiles that have loaded: the last full set, stretched, while
+                    // the next one loads out of sight (GPUI draws nothing while an image loads).
+                    let ready = self.ready.borrow().get(&d.path).copied().map(|s| (s, tiles(d, s))).filter(|(_, t)| t.iter().all(|t| self.decoded.contains(&t.path)));
+                    let first_load = ready.is_none();
+                    let (show_step, show) = ready.unwrap_or((step, want.clone()));
+                    self.shown.extend(show.iter().map(|t| t.path.clone()));
+                    if show_step != step {
+                        self.shown.extend(want.iter().map(|t| t.path.clone()));
                     }
-                    let images = self.images.clone();
-                    img(sharp)
-                        .image_cache(&self.images)
-                        .object_fit(ObjectFit::Fill)
-                        .w(w)
-                        .h(h)
-                        .flex_none()
-                        .with_loading(move || match prev.clone() {
-                            Some(p) => img(p).image_cache(&images).object_fit(ObjectFit::Fill).w(w).h(h).into_any_element(),
-                            None => div().w(w).h(h).into_any_element(),
-                        })
-                        .into_any_element()
+                    let (rw, rh) = (d.w * show_step, d.h * show_step);
+                    let mut layer = div().relative().w(w).h(h);
+                    for (k, t) in show.into_iter().enumerate() {
+                        // A hair of overlap so no seam shows between tiles.
+                        let pic = img(t.path)
+                            .image_cache(&self.images)
+                            .object_fit(ObjectFit::Fill)
+                            .absolute()
+                            .left(w * (t.x / rw))
+                            .top(h * (t.y / rh))
+                            .w(w * (t.w / rw) + gpui::px(0.5))
+                            .h(h * (t.h / rh) + gpui::px(0.5))
+                            .with_fallback(move || div().debug_selector(move || format!("md-mermaid-failed-{id}")).into_any_element());
+                        let pic = if first_load && k == 0 { pic.with_loading(move || div().debug_selector(move || format!("md-mermaid-blank-{id}")).into_any_element()) } else { pic };
+                        layer = layer.child(pic);
+                    }
+                    layer.into_any_element()
                 } else {
                     div().w(w).h(h).flex_none().into_any_element()
                 };
@@ -1380,7 +1606,52 @@ fn code_runs(line: &str, spans: Option<&Vec<(Range<usize>, u8)>>) -> Vec<TextRun
 
 #[cfg(test)]
 mod tests {
-    use super::{Block, image_size, mermaid, parse};
+    use super::{Block, Diagram, TILE, crop_svg, emoji_in_emoji_font, image_size, outline_text, mermaid, parse, tiles};
+
+    #[test]
+    fn big_diagrams_are_drawn_in_tiles_that_cover_them_exactly() {
+        let dir = std::env::temp_dir().join(format!("kite-tiles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.svg");
+        std::fs::write(&path, r#"<svg xmlns="http://www.w3.org/2000/svg" width="800" height="2600" viewBox="0 0 400 1300"><rect width="400" height="1300"/></svg>"#).unwrap();
+        let d = Diagram { path: path.clone(), w: 800., h: 2600. };
+        // At 1.5x: 1200 x 3900 pixels, so 2 x 4 tiles, none past TILE.
+        let t = tiles(&d, 1.5);
+        assert_eq!(t.len(), 8);
+        assert!(t.iter().all(|t| t.w <= TILE && t.h <= TILE && t.w > 0. && t.h > 0.));
+        let area: f32 = t.iter().map(|t| t.w * t.h).sum();
+        assert_eq!(area, 1200. * 3900., "they cover it, no gaps or overlaps");
+        // Each tile's SVG shows its part: the last tile starts at (1024, 3072) px, which is
+        // (341.33, 1024) in this SVG's units (a third of a unit per pixel).
+        let last = std::fs::read_to_string(&t[7].path).unwrap();
+        assert!(last.contains(r#"viewBox="341.33334 1024 58.666668 276""#) && last.contains(r#"width="176" height="828""#), "{last}");
+        // A small one is a single tile.
+        assert_eq!(tiles(&d, 0.25).len(), 1);
+        assert!(crop_svg("<svg width=\"10\" height=\"10\">x</svg>", 10., 10., 1., (0., 0., 10., 10.)).contains(r#"viewBox="0 0 10 10""#), "a missing viewBox is the SVG's own size");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn emoji_get_a_span_of_the_emoji_font() {
+        let svg = "<svg><text x=\"1\">\u{2705} Verified \u{1F468}\u{200D}\u{1F4BB}!</text><g id=\"\u{2705}\"/></svg>";
+        assert_eq!(
+            emoji_in_emoji_font(svg),
+            "<svg><text x=\"1\"><tspan font-family=\"Apple Color Emoji\">\u{2705}</tspan> Verified <tspan font-family=\"Apple Color Emoji\">\u{1F468}\u{200D}\u{1F4BB}</tspan>!</text><g id=\"\u{2705}\"/></svg>",
+            "text only, never inside tags; joined emoji stay one"
+        );
+        assert_eq!(emoji_in_emoji_font("<text>a → b ✓</text>"), "<text>a → b ✓</text>", "arrows and plain marks stay in the text's font");
+    }
+
+    #[test]
+    fn diagram_text_becomes_shapes_and_emoji_pictures() {
+        // A label starting with an emoji: the one the text's font alone drew as a box.
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"200\" height=\"40\"><text x=\"5\" y=\"30\" font-family=\"Inter, sans-serif, Apple Color Emoji\" font-size=\"14\">\u{2705} Verified</text></svg>";
+        let out = outline_text(&emoji_in_emoji_font(svg)).expect("drawn");
+        assert!(!out.contains("<text"), "no text left for GPUI to look fonts up for");
+        assert!(out.contains("<path"), "the letters are shapes");
+        assert!(out.contains("data:image/png"), "the emoji is Apple's picture of it");
+        assert_eq!(super::svg_size(&out), Some((200., 40.)), "same size");
+    }
 
     #[test]
     fn mermaid_fences_become_diagrams() {

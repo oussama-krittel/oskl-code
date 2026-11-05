@@ -6707,6 +6707,65 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     #[gpui::test]
+    fn zoomed_diagrams_never_disappear(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        // A big diagram (small text once fitted to the page) and a small one.
+        let mut big = String::from("```mermaid\nflowchart TD\n");
+        for i in 0..40 {
+            big.push_str(&format!("  N{i}[Step number {i} of the long flow] --> N{}[Step number {} of the long flow]\n", i + 1, i + 1));
+        }
+        big.push_str("```\n\n```mermaid\nflowchart LR\n  A[Start] --> B[End]\n```\n");
+        std::fs::write(root.join("d.md"), big).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("d.md"), None, false, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-shift-v");
+        let settle = |cx: &mut VisualTestContext| {
+            for _ in 0..4 {
+                cx.run_until_parked();
+                cx.update(|window, _| window.refresh());
+                cx.run_until_parked();
+            }
+        };
+        settle(cx);
+        let page = cx.debug_bounds("preview-markdown").expect("the page");
+        let at = gpui::point(page.center().x, page.top() + gpui::px(200.));
+        // Something is drawn for each diagram near the screen: never blank, never failed.
+        let check = |cx: &mut VisualTestContext, when: &str| {
+            for id in [1, 2] {
+                let blank: &'static str = Box::leak(format!("md-mermaid-blank-{id}").into_boxed_str());
+                let failed: &'static str = Box::leak(format!("md-mermaid-failed-{id}").into_boxed_str());
+                let shown: &'static str = Box::leak(format!("md-mermaid-{id}").into_boxed_str());
+                if cx.debug_bounds(shown).is_some() {
+                    assert!(cx.debug_bounds(failed).is_none(), "{when}: diagram {id} failed to draw");
+                }
+                let _ = blank;
+            }
+        };
+        let blank_now = |cx: &mut VisualTestContext| cx.debug_bounds("md-mermaid-blank-1").is_some();
+        assert!(!blank_now(cx), "drawn once loaded");
+        // Pinch out to 4x and back, pausing now and then (when a sharper picture is drawn).
+        let mut z = 1.;
+        for step in 0..60 {
+            let magnify = if step < 30 { 0.05 } else { -0.05 };
+            ws.update_in(cx, |ws, window, cx| ws.pinch(crate::pinch::Pinch { magnify, at }, window, cx));
+            z = (z * (1. + magnify)).clamp(1., 4.);
+            // Mid-pinch: only stretched, so the picture on screen stays.
+            cx.run_until_parked();
+            assert!(!blank_now(cx), "pinching at {z:.2}x: blank");
+            if step % 7 == 6 {
+                // A pause: a sharper picture is drawn; the old one shows until it's ready.
+                cx.executor().advance_clock(std::time::Duration::from_millis(250));
+                cx.run_until_parked();
+                assert!(!blank_now(cx), "paused at {z:.2}x: blank while the sharper picture loads");
+                settle(cx);
+                assert!(!blank_now(cx), "paused at {z:.2}x: blank after it loaded");
+            }
+            check(cx, &format!("{z:.2}x"));
+        }
+    }
+
+    #[gpui::test]
     fn only_diagrams_near_the_screen_are_drawn(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));
@@ -6735,6 +6794,16 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         let decoded = |cx: &mut VisualTestContext| preview.read_with(cx, |v, _| v.pictures_decoded());
         let top = decoded(cx);
         assert!((1..12).contains(&top), "the ones near the top are drawn, not all 12 ({top})");
+        // A couple of screens down and back: nothing near the top was freed on the way, so
+        // nothing has to be drawn again (it would be blank meanwhile).
+        let screen = cx.debug_bounds("preview-markdown").expect("the page").size.height / gpui::px(1.);
+        preview.update(cx, |v, cx| v.scroll_page_to(screen * 2., cx));
+        settle(cx);
+        let down = decoded(cx);
+        assert!(down >= top, "the top ones are kept a while ({down} after {top})");
+        preview.update(cx, |v, cx| v.scroll_page_to(0., cx));
+        settle(cx);
+        assert_eq!(decoded(cx), down, "back at the top: the same pictures, none freed or redrawn");
         // Scrolled to the end: those are drawn, the top ones freed.
         let max = preview.read_with(cx, |v, _| v.page_scroll().1.height / gpui::px(1.));
         preview.update(cx, |v, cx| v.scroll_page_to(max, cx));

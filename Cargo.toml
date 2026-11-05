@@ -13,6 +13,8 @@ futures = "0.3"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
+# The one GPUI draws SVGs with: diagrams' text is turned into shapes with a font fallback that works.
+usvg = { version = "0.45.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 mimalloc = "0.1.52"
 notify = "6"
 objc = "0.2.7"
