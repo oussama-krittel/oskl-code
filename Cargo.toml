@@ -7,6 +7,18 @@ license = "MIT"
 
 [dependencies]
 alacritty_terminal = "0.26"
+# Databases: one background thread runs them all (tokio, current-thread); TLS is macOS's own
+# except for MongoDB, whose driver only does rustls.
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "io-util"] }
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+postgres-native-tls = "0.5"
+native-tls = "0.2"
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls"] }
+mongodb = "3"
+redis = { version = "1", default-features = false, features = ["tokio-comp", "tokio-native-tls-comp"] }
+ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
+security-framework = "3"
 anyhow = "1"
 block = "0.1.6"
 futures = "0.3"

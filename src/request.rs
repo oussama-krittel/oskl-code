@@ -58,6 +58,8 @@ pub enum Request {
     AddFolder,
     /// Take this added folder out of the workspace.
     RemoveFolder(PathBuf),
+    /// From the Databases panel and tabs.
+    Db(crate::db_view::DbRequest),
     Message(String),
     Error(String),
 }

@@ -312,7 +312,7 @@ impl PreviewView {
         for job in PENDING.with(|p| std::mem::take(&mut *p.borrow_mut())) {
             let draw = cx.background_executor().spawn(async move { job.draw() });
             cx.spawn(async move |this, cx| {
-                draw.await;
+                let _ = draw.await;
                 this.update(cx, |v, cx| v.mark_stale(cx)).ok();
             })
             .detach();

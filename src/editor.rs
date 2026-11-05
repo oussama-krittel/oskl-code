@@ -349,6 +349,8 @@ pub struct Editor {
     pub root: Option<PathBuf>,
     pub placeholder: SharedString,
     pub read_only: bool,
+    /// A password box: every character drawn as a dot, and nothing copied out.
+    pub secret: bool,
     scroll_x: f32,
     scroll_y: f32,
     autoscroll: Option<bool>,
@@ -435,6 +437,7 @@ impl Editor {
             path: None,
             root: None,
             placeholder: SharedString::default(),
+            secret: false,
             read_only: false,
             scroll_x: 0.,
             scroll_y: 0.,
@@ -1642,6 +1645,9 @@ impl Editor {
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) { self.buf.single_cursor(); self.edit_unlinked(cx, |b| { b.redo(); }) }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.secret {
+            return;
+        }
         if !self.buf.extra.is_empty() {
             // One line per cursor; pasting with the same number of cursors puts one at each.
             let parts: Vec<String> = self.buf.all_sels().iter().map(|s| self.buf.slice(s.range())).collect();
@@ -1660,6 +1666,9 @@ impl Editor {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.secret {
+            return;
+        }
         self.copy(&Copy, window, cx);
         if !self.buf.extra.is_empty() {
             return self.edit(cx, |b| b.insert(""));
@@ -2186,7 +2195,9 @@ impl Editor {
                 }
             };
             let (mut display, mut map) = self.buf.display_line(row);
-            if let Some(m) = env_masks.as_ref().and_then(|m| m.get(row).cloned().flatten()).filter(|_| !revealed.contains(&row)) {
+            if self.secret && map.len() > 1 {
+                (display, map) = mask_cols(&display, &map, 0, map.len() - 1);
+            } else if let Some(m) = env_masks.as_ref().and_then(|m| m.get(row).cloned().flatten()).filter(|_| !revealed.contains(&row)) {
                 (display, map) = mask_cols(&display, &map, m.start, m.end);
             } else if full {
                 for (col, color) in self.colors_in(row).into_iter().rev() {

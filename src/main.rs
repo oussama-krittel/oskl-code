@@ -4,6 +4,9 @@ mod colors;
 mod commit_view;
 mod complete;
 mod datafiles;
+mod db;
+mod db_panel;
+mod db_view;
 mod definition;
 mod dialog;
 mod diagnostics;
@@ -155,6 +158,7 @@ fn main() {
         findbar::bind_keys();
         diff_edit::bind_keys();
         dialog::bind_keys();
+        db_view::bind_keys();
         keybindings::apply(cx);
         cx.on_action(|_: &QuitApp, cx| cx.quit());
         cx.on_action(|_: &NewWindow, cx| open_window(workspace::no_project_dir(), cx));

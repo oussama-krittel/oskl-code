@@ -174,6 +174,8 @@ enum Side {
     Files,
     Search,
     Git,
+    /// Saved database connections.
+    Databases,
     /// Settings, and its Shortcuts tab (the shortcuts list).
     Settings,
     Keys,
@@ -205,6 +207,7 @@ enum TabKind {
     Terminal(Entity<TerminalView>),
     Merge(Entity<crate::merge_view::MergeView>),
     Preview(Entity<PreviewView>),
+    Db(Entity<crate::db_view::DbView>),
 }
 
 /// What the find bar (⌘F) searches: a text editor, or a read-only diff.
@@ -446,6 +449,7 @@ pub struct Workspace {
     repo_subs: Vec<Subscription>,
     tree: Entity<FileTree>,
     git_panel: Entity<GitPanel>,
+    db_panel: Entity<crate::db_panel::DbPanel>,
     search: Entity<SearchPanel>,
     keys: Entity<KeysPanel>,
     settings: Settings,
@@ -541,6 +545,8 @@ impl Workspace {
         let repo = cx.new(|cx| Repo::new(root, cx));
         let tree = cx.new(|cx| FileTree::new(repo.clone(), cx));
         let git_panel = cx.new(|cx| GitPanel::new(repo.clone(), window, cx));
+        let db_root = repo.read(cx).root.clone();
+        let db_panel = cx.new(|cx| crate::db_panel::DbPanel::new(vec![db_root], cx));
         let cmd = cx.new(|cx| Editor::new(EditorMode::SingleLine, cx));
         let search = cx.new(|cx| SearchPanel::new(repo.clone(), window, cx));
         let keys = cx.new(|cx| KeysPanel::new(window, cx));
@@ -565,6 +571,7 @@ impl Workspace {
             }),
             cx.subscribe_in(&tree, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&git_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
+            cx.subscribe_in(&db_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&cmd, window, |ws, _, ev: &EditorEvent, window, cx| ws.on_cmd_event(ev, window, cx)),
         ];
         let project = repo.read(cx).root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -578,6 +585,7 @@ impl Workspace {
             repo,
             tree,
             git_panel,
+            db_panel,
             search,
             keys,
             tabs: Vec::new(),
@@ -911,6 +919,23 @@ impl Workspace {
 
     fn handle_request(&mut self, req: &Request, window: &mut Window, cx: &mut Context<Self>) {
         match req {
+            Request::Db(crate::db_view::DbRequest::Open(open)) => self.open_db(open.clone(), window, cx),
+            Request::Db(crate::db_view::DbRequest::Changed { expand }) => {
+                let expand = expand.clone();
+                self.db_panel.update(cx, |p, cx| p.reload_and_expand(expand.clone(), cx));
+                for t in &self.tabs {
+                    if let TabKind::Db(v) = &t.kind {
+                        v.update(cx, |v, cx| v.conn_changed(cx));
+                    }
+                }
+                if expand.is_some() {
+                    self.side = Side::Databases;
+                    self.side_visible = true;
+                }
+                cx.notify();
+            }
+            // Only a tab sends this (handled where it's subscribed).
+            Request::Db(crate::db_view::DbRequest::Close) => {}
             Request::MarkResolved(rel) => {
                 let rel = rel.clone();
                 if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Merge(m) if m.read(cx).rel == rel)) {
@@ -1289,6 +1314,7 @@ impl Workspace {
                 Side::Files => "files",
                 Side::Search => "search",
                 Side::Git => "git",
+                Side::Databases => "databases",
                 Side::Settings => "settings",
                 Side::Keys => "keys",
             }
@@ -1394,6 +1420,7 @@ impl Workspace {
         self.side = match saved.side.as_str() {
             "search" => Side::Search,
             "git" => Side::Git,
+            "databases" => Side::Databases,
             "keys" => Side::Keys,
             "settings" => Side::Settings,
             _ => Side::Files,
@@ -1800,6 +1827,7 @@ impl Workspace {
             TabKind::Terminal(t) => t.read(cx).focus(window),
             TabKind::Merge(m) => m.read(cx).focus(window, cx),
             TabKind::Preview(v) => v.read(cx).focus(window),
+            TabKind::Db(v) => v.read(cx).focus(window, cx),
         }
     }
 
@@ -1951,6 +1979,39 @@ impl Workspace {
             self.sync_active();
             self.focus_active(window, cx);
         }
+        cx.notify();
+    }
+
+    /// The folders whose Workspace connections show, the first being where new ones are saved.
+    fn db_roots(&self, cx: &App) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = vec![self.repo.read(cx).root.clone()];
+        for f in &self.folders {
+            let r = f.read(cx).root.clone();
+            if !roots.contains(&r) {
+                roots.push(r);
+            }
+        }
+        roots.retain(|r| root_is_project(r));
+        roots
+    }
+
+    /// Opens a database tab (or shows the one already showing the same thing).
+    fn open_db(&mut self, open: crate::db_view::Open, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Db(v) if v.read(cx).shows(&open))) {
+            return self.activate(ix, window, cx);
+        }
+        let project = self.db_roots(cx).into_iter().next();
+        let view = cx.new(|cx| crate::db_view::DbView::new(open, project, window, cx));
+        let sub = cx.subscribe_in(&view, window, |ws, view, req: &Request, window, cx| {
+            if matches!(req, Request::Db(crate::db_view::DbRequest::Close)) {
+                if let Some(ix) = ws.tabs.iter().position(|t| matches!(&t.kind, TabKind::Db(v) if v == view)) {
+                    ws.close_tab(ix, true, window, cx);
+                }
+            } else {
+                ws.handle_request(req, window, cx);
+            }
+        });
+        self.add_tab(TabKind::Db(view), sub, false, window, cx);
         cx.notify();
     }
 
@@ -2188,6 +2249,7 @@ impl Workspace {
                 let v = v.read(cx);
                 (v.title(), v.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), false)
             }
+            TabKind::Db(v) => (v.read(cx).title().0, String::new(), false),
         }
     }
 
@@ -2312,6 +2374,7 @@ impl Workspace {
         match self.side {
             Side::Files => self.tree.read(cx).focus(window),
             Side::Git => self.git_panel.read(cx).focus(window),
+            Side::Databases => self.db_panel.read(cx).focus(window),
             Side::Search => {
                 let query = self.search.read(cx).query.clone();
                 query.update(cx, |q, cx| {
@@ -2441,7 +2504,7 @@ impl Workspace {
                 d.update(cx, |d, cx| d.set_blame(on, cx));
                 self.blame_default = on;
             }
-            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Preview(_) => {}
+            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Preview(_) | TabKind::Db(_) => {}
         }
         self.settings.blame_default = self.blame_default;
         self.settings.save();
@@ -4017,7 +4080,7 @@ impl Workspace {
                         v.update(cx, |v, cx| v.mark_stale(cx));
                     }
                 }
-                TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) => {}
+                TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Db(_) => {}
             }
         }
         for r in &meta_repos {
@@ -4092,6 +4155,7 @@ impl Workspace {
             .child(item("act-git", "git", Side::Git, "Source Control (⌃⇧G)", self, cx).when(changes > 0, |d| {
                 d.child(div().absolute().bottom(px(8.)).right(px(6.)).child(ui::badge(changes.to_string(), theme::accent()).text_size(px(10.)).h(px(16.)).min_w(px(16.))))
             }))
+            .child(item("act-databases", "database", Side::Databases, "Databases", self, cx))
             .child(div().flex_1())
             .child(tool("tb-open", "folder", "Open Folder here (⌘O)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))))
             .child(tool("tb-add-folder", "new-folder", "Add Folder to Workspace…", 16.).on_click(cx.listener(|ws, _, w, cx| ws.add_folder_prompt(w, cx))))
@@ -4176,6 +4240,7 @@ impl Workspace {
             Some(TabKind::Terminal(t)) => t.clone().into_any_element(),
             Some(TabKind::Merge(m)) => m.clone().into_any_element(),
             Some(TabKind::Preview(v)) => v.clone().into_any_element(),
+            Some(TabKind::Db(v)) => v.clone().into_any_element(),
             None if self.panes.len() == 1 => self.render_welcome(cx),
             None => self.render_empty_pane(),
         };
@@ -5090,6 +5155,11 @@ impl Render for Workspace {
         let sidebar: AnyElement = match self.side {
             Side::Files => self.tree.clone().into_any_element(),
             Side::Git => self.git_panel.clone().into_any_element(),
+            Side::Databases => {
+                let roots = self.db_roots(cx);
+                self.db_panel.update(cx, |p, cx| p.set_roots(roots, cx));
+                self.db_panel.clone().into_any_element()
+            }
             Side::Search => self.search.clone().into_any_element(),
             Side::Keys => div().flex().flex_col().size_full().child(self.render_settings_tabs(cx)).child(div().flex_1().min_h_0().child(self.keys.clone())).into_any_element(),
             Side::Settings => self.render_settings(cx).into_any_element(),
@@ -5411,6 +5481,7 @@ mod ui_tests {
             crate::workspace::bind_keys();
             crate::file_tree::bind_keys();
             crate::git_panel::bind_keys();
+            crate::db_view::bind_keys();
             crate::diff_view::bind_keys();
             crate::commit_view::bind_keys();
             crate::search::bind_keys();
@@ -7412,6 +7483,123 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
             });
             assert_eq!(a, Some((2, 0)), "cursor line restored");
         });
+    }
+
+    /// The open database tab.
+    fn db_tab(ws: &gpui::Entity<Workspace>, cx: &mut VisualTestContext) -> Option<gpui::Entity<crate::db_view::DbView>> {
+        ws.read_with(cx, |ws, _| ws.active.and_then(|a| match &ws.tabs[a].kind {
+            TabKind::Db(v) => Some(v.clone()),
+            _ => None,
+        }))
+    }
+
+    fn click_on(cx: &mut VisualTestContext, sel: &'static str) {
+        let at = cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} on screen")).center();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// Waits (for real: the database thread is real) until `done`.
+    fn wait_for(cx: &mut VisualTestContext, what: &str, done: impl Fn(&mut VisualTestContext) -> bool) {
+        for _ in 0..400 {
+            cx.run_until_parked();
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[gpui::test]
+    fn database_connections_are_made_saved_and_deleted(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Databases, window, cx));
+        cx.run_until_parked();
+        click_on(cx, "db-empty-new");
+        let form = db_tab(&ws, cx).expect("the connect form opens as a tab");
+        assert_eq!(ws.read_with(cx, |ws, cx| ws.tab_title(&ws.tabs[ws.active.unwrap()], cx).0), "Connect");
+        assert_eq!(form.read_with(cx, |f, cx| (f.form_text("port", cx), f.form_text("user", cx))), ("5432".into(), "postgres".into()));
+        click_on(cx, "db-type-redis");
+        assert_eq!(
+            form.read_with(cx, |f, cx| (f.form_text("port", cx), f.form_text("user", cx), f.form_text("database", cx))),
+            ("6379".into(), String::new(), "0".into()),
+            "defaults follow the type"
+        );
+        form.update(cx, |f, cx| {
+            f.fill("name", "Cache", cx);
+            f.fill("password", "pw", cx);
+            f.fill("port", "notaport", cx);
+        });
+        click_on(cx, "db-save");
+        assert!(form.read_with(cx, |f, _| f.form_status()).is_some_and(|s| s.is_err()), "a bad port is said, not saved");
+        assert!(crate::db::load().is_empty());
+        form.update(cx, |f, cx| f.fill("port", "6390", cx));
+        click_on(cx, "db-scope-workspace");
+        click_on(cx, "db-save");
+        let saved = crate::db::load();
+        assert_eq!(saved.len(), 1);
+        let c = &saved[0];
+        assert_eq!((c.name.as_str(), c.kind, c.port, c.project.as_deref()), ("Cache", crate::db::Kind::Redis, 6390, Some(root.as_path())));
+        assert_eq!(crate::db::secret(&c.id), "pw", "the password goes to the Keychain");
+        assert_eq!(ws.read_with(cx, |ws, cx| ws.tab_title(&ws.tabs[ws.active.unwrap()], cx).0), "Edit: Cache");
+        assert!(cx.debug_bounds("db-conn-Cache").is_some(), "shown in the panel");
+        click_on(cx, "db-connect");
+        assert!(db_tab(&ws, cx).is_none(), "Connect closes the form");
+        // Deleting asks first.
+        let row = cx.debug_bounds("db-conn-Cache").unwrap();
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        click_on(cx, "db-delete-0");
+        assert!(ws.read_with(cx, |ws, _| ws.ask.is_some()));
+        click_on(cx, "dialog-button-Delete");
+        assert!(crate::db::load().is_empty(), "deleted");
+        assert_eq!(crate::db::secret(&c.id), "", "with its password");
+    }
+
+    /// With the test PostgreSQL server running (KITE_DB_LIVE=1, port 55432).
+    #[gpui::test]
+    fn a_postgres_table_is_browsed_searched_and_queried(cx: &mut TestAppContext) {
+        if std::env::var_os("KITE_DB_LIVE").is_none() {
+            return;
+        }
+        let (ws, cx) = setup(cx);
+        let mut c = crate::db::Conn::new(crate::db::Kind::Postgres);
+        c.name = "Local".into();
+        c.port = 55432;
+        crate::db::save(&c, Some("testpw")).unwrap();
+        ws.update_in(cx, |ws, window, cx| {
+            ws.db_panel.update(cx, |p, cx| p.reload_and_expand(None, cx));
+            ws.select_side(super::Side::Databases, window, cx)
+        });
+        cx.run_until_parked();
+        click_on(cx, "db-conn-Local");
+        wait_for(cx, "the databases", |cx| cx.debug_bounds("db-node-crm").is_some());
+        click_on(cx, "db-node-crm");
+        wait_for(cx, "the schemas", |cx| cx.debug_bounds("db-node-public").is_some());
+        click_on(cx, "db-node-public");
+        wait_for(cx, "the tables", |cx| cx.debug_bounds("db-node-fruit_order").is_some());
+        click_on(cx, "db-node-fruit_order");
+        let tab = db_tab(&ws, cx).expect("a data tab");
+        assert_eq!(ws.read_with(cx, |ws, cx| ws.tab_title(&ws.tabs[ws.active.unwrap()], cx).0), "PostgreSQL: fruit_order");
+        wait_for(cx, "the rows", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
+        let (cols, rows, total) = tab.read_with(cx, |t, _| t.data_summary()).unwrap();
+        assert_eq!((cols[0].as_str(), rows, total), ("name", 11, Some(11)));
+        assert!(cx.debug_bounds("db-grid").is_some());
+        tab.update(cx, |t, cx| t.search_for("an", cx));
+        wait_for(cx, "the search", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 3));
+        click_on(cx, "db-col-1");
+        click_on(cx, "db-tab-query");
+        cx.simulate_keystrokes("cmd-enter");
+        wait_for(cx, "the query", |cx| tab.read_with(cx, |t, _| t.query_result()).is_some());
+        assert_eq!(tab.read_with(cx, |t, _| t.query_result()), Some(Ok((vec!["name".into(), "qty".into(), "note".into(), "at".into()], 11))));
+        // Clicking it again shows the same tab.
+        click_on(cx, "db-node-fruit_order");
+        assert_eq!(db_tab(&ws, cx), Some(tab));
+        assert_eq!(ws.read_with(cx, |ws, _| ws.tabs.iter().filter(|t| matches!(t.kind, TabKind::Db(_))).count()), 1);
     }
 }
 

@@ -10,6 +10,12 @@ const HEAD: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16
 
 fn icon_body(name: &str) -> Option<&'static str> {
     Some(match name {
+        "database" => r#"<ellipse cx="8" cy="3.8" rx="5" ry="2"/><path d="M3 3.8v8.4c0 1.1 2.2 2 5 2s5-.9 5-2V3.8"/><path d="M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>"#,
+        "table" => r#"<rect x="2" y="2.5" width="12" height="11" rx="1"/><path d="M2 6h12M2 9.5h12M6.5 6v7.5"/>"#,
+        "collection" => r#"<path d="M4.5 2.5h5l2 2v9h-7z"/><path d="M2.5 4.5v10h7"/><path d="M6.5 7h3M6.5 9.5h3"/>"#,
+        "key" => r#"<circle cx="5" cy="10.5" r="2.7"/><path d="M7 8.5l6-6M11 4.5l1.5 1.5M9.5 6l1.2 1.2"/>"#,
+        "queue" => r#"<rect x="1.5" y="5" width="3.2" height="6" rx=".6"/><rect x="6.4" y="5" width="3.2" height="6" rx=".6"/><path d="M11.5 8h3M13 6.5L14.5 8 13 9.5"/>"#,
+        "exchange" => r#"<path d="M2.5 5h9M9.5 3l2 2-2 2"/><path d="M13.5 11h-9M6.5 9l-2 2 2 2"/>"#,
         "files" => r#"<path d="M5.5 1.5h5l3 3v8h-8z"/><path d="M10.5 1.5v3h3"/><path d="M3.5 4.5v10h7"/>"#,
         "git" => r#"<circle cx="4.5" cy="3.5" r="1.7"/><circle cx="4.5" cy="12.5" r="1.7"/><circle cx="11.5" cy="5.5" r="1.7"/><path d="M4.5 5.2v5.6"/><path d="M11.5 7.2c0 3-7 1.8-7 3.6"/>"#,
         "check" => r#"<path d="M3 8.5l3.2 3.2L13 4.8"/>"#,
