@@ -6707,6 +6707,43 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     #[gpui::test]
+    fn only_diagrams_near_the_screen_are_drawn(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let mut md = String::new();
+        for i in 0..12 {
+            md.push_str(&format!("## Part {i}\n\n"));
+            md.push_str(&"Some words to read before the diagram.\n\n".repeat(12));
+            md.push_str(&format!("```mermaid\nflowchart TD\n  A{i}[Start] --> B{i}[Step]\n  B{i} --> C{i}[End]\n```\n\n"));
+        }
+        std::fs::write(root.join("long.md"), md).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("long.md"), None, false, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-shift-v");
+        let settle = |cx: &mut VisualTestContext| {
+            for _ in 0..3 {
+                cx.run_until_parked();
+                cx.update(|window, _| window.refresh());
+                cx.run_until_parked();
+            }
+        };
+        settle(cx);
+        let preview = ws.read_with(cx, |ws, _| ws.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Preview(v) => Some(v.clone()),
+            _ => None,
+        })).expect("the preview");
+        let decoded = |cx: &mut VisualTestContext| preview.read_with(cx, |v, _| v.pictures_decoded());
+        let top = decoded(cx);
+        assert!((1..12).contains(&top), "the ones near the top are drawn, not all 12 ({top})");
+        // Scrolled to the end: those are drawn, the top ones freed.
+        let max = preview.read_with(cx, |v, _| v.page_scroll().1.height / gpui::px(1.));
+        preview.update(cx, |v, cx| v.scroll_page_to(max, cx));
+        settle(cx);
+        let end = decoded(cx);
+        assert!((1..12).contains(&end), "only those near the end now ({end})");
+    }
+
+    #[gpui::test]
     fn previews_follow_markdown_and_show_pictures(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));

@@ -47,6 +47,23 @@ use workspace::Workspace;
 
 actions!(kite, [QuitApp, NewWindow, OpenFolderApp]);
 
+/// mimalloc instead of the system allocator: it hands freed memory back to macOS, where the
+/// system one keeps big freed blocks (decoded pictures…) counted against the app.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Freed memory goes back to macOS right away (decommitted, not just marked reusable), so the
+/// app's footprint drops when big pictures are freed.
+pub fn tune_allocator() {
+    // mimalloc v3's mi_option_purge_decommits and mi_option_purge_delay.
+    const PURGE_DECOMMITS: libmimalloc_sys::mi_option_t = 5;
+    const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+    unsafe {
+        libmimalloc_sys::mi_option_set(PURGE_DECOMMITS, 1);
+        libmimalloc_sys::mi_option_set(PURGE_DELAY, 0);
+    }
+}
+
 pub fn open_window(root: PathBuf, cx: &mut App) {
     open_window_with(root, None, cx);
 }
@@ -90,6 +107,7 @@ pub fn open_window_with(root: PathBuf, file: Option<PathBuf>, cx: &mut App) {
 }
 
 fn main() {
+    tune_allocator();
     let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
     // `kite <file>` opens the file's repo (or folder); `kite <folder> [file]` opens the folder.
     // With no arguments: from a terminal, the current folder; from the Dock/Finder, the
@@ -108,6 +126,8 @@ fn main() {
 
     // Resolve the login-shell PATH in the background so tools are found when launched from Finder.
     std::thread::spawn(tools::init_shell_path);
+    // Diagram pictures left in the temp folder by earlier runs.
+    std::thread::spawn(preview::clean_old_temp_files);
 
     // Folders opened from macOS (Dock recent items, Finder "Open With", `open -a`).
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();

@@ -72,10 +72,17 @@ pub struct PreviewView {
     locked_w: Option<f32>,
     page_w: Rc<std::cell::Cell<f32>>,
     area: Rc<std::cell::Cell<Bounds<Pixels>>>,
-    /// Each diagram's sharp picture and the one before (covering while the new one loads).
-    pictures: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, (PathBuf, Option<PathBuf>)>>>,
-    /// Pictures two zoom steps back: freed on the next draw.
-    old_pictures: Rc<std::cell::RefCell<Vec<PathBuf>>>,
+    /// Where each diagram was last drawn (by its file), to draw only those near the screen.
+    boxes: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, Bounds<Pixels>>>>,
+    /// The picture each diagram showed last (covering while a sharper one loads), and the
+    /// pictures decoded now: any not shown any more is freed.
+    last: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, PathBuf>>>,
+    decoded: std::collections::HashSet<PathBuf>,
+    /// Hands freed memory back to macOS a moment after pictures come and go.
+    relief: Option<Task<()>>,
+    /// The page's pictures (diagrams, images), decoded here rather than in GPUI's app-wide
+    /// cache, so the ones not shown any more and all of them on closing are really freed.
+    images: Entity<RetainAllImageCache>,
     _sub: Option<Subscription>,
 }
 
@@ -104,8 +111,11 @@ impl PreviewView {
             locked_w: None,
             page_w: Default::default(),
             area: Default::default(),
-            pictures: Default::default(),
-            old_pictures: Default::default(),
+            boxes: Default::default(),
+            last: Default::default(),
+            decoded: Default::default(),
+            relief: None,
+            images: RetainAllImageCache::new(cx),
             _sub: sub,
         };
         view.refresh(window, cx);
@@ -153,7 +163,8 @@ impl PreviewView {
                 let now = diagram_files(&self.blocks);
                 for old in self.diagrams.iter().filter(|p| !now.contains(p)) {
                     forget_diagram(old, window, cx);
-                    self.pictures.borrow_mut().remove(old);
+                    self.last.borrow_mut().remove(old);
+                    self.boxes.borrow_mut().remove(old);
                 }
                 self.diagrams = now;
             }
@@ -220,6 +231,19 @@ impl PreviewView {
         self.zoom
     }
 
+    /// How many diagram pictures are decoded now (tests).
+    #[cfg(test)]
+    pub fn pictures_decoded(&self) -> usize {
+        self.decoded.len()
+    }
+
+    /// Scrolls the page to `y` from the top (tests).
+    #[cfg(test)]
+    pub fn scroll_page_to(&mut self, y: f32, cx: &mut Context<Self>) {
+        self.scroll.set_offset(point(gpui::px(0.), gpui::px(-y)));
+        cx.notify();
+    }
+
     /// How far the page scrolls each way, and how far it can (tests).
     #[cfg(test)]
     pub fn page_scroll(&self) -> (Point<Pixels>, Size<Pixels>) {
@@ -246,6 +270,9 @@ impl PreviewView {
         for d in std::mem::take(&mut self.diagrams) {
             forget_diagram(&d, window, cx);
         }
+        self.decoded.clear();
+        self.images.update(cx, |c, cx| c.clear(window, cx));
+        give_memory_back();
 
     }
 
@@ -289,7 +316,27 @@ impl PreviewView {
             .into_any_element()
     }
 
-    fn render_markdown(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Frees the diagram pictures the page stopped showing (scrolled far away, zoomed past,
+    /// edited), then gives the memory back to macOS once decoding has settled.
+    fn keep_pictures(&mut self, shown: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let shown: std::collections::HashSet<PathBuf> = shown.into_iter().collect();
+        if shown == self.decoded {
+            return;
+        }
+        let gone: Vec<PathBuf> = self.decoded.difference(&shown).cloned().collect();
+        self.images.update(cx, |c, cx| {
+            for p in gone {
+                c.remove(&Resource::Path(Arc::from(p.as_path())), window, cx);
+            }
+        });
+        self.decoded = shown;
+        self.relief = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(Duration::from_millis(1500)).await;
+            give_memory_back();
+        }));
+    }
+
+    fn render_markdown(&self, cx: &mut Context<Self>) -> (AnyElement, Vec<PathBuf>) {
         let blocks = self.blocks.clone();
         // Every size on the page follows the zoom while it's built (see `px`).
         PAGE_SCALE.with(|s| s.set(self.zoom));
@@ -299,8 +346,17 @@ impl PreviewView {
             n: 0,
             color: theme::fg(),
             zoom: self.zoom,
-            pictures: self.pictures.clone(),
-            old_pictures: self.old_pictures.clone(),
+            boxes: self.boxes.clone(),
+            last: self.last.clone(),
+            decoded: self.decoded.clone(),
+            images: self.images.clone(),
+            shown: Vec::new(),
+            near: {
+                let area = self.area.get();
+                // A screen above and below: drawn before they scroll in, freed once far away.
+                let reach = area.size.height;
+                Bounds::new(point(area.left(), area.top() - reach), size(area.size.width, area.size.height + reach * 2.))
+            },
             paras: 0,
         };
         let children: Vec<AnyElement> = blocks.iter().map(|b| r.block(b)).collect();
@@ -350,7 +406,7 @@ impl PreviewView {
             )
             .into_any_element();
         PAGE_SCALE.with(|s| s.set(1.));
-        div()
+        let el = div()
             .relative()
             .size_full()
             .child(page)
@@ -378,7 +434,8 @@ impl PreviewView {
                         .child(format!("{}% · click for 100%", (zoom * 100.).round())),
                 )
             })
-            .into_any_element()
+            .into_any_element();
+        (el, r.shown)
     }
 }
 
@@ -401,15 +458,12 @@ impl Render for PreviewView {
         if std::mem::take(&mut self.stale) {
             self.refresh(window, cx);
         }
-        // Zoomed past them: free the diagram pictures no longer shown or covering.
-        let in_use: Vec<PathBuf> = self.pictures.borrow().values().flat_map(|(a, b)| std::iter::once(a.clone()).chain(b.clone())).collect();
-        for p in std::mem::take(&mut *self.old_pictures.borrow_mut()) {
-            if !in_use.contains(&p) {
-                release(&p, window, cx);
-            }
-        }
         let body = match self.kind {
-            Kind::Markdown => self.render_markdown(cx),
+            Kind::Markdown => {
+                let (page, shown) = self.render_markdown(cx);
+                self.keep_pictures(shown, window, cx);
+                page
+            }
             Kind::Image | Kind::Svg => self.render_image(cx),
         };
         div().key_context("Preview").track_focus(&self.focus).size_full().bg(theme::bg_editor()).child(body)
@@ -423,6 +477,37 @@ fn release(path: &Path, window: &mut Window, cx: &mut App) {
         window.drop_image(image).ok();
     }
     ImageSource::Resource(resource).remove_asset(cx);
+}
+
+// ---------------------------------------------------------------- memory
+
+/// Hands memory freed by big pictures (decoded diagrams and their copies) back to macOS,
+/// instead of it staying counted against the app: the app's allocator, then the system's.
+fn give_memory_back() {
+    unsafe { libmimalloc_sys::mi_collect(true) };
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+}
+
+/// Deletes the temporary diagram and SVG files of earlier runs (closed or crashed).
+pub fn clean_old_temp_files() {
+    let ours = std::process::id().to_string();
+    let Ok(dir) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for e in dir.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix("kite-mermaid-").or_else(|| name.strip_prefix("kite-svg-")) else { continue };
+        let pid = rest.split('-').next().unwrap_or("");
+        if pid != ours && !pid.is_empty() && name.ends_with(".svg") {
+            std::fs::remove_file(e.path()).ok();
+        }
+    }
 }
 
 // ---------------------------------------------------------------- Mermaid
@@ -464,8 +549,10 @@ fn mermaid(src: &str) -> Result<Diagram, String> {
 const PAGE_W: f32 = 796.;
 /// How far the page zooms in (100% is the least).
 const PAGE_ZOOM_MAX: f32 = 4.;
-/// The biggest picture a diagram is drawn at (in pixels): past it, it's stretched instead.
-const MAX_SHARP_PIXELS: f32 = 8_000_000.;
+/// The biggest picture a diagram is drawn at (in pixels; 4 bytes each, and decoding makes a
+/// few copies for a moment): past it, it's stretched instead. A bit more while zoomed in.
+const MAX_SHARP_PIXELS: f32 = 2_000_000.;
+const MAX_SHARP_PIXELS_ZOOMED: f32 = 4_000_000.;
 
 thread_local! {
     /// The page zoom while a Markdown page is being built; 1 otherwise.
@@ -482,9 +569,11 @@ fn px(v: f32) -> Pixels {
 /// pinching doesn't make a new picture every frame, and no bigger than MAX_SHARP_PIXELS.
 fn sharp_file(d: &Diagram, scale: f32) -> PathBuf {
     const STEPS: [f32; 12] = [0.5, 0.75, 1., 1.5, 2., 3., 4., 6., 8., 12., 16., 24.];
-    let cap = (MAX_SHARP_PIXELS / (d.w * d.h).max(1.)).sqrt();
+    let max = if scale > (PAGE_W / d.w).min(1.) + 0.01 { MAX_SHARP_PIXELS_ZOOMED } else { MAX_SHARP_PIXELS };
+    let cap = (max / (d.w * d.h).max(1.)).sqrt();
     let want = (scale * 2.).min(cap);
-    let step = STEPS.iter().copied().find(|s| *s >= want).unwrap_or(STEPS[STEPS.len() - 1]).min(cap.max(0.5));
+    // The largest step within the cap (a diagram too big even at the smallest gets the cap).
+    let step = STEPS.iter().copied().filter(|s| *s <= cap).find(|s| *s >= want).or_else(|| STEPS.iter().copied().filter(|s| *s <= cap).last()).unwrap_or(cap);
     let path = d.path.with_extension(format!("x{}.svg", (step * 100.).round() as u32));
     if !path.exists()
         && let Ok(svg) = std::fs::read_to_string(&d.path)
@@ -936,8 +1025,13 @@ struct Renderer {
     color: Hsla,
     /// The page zoom, and the picture each diagram showed last (covering while a sharper loads).
     zoom: f32,
-    pictures: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, (PathBuf, Option<PathBuf>)>>>,
-    old_pictures: Rc<std::cell::RefCell<Vec<PathBuf>>>,
+    boxes: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, Bounds<Pixels>>>>,
+    last: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, PathBuf>>>,
+    decoded: std::collections::HashSet<PathBuf>,
+    images: Entity<RetainAllImageCache>,
+    /// Pictures this page shows now, and the part of the window near the screen.
+    shown: Vec<PathBuf>,
+    near: Bounds<Pixels>,
     /// Paragraphs drawn so far (for their test names).
     paras: usize,
 }
@@ -1127,33 +1221,56 @@ impl Renderer {
             }
             Block::Image(url, alt) => self.image(url, alt),
             Block::Mermaid(Ok(d), _) => {
-                // Fitted to the page and zoomed with it, drawn sharp for that size (in steps);
-                // until a sharper picture is ready, the last one shows, stretched to fit.
+                // Fitted to the page and zoomed with it. Only diagrams on or near the screen get
+                // a picture (drawn for that size, in steps); the rest are boxes of the same size,
+                // and their pictures are freed. Until a sharper picture is ready, the last one
+                // shows, stretched to fit.
                 let fit = (PAGE_W / d.w).min(1.);
-                let sharp = sharp_file(d, fit * self.zoom);
-                let prev = {
-                    let mut pics = self.pictures.borrow_mut();
-                    let entry = pics.entry(d.path.clone()).or_insert_with(|| (sharp.clone(), None));
-                    if entry.0 != sharp {
-                        // A new step: the current one covers until it loads; the one before goes.
-                        let before = std::mem::replace(entry, (sharp.clone(), Some(entry.0.clone())));
-                        if let Some(old) = before.1.filter(|o| *o != sharp) {
-                            self.old_pictures.borrow_mut().push(old);
-                        }
-                    }
-                    entry.1.clone()
-                };
                 let (w, h) = (px(d.w * fit), px(d.h * fit));
+                let near = self.boxes.borrow().get(&d.path).is_some_and(|b| b.intersects(&self.near));
                 let id = self.id();
+                let boxes = self.boxes.clone();
+                let key = d.path.clone();
+                let measure = canvas(
+                    move |b, window, _| {
+                        let first = boxes.borrow_mut().insert(key, b).is_none();
+                        if first {
+                            // Now its place is known: draw again to decide whether it's near.
+                            window.request_animation_frame();
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full();
+                let body: AnyElement = if near {
+                    let sharp = sharp_file(d, fit * self.zoom);
+                    let prev = self.last.borrow_mut().insert(d.path.clone(), sharp.clone()).filter(|p| *p != sharp && self.decoded.contains(p));
+                    self.shown.push(sharp.clone());
+                    if let Some(p) = &prev {
+                        self.shown.push(p.clone());
+                    }
+                    let images = self.images.clone();
+                    img(sharp)
+                        .image_cache(&self.images)
+                        .object_fit(ObjectFit::Fill)
+                        .w(w)
+                        .h(h)
+                        .flex_none()
+                        .with_loading(move || match prev.clone() {
+                            Some(p) => img(p).image_cache(&images).object_fit(ObjectFit::Fill).w(w).h(h).into_any_element(),
+                            None => div().w(w).h(h).into_any_element(),
+                        })
+                        .into_any_element()
+                } else {
+                    div().w(w).h(h).flex_none().into_any_element()
+                };
                 div()
                     .debug_selector(move || format!("md-mermaid-{id}"))
                     .flex()
                     .justify_center()
                     .py(px(4.))
-                    .child(img(sharp).object_fit(ObjectFit::Fill).w(w).h(h).flex_none().with_loading(move || match prev.clone() {
-                        Some(p) => img(p).object_fit(ObjectFit::Fill).w(w).h(h).into_any_element(),
-                        None => div().w(w).h(h).into_any_element(),
-                    }))
+                    .child(div().relative().flex_none().w(w).h(h).child(body).child(measure))
                     .into_any_element()
             }
             Block::Mermaid(Err(e), src) => {
@@ -1175,7 +1292,7 @@ impl Renderer {
         let path = self.base.join(url.split(['?', '#']).next().unwrap_or(url));
         if local && path.is_file() {
             let alt = alt.to_string();
-            let el = img(path.clone()).object_fit(ObjectFit::Contain).with_fallback(move || div().text_color(theme::fg_dim()).child(format!("[{alt}]")).into_any_element());
+            let el = img(path.clone()).image_cache(&self.images).object_fit(ObjectFit::Contain).with_fallback(move || div().text_color(theme::fg_dim()).child(format!("[{alt}]")).into_any_element());
             let el = match image_size(&path) {
                 Some((w, h)) if w > 0 && h > 0 => {
                     let scale = (760. / w as f32).min(1.);
