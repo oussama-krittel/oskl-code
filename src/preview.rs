@@ -64,6 +64,18 @@ pub struct PreviewView {
     info: String,
     scroll: ScrollHandle,
     refresh_task: Option<Task<()>>,
+    /// Mermaid diagrams on show, to free the ones that go away (edited or closed).
+    diagrams: Vec<PathBuf>,
+    /// Pinch zoom of the whole page (1 = 100%), and where the page was drawn.
+    zoom: f32,
+    /// The page's width at 100% when zooming started (kept while zoomed), and its last width.
+    locked_w: Option<f32>,
+    page_w: Rc<std::cell::Cell<f32>>,
+    area: Rc<std::cell::Cell<Bounds<Pixels>>>,
+    /// Each diagram's sharp picture and the one before (covering while the new one loads).
+    pictures: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, (PathBuf, Option<PathBuf>)>>>,
+    /// Pictures two zoom steps back: freed on the next draw.
+    old_pictures: Rc<std::cell::RefCell<Vec<PathBuf>>>,
     _sub: Option<Subscription>,
 }
 
@@ -87,6 +99,13 @@ impl PreviewView {
             info: String::new(),
             scroll: ScrollHandle::new(),
             refresh_task: None,
+            diagrams: Vec::new(),
+            zoom: 1.,
+            locked_w: None,
+            page_w: Default::default(),
+            area: Default::default(),
+            pictures: Default::default(),
+            old_pictures: Default::default(),
             _sub: sub,
         };
         view.refresh(window, cx);
@@ -129,7 +148,15 @@ impl PreviewView {
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.version = self.source.as_ref().map(|e| e.read(cx).buf.version());
         match self.kind {
-            Kind::Markdown => self.blocks = Rc::new(parse(&self.text(cx))),
+            Kind::Markdown => {
+                self.blocks = Rc::new(parse(&self.text(cx)));
+                let now = diagram_files(&self.blocks);
+                for old in self.diagrams.iter().filter(|p| !now.contains(p)) {
+                    forget_diagram(old, window, cx);
+                    self.pictures.borrow_mut().remove(old);
+                }
+                self.diagrams = now;
+            }
             Kind::Svg if self.source.is_some() => {
                 let text = self.text(cx);
                 let file = std::env::temp_dir().join(format!("kite-svg-{}-{:x}.svg", std::process::id(), hash(&text)));
@@ -151,6 +178,63 @@ impl PreviewView {
         cx.notify();
     }
 
+    /// A trackpad pinch over the page: zooms all of it (text, tables, code, diagrams), keeping
+    /// the spot under the fingers where it is. Returns whether this preview took it.
+    pub fn pinch(&mut self, p: crate::pinch::Pinch, cx: &mut Context<Self>) -> bool {
+        let area = self.area.get();
+        if self.kind != Kind::Markdown || !area.contains(&p.at) {
+            return false;
+        }
+        let old = self.zoom;
+        // 100% is as small as it gets: it's a magnifier, the page itself never changes.
+        let new = (old * (1. + p.magnify)).clamp(1., PAGE_ZOOM_MAX);
+        if (new - old).abs() < 1e-4 {
+            return true;
+        }
+        if self.locked_w.is_none() {
+            self.locked_w = Some(self.page_w.get() / old);
+        }
+        // The page is laid out centered at 100%: where it starts then, to scroll from there.
+        let lead = if old <= 1. { ((area.size.width / gpui::px(1.) - self.page_w.get()) / 2.).max(0.) } else { 0. };
+        self.zoom = new;
+        // The spot under the fingers stays there: it moves out by the zoom, the scroll follows.
+        let off = self.scroll.offset();
+        let k = new / old;
+        let rel = p.at - area.origin;
+        let x = (rel.x - off.x - gpui::px(lead)) * k;
+        let y = (rel.y - off.y) * k;
+        let to = point((rel.x - x).min(gpui::px(0.)), (rel.y - y).min(gpui::px(0.)));
+        self.scroll.set_offset(to);
+        if new <= 1. {
+            // Back to the page as it was.
+            self.locked_w = None;
+            self.scroll.set_offset(point(gpui::px(0.), to.y));
+        }
+        cx.notify();
+        true
+    }
+
+    /// The page's zoom (tests).
+    #[cfg(test)]
+    pub fn page_zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// How far the page scrolls each way, and how far it can (tests).
+    #[cfg(test)]
+    pub fn page_scroll(&self) -> (Point<Pixels>, Size<Pixels>) {
+        (self.scroll.offset(), self.scroll.max_offset())
+    }
+
+    fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        // Same place in the text, at its normal size.
+        let off = self.scroll.offset();
+        self.scroll.set_offset(point(gpui::px(0.), off.y / self.zoom));
+        self.zoom = 1.;
+        self.locked_w = None;
+        cx.notify();
+    }
+
     pub fn mark_stale(&mut self, cx: &mut Context<Self>) {
         self.stale = true;
         cx.notify();
@@ -159,6 +243,10 @@ impl PreviewView {
     /// Frees the decoded picture (the tab is closing).
     pub fn release(&mut self, window: &mut Window, cx: &mut App) {
         release(&self.shown, window, cx);
+        for d in std::mem::take(&mut self.diagrams) {
+            forget_diagram(&d, window, cx);
+        }
+
     }
 
     fn render_image(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -203,26 +291,50 @@ impl PreviewView {
 
     fn render_markdown(&self, cx: &mut Context<Self>) -> AnyElement {
         let blocks = self.blocks.clone();
-        let mut r = Renderer { base: self.path.parent().map(Path::to_path_buf).unwrap_or_default(), weak: cx.entity().downgrade(), n: 0, color: theme::fg() };
+        // Every size on the page follows the zoom while it's built (see `px`).
+        PAGE_SCALE.with(|s| s.set(self.zoom));
+        let mut r = Renderer {
+            base: self.path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            weak: cx.entity().downgrade(),
+            n: 0,
+            color: theme::fg(),
+            zoom: self.zoom,
+            pictures: self.pictures.clone(),
+            old_pictures: self.old_pictures.clone(),
+            paras: 0,
+        };
         let children: Vec<AnyElement> = blocks.iter().map(|b| r.block(b)).collect();
-        div()
+        let area = self.area.clone();
+        let page_w = self.page_w.clone();
+        let zoom = self.zoom;
+        // Zoomed, the page keeps the width it had at 100% and everything (that width too) grows
+        // by the zoom: lines break exactly as before, it's only bigger, and scrolls both ways.
+        let locked = self.locked_w.filter(|_| zoom > 1.);
+        let wide = locked.is_some_and(|w| w * zoom > self.area.get().size.width / gpui::px(1.));
+        let column = div()
+            .debug_selector(|| "preview-page".into())
+            .child(canvas(move |b, _, _| page_w.set(b.size.width / gpui::px(1.)), |_, _, _, _| {}).absolute().size_full());
+        let column = match locked {
+            Some(w) => column.w(gpui::px(w * zoom)),
+            // 860 wide, narrower when the pane is: a definite width either way, so tables
+            // (sized against it) stay as wide as the page.
+            None => column.w(px(860.)).max_w(relative(1.)),
+        };
+        let page = div()
             .id("markdown")
             .debug_selector(|| "preview-markdown".into())
             .size_full()
-            .overflow_y_scroll()
+            .when(locked.is_some(), |d| d.overflow_scroll())
+            .when(locked.is_none(), |d| d.overflow_y_scroll())
             .track_scroll(&self.scroll)
             .child(
                 div()
-                    .w_full()
-                    .flex()
-                    .justify_center()
+                    .when(!wide, |d| d.w_full().flex().justify_center())
+                    // Wider than the pane: as wide as the zoomed page, so it scrolls to its edges.
+                    .when_some(locked.filter(|_| wide), |d, w| d.flex_none().w(gpui::px(w * zoom)))
                     .child(
-                        div()
-                            .debug_selector(|| "preview-page".into())
-                            // 860 wide, narrower when the pane is: a definite width either way,
-                            // so tables (sized against it) stay as wide as the page.
-                            .w(px(860.))
-                            .max_w(relative(1.))
+                        column
+                            .relative()
                             .flex_shrink_0()
                             .px(px(32.))
                             .py(px(28.))
@@ -236,6 +348,36 @@ impl PreviewView {
                             .children(children),
                     ),
             )
+            .into_any_element();
+        PAGE_SCALE.with(|s| s.set(1.));
+        div()
+            .relative()
+            .size_full()
+            .child(page)
+            .child(canvas(move |bounds, _, _| area.set(bounds), |_, _, _, _| {}).absolute().top_0().left_0().size_full())
+            // While zoomed: how much, and a click to go back.
+            .when((zoom - 1.).abs() > 0.01, |d| {
+                d.child(
+                    div()
+                        .id("preview-zoom")
+                        .debug_selector(|| "preview-zoom".into())
+                        .absolute()
+                        .top(gpui::px(8.))
+                        .right(gpui::px(14.))
+                        .px(gpui::px(8.))
+                        .py(gpui::px(2.))
+                        .rounded(gpui::px(4.))
+                        .bg(theme::bg_popup())
+                        .border_1()
+                        .border_color(theme::border_input())
+                        .text_size(gpui::px(11.))
+                        .text_color(theme::fg_dim())
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(theme::fg_bright()))
+                        .on_click(cx.listener(|v, _, _, cx| v.reset_zoom(cx)))
+                        .child(format!("{}% · click for 100%", (zoom * 100.).round())),
+                )
+            })
             .into_any_element()
     }
 }
@@ -259,6 +401,13 @@ impl Render for PreviewView {
         if std::mem::take(&mut self.stale) {
             self.refresh(window, cx);
         }
+        // Zoomed past them: free the diagram pictures no longer shown or covering.
+        let in_use: Vec<PathBuf> = self.pictures.borrow().values().flat_map(|(a, b)| std::iter::once(a.clone()).chain(b.clone())).collect();
+        for p in std::mem::take(&mut *self.old_pictures.borrow_mut()) {
+            if !in_use.contains(&p) {
+                release(&p, window, cx);
+            }
+        }
         let body = match self.kind {
             Kind::Markdown => self.render_markdown(cx),
             Kind::Image | Kind::Svg => self.render_image(cx),
@@ -274,6 +423,143 @@ fn release(path: &Path, window: &mut Window, cx: &mut App) {
         window.drop_image(image).ok();
     }
     ImageSource::Resource(resource).remove_asset(cx);
+}
+
+// ---------------------------------------------------------------- Mermaid
+
+thread_local! {
+    /// Diagrams drawn, by their text and colors: unchanged ones aren't drawn again while typing.
+    static DIAGRAMS: std::cell::RefCell<std::collections::HashMap<u64, Result<Diagram, String>>> = Default::default();
+}
+
+/// Draws a Mermaid diagram to an SVG file in the theme's colors (pure Rust, no browser).
+fn mermaid(src: &str) -> Result<Diagram, String> {
+    let bg = theme::bg_editor().to_rgb();
+    let dark = 0.2126 * bg.r + 0.7152 * bg.g + 0.0722 * bg.b < 0.5;
+    let hex = |c: Hsla| {
+        let c = c.to_rgb();
+        format!("#{:02x}{:02x}{:02x}", (c.r * 255.).round() as u8, (c.g * 255.).round() as u8, (c.b * 255.).round() as u8)
+    };
+    let key = hash(&format!("{src}\u{0}{}\u{0}{}", hex(theme::bg_editor()), hex(theme::fg())));
+    if let Some(done) = DIAGRAMS.with(|d| d.borrow().get(&key).cloned()) {
+        return done;
+    }
+    let mut opts = if dark { mermaid_rs_renderer::RenderOptions { theme: mermaid_rs_renderer::Theme::dark(), ..Default::default() } } else { mermaid_rs_renderer::RenderOptions::modern() };
+    opts.theme.background = hex(theme::bg_editor());
+    // A diagram the renderer can't handle shows its source, never takes the app down.
+    let svg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mermaid_rs_renderer::render_with_options(src, opts)))
+        .map_err(|_| "the renderer couldn't draw this diagram".to_string())
+        .and_then(|r| r.map_err(|e| e.to_string().lines().next().unwrap_or("not valid Mermaid").to_string()));
+    let result = svg.and_then(|svg| {
+        let (w, h) = svg_size(&svg).ok_or("the drawing has no size")?;
+        let path = std::env::temp_dir().join(format!("kite-mermaid-{}-{key:x}.svg", std::process::id()));
+        std::fs::write(&path, &svg).map_err(|e| e.to_string())?;
+        Ok(Diagram { path, w, h })
+    });
+    DIAGRAMS.with(|d| d.borrow_mut().insert(key, result.clone()));
+    result
+}
+
+/// The page's text width.
+const PAGE_W: f32 = 796.;
+/// How far the page zooms in (100% is the least).
+const PAGE_ZOOM_MAX: f32 = 4.;
+/// The biggest picture a diagram is drawn at (in pixels): past it, it's stretched instead.
+const MAX_SHARP_PIXELS: f32 = 8_000_000.;
+
+thread_local! {
+    /// The page zoom while a Markdown page is being built; 1 otherwise.
+    static PAGE_SCALE: std::cell::Cell<f32> = const { std::cell::Cell::new(1.) };
+}
+
+/// `gpui::px` times the page zoom: the Markdown page uses this one (it shadows gpui's), so
+/// pinching zooms all of it.
+fn px(v: f32) -> Pixels {
+    gpui::px(v * PAGE_SCALE.with(|s| s.get()))
+}
+
+/// The diagram redrawn for a display scale: twice the size for Retina screens, in steps so
+/// pinching doesn't make a new picture every frame, and no bigger than MAX_SHARP_PIXELS.
+fn sharp_file(d: &Diagram, scale: f32) -> PathBuf {
+    const STEPS: [f32; 12] = [0.5, 0.75, 1., 1.5, 2., 3., 4., 6., 8., 12., 16., 24.];
+    let cap = (MAX_SHARP_PIXELS / (d.w * d.h).max(1.)).sqrt();
+    let want = (scale * 2.).min(cap);
+    let step = STEPS.iter().copied().find(|s| *s >= want).unwrap_or(STEPS[STEPS.len() - 1]).min(cap.max(0.5));
+    let path = d.path.with_extension(format!("x{}.svg", (step * 100.).round() as u32));
+    if !path.exists()
+        && let Ok(svg) = std::fs::read_to_string(&d.path)
+    {
+        std::fs::write(&path, resize_svg(&svg, d.w, d.h, step)).ok();
+    }
+    if path.exists() { path } else { d.path.clone() }
+}
+
+/// The same SVG at `step` times its size (its own coordinates kept through the viewBox).
+fn resize_svg(svg: &str, w: f32, h: f32, step: f32) -> String {
+    let Some(end) = svg.find('>') else { return svg.to_string() };
+    let Some(start) = svg[..end].find("<svg") else { return svg.to_string() };
+    let mut head = svg[start..end].to_string();
+    let drop_attr = |head: &mut String, name: &str| {
+        if let Some(at) = head.find(&format!(" {name}=\"")) {
+            let rest = at + name.len() + 3;
+            if let Some(close) = head[rest..].find('"') {
+                head.replace_range(at..rest + close + 1, "");
+            }
+        }
+    };
+    drop_attr(&mut head, "width");
+    drop_attr(&mut head, "height");
+    if !head.contains("viewBox=") {
+        head.push_str(&format!(" viewBox=\"0 0 {w} {h}\""));
+    }
+    head.push_str(&format!(" width=\"{}\" height=\"{}\"", w * step, h * step));
+    format!("{}{}{}", &svg[..start], head, &svg[end..])
+}
+
+/// An SVG's size: its width/height, else its viewBox.
+fn svg_size(svg: &str) -> Option<(f32, f32)> {
+    let head = &svg[..svg.find('>')?];
+    let attr = |name: &str| {
+        let at = head.find(&format!(" {name}=\""))? + name.len() + 3;
+        head[at..].split('"').next()
+    };
+    let num = |v: &str| v.trim_end_matches("px").parse::<f32>().ok();
+    if let (Some(w), Some(h)) = (attr("width").and_then(num), attr("height").and_then(num)) {
+        return Some((w, h));
+    }
+    let vb: Vec<f32> = attr("viewBox")?.split([' ', ',']).filter_map(|v| v.parse().ok()).collect();
+    (vb.len() == 4).then(|| (vb[2], vb[3]))
+}
+
+/// The diagram files a page shows (in lists and quotes too).
+fn diagram_files(blocks: &[Block]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for b in blocks {
+        match b {
+            Block::Mermaid(Ok(d), _) => out.push(d.path.clone()),
+            Block::Quote(inner) => out.extend(diagram_files(inner)),
+            Block::List(_, items) => out.extend(items.iter().flat_map(|i| diagram_files(&i.blocks))),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Frees a diagram no longer shown: its decoded picture, its file, and its cache entry.
+fn forget_diagram(path: &Path, window: &mut Window, cx: &mut App) {
+    release(path, window, cx);
+    std::fs::remove_file(path).ok();
+    // Its sharp copies (name.x200.svg…).
+    if let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().map(|s| s.to_string_lossy().to_string())) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with(&format!("{stem}.x")) && name.ends_with(".svg") {
+                release(&e.path(), window, cx);
+                std::fs::remove_file(e.path()).ok();
+            }
+        }
+    }
+    DIAGRAMS.with(|d| d.borrow_mut().retain(|_, v| v.as_ref().map(|x| x.path.as_path() != path).unwrap_or(true)));
 }
 
 fn hash(s: &str) -> u64 {
@@ -387,6 +673,16 @@ enum Block {
     Table(Vec<Alignment>, Vec<Vec<Inline>>),
     Image(String, String),
     Html(String),
+    /// A ```mermaid fence: the drawn diagram, or why it couldn't be (and its source).
+    Mermaid(Result<Diagram, String>, String),
+}
+
+/// A Mermaid diagram drawn to an SVG file (temporary, freed when no longer shown).
+#[derive(Clone, Debug, PartialEq)]
+struct Diagram {
+    path: PathBuf,
+    w: f32,
+    h: f32,
 }
 
 enum Frame {
@@ -530,6 +826,11 @@ impl Builder {
                 }
                 TagEnd::CodeBlock => {
                     if let Some((lang, text)) = self.code.take() {
+                        if lang.as_deref().is_some_and(|l| l.eq_ignore_ascii_case("mermaid")) {
+                            let src = text.trim_end().to_string();
+                            self.push_block(Block::Mermaid(mermaid(&src), src));
+                            return;
+                        }
                         let text = text.trim_end_matches('\n').replace('\t', "    ");
                         let spans = lang.as_deref().and_then(code_lang).and_then(|l| highlight::highlight(l, &text)).map(Arc::new);
                         self.push_block(Block::Code(text, spans));
@@ -633,6 +934,12 @@ struct Renderer {
     weak: WeakEntity<PreviewView>,
     n: usize,
     color: Hsla,
+    /// The page zoom, and the picture each diagram showed last (covering while a sharper loads).
+    zoom: f32,
+    pictures: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, (PathBuf, Option<PathBuf>)>>>,
+    old_pictures: Rc<std::cell::RefCell<Vec<PathBuf>>>,
+    /// Paragraphs drawn so far (for their test names).
+    paras: usize,
 }
 
 fn open_link(url: &str, base: &Path, weak: &WeakEntity<PreviewView>, cx: &mut App) {
@@ -713,7 +1020,11 @@ impl Renderer {
                     .child(text)
                     .into_any_element()
             }
-            Block::Para(inl) => div().child(self.inline(inl, false)).into_any_element(),
+            Block::Para(inl) => {
+                let n = self.paras;
+                self.paras += 1;
+                div().debug_selector(move || format!("md-para-{n}")).child(self.inline(inl, false)).into_any_element()
+            }
             Block::Code(text, spans) => code_block(self.id(), text, spans.as_deref()),
             Block::Quote(blocks) => {
                 let color = std::mem::replace(&mut self.color, theme::fg_dim());
@@ -815,6 +1126,46 @@ impl Renderer {
                     .into_any_element()
             }
             Block::Image(url, alt) => self.image(url, alt),
+            Block::Mermaid(Ok(d), _) => {
+                // Fitted to the page and zoomed with it, drawn sharp for that size (in steps);
+                // until a sharper picture is ready, the last one shows, stretched to fit.
+                let fit = (PAGE_W / d.w).min(1.);
+                let sharp = sharp_file(d, fit * self.zoom);
+                let prev = {
+                    let mut pics = self.pictures.borrow_mut();
+                    let entry = pics.entry(d.path.clone()).or_insert_with(|| (sharp.clone(), None));
+                    if entry.0 != sharp {
+                        // A new step: the current one covers until it loads; the one before goes.
+                        let before = std::mem::replace(entry, (sharp.clone(), Some(entry.0.clone())));
+                        if let Some(old) = before.1.filter(|o| *o != sharp) {
+                            self.old_pictures.borrow_mut().push(old);
+                        }
+                    }
+                    entry.1.clone()
+                };
+                let (w, h) = (px(d.w * fit), px(d.h * fit));
+                let id = self.id();
+                div()
+                    .debug_selector(move || format!("md-mermaid-{id}"))
+                    .flex()
+                    .justify_center()
+                    .py(px(4.))
+                    .child(img(sharp).object_fit(ObjectFit::Fill).w(w).h(h).flex_none().with_loading(move || match prev.clone() {
+                        Some(p) => img(p).object_fit(ObjectFit::Fill).w(w).h(h).into_any_element(),
+                        None => div().w(w).h(h).into_any_element(),
+                    }))
+                    .into_any_element()
+            }
+            Block::Mermaid(Err(e), src) => {
+                let id = self.id();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(div().debug_selector(move || format!("md-mermaid-error-{id}")).text_size(px(12.)).text_color(theme::git_deleted()).child(format!("Mermaid diagram not drawn: {e}")))
+                    .child(code_block(self.id(), src, None))
+                    .into_any_element()
+            }
             Block::Html(text) => div().font_family(theme::MONO_FONT).text_size(px(12.)).text_color(theme::fg_muted()).child(text.trim().to_string()).into_any_element(),
         }
     }
@@ -912,7 +1263,37 @@ fn code_runs(line: &str, spans: Option<&Vec<(Range<usize>, u8)>>) -> Vec<TextRun
 
 #[cfg(test)]
 mod tests {
-    use super::{Block, image_size, parse};
+    use super::{Block, image_size, mermaid, parse};
+
+    #[test]
+    fn mermaid_fences_become_diagrams() {
+        // This process's memory (macOS `ps`, in KB).
+        let rss = || {
+            let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap_or(0.) / 1024.
+        };
+        let before = rss();
+        for (kind, src) in [
+            ("flowchart", "flowchart LR\n  A[Start] --> B{Ok?}\n  B -->|yes| C[Done]\n  B -->|no| A"),
+            ("sequence", "sequenceDiagram\n  Alice->>Bob: Hello\n  Bob-->>Alice: Hi"),
+            ("class", "classDiagram\n  Animal <|-- Duck\n  Animal : +int age"),
+            ("state", "stateDiagram-v2\n  [*] --> Still\n  Still --> Moving\n  Moving --> [*]"),
+            ("er", "erDiagram\n  CUSTOMER ||--o{ ORDER : places"),
+            ("gantt", "gantt\n  title Plan\n  dateFormat YYYY-MM-DD\n  section A\n  Task :a1, 2026-01-01, 3d"),
+            ("pie", "pie title Pets\n  \"Dogs\" : 386\n  \"Cats\" : 85"),
+        ] {
+            let d = mermaid(src).unwrap_or_else(|e| panic!("{kind}: {e}"));
+            assert!(d.w > 10. && d.h > 10., "{kind}: {d:?}");
+            assert!(std::fs::read_to_string(&d.path).unwrap().contains("<svg"), "{kind}");
+            assert_eq!(mermaid(src).unwrap(), d, "{kind}: drawn once, then reused");
+            std::fs::remove_file(&d.path).ok();
+        }
+        eprintln!("[mermaid] memory {before:.1} MB -> {:.1} MB after drawing 7 diagrams", rss());
+        assert!(mermaid("flowchart LR\n  A --> ").is_err() || mermaid("this is not mermaid").is_err(), "nonsense is an error, not a panic");
+        let b = parse("Before\n\n```mermaid\ngraph TD; A-->B\n```\n\n```mermaid\nnot a diagram at all\n```\n");
+        assert!(matches!(&b[1], Block::Mermaid(Ok(_), _)), "{:?}", b[1]);
+        assert!(matches!(&b[2], Block::Mermaid(Err(_), src) if src == "not a diagram at all"), "the source stays, to show with the error");
+    }
 
     #[test]
     fn parses_the_usual_markdown() {

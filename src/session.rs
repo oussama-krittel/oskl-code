@@ -38,6 +38,17 @@ pub struct Session {
     /// Where the window was: which display, its size, maximized or full screen.
     #[serde(default)]
     pub window: Option<WindowPlace>,
+    /// What each repository's graph shows, when not Auto.
+    #[serde(default)]
+    pub graph: Vec<GraphScope>,
+}
+
+/// The branches a repository's graph shows: all of them, or a pick (both off: Auto).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct GraphScope {
+    pub root: PathBuf,
+    pub all: bool,
+    pub only: Vec<String>,
 }
 
 /// A window's place on screen, to open it there again (like VS Code).
@@ -140,6 +151,7 @@ mod tests {
             side_w: 300.,
             folders: vec![],
             window: Some(super::WindowPlace { display: Some("ABC".into()), state: "fullscreen".into(), x: 10., y: 20., w: 1200., h: 800. }),
+            graph: vec![super::GraphScope { root: "/p".into(), all: false, only: vec!["main".into(), "origin/java".into()] }],
         };
         let text = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<Session>(&text).unwrap(), s);

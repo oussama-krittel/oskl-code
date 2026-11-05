@@ -21,6 +21,7 @@ mod icons;
 mod keybindings;
 mod keymap;
 mod merge_view;
+mod pinch;
 mod preview;
 mod repo;
 mod rust_def;
@@ -157,6 +158,21 @@ fn main() {
         cx.on_app_quit(|cx| {
             session::save_windows(&workspace::open_project_roots(cx));
             async {}
+        })
+        .detach();
+
+        // Trackpad pinches (GPUI doesn't deliver them): to the window they happened in.
+        let (pinch_tx, mut pinch_rx) = futures::channel::mpsc::unbounded::<pinch::Pinch>();
+        pinch::listen(pinch_tx);
+        cx.spawn(async move |cx| {
+            while let Some(p) = pinch_rx.next().await {
+                cx.update(|cx| {
+                    if let Some(ws) = cx.active_window().and_then(|w| w.downcast::<Workspace>()) {
+                        ws.update(cx, |ws, window, cx| ws.pinch(p, window, cx)).ok();
+                    }
+                })
+                .ok();
+            }
         })
         .detach();
 

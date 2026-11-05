@@ -489,6 +489,8 @@ pub struct Workspace {
     font_size: f32,
     blame_default: bool,
     window_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// Saved graph filters of repositories not found yet (applied when they are).
+    graph_scopes: Vec<crate::session::GraphScope>,
     /// This window's display, size and full-screen state, saved with the session.
     place: Option<crate::session::WindowPlace>,
     window_handle: AnyWindowHandle,
@@ -615,6 +617,7 @@ impl Workspace {
             blame_default: settings.blame_default,
             settings,
             window_bounds: Rc::new(Cell::new(Bounds::default())),
+            graph_scopes: Vec::new(),
             place: Some(window_place(window, cx)),
             window_handle: window.window_handle(),
             tool_task: None,
@@ -708,6 +711,22 @@ impl Workspace {
 
     /// Finds the git repositories of the project and the added folders (and those nested in
     /// them), keeps the one shown if it's still there, and tells the panels.
+    /// Puts back the branches each repository's graph showed last time (once, when it's found).
+    fn apply_graph_scopes(&mut self, cx: &mut Context<Self>) {
+        let repos: Vec<Entity<Repo>> = self.repos.iter().chain(std::iter::once(&self.repo)).cloned().collect();
+        let mut pending = std::mem::take(&mut self.graph_scopes);
+        pending.retain(|s| {
+            let Some(r) = repos.iter().find(|r| r.read(cx).root == s.root) else { return true };
+            r.update(cx, |r, cx| {
+                r.graph_all = s.all;
+                r.graph_only = s.only.clone();
+                r.refresh_log(cx);
+            });
+            false
+        });
+        self.graph_scopes = pending;
+    }
+
     fn refresh_repos(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let folders: Vec<Entity<Repo>> = std::iter::once(self.repo.clone()).chain(self.folders.clone()).collect();
         let mut list: Vec<Entity<Repo>> = Vec::new();
@@ -728,6 +747,8 @@ impl Workspace {
         if !list.contains(&self.git) {
             self.git = list.first().cloned().unwrap_or_else(|| self.repo.clone());
         }
+        self.repos = list.clone();
+        self.apply_graph_scopes(cx);
         let mut watched = list.clone();
         if !watched.contains(&self.repo) {
             watched.push(self.repo.clone());
@@ -1276,6 +1297,20 @@ impl Workspace {
             side_w: self.side_w,
             folders: self.folders.iter().map(|f| f.read(cx).root.clone()).collect(),
             window: self.place.clone(),
+            graph: self
+                .repos
+                .iter()
+                .chain(std::iter::once(&self.repo))
+                .map(|r| r.read(cx))
+                .filter(|r| r.graph_all || !r.graph_only.is_empty())
+                .map(|r| crate::session::GraphScope { root: r.root.clone(), all: r.graph_all, only: r.graph_only.clone() })
+                .chain(self.graph_scopes.iter().cloned())
+                .fold(Vec::new(), |mut v: Vec<crate::session::GraphScope>, s| {
+                    if !v.iter().any(|x| x.root == s.root) {
+                        v.push(s);
+                    }
+                    v
+                }),
         }
     }
 
@@ -1298,6 +1333,8 @@ impl Workspace {
             return;
         }
         let Some(saved) = crate::session::load(&self.root(cx)) else { return };
+        self.graph_scopes = saved.graph.clone();
+        self.apply_graph_scopes(cx);
         for dir in saved.folders.iter().filter(|d| d.is_dir()) {
             self.add_folder(dir.clone(), window, cx);
         }
@@ -2536,6 +2573,24 @@ impl Workspace {
     fn side_edge_distance(&self, p: Point<Pixels>) -> f32 {
         let b = self.window_bounds.get();
         if self.settings.sidebar_right { (b.right() - p.x) / gpui::px(1.) } else { (p.x - b.left()) / gpui::px(1.) }
+    }
+
+    /// A trackpad pinch: to the Markdown preview (shown in some split) under the fingers.
+    pub fn pinch(&mut self, p: crate::pinch::Pinch, _: &mut Window, cx: &mut Context<Self>) {
+        let shown: Vec<Entity<crate::preview::PreviewView>> = self
+            .panes
+            .iter()
+            .filter_map(|pane| pane.active.and_then(|t| self.tabs.iter().find(|tab| tab.id == t)))
+            .filter_map(|tab| match &tab.kind {
+                TabKind::Preview(v) => Some(v.clone()),
+                _ => None,
+            })
+            .collect();
+        for v in shown {
+            if v.update(cx, |v, cx| v.pinch(p, cx)) {
+                break;
+            }
+        }
     }
 
     /// ⌘⇧+ / ⌘⇧− / ⌘⇧0: zoom the interface (panels, tabs, bars), leaving code text as it is.
@@ -6548,6 +6603,110 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     #[gpui::test]
+    fn markdown_preview_draws_mermaid_diagrams(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::write(root.join("flow.md"), "```mermaid\nflowchart LR\n  A[Order] --> B{Paid?}\n  B -->|yes| C[Ship]\n```\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("flow.md"), None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).unwrap();
+        cx.simulate_keystrokes("cmd-k v");
+        cx.run_until_parked();
+        let shown = cx.debug_bounds("md-mermaid-1").expect("the diagram is drawn");
+        assert!(shown.size.width > gpui::px(100.) && shown.size.height > gpui::px(20.), "{shown:?}");
+        let files = || std::fs::read_dir(std::env::temp_dir()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&format!("kite-mermaid-{}-", std::process::id()))).count();
+        let before = files();
+
+        // Broken while typing: the error and the source show, and the old picture is freed.
+        ed.update(cx, |e, cx| e.set_text("```mermaid\nflowchart LR\n  A[Order] -->\n```\n", cx));
+        cx.executor().advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        if cx.debug_bounds("md-mermaid-error-1").is_some() {
+            assert!(files() < before, "the replaced diagram's file is gone");
+        }
+        // Fixed again: drawn again.
+        ed.update(cx, |e, cx| e.set_text("```mermaid\nsequenceDiagram\n  Shop->>Bank: Pay\n```\n", cx));
+        cx.executor().advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("md-mermaid-1").is_some(), "a sequence diagram now");
+    }
+
+    #[gpui::test]
+    fn pinching_the_preview_magnifies_it_without_rewrapping(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let mut md = String::from("# Title\n\n");
+        md.push_str(&"A long paragraph that wraps over several lines in the preview, so we can see it keeps its line breaks. ".repeat(6));
+        md.push_str("\n\n");
+        for i in 0..30 {
+            md.push_str(&format!("Paragraph {i} with some words to read.\n\n"));
+        }
+        md.push_str("```mermaid\nflowchart LR\n  A[Order] --> B{Paid?}\n  B -->|yes| C[Ship]\n```\n");
+        std::fs::write(root.join("doc.md"), md).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("doc.md"), None, false, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-k v");
+        cx.run_until_parked();
+        let preview = ws.read_with(cx, |ws, _| ws.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Preview(v) => Some(v.clone()),
+            _ => None,
+        })).expect("the preview");
+        let zoom = |cx: &mut VisualTestContext| preview.read_with(cx, |v, _| v.page_zoom());
+        let pinch = |cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>, magnify: f32| {
+            ws.update_in(cx, |ws, window, cx| ws.pinch(crate::pinch::Pinch { magnify, at }, window, cx));
+            cx.run_until_parked();
+        };
+        let page = cx.debug_bounds("preview-markdown").expect("the page");
+        let para = cx.debug_bounds("md-para-0").expect("the long paragraph");
+        let diagram = cx.debug_bounds("md-mermaid-1").expect("the diagram");
+
+        // Over the editor beside it: nothing. Pinching in at 100%: nothing (it's the least).
+        pinch(cx, gpui::point(page.left() - gpui::px(100.), page.center().y), 0.5);
+        pinch(cx, page.center(), -0.3);
+        assert_eq!(zoom(cx), 1., "100% is as small as it gets");
+
+        // Out, in small steps like a real pinch, over the long paragraph.
+        let at = para.center();
+        for _ in 0..20 {
+            pinch(cx, at, 0.035);
+        }
+        let z = zoom(cx);
+        assert!((1.9..2.1).contains(&z), "zoomed to {z}");
+        // Pure magnification: the paragraph is just bigger, with the same lines (same height ratio).
+        let big = cx.debug_bounds("md-para-0").unwrap();
+        let (wr, hr) = (big.size.width / para.size.width, big.size.height / para.size.height);
+        assert!((wr - z).abs() < 0.03 && (hr - z).abs() < 0.03, "{z}x: width {wr:.3}x, height {hr:.3}x (lines kept)");
+        let dbig = cx.debug_bounds("md-mermaid-1").unwrap();
+        assert!((dbig.size.width / diagram.size.width - z).abs() < 0.05, "the diagram too");
+        // The spot under the fingers is still under them.
+        let rel_before = (at.y - para.top()) / para.size.height;
+        let rel_now = (at.y - big.top()) / big.size.height;
+        assert!((rel_before - rel_now).abs() < 0.05, "{rel_before:.2} → {rel_now:.2}");
+        // Scrolls both ways, as far as the zoomed page goes.
+        let (_, max) = preview.read_with(cx, |v, _| v.page_scroll());
+        assert!(max.width > gpui::px(100.) && max.height > gpui::px(100.), "{max:?}");
+
+        // Pinching back stops at 100%, the page exactly as it was.
+        for _ in 0..40 {
+            pinch(cx, at, -0.05);
+        }
+        assert_eq!(zoom(cx), 1.);
+        let back = cx.debug_bounds("md-para-0").unwrap();
+        assert!((back.size.width - para.size.width).abs() < gpui::px(1.) && (back.size.height - para.size.height).abs() < gpui::px(1.), "{para:?} → {back:?}");
+        let (off, _) = preview.read_with(cx, |v, _| v.page_scroll());
+        assert_eq!(off.x, gpui::px(0.), "no sideways scroll left over");
+
+        // The label resets it in one click.
+        for _ in 0..10 {
+            pinch(cx, at, 0.05);
+        }
+        let label = cx.debug_bounds("preview-zoom").expect("shows how much").center();
+        cx.simulate_click(label, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(zoom(cx), 1.);
+    }
+
+    #[gpui::test]
     fn previews_follow_markdown_and_show_pictures(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));
@@ -7041,6 +7200,44 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
             assert_eq!(ws.panes.len(), 4);
             assert_eq!(ws.pane(right).unwrap().items.len(), 1, "back in the right split");
         });
+    }
+
+    #[gpui::test]
+    fn the_graphs_branch_choice_is_remembered_per_project(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            sh("echo a > a.txt && git add . && git commit -qm one && git branch java && git branch auth");
+        });
+        cx.run_until_parked();
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        // Pick two branches, as the filter does.
+        ws.update(cx, |ws, cx| ws.repo.update(cx, |r, cx| {
+            r.graph_only = vec!["main".into(), "java".into()];
+            r.refresh_log(cx);
+        }));
+        ws.update(cx, |ws, cx| ws.save_session(cx));
+
+        // Closed and opened again: the same pick.
+        let (ws2, cx2) = cx.add_window_view(|window, cx| Workspace::new(root.clone(), window, cx));
+        ws2.update_in(cx2, |ws, window, cx| ws.restore_session(window, cx));
+        cx2.run_until_parked();
+        let scope = ws2.read_with(cx2, |ws, cx| (ws.repo.read(cx).graph_all, ws.repo.read(cx).graph_only.clone()));
+        assert_eq!(scope, (false, vec!["main".to_string(), "java".to_string()]));
+
+        // "All branches" too; back to Auto saves nothing.
+        ws2.update(cx2, |ws, cx| ws.repo.update(cx, |r, _| {
+            r.graph_all = true;
+            r.graph_only.clear();
+        }));
+        ws2.update(cx2, |ws, cx| ws.save_session(cx));
+        let saved = crate::session::load(&root).unwrap().graph;
+        assert_eq!((saved.len(), saved[0].all), (1, true));
+        ws2.update(cx2, |ws, cx| ws.repo.update(cx, |r, _| r.graph_all = false));
+        ws2.update(cx2, |ws, cx| ws.save_session(cx));
+        assert!(crate::session::load(&root).unwrap().graph.is_empty(), "Auto is the default");
     }
 
     #[gpui::test]
