@@ -834,6 +834,30 @@ impl DbView {
         }
     }
 
+    /// Deletes the saved connection (asking first), then closes the form.
+    fn ask_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(f) = self.form_mut() else { return };
+        let (id, name) = (f.conn.id.clone(), f.conn.title());
+        let weak = cx.entity().downgrade();
+        cx.emit(Request::Ask(crate::dialog::Ask {
+            title: format!("Delete the connection “{name}”?"),
+            detail: "Its saved settings and password are removed. The database itself isn't touched.".into(),
+            buttons: vec!["Delete".into()],
+            danger: true,
+            cancel_default: false,
+            cancel_label: None,
+            on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
+                db::delete(&id).ok();
+                if let Some(v) = weak.upgrade() {
+                    v.update(cx, |_, cx| {
+                        cx.emit(Request::Db(DbRequest::Changed { expand: None }));
+                        cx.emit(Request::Db(DbRequest::Close));
+                    });
+                }
+            }),
+        }));
+    }
+
     /// Saves, opens it in the panel, and closes the form.
     fn connect(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.save(cx) {
@@ -1080,7 +1104,8 @@ impl DbView {
                                 v.save(cx);
                             })))
                             .child(button("db-connect", "Connect", Some("plus"), true).on_click(cx.listener(|v, _, w, cx| v.connect(w, cx))))
-                            .child(button("db-close", "Close", Some("close"), false).on_click(cx.listener(|_, _, _, cx| cx.emit(Request::Db(DbRequest::Close))))),
+                            .child(button("db-close", "Close", Some("close"), false).on_click(cx.listener(|_, _, _, cx| cx.emit(Request::Db(DbRequest::Close)))))
+                            .when(f.saved, |el| el.child(div().flex_1()).child(button("db-delete", "Delete", Some("trash"), false).text_color(theme::git_deleted()).on_click(cx.listener(|v, _, _, cx| v.ask_delete(cx))))),
                     )
                     .when_some(status, |d, s| {
                         let (ok, text) = match s {

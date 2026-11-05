@@ -4496,22 +4496,18 @@ impl Workspace {
             .when(active_ix.is_none() && self.panes.len() > 1, |d| {
                 d.child(glyph("close-pane", "close", "Close pane (⌘⇧W)").on_click(cx.listener(move |ws, _, w, cx| ws.close_pane(id, w, cx))))
             });
-        // The window buttons over this pane's corner (the sidebar is hidden): the frame steps
-        // around them, like a title bar, instead of running underneath.
-        let notch = (id == self.top_left_pane() && self.lights_pad > 0.).then(|| {
-            let w = gpui::px(self.lights_pad + 6.);
-            let h = px(24.) - gpui::px(1.);
-            div()
-                .absolute()
-                .top(gpui::px(-1.))
-                .left(gpui::px(-1.))
-                .w(w)
-                .h(h + gpui::px(1.))
-                .bg(theme::bg_editor())
-                .border_b_1()
-                .border_r_1()
-                .border_color(frame)
-                .rounded_br(px(6.))
+        // The window buttons over this pane's corner (the sidebar is hidden): no frame there,
+        // only a line beside and one under them, so the frame runs around them like a title bar.
+        let notch = (id == self.top_left_pane() && self.lights_pad > 0.).then(|| (gpui::px(self.lights_pad + 6.), px(24.)));
+        let notch_lines = notch.map(|(w, h)| {
+            let line = || div().absolute().bg(frame);
+            vec![
+                // Under the buttons, and beside them (a small rounded step between).
+                div().absolute().top_0().left_0().w(w).h(h).border_b_1().border_r_1().border_color(frame).rounded_br(px(6.)).into_any_element(),
+                // The frame's top, from the step on; its left side, from under the buttons down.
+                line().top_0().left(w - px(1.)).right_0().h(gpui::px(1.)).into_any_element(),
+                line().left_0().top(h - px(1.)).bottom_0().w(gpui::px(1.)).into_any_element(),
+            ]
         });
         div()
             .size_full()
@@ -4523,12 +4519,13 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .rounded(px(6.))
-                    .when(notch.is_some(), |d| d.rounded_tl(gpui::px(0.)))
-                    .border_1()
+                    .when(notch.is_none(), |d| d.border_1())
+                    // Its top and left are drawn as lines that leave the buttons' corner open.
+                    .when(notch.is_some(), |d| d.rounded_tl(gpui::px(0.)).rounded_tr(gpui::px(0.)).rounded_bl(gpui::px(0.)).border_r_1().border_b_1())
                     .border_color(frame)
                     .bg(theme::bg_editor())
                     .overflow_hidden()
-                    .children(notch)
+                    .children(notch_lines.into_iter().flatten())
                     .capture_any_mouse_down(cx.listener(move |ws, _, _, cx| {
                         if ws.focused_pane != id {
                             ws.set_focused_pane(id);
@@ -7713,6 +7710,8 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("db-connect-0").is_some(), "not connected: Connect shows");
+        assert!(cx.debug_bounds("db-edit-0").is_some() && cx.debug_bounds("db-delete-0").is_some(), "with Edit and Remove");
+        assert!(cx.debug_bounds("db-query-0").is_none(), "queries only once it's connected");
         click_on(cx, "db-connect-0");
         wait_for(cx, "the popup", |cx| ws.read_with(cx, |ws, _| ws.ask.is_some()));
         assert!(cx.debug_bounds("dialog-button-Retry").is_some() && cx.debug_bounds("dialog-button-Close").is_some(), "Retry and Close");

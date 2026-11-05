@@ -388,6 +388,7 @@ impl DbPanel {
                     .child(name(title, theme::fg_bright()))
                     .when(c.project.is_some(), |d| d.child(div().text_size(px(10.)).text_color(theme::fg_muted()).child("workspace")))
                     .when(live, |d| d.child(ui::small_icon("dot", theme::git_added()).size(px(9.))))
+                    // Not connected: Connect and Edit, always shown; the rest once it's connected.
                     .when(!live, |d| {
                         let id = id.clone();
                         d.child(
@@ -409,29 +410,73 @@ impl DbPanel {
                                 }))
                                 .child("Connect"),
                         )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("db-edit-{ci}")))
+                                .debug_selector(move || format!("db-edit-{ci}"))
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .size(px(20.))
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::ca(0x5a5d5e50)))
+                                .tooltip(ui::tooltip("Edit connection"))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(Request::Db(DbRequest::Open(Open::Edit(i4.clone()))));
+                                }))
+                                .child(ui::small_icon("settings", theme::fg_dim())),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("db-delete-{ci}")))
+                                .debug_selector(move || format!("db-delete-{ci}"))
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .size(px(20.))
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::ca(0x5a5d5e50)))
+                                .tooltip(ui::tooltip("Remove connection"))
+                                .on_click(cx.listener(move |p, _, _, cx| {
+                                    cx.stop_propagation();
+                                    p.delete(ci, cx);
+                                }))
+                                .child(ui::small_icon("trash", theme::fg_dim())),
+                        )
                     })
-                    .child(actions().child(hover_button(format!("db-query-{ci}"), "terminal", "New query").on_click(cx.listener(move |_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.emit(Request::Db(DbRequest::Open(Open::Query { conn: i2.clone(), path: Vec::new() })));
-                    })))
-                    .child(hover_button(format!("db-refresh-{ci}"), "refresh", "Refresh").on_click(cx.listener(move |p, _, _, cx| {
-                        cx.stop_propagation();
-                        p.refresh(&i3, Vec::new(), cx);
-                    })))
-                    .child(hover_button(format!("db-edit-{ci}"), "settings", "Edit connection").on_click(cx.listener(move |_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.emit(Request::Db(DbRequest::Open(Open::Edit(i4.clone()))));
-                    })))
                     .when(live, |d| {
-                        d.child(hover_button(format!("db-disconnect-{ci}"), "close", "Disconnect").on_click(cx.listener(move |p, _, _, cx| {
-                            cx.stop_propagation();
-                            p.disconnect(&i5, cx);
-                        })))
+                        d.child(
+                            actions()
+                                .child(hover_button(format!("db-query-{ci}"), "terminal", "New query").on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(Request::Db(DbRequest::Open(Open::Query { conn: i2.clone(), path: Vec::new() })));
+                                })))
+                                .child(hover_button(format!("db-refresh-{ci}"), "refresh", "Refresh").on_click(cx.listener(move |p, _, _, cx| {
+                                    cx.stop_propagation();
+                                    p.refresh(&i3, Vec::new(), cx);
+                                })))
+                                .child(hover_button(format!("db-edit-{ci}"), "settings", "Edit connection").on_click(cx.listener({
+                                    let id = id.clone();
+                                    move |_, _, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.emit(Request::Db(DbRequest::Open(Open::Edit(id.clone()))));
+                                    }
+                                })))
+                                .child(hover_button(format!("db-disconnect-{ci}"), "close", "Disconnect").on_click(cx.listener(move |p, _, _, cx| {
+                                    cx.stop_propagation();
+                                    p.disconnect(&i5, cx);
+                                })))
+                                .child(hover_button(format!("db-delete-{ci}"), "trash", "Remove connection").on_click(cx.listener(move |p, _, _, cx| {
+                                    cx.stop_propagation();
+                                    p.delete(ci, cx);
+                                }))),
+                        )
                     })
-                    .child(hover_button(format!("db-delete-{ci}"), "discard", "Delete connection").on_click(cx.listener(move |p, _, _, cx| {
-                        cx.stop_propagation();
-                        p.delete(ci, cx);
-                    }))))
                     .into_any_element()
             }
             RowKind::Node(ci, n) => {
