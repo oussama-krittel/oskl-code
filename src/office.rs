@@ -133,8 +133,18 @@ fn excel_date(v: f64) -> String {
     if secs == 0 { format!("{y:04}-{m:02}-{d:02}") } else { format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", secs / 3600, secs / 60 % 60) }
 }
 
+/// Runs a reader so that a file it trips over is an error, never a crash.
+fn guarded<T>(what: impl FnOnce() -> Result<T, String> + std::panic::UnwindSafe) -> Result<T, String> {
+    std::panic::catch_unwind(what).unwrap_or_else(|_| Err("this file has something this reader doesn't understand".into()))
+}
+
 /// The sheets of a workbook: (name, rows), and whether some were cut at MAX_ROWS.
 pub fn xlsx(path: &Path) -> Result<(Vec<(String, Vec<Vec<String>>)>, bool), String> {
+    let path = path.to_path_buf();
+    guarded(move || read_xlsx(&path))
+}
+
+fn read_xlsx(path: &Path) -> Result<(Vec<(String, Vec<Vec<String>>)>, bool), String> {
     let mut z = Zip::open(path)?;
     // Shared strings: most text lives here, cells point to it.
     let mut shared: Vec<String> = Vec::new();
@@ -320,6 +330,11 @@ pub fn xlsx(path: &Path) -> Result<(Vec<(String, Vec<Vec<String>>)>, bool), Stri
 
 /// A Word document as Markdown.
 pub fn docx_markdown(path: &Path) -> Result<String, String> {
+    let path = path.to_path_buf();
+    guarded(move || read_docx(&path))
+}
+
+fn read_docx(path: &Path) -> Result<String, String> {
     let mut z = Zip::open(path)?;
     let x = z.read("word/document.xml").ok_or("no document in this file (is it the old .doc format?)")?;
     // Numbered lists vs bullets: numbering definitions say which.
@@ -368,6 +383,11 @@ pub fn docx_markdown(path: &Path) -> Result<String, String> {
             return;
         }
         let t = std::mem::take(run);
+        // Only spaces: nothing to mark (and no inside to cut out).
+        if t.trim().is_empty() {
+            para.push_str(&t);
+            return;
+        }
         let (lead, body, trail) = {
             let start = t.len() - t.trim_start().len();
             let end = t.trim_end().len();
@@ -582,7 +602,7 @@ mod tests {
         zip(&p, &[
             ("word/document.xml", r#"<w:document><w:body>
                 <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Plan</w:t></w:r></w:p>
-                <w:p><w:r><w:t xml:space="preserve">Ship it </w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>today</w:t></w:r><w:r><w:t>.</w:t></w:r></w:p>
+                <w:p><w:r><w:t xml:space="preserve">Ship it </w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>today</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve"> </w:t></w:r><w:r><w:t>.</w:t></w:r></w:p>
                 <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>First</w:t></w:r></w:p>
                 <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Second</w:t></w:r></w:p>
                 <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Qty</w:t></w:r></w:p></w:tc></w:tr>
@@ -591,7 +611,7 @@ mod tests {
             ("word/numbering.xml", r#"<w:numbering><w:abstractNum w:abstractNumId="7"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="7"/></w:num></w:numbering>"#),
         ]);
         let md = docx_markdown(&p).unwrap();
-        assert_eq!(md, "# Plan\n\nShip it **today**.\n\n1. First\n2. Second\n\n| Name | Qty |\n| --- | --- |\n| Pen | 2 |\n\n");
+        assert_eq!(md, "# Plan\n\nShip it **today** .\n\n1. First\n2. Second\n\n| Name | Qty |\n| --- | --- |\n| Pen | 2 |\n\n");
         std::fs::remove_file(p).ok();
     }
 }

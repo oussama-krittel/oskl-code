@@ -1972,6 +1972,24 @@ fn code_runs(line: &str, spans: Option<&Vec<(Range<usize>, u8)>>) -> Vec<TextRun
 
 #[cfg(test)]
 mod tests {
+    /// Real files from KITE_OFFICE_FILES (one path a line): read without panicking.
+    #[test]
+    fn real_office_files_read() {
+        let Ok(list) = std::env::var("KITE_OFFICE_FILES") else { return };
+        for p in list.lines().filter(|l| !l.trim().is_empty()) {
+            let path = std::path::Path::new(p.trim());
+            eprintln!("-- {p}");
+            if p.ends_with(".docx") {
+                let md = crate::office::docx_markdown(path).unwrap();
+                eprintln!("{} chars", md.len());
+                let _ = super::parse(&md);
+            } else {
+                let (s, _) = crate::office::xlsx(path).unwrap();
+                eprintln!("{} sheets", s.len());
+            }
+        }
+    }
+
     use super::{Block, Diagram, PENDING, PREVIOUS, TILE, crop_svg, emoji_in_emoji_font, image_size, mermaid_now, outline_text, parse, tiles};
 
     #[test]
