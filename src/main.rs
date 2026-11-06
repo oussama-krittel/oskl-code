@@ -1,3 +1,6 @@
+mod api;
+mod api_panel;
+mod api_view;
 mod assets;
 mod buffer;
 mod colors;
@@ -159,6 +162,7 @@ fn main() {
         diff_edit::bind_keys();
         dialog::bind_keys();
         db_view::bind_keys();
+        api_view::bind_keys();
         keybindings::apply(cx);
         cx.on_action(|_: &QuitApp, cx| cx.quit());
         cx.on_action(|_: &NewWindow, cx| open_window(workspace::no_project_dir(), cx));

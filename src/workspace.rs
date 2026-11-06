@@ -181,6 +181,8 @@ enum Side {
     Git,
     /// Saved database connections.
     Databases,
+    /// API requests: collections, history, environments.
+    Api,
     /// Settings, and its Shortcuts tab (the shortcuts list).
     Settings,
     Keys,
@@ -213,6 +215,7 @@ enum TabKind {
     Merge(Entity<crate::merge_view::MergeView>),
     Preview(Entity<PreviewView>),
     Db(Entity<crate::db_view::DbView>),
+    Api(Entity<crate::api_view::ApiView>),
 }
 
 /// What the find bar (⌘F) searches: a text editor, or a read-only diff.
@@ -455,6 +458,7 @@ pub struct Workspace {
     tree: Entity<FileTree>,
     git_panel: Entity<GitPanel>,
     db_panel: Entity<crate::db_panel::DbPanel>,
+    api_panel: Entity<crate::api_panel::ApiPanel>,
     search: Entity<SearchPanel>,
     keys: Entity<KeysPanel>,
     settings: Settings,
@@ -553,7 +557,8 @@ impl Workspace {
         let tree = cx.new(|cx| FileTree::new(repo.clone(), cx));
         let git_panel = cx.new(|cx| GitPanel::new(repo.clone(), window, cx));
         let db_root = repo.read(cx).root.clone();
-        let db_panel = cx.new(|cx| crate::db_panel::DbPanel::new(vec![db_root], cx));
+        let db_panel = cx.new(|cx| crate::db_panel::DbPanel::new(vec![db_root.clone()], cx));
+        let api_panel = cx.new(|cx| crate::api_panel::ApiPanel::new(if root_is_project(&db_root) { vec![db_root] } else { Vec::new() }, cx));
         let cmd = cx.new(|cx| Editor::new(EditorMode::SingleLine, cx));
         let search = cx.new(|cx| SearchPanel::new(repo.clone(), window, cx));
         let keys = cx.new(|cx| KeysPanel::new(window, cx));
@@ -579,6 +584,7 @@ impl Workspace {
             cx.subscribe_in(&tree, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&git_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&db_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
+            cx.subscribe_in(&api_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&cmd, window, |ws, _, ev: &EditorEvent, window, cx| ws.on_cmd_event(ev, window, cx)),
         ];
         let project = repo.read(cx).root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -593,6 +599,7 @@ impl Workspace {
             tree,
             git_panel,
             db_panel,
+            api_panel,
             search,
             keys,
             tabs: Vec::new(),
@@ -956,6 +963,12 @@ impl Workspace {
             }
             // Only a tab sends this (handled where it's subscribed).
             Request::Db(crate::db_view::DbRequest::Close) => {}
+            Request::Api(crate::api_view::ApiRequest::Open(open)) => self.open_api(open.clone(), window, cx),
+            Request::Api(crate::api_view::ApiRequest::Changed) => {
+                self.api_panel.update(cx, |p, cx| p.reload(cx));
+                cx.notify();
+            }
+            Request::Api(crate::api_view::ApiRequest::Close) => {}
             Request::MarkResolved(rel) => {
                 let rel = rel.clone();
                 if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Merge(m) if m.read(cx).rel == rel)) {
@@ -1335,6 +1348,7 @@ impl Workspace {
                 Side::Search => "search",
                 Side::Git => "git",
                 Side::Databases => "databases",
+                Side::Api => "api",
                 Side::Settings => "settings",
                 Side::Keys => "keys",
             }
@@ -1441,6 +1455,7 @@ impl Workspace {
             "search" => Side::Search,
             "git" => Side::Git,
             "databases" => Side::Databases,
+            "api" => Side::Api,
             "keys" => Side::Keys,
             "settings" => Side::Settings,
             _ => Side::Files,
@@ -1520,6 +1535,7 @@ impl Workspace {
             TabKind::Editor(e) => e.read(cx).buf.is_dirty(),
             TabKind::DiffEdit(d) => d.read(cx).right.read(cx).buf.is_dirty(),
             TabKind::Merge(m) => m.read(cx).result.read(cx).buf.is_dirty(),
+            TabKind::Api(v) => v.read(cx).is_dirty(),
             _ => false,
         }
     }
@@ -1848,6 +1864,7 @@ impl Workspace {
             TabKind::Merge(m) => m.read(cx).focus(window, cx),
             TabKind::Preview(v) => v.read(cx).focus(window),
             TabKind::Db(v) => v.read(cx).focus(window, cx),
+            TabKind::Api(v) => v.read(cx).focus(window, cx),
         }
     }
 
@@ -2013,6 +2030,31 @@ impl Workspace {
         }
         roots.retain(|r| root_is_project(r));
         roots
+    }
+
+    /// The folders API collections and environments can be saved in.
+    fn api_roots(&self, cx: &App) -> Vec<PathBuf> {
+        self.db_roots(cx)
+    }
+
+    /// Opens an API tab (or shows the one already showing the same thing).
+    fn open_api(&mut self, open: crate::api_view::ApiOpen, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Api(v) if v.read(cx).shows(&open))) {
+            return self.activate(ix, window, cx);
+        }
+        let roots = self.api_roots(cx);
+        let view = cx.new(|cx| crate::api_view::ApiView::new(open, roots, cx));
+        let sub = cx.subscribe_in(&view, window, |ws, view, req: &Request, window, cx| {
+            if matches!(req, Request::Api(crate::api_view::ApiRequest::Close)) {
+                if let Some(ix) = ws.tabs.iter().position(|t| matches!(&t.kind, TabKind::Api(v) if v == view)) {
+                    ws.close_tab(ix, true, window, cx);
+                }
+            } else {
+                ws.handle_request(req, window, cx);
+            }
+        });
+        self.add_tab(TabKind::Api(view), sub, false, window, cx);
+        cx.notify();
     }
 
     /// Opens a database tab (or shows the one already showing the same thing).
@@ -2281,6 +2323,12 @@ impl Workspace {
             }
             // "db:<type>" names the type's icon for the tab.
             TabKind::Db(v) => (v.read(cx).title().0, v.read(cx).kind().map(|k| format!("db:{}", k.id())).unwrap_or_default(), false),
+            // "api:<method>" draws the API icon in the method's color.
+            TabKind::Api(v) => {
+                let v = v.read(cx);
+                let (title, _, dirty) = v.title(cx);
+                (title, format!("api:{}", v.method().unwrap_or_default()), dirty)
+            }
         }
     }
 
@@ -2406,6 +2454,7 @@ impl Workspace {
             Side::Files => self.tree.read(cx).focus(window),
             Side::Git => self.git_panel.read(cx).focus(window),
             Side::Databases => self.db_panel.read(cx).focus(window),
+            Side::Api => self.api_panel.read(cx).focus(window),
             Side::Search => {
                 let query = self.search.read(cx).query.clone();
                 query.update(cx, |q, cx| {
@@ -2535,7 +2584,7 @@ impl Workspace {
                 d.update(cx, |d, cx| d.set_blame(on, cx));
                 self.blame_default = on;
             }
-            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Preview(_) | TabKind::Db(_) => {}
+            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Preview(_) | TabKind::Db(_) | TabKind::Api(_) => {}
         }
         self.settings.blame_default = self.blame_default;
         self.settings.save();
@@ -4119,7 +4168,7 @@ impl Workspace {
                         v.update(cx, |v, cx| v.mark_stale(cx));
                     }
                 }
-                TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Db(_) => {}
+                TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Db(_) | TabKind::Api(_) => {}
             }
         }
         for r in &meta_repos {
@@ -4198,6 +4247,7 @@ impl Workspace {
                 d.child(div().absolute().bottom(px(8.)).right(px(6.)).child(ui::badge(changes.to_string(), theme::accent()).text_size(px(10.)).h(px(16.)).min_w(px(16.))))
             }))
             .child(item("act-databases", "database", Side::Databases, "Databases", self, cx))
+            .child(item("act-api", "api", Side::Api, "API: requests, collections, environments", self, cx))
             .child(div().flex_1())
             .child(tool("tb-open", "folder", "Open Folder here (⌘O)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))))
             .child(tool("tb-add-folder", "new-folder", "Add Folder to Workspace…", 16.).on_click(cx.listener(|ws, _, w, cx| ws.add_folder_prompt(w, cx))))
@@ -4283,6 +4333,7 @@ impl Workspace {
             Some(TabKind::Merge(m)) => m.clone().into_any_element(),
             Some(TabKind::Preview(v)) => v.clone().into_any_element(),
             Some(TabKind::Db(v)) => v.clone().into_any_element(),
+            Some(TabKind::Api(v)) => v.clone().into_any_element(),
             None if self.panes.len() == 1 => self.render_welcome(cx),
             None => self.render_empty_pane(),
         };
@@ -4394,7 +4445,9 @@ impl Workspace {
                                 }
                             }))
                             .child(div().text_color(if active { theme::frame_focused() } else { theme::fg_muted() }).child(if i < 9 { format!("{}", i + 1) } else { "·".into() }))
-                            .child(if term { ui::small_icon("terminal", theme::frame_focused()).size(px(12.)) } else { match icon_name.strip_prefix("db:") {
+                            .child(if term { ui::small_icon("terminal", theme::frame_focused()).size(px(12.)) } else if let Some(m) = icon_name.strip_prefix("api:") {
+                                ui::icon("api", if m.is_empty() { theme::accent() } else { theme::c(crate::api::method_color(m)) }).size(px(13.))
+                            } else { match icon_name.strip_prefix("db:") {
                                 Some(kind) => ui::icon(&format!("db-{kind}"), theme::c(crate::db::Kind::ALL.into_iter().find(|k| k.id() == kind).map(|k| k.color()).unwrap_or(0x888888))).size(px(12.)),
                                 None => ui::file_icon(&icon_name).size(px(12.)),
                             } })
@@ -5300,6 +5353,11 @@ impl Render for Workspace {
                 self.db_panel.update(cx, |p, cx| p.set_roots(roots, cx));
                 self.db_panel.clone().into_any_element()
             }
+            Side::Api => {
+                let roots = self.api_roots(cx);
+                self.api_panel.update(cx, |p, cx| p.set_roots(roots, cx));
+                self.api_panel.clone().into_any_element()
+            }
             Side::Search => self.search.clone().into_any_element(),
             Side::Keys => div().flex().flex_col().size_full().child(self.render_settings_tabs(cx)).child(div().flex_1().min_h_0().child(self.keys.clone())).into_any_element(),
             Side::Settings => self.render_settings(cx).into_any_element(),
@@ -5623,6 +5681,7 @@ mod ui_tests {
             crate::file_tree::bind_keys();
             crate::git_panel::bind_keys();
             crate::db_view::bind_keys();
+            crate::api_view::bind_keys();
             crate::diff_view::bind_keys();
             crate::commit_view::bind_keys();
             crate::search::bind_keys();
@@ -7735,6 +7794,60 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         click_on(cx, "dialog-button-Delete");
         assert!(crate::db::load().is_empty(), "deleted");
         assert_eq!(crate::db::secret(&c.id), "", "with its password");
+    }
+
+    fn api_tab(ws: &gpui::Entity<Workspace>, cx: &mut VisualTestContext) -> Option<gpui::Entity<crate::api_view::ApiView>> {
+        ws.read_with(cx, |ws, _| ws.active.and_then(|a| match &ws.tabs[a].kind {
+            TabKind::Api(v) => Some(v.clone()),
+            _ => None,
+        }))
+    }
+
+    #[gpui::test]
+    fn api_requests_are_sent_saved_and_use_environments(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let port = crate::api::send::tests::server();
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Api, window, cx));
+        cx.run_until_parked();
+        click_on(cx, "api-empty-new");
+        let tab = api_tab(&ws, cx).expect("a request tab opens");
+        // The URL and the Params table follow each other.
+        tab.update(cx, |t, cx| t.set_url(&format!("http://127.0.0.1:{port}/echo/:id?a=1&b=two"), cx));
+        cx.run_until_parked();
+        assert_eq!(tab.read_with(cx, |t, cx| t.params(cx)), (vec![("a".into(), "1".into()), ("b".into(), "two".into())], vec!["id".to_string()]));
+        tab.update(cx, |t, cx| t.set_param(1, "three", cx));
+        cx.run_until_parked();
+        assert_eq!(tab.read_with(cx, |t, cx| t.url_text(cx)), format!("http://127.0.0.1:{port}/echo/:id?a=1&b=three"));
+        tab.update(cx, |t, cx| {
+            t.set_url(&format!("http://127.0.0.1:{port}/echo?a=1"), cx);
+            t.add_test("status", "equal", "200", cx);
+            t.set_name("Echo", cx);
+        });
+        cx.run_until_parked();
+        click_on(cx, "api-send");
+        wait_for(cx, "the response", |cx| tab.read_with(cx, |t, cx| t.response(cx).is_some() || t.error().is_some()));
+        let (status, body, passed) = tab.read_with(cx, |t, cx| t.response(cx)).unwrap_or_else(|| panic!("{:?}", tab.read_with(cx, |t, _| t.error())));
+        assert_eq!((status, passed), (200, 1));
+        assert!(body.contains("\"path\": \"/echo?a=1\""), "JSON shown indented: {body}");
+        assert_eq!(crate::api::history().len(), 1, "kept in history");
+        // Saving with no collection yet makes one.
+        click_on(cx, "api-save");
+        let colls = crate::api::collections(&[]);
+        let saved: Vec<_> = ws.read_with(cx, |ws, cx| crate::api::collections(&ws.api_roots(cx)));
+        assert!(colls.is_empty(), "a workspace collection, not a global one");
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].root.requests[0].name, "Echo");
+        click_on(cx, "api-coll-My Requests");
+        assert!(cx.debug_bounds("api-req-Echo").is_some(), "shown in the panel");
+        // An environment's variable fills {{base}}.
+        let env = crate::api::Environment { id: crate::api::new_id(), name: "Local".into(), vars: vec![crate::api::Row::new("base", &format!("http://127.0.0.1:{port}"))], ..Default::default() };
+        crate::api::save_environment(&env).unwrap();
+        let project = ws.read_with(cx, |ws, cx| ws.api_roots(cx).first().cloned());
+        crate::api::set_active_env(project.as_deref(), Some(&env.id));
+        tab.update(cx, |t, cx| t.set_url("{{base}}/echo?from=env", cx));
+        cx.run_until_parked();
+        click_on(cx, "api-send");
+        wait_for(cx, "the second response", |cx| tab.read_with(cx, |t, cx| t.response(cx).is_some_and(|r| r.1.contains("from=env"))));
     }
 
     #[gpui::test]

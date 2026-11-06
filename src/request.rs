@@ -60,6 +60,8 @@ pub enum Request {
     RemoveFolder(PathBuf),
     /// From the Databases panel and tabs.
     Db(crate::db_view::DbRequest),
+    /// From the API panel and tabs.
+    Api(crate::api_view::ApiRequest),
     Message(String),
     Error(String),
 }

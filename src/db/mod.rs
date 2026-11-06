@@ -281,7 +281,7 @@ fn set_secret(id: &str, secret: &str) -> Result<(), String> {
 
 /// The `security` tool. Secrets are stored hex-encoded (always plain ASCII, nothing to
 /// quote) and are passed on its standard input, never on a command line others can see.
-mod keychain {
+pub(crate) mod keychain {
     use std::io::Write;
     use std::process::{Command, Stdio};
 

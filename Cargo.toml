@@ -9,8 +9,8 @@ license = "MIT"
 alacritty_terminal = "0.26"
 # Databases: one background thread runs them all (tokio, current-thread); TLS is macOS's own
 # except for MongoDB, whose driver only does rustls.
-tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "io-util"] }
-tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "io-util", "fs"] }
+tokio-util = { version = "0.7", default-features = false, features = ["compat", "io"] }
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 postgres-native-tls = "0.5"
 native-tls = "0.2"
@@ -19,6 +19,18 @@ mongodb = "3"
 redis = { version = "1", default-features = false, features = ["tokio-comp", "tokio-native-tls-comp"] }
 ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
 security-framework = "3"
+# API requests: an HTTP client (HTTP/2, macOS TLS, proxies), WebSocket, scripts (QuickJS),
+# JSONPath and JSON Schema for tests, hashes for Digest and AWS signatures.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "system-proxy", "charset", "multipart", "stream", "gzip", "brotli", "deflate", "zstd", "socks"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+rquickjs = "0.14"
+serde_json_path = "0.7"
+jsonschema = { version = "0.60", default-features = false }
+sha2 = "0.11"
+hmac = "0.13"
+md-5 = "0.11"
+fastrand = "2"
+futures-util = "0.3"
 anyhow = "1"
 block = "0.1.6"
 futures = "0.3"

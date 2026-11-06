@@ -14,7 +14,7 @@ const IDLE: Duration = Duration::from_secs(10 * 60);
 /// How long to wait for a server to answer when connecting.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn runtime() -> &'static tokio::runtime::Handle {
+pub(crate) fn runtime() -> &'static tokio::runtime::Handle {
     static RT: OnceLock<tokio::runtime::Handle> = OnceLock::new();
     RT.get_or_init(|| {
         let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().thread_name("kite-db").build().expect("database runtime");

@@ -511,6 +511,18 @@ impl Editor {
         self.schedule_highlight(Duration::ZERO, cx);
     }
 
+    /// Highlights the text as this kind of file (by extension: "json", "js", "html"…; "" for none).
+    pub fn set_language(&mut self, ext: &str, cx: &mut Context<Self>) {
+        let lang = if ext.is_empty() { None } else { highlight::detect(std::path::Path::new(&format!("x.{ext}"))) };
+        if lang == self.lang {
+            return;
+        }
+        self.lang = lang;
+        self.spans = None;
+        self.schedule_highlight(Duration::ZERO, cx);
+        cx.notify();
+    }
+
     /// Re-highlights the whole buffer in the background (tree-sitter is fast enough).
     fn schedule_highlight(&mut self, delay: Duration, cx: &mut Context<Self>) {
         if self.lang.is_none() {
@@ -578,6 +590,9 @@ impl Editor {
         self.scroll_x = 0.;
         self.scroll_y = 0.;
         self.autoscroll = Some(false);
+        if self.lang.is_some() {
+            self.schedule_highlight(Duration::ZERO, cx);
+        }
         cx.emit(EditorEvent::Changed);
         cx.notify();
     }
