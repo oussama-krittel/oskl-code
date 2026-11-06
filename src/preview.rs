@@ -26,6 +26,10 @@ pub enum Kind {
     Markdown,
     /// CSV / TSV, as a table.
     Table,
+    /// Word: shown as the Markdown it reads as.
+    Doc,
+    /// Excel: its sheets as tables.
+    Sheet,
 }
 
 pub fn kind_of(path: &Path) -> Option<Kind> {
@@ -35,13 +39,15 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
         "svg" => Kind::Svg,
         "md" | "markdown" | "mdx" => Kind::Markdown,
         "csv" | "tsv" | "tab" => Kind::Table,
+        "docx" | "docm" | "dotx" | "doc" => Kind::Doc,
+        "xlsx" | "xlsm" | "xltx" | "xls" => Kind::Sheet,
         _ => return None,
     })
 }
 
 /// Pictures open as a preview (there's no text to edit). Markdown and SVG open as text.
 pub fn opens_as_preview(path: &Path) -> bool {
-    kind_of(path) == Some(Kind::Image)
+    matches!(kind_of(path), Some(Kind::Image | Kind::Doc | Kind::Sheet))
 }
 
 /// Text files that can also be shown rendered.
@@ -63,6 +69,8 @@ pub struct PreviewView {
     /// A CSV's (or spreadsheet's) table.
     table: Option<Entity<crate::table::TableView>>,
     table_task: Option<Task<()>>,
+    /// A Word document (its text is what it reads as, in Markdown).
+    doc: bool,
     /// The shown picture's own width and height (read once per file).
     natural: std::cell::RefCell<Option<(PathBuf, Option<(f32, f32)>)>>,
     snapshot: Option<PathBuf>,
@@ -105,6 +113,8 @@ impl EventEmitter<Request> for PreviewView {}
 impl PreviewView {
     pub fn new(path: PathBuf, source: Option<Entity<Editor>>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let kind = kind_of(&path).unwrap_or(Kind::Markdown);
+        // A Word file is read as Markdown and shown like it.
+        let (kind, doc) = if kind == Kind::Doc { (Kind::Markdown, true) } else { (kind, false) };
         let sub = source.as_ref().map(|ed| cx.observe_in(ed, window, |view, _, window, cx| view.source_changed(window, cx)));
         let mut view = Self {
             focus: cx.focus_handle(),
@@ -112,6 +122,7 @@ impl PreviewView {
             natural: Default::default(),
             table: None,
             table_task: None,
+            doc,
             path,
             kind,
             source,
@@ -145,7 +156,8 @@ impl PreviewView {
     pub fn title(&self) -> String {
         let name = self.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         match self.kind {
-            Kind::Image => name,
+            Kind::Image | Kind::Sheet => name,
+            _ if self.doc => name,
             Kind::Table => format!("Table {name}"),
             _ => format!("Preview {name}"),
         }
@@ -161,6 +173,9 @@ impl PreviewView {
     }
 
     fn text(&self, cx: &App) -> String {
+        if self.doc {
+            return crate::office::docx_markdown(&self.path).unwrap_or_else(|e| format!("*Can't show this document: {e}.*"));
+        }
         match &self.source {
             Some(ed) => ed.read(cx).text(),
             None => std::fs::read_to_string(&self.path).unwrap_or_default(),
@@ -239,6 +254,28 @@ impl PreviewView {
                     .ok();
                 }));
             }
+            Kind::Sheet => {
+                let path = self.path.clone();
+                let read = cx.background_executor().spawn(async move { crate::office::xlsx(&path) });
+                self.table_task = Some(cx.spawn(async move |this, cx| {
+                    let book = read.await;
+                    this.update(cx, |v, cx| {
+                        match book {
+                            Ok((sheets, _cut)) => {
+                                let sheets: Vec<crate::table::Sheet> = sheets.into_iter().map(|(n, rows)| crate::table::Sheet::cells(n, rows)).collect();
+                                match &v.table {
+                                    Some(t) => t.update(cx, |t, cx| t.replace(sheets, cx)),
+                                    None => v.table = Some(cx.new(|_| crate::table::TableView::new(sheets, false))),
+                                }
+                            }
+                            Err(e) => v.info = format!("Can't show this workbook: {e}."),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+            }
+            Kind::Doc => {}
             Kind::Svg | Kind::Image => {
                 // The file changed on disk: drop the picture decoded from the old one.
                 release(&self.shown, window, cx);
@@ -251,7 +288,7 @@ impl PreviewView {
     /// A trackpad pinch over the page: zooms all of it (text, tables, code, diagrams), keeping
     /// the spot under the fingers where it is. Returns whether this preview took it.
     pub fn pinch(&mut self, p: crate::pinch::Pinch, cx: &mut Context<Self>) -> bool {
-        if self.kind == Kind::Table {
+        if matches!(self.kind, Kind::Table | Kind::Sheet) {
             let Some(t) = self.table.clone().filter(|t| t.read(cx).area.get().contains(&p.at)) else { return false };
             t.update(cx, |t, cx| t.pinch(p.magnify, cx));
             return true;
@@ -709,7 +746,8 @@ impl Render for PreviewView {
                 page
             }
             Kind::Image | Kind::Svg => self.render_image(cx),
-            Kind::Table => match &self.table {
+            Kind::Doc => div().into_any_element(),
+            Kind::Table | Kind::Sheet => match &self.table {
                 Some(t) => t.clone().into_any_element(),
                 None => div().size_full().flex().items_center().justify_center().text_color(theme::fg_dim()).child(if self.info.is_empty() { "Reading…".to_string() } else { self.info.clone() }).into_any_element(),
             },

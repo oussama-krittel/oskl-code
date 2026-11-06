@@ -27,6 +27,7 @@ mod icons;
 mod keybindings;
 mod keymap;
 mod merge_view;
+mod office;
 mod pinch;
 mod preview;
 mod repo;

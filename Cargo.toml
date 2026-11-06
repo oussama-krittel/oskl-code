@@ -42,6 +42,9 @@ usvg = { version = "0.45.1", default-features = false, features = ["text", "syst
 mimalloc = "0.1.52"
 # Big CSV files are read from disk as shown, not copied into memory.
 memmap2 = "0.9"
+# Word and Excel files are ZIPs of XML: inflated and read as they stream.
+miniz_oxide = "0.8"
+quick-xml = "0.41"
 notify = "6"
 objc = "0.2.7"
 pulldown-cmark = { version = "0.13", default-features = false }
