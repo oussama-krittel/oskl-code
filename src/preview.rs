@@ -261,8 +261,9 @@ impl PreviewView {
                     let book = read.await;
                     this.update(cx, |v, cx| {
                         match book {
-                            Ok((sheets, _cut)) => {
-                                let sheets: Vec<crate::table::Sheet> = sheets.into_iter().map(|(n, rows)| crate::table::Sheet::cells(n, rows)).collect();
+                            Ok((sheets, _cut, palette)) => {
+                                let palette = std::sync::Arc::new(palette);
+                                let sheets: Vec<crate::table::Sheet> = sheets.into_iter().map(|d| crate::table::Sheet::spreadsheet(d, palette.clone())).collect();
                                 match &v.table {
                                     Some(t) => t.update(cx, |t, cx| t.replace(sheets, cx)),
                                     None => v.table = Some(cx.new(|_| crate::table::TableView::new(sheets, false))),
@@ -1984,7 +1985,7 @@ mod tests {
                 eprintln!("{} chars", md.len());
                 let _ = super::parse(&md);
             } else {
-                let (s, _) = crate::office::xlsx(path).unwrap();
+                let (s, _, _) = crate::office::xlsx(path).unwrap();
                 eprintln!("{} sheets", s.len());
             }
         }

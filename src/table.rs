@@ -35,6 +35,45 @@ enum Store {
     Cells(Vec<Vec<String>>),
 }
 
+/// How a spreadsheet cell looks (from the workbook's styles).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Look {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    /// Text and background colors (RGB).
+    pub color: Option<u32>,
+    pub fill: Option<u32>,
+    /// Points.
+    pub size: Option<f32>,
+    /// Borders drawn: left 1, right 2, top 4, bottom 8.
+    pub borders: u8,
+    pub border_color: Option<u32>,
+    /// 0 as usual (numbers right, text left), 1 left, 2 center, 3 right.
+    pub align: u8,
+    pub wrap: bool,
+}
+
+impl Look {
+    /// Shows something even with no text in the cell.
+    pub fn visible(&self) -> bool {
+        self.fill.is_some() || self.borders != 0
+    }
+}
+
+/// A spreadsheet's look: each cell's style, merged cells, the default row height.
+pub struct Paper {
+    pub looks: Vec<Vec<u32>>,
+    pub palette: Arc<Vec<Look>>,
+    /// A merged range's first cell → its last (row, col).
+    pub merges: std::collections::HashMap<(usize, usize), (usize, usize)>,
+    /// Cells inside a merged range (not its first) → its first.
+    pub covered: std::collections::HashMap<(usize, usize), (usize, usize)>,
+    /// Points.
+    pub row_h: f32,
+}
+
 pub struct Sheet {
     pub name: String,
     store: Store,
@@ -42,6 +81,8 @@ pub struct Sheet {
     /// The first row names the columns (CSV); otherwise columns are lettered (A, B…).
     header: bool,
     widths: Vec<f32>,
+    /// A spreadsheet drawn as it looks in Excel (white, gridlines, its colors and borders).
+    paper: Option<Paper>,
 }
 
 /// The separator a delimited file uses (by its name, else by its first line).
@@ -120,15 +161,56 @@ impl Sheet {
         let first = b.split(|c| *c == b'\n').next().unwrap_or(&[]);
         let sep = separator(path, &String::from_utf8_lossy(first));
         let starts = row_starts(b);
-        let mut s = Sheet { name: String::new(), store: Store::Delimited { text, starts, sep }, cols: 0, header: true, widths: Vec::new() };
+        let mut s = Sheet { name: String::new(), store: Store::Delimited { text, starts, sep }, cols: 0, header: true, widths: Vec::new(), paper: None };
         s.measure();
         Ok(s)
     }
 
     pub fn cells(name: String, rows: Vec<Vec<String>>) -> Sheet {
-        let mut s = Sheet { name, store: Store::Cells(rows), cols: 0, header: false, widths: Vec::new() };
+        let mut s = Sheet { name, store: Store::Cells(rows), cols: 0, header: false, widths: Vec::new(), paper: None };
         s.measure();
         s
+    }
+
+    /// A workbook's sheet, with its looks, column widths and merged cells.
+    pub fn spreadsheet(d: crate::office::SheetData, palette: Arc<Vec<Look>>) -> Sheet {
+        let mut merges = std::collections::HashMap::new();
+        let mut covered = std::collections::HashMap::new();
+        for (r0, c0, r1, c1) in d.merges {
+            merges.insert((r0, c0), (r1, c1));
+            if (r1 - r0 + 1) * (c1 - c0 + 1) > 20_000 {
+                continue;
+            }
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    if (r, c) != (r0, c0) {
+                        covered.insert((r, c), (r0, c0));
+                    }
+                }
+            }
+        }
+        let mut s = Sheet {
+            name: d.name,
+            store: Store::Cells(d.rows),
+            cols: 0,
+            header: false,
+            widths: Vec::new(),
+            paper: Some(Paper { looks: d.looks, palette, merges, covered, row_h: d.row_h.unwrap_or(15.).clamp(8., 60.) }),
+        };
+        s.measure();
+        // Excel's widths (characters) where the sheet sets them; its default otherwise.
+        // Empty columns past the data too, like a sheet (at least A to Z).
+        let n = s.cols.max(d.widths.len().min(200)).max(26);
+        s.cols = n;
+        s.widths = (0..s.cols).map(|c| d.widths.get(c).copied().flatten().map(|w| (w * 7. + 5.).round()).unwrap_or(64.)).collect();
+        s
+    }
+
+    fn look(&self, r: usize, c: usize) -> Option<&Look> {
+        let p = self.paper.as_ref()?;
+        let (r, c) = p.covered.get(&(r, c)).copied().unwrap_or((r, c));
+        let ix = *p.looks.get(r)?.get(c)? as usize;
+        p.palette.get(ix).filter(|l| **l != Look::default())
     }
 
     pub fn rows(&self) -> usize {
@@ -220,6 +302,9 @@ impl TableView {
     fn render_row(&self, ix: usize, cx: &App) -> gpui::AnyElement {
         let _ = cx;
         let Some(s) = self.sheets.get(self.current) else { return div().into_any_element() };
+        if s.paper.is_some() {
+            return self.render_paper_row(s, ix);
+        }
         let z = self.zoom;
         let r = if s.header { ix + 1 } else { ix };
         let cells = s.row(r);
@@ -252,6 +337,84 @@ impl TableView {
     }
 }
 
+/// Excel's own colors: the sheet is white whatever the theme, as the colors in it expect.
+const PAPER: u32 = 0xFFFFFF;
+const GRID: u32 = 0xE1E1E1;
+const HEAD: u32 = 0xF3F3F3;
+const HEAD_TEXT: u32 = 0x5C5C5C;
+const INK: u32 = 0x000000;
+
+impl TableView {
+    fn render_paper_row(&self, s: &Sheet, r: usize) -> gpui::AnyElement {
+        let z = self.zoom;
+        let p = s.paper.as_ref().unwrap();
+        let h = p.row_h * 1.333 * z;
+        let cells = s.row(r);
+        let mut out: Vec<gpui::AnyElement> = Vec::new();
+        let mut c = 0;
+        while c < s.cols {
+            // A merge's first cell spans its columns; the cells it covers on this row are skipped.
+            let span_end = p.merges.get(&(r, c)).map(|(_, c1)| (*c1).min(s.cols - 1)).unwrap_or(c);
+            let covered_left = p.covered.get(&(r, c)).is_some_and(|(r0, _)| *r0 == r);
+            if covered_left {
+                c += 1;
+                continue;
+            }
+            let w: f32 = s.widths[c..=span_end].iter().sum::<f32>() * z;
+            let inside_merge = p.covered.contains_key(&(r, c));
+            let raw = if inside_merge { "" } else { cells.get(c).map(String::as_str).unwrap_or("") };
+            let numeric = raw.starts_with(crate::office::NUMBER);
+            let text = cut(raw.trim_start_matches(crate::office::NUMBER));
+            let look = s.look(r, c).cloned().unwrap_or_default();
+            let align = match look.align {
+                1 => 1,
+                2 => 2,
+                3 => 3,
+                _ if numeric => 3,
+                _ => 1,
+            };
+            let size = look.size.unwrap_or(11.) * 1.2 * z;
+            let b = look.borders;
+            let bc = theme::c(look.border_color.unwrap_or(INK));
+            let mut cell = div()
+                .w(px(w))
+                .h(px(h))
+                .flex_none()
+                .flex()
+                .items_center()
+                .px(px(4. * z))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .bg(theme::c(look.fill.unwrap_or(PAPER)))
+                .text_size(px(size))
+                .text_color(theme::c(look.color.unwrap_or(INK)))
+                .when(align == 2, |d| d.justify_center())
+                .when(align == 3, |d| d.justify_end())
+                .when(look.bold, |d| d.font_weight(FontWeight::BOLD))
+                .when(look.italic, |d| d.italic())
+                .when(look.underline, |d| d.underline())
+                .when(look.strike, |d| d.line_through());
+            // Its own borders where it has them; light gridlines elsewhere.
+            cell = if b == 0 {
+                cell.border_r_1().border_b_1().border_color(theme::c(GRID))
+            } else {
+                // One color per cell: the border's (sides it doesn't set show no line).
+                cell.border_color(bc).when(b & 1 != 0, |d| d.border_l_1()).when(b & 2 != 0, |d| d.border_r_1()).when(b & 4 != 0, |d| d.border_t_1()).when(b & 8 != 0, |d| d.border_b_1())
+            };
+            out.push(cell.child(text).into_any_element());
+            c = span_end + 1;
+        }
+        div()
+            .id(("tbl-row", r))
+            .flex()
+            .h(px(h))
+            .bg(theme::c(PAPER))
+            .child(div().w(px(46. * z)).h(px(h)).flex_none().flex().items_center().justify_center().border_r_1().border_b_1().border_color(theme::c(0xC8C8C8)).bg(theme::c(HEAD)).text_size(px(11. * z)).text_color(theme::c(HEAD_TEXT)).child((r + 1).to_string()))
+            .children(out)
+            .into_any_element()
+    }
+}
+
 fn cut(t: &str) -> String {
     if t.chars().count() <= CELL_MAX { t.replace(['\n', '\r'], " ") } else { format!("{}…", t.chars().take(CELL_MAX).collect::<String>().replace(['\n', '\r'], " ")) }
 }
@@ -266,8 +429,20 @@ impl Render for TableView {
             return div().size_full().flex().items_center().justify_center().text_color(theme::fg_dim()).child("Empty");
         };
         let z = self.zoom;
-        let total_w: f32 = (s.widths.iter().sum::<f32>() + 52.) * z;
+        let paper = s.paper.is_some();
+        let total_w: f32 = (s.widths.iter().sum::<f32>() + if paper { 46. } else { 52. }) * z;
         let head_cells: Vec<String> = if s.header { s.row(0) } else { (0..s.cols).map(column_name).collect() };
+        let paper_header = div()
+            .flex()
+            .flex_none()
+            .h(px(20. * z))
+            .bg(theme::c(HEAD))
+            .text_size(px(11. * z))
+            .text_color(theme::c(HEAD_TEXT))
+            .child(div().w(px(46. * z)).h_full().flex_none().border_r_1().border_b_1().border_color(theme::c(0xC8C8C8)))
+            .children((0..s.cols).map(|c| {
+                div().w(px(s.widths[c] * z)).h_full().flex_none().flex().items_center().justify_center().border_r_1().border_b_1().border_color(theme::c(0xC8C8C8)).overflow_hidden().child(column_name(c))
+            }));
         let header = div()
             .flex()
             .flex_none()
@@ -293,7 +468,9 @@ impl Render for TableView {
                     .child(head_cells.get(c).map(|t| cut(t)).unwrap_or_default())
             }));
         let rows = s.rows().saturating_sub(s.header as usize);
-        let body = uniform_list("tbl-rows", rows, cx.processor(|t: &mut TableView, range: Range<usize>, _, cx| range.map(|ix| t.render_row(ix, cx)).collect::<Vec<_>>())).track_scroll(self.list.clone()).flex_1();
+        // A spreadsheet goes on past its last row, empty, like Excel's does.
+        let shown_rows = if paper { (rows + 30).max(100) } else { rows };
+        let body = uniform_list("tbl-rows", shown_rows, cx.processor(|t: &mut TableView, range: Range<usize>, _, cx| range.map(|ix| t.render_row(ix, cx)).collect::<Vec<_>>())).track_scroll(self.list.clone()).flex_1();
         let tabs = (self.sheets.len() > 1).then(|| {
             div().flex().flex_none().gap(px(2.)).px(px(6.)).h(px(28.)).items_center().border_t_1().border_color(theme::border()).bg(theme::bg_side()).children(self.sheets.iter().enumerate().map(|(i, sh)| {
                 let on = i == self.current;
@@ -329,7 +506,12 @@ impl Render for TableView {
                     .overflow_x_scroll()
                     .track_scroll(&self.hscroll)
                     .child(gpui::canvas(move |b, _, _| area.set(b), |_, _, _, _| {}).absolute().top_0().left_0().size_full())
-                    .child(div().min_w(px(total_w)).w(px(total_w)).h_full().flex().flex_col().font_family(theme::MONO_FONT).text_size(px(12.5 * z)).child(header).child(body)),
+                    .child(if paper {
+                        // A spreadsheet: Excel's look, its own font.
+                        div().min_w(px(total_w)).w(px(total_w)).h_full().flex().flex_col().bg(theme::c(PAPER)).font_family(".SystemUIFont").child(paper_header).child(body)
+                    } else {
+                        div().min_w(px(total_w)).w(px(total_w)).h_full().flex().flex_col().font_family(theme::MONO_FONT).text_size(px(12.5 * z)).child(header).child(body)
+                    }),
             )
             .children(tabs)
             .child(
