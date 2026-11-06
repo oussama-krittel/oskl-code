@@ -57,6 +57,8 @@ pub struct PreviewView {
     /// What the picture shows: the file, or a snapshot of the SVG being edited (a temp file,
     /// so it's drawn as sharply as files are).
     shown: PathBuf,
+    /// The shown picture's own width and height (read once per file).
+    natural: std::cell::RefCell<Option<(PathBuf, Option<(f32, f32)>)>>,
     snapshot: Option<PathBuf>,
     light: bool,
     /// The file changed on disk; reloaded on the next draw.
@@ -101,6 +103,7 @@ impl PreviewView {
         let mut view = Self {
             focus: cx.focus_handle(),
             shown: path.clone(),
+            natural: Default::default(),
             path,
             kind,
             source,
@@ -218,8 +221,11 @@ impl PreviewView {
     /// the spot under the fingers where it is. Returns whether this preview took it.
     pub fn pinch(&mut self, p: crate::pinch::Pinch, cx: &mut Context<Self>) -> bool {
         let area = self.area.get();
-        if self.kind != Kind::Markdown || !area.contains(&p.at) {
+        if !area.contains(&p.at) {
             return false;
+        }
+        if self.kind != Kind::Markdown {
+            return self.pinch_image(p, cx);
         }
         let old = self.zoom;
         // 100% is as small as it gets: it's a magnifier, the page itself never changes.
@@ -255,6 +261,28 @@ impl PreviewView {
             self.locked_w = None;
             self.scroll.set_offset(point(gpui::px(0.), to.y));
         }
+        cx.notify();
+        true
+    }
+
+    /// Pinching a picture: it grows from its fitted size (never smaller), the spot under the
+    /// fingers staying put; past the pane it scrolls both ways.
+    fn pinch_image(&mut self, p: crate::pinch::Pinch, cx: &mut Context<Self>) -> bool {
+        let area = self.area.get();
+        let old = self.zoom;
+        let new = (old * (1. + p.magnify)).clamp(1., IMAGE_ZOOM_MAX);
+        if (new - old).abs() < 1e-4 {
+            return true;
+        }
+        self.zoom = new;
+        let off = self.scroll.offset();
+        let k = new / old;
+        let rel = p.at - area.origin;
+        let x = (rel.x - off.x) * k;
+        let y = (rel.y - off.y) * k;
+        let max = |a: Pixels| -(a * (new - 1.));
+        let to = point((rel.x - x).min(gpui::px(0.)).max(max(area.size.width)), (rel.y - y).min(gpui::px(0.)).max(max(area.size.height)));
+        self.scroll.set_offset(if new <= 1. { point(gpui::px(0.), gpui::px(0.)) } else { to });
         cx.notify();
         true
     }
@@ -338,6 +366,30 @@ impl PreviewView {
 
     fn render_image(&self, cx: &mut Context<Self>) -> AnyElement {
         let bg = if self.light { theme::c(0xf3f3f3) } else { theme::bg_editor() };
+        let zoom = self.zoom;
+        let area = self.area.clone();
+        let size = self.area.get().size;
+        // Fitted: as big as the pane allows, its proportions kept (width or height fills it,
+        // the other follows). Zoomed: that, bigger, in a pane that scrolls both ways.
+        let picture = img(self.shown.clone()).size_full().object_fit(ObjectFit::Contain).with_fallback(|| {
+            div().size_full().flex().items_center().justify_center().text_color(theme::fg_dim()).child("Can't show this image").into_any_element()
+        });
+        let zoomed = zoom > 1.001 && size.width > gpui::px(0.);
+        // Its size on screen: the biggest that fits the pane (width or height fills it, the
+        // other follows), times the zoom. Set exactly: left to itself, a picture's layout takes
+        // its height from its width and spills out of the pane.
+        let natural = {
+            let mut n = self.natural.borrow_mut();
+            if n.as_ref().is_none_or(|(p, _)| *p != self.shown) {
+                *n = Some((self.shown.clone(), natural_size(&self.shown)));
+            }
+            n.as_ref().and_then(|(_, s)| *s)
+        };
+        let (aw, ah) = (size.width / gpui::px(1.), size.height / gpui::px(1.));
+        let fitted = natural.filter(|_| aw > 0. && ah > 0.).map(|(w, h)| {
+            let k = (aw / w).min(ah / h);
+            (w * k * zoom, h * k * zoom)
+        });
         div()
             .size_full()
             .flex()
@@ -346,6 +398,7 @@ impl PreviewView {
                 div()
                     .id("image-area")
                     .debug_selector(|| "preview-image".into())
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .p(px(20.))
@@ -356,9 +409,71 @@ impl PreviewView {
                         v.light = !v.light;
                         cx.notify();
                     }))
-                    .child(img(self.shown.clone()).size_full().object_fit(ObjectFit::ScaleDown).with_fallback(|| {
-                        div().size_full().flex().items_center().justify_center().text_color(theme::fg_dim()).child("Can't show this image").into_any_element()
-                    })),
+                    .child(
+                        div()
+                            .relative()
+                            .size_full()
+                            // The pane's size, for fitting the picture: drawn again when it changes.
+                            .child(
+                                canvas(
+                                    move |bounds, window, _| {
+                                        if area.get() != bounds {
+                                            area.set(bounds);
+                                            window.refresh();
+                                        }
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full(),
+                            )
+                            .child(
+                                div()
+                                    .id("image-scroll")
+                                    .size_full()
+                                    .overflow_scroll()
+                                    .track_scroll(&self.scroll)
+                                    .child(match fitted {
+                                        // Centered while it's smaller than the pane, from the corner once it's bigger.
+                                        Some((w, h)) => div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .w(gpui::px(w.max(aw)))
+                                            .h(gpui::px(h.max(ah)))
+                                            .child(picture.w(gpui::px(w)).h(gpui::px(h)).flex_none()),
+                                        None => div().size_full().child(picture),
+                                    }),
+                            ),
+                    )
+                    .when(zoomed, |d| {
+                        d.child(
+                            div()
+                                .id("image-zoom")
+                                .debug_selector(|| "image-zoom".into())
+                                .absolute()
+                                .top(px(8.))
+                                .right(px(10.))
+                                .px(px(8.))
+                                .py(px(2.))
+                                .rounded(px(4.))
+                                .bg(theme::bg_popup())
+                                .border_1()
+                                .border_color(theme::border_input())
+                                .text_size(px(11.))
+                                .text_color(theme::fg())
+                                .cursor_pointer()
+                                .on_click(cx.listener(|v, _, _, cx| {
+                                    cx.stop_propagation();
+                                    v.zoom = 1.;
+                                    v.scroll.set_offset(point(gpui::px(0.), gpui::px(0.)));
+                                    cx.notify();
+                                }))
+                                .child(format!("{}% · click to fit", (zoom * 100.).round())),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -797,6 +912,8 @@ fn outline_text(svg: &str) -> Option<String> {
 const PAGE_W: f32 = 796.;
 /// How far the page zooms in (100% is the least).
 const PAGE_ZOOM_MAX: f32 = 4.;
+/// How far a picture can be magnified past its fitted size.
+const IMAGE_ZOOM_MAX: f32 = 12.;
 /// The biggest picture a diagram is drawn at (in pixels; 4 bytes each, and decoding makes a
 /// few copies for a moment): past it, it's stretched instead. A bit more while zoomed in.
 const MAX_SHARP_PIXELS: f32 = 2_000_000.;
@@ -990,6 +1107,20 @@ fn file_info(path: &Path) -> String {
         Some((w, h)) => format!("{ext} · {w} × {h} · {size}"),
         None => format!("{ext} · {size}"),
     }
+}
+
+/// A picture's own size: from a raster file's header, or an SVG's width and height (or viewBox).
+fn natural_size(path: &Path) -> Option<(f32, f32)> {
+    let is_svg = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg"));
+    let (w, h) = if is_svg {
+        let data = std::fs::read(path).ok()?;
+        let t = usvg::Tree::from_data(&data, &usvg::Options::default()).ok()?;
+        (t.size().width(), t.size().height())
+    } else {
+        let (w, h) = image_size(path)?;
+        (w as f32, h as f32)
+    };
+    (w > 0. && h > 0.).then_some((w, h))
 }
 
 /// Width and height from the file's header (PNG, GIF, BMP, JPEG, WebP), without decoding it.

@@ -6936,6 +6936,37 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     #[gpui::test]
+    fn pictures_fit_the_pane_and_pinch_to_zoom(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        // A 40×10 PNG.
+        let hex = "89504e470d0a1a0a0000000d49484452000000280000000a080200000049f88b070000001a49444154789c635068681810c4306af1a8c5a3168f5a4c2e02002703c210a404bfbc0000000049454e44ae426082";
+        let png: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+        std::fs::write(root.join("wide.png"), png).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("wide.png"), None, false, window, cx));
+        cx.run_until_parked();
+        let preview = ws.read_with(cx, |ws, _| ws.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Preview(v) => Some(v.clone()),
+            _ => None,
+        })).expect("a picture opens in a preview");
+        let area = cx.debug_bounds("preview-image").expect("the picture's pane");
+        let zoom = |cx: &mut VisualTestContext| preview.read_with(cx, |v, _| v.page_zoom());
+        let pinch = |cx: &mut VisualTestContext, magnify: f32| {
+            ws.update_in(cx, |ws, window, cx| ws.pinch(crate::pinch::Pinch { magnify, at: area.center() }, window, cx));
+            cx.run_until_parked();
+        };
+        pinch(cx, -0.5);
+        assert_eq!(zoom(cx), 1., "fitted is as small as it gets");
+        for _ in 0..20 {
+            pinch(cx, 0.035);
+        }
+        assert!((1.9..2.1).contains(&zoom(cx)), "zoomed to {}", zoom(cx));
+        assert!(cx.debug_bounds("image-zoom").is_some(), "the zoom is shown");
+        click_on(cx, "image-zoom");
+        assert_eq!(zoom(cx), 1., "a click fits it again");
+    }
+
+    #[gpui::test]
     fn pinching_the_preview_magnifies_it_without_rewrapping(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));
