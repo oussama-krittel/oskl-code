@@ -19,8 +19,32 @@ pub enum Tab {
     Envs,
 }
 
+/// What the name box in the tree names.
+#[derive(Clone, PartialEq)]
+enum NameFor {
+    NewCollection,
+    /// A new folder in this collection, inside `parent` (a folder, or the collection).
+    NewFolder { ci: usize, parent: String },
+    Rename { ci: usize, what: Target },
+}
+
+#[derive(Clone, PartialEq)]
+enum Target {
+    Coll,
+    Folder(String),
+    Req(String),
+}
+
+struct Naming {
+    what: NameFor,
+    input: Entity<crate::editor::Editor>,
+    _subs: Vec<gpui::Subscription>,
+}
+
 #[derive(Clone)]
 enum RowKind {
+    /// The name box of something new.
+    Naming,
     Coll(usize),
     Folder(usize, String),
     Req(usize, api::Item),
@@ -53,8 +77,9 @@ pub struct ApiPanel {
     scroll: UniformListScrollHandle,
     filter: Entity<crate::editor::Editor>,
     menu: Option<(Point<Pixels>, Vec<(String, Act)>)>,
-    /// A request being dragged onto a folder.
     status: Option<String>,
+    /// Naming a new collection or folder, or renaming one (a box in the tree).
+    naming: Option<Naming>,
 }
 
 /// A request's entry, dragged to another folder.
@@ -100,6 +125,7 @@ impl ApiPanel {
             filter,
             menu: None,
             status: None,
+            naming: None,
         };
         p.reload(cx);
         p
@@ -144,14 +170,18 @@ impl ApiPanel {
                 fn matches(f: &Folder, q: &str) -> bool {
                     f.name.to_lowercase().contains(q) || f.requests.iter().any(|r| r.name.to_lowercase().contains(q) || r.method.to_lowercase() == q) || f.folders.iter().any(|s| matches(s, q))
                 }
-                fn walk(ci: usize, f: &Folder, depth: usize, open: &HashSet<String>, q: &str, rows: &mut Vec<Row>) {
+                // `np`: the folder a new folder is being named in (its box goes first inside it).
+                fn walk(ci: usize, f: &Folder, depth: usize, open: &HashSet<String>, q: &str, np: Option<&str>, rows: &mut Vec<Row>) {
                     for sub in &f.folders {
                         if !q.is_empty() && !matches(sub, q) {
                             continue;
                         }
                         rows.push(Row { depth, kind: RowKind::Folder(ci, sub.id.clone()), key: sub.id.clone() });
+                        if np == Some(sub.id.as_str()) {
+                            rows.push(Row { depth: depth + 1, kind: RowKind::Naming, key: "naming".into() });
+                        }
                         if open.contains(&sub.id) || !q.is_empty() {
-                            walk(ci, sub, depth + 1, open, q, rows);
+                            walk(ci, sub, depth + 1, open, q, np, rows);
                         }
                     }
                     for r in &f.requests {
@@ -161,14 +191,25 @@ impl ApiPanel {
                         rows.push(Row { depth, kind: RowKind::Req(ci, r.clone()), key: r.id.clone() });
                     }
                 }
+                if self.naming.as_ref().is_some_and(|n| n.what == NameFor::NewCollection) {
+                    rows.push(Row { depth: 0, kind: RowKind::Naming, key: "naming".into() });
+                }
+                let new_in: Option<(usize, String)> = match self.naming.as_ref().map(|n| &n.what) {
+                    Some(NameFor::NewFolder { ci, parent }) => Some((*ci, parent.clone())),
+                    _ => None,
+                };
                 for (ci, c) in self.colls.iter().enumerate() {
                     if !q.is_empty() && !matches(&c.root, &q) {
                         continue;
                     }
                     rows.push(Row { depth: 0, kind: RowKind::Coll(ci), key: c.id.clone() });
+                    let np = new_in.as_ref().filter(|(i, _)| *i == ci).map(|(_, p)| p.as_str());
+                    if np == Some(c.id.as_str()) {
+                        rows.push(Row { depth: 1, kind: RowKind::Naming, key: "naming".into() });
+                    }
                     if self.open.contains(&c.id) || !q.is_empty() {
-                        walk(ci, &c.root, 1, &self.open, &q, &mut rows);
-                        if c.root.count() == 0 && q.is_empty() {
+                        walk(ci, &c.root, 1, &self.open, &q, np, &mut rows);
+                        if c.root.count() == 0 && q.is_empty() && np.is_none() {
                             rows.push(Row { depth: 1, kind: RowKind::Info("No requests yet".into()), key: format!("empty:{}", c.id) });
                         }
                     }
@@ -192,27 +233,139 @@ impl ApiPanel {
         self.rows = rows;
     }
 
-    fn new_collection(&mut self, cx: &mut Context<Self>) {
-        let n = self.colls.len() + 1;
-        let c = Collection::new(&if n == 1 { "My API".to_string() } else { format!("Collection {n}") }, self.project());
-        api::save_collection(&c).ok();
-        self.open.insert(c.id.clone());
-        let id = c.id.clone();
-        self.reload(cx);
-        // Named in its settings tab.
-        cx.emit(open_req(ApiOpen::Folder { coll: id.clone(), folder: id }));
+    /// A new collection: its name is typed in the tree (Enter keeps it, Esc drops it).
+    fn new_collection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab = Tab::Collections;
+        self.start_naming(NameFor::NewCollection, "", window, cx);
     }
 
-    fn new_folder(&mut self, ci: usize, parent: &str, cx: &mut Context<Self>) {
-        let Some(c) = self.colls.get_mut(ci) else { return };
-        let f = Folder { auth: api::Auth::Inherit, ..Default::default() };
-        let fid = f.id.clone();
-        c.root.folder_or_self(Some(parent)).folders.push(f);
-        api::save_collection(c).ok();
+    fn new_folder(&mut self, ci: usize, parent: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.open.insert(parent.to_string());
-        let cid = c.id.clone();
+        self.start_naming(NameFor::NewFolder { ci, parent: parent.to_string() }, "", window, cx);
+    }
+
+    fn rename(&mut self, ci: usize, what: Target, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.colls.get(ci) else { return };
+        let now = match &what {
+            Target::Coll => c.name().to_string(),
+            Target::Folder(f) => c.root.find(f).map(|f| f.name.clone()).unwrap_or_default(),
+            Target::Req(r) => find_item(&c.root, r).map(|i| i.name.clone()).unwrap_or_default(),
+        };
+        self.start_naming(NameFor::Rename { ci, what }, &now, window, cx);
+    }
+
+    fn start_naming(&mut self, what: NameFor, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| {
+            let mut e = crate::editor::Editor::new(crate::editor::EditorMode::SingleLine, cx);
+            e.placeholder = match &what {
+                NameFor::NewCollection => "Collection name",
+                NameFor::NewFolder { .. } => "Folder name",
+                NameFor::Rename { .. } => "Name",
+            }
+            .into();
+            e.set_text(text, cx);
+            e.select_range(0..text.chars().count(), cx);
+            e
+        });
+        let subs = vec![
+            cx.subscribe_in(&input, window, |p: &mut ApiPanel, _, ev: &crate::editor::EditorEvent, window, cx| match ev {
+                crate::editor::EditorEvent::Submit => p.commit_naming(window, cx),
+                crate::editor::EditorEvent::Cancel => p.cancel_naming(window, cx),
+                _ => {}
+            }),
+            // Clicking elsewhere keeps what was typed, like the file tree.
+            cx.on_blur(&input.focus_handle(cx), window, |p, window, cx| {
+                if p.naming.is_some() {
+                    p.commit_naming(window, cx);
+                }
+            }),
+        ];
+        self.naming = Some(Naming { what, input: input.clone(), _subs: subs });
+        self.rebuild(cx);
+        if let Some(ix) = self.rows.iter().position(|r| matches!(r.kind, RowKind::Naming) || self.renaming(&r.key)) {
+            self.scroll.scroll_to_item(ix, gpui::ScrollStrategy::Center);
+        }
+        input.read(cx).focus(window);
+        // Again once it's on screen: focus given to something not drawn yet can be lost.
+        let again = input.clone();
+        cx.on_next_frame(window, move |p, window, cx| {
+            if p.naming.as_ref().is_some_and(|n| n.input == again) {
+                again.read(cx).focus(window);
+            }
+        });
+        cx.notify();
+    }
+
+    /// Whether the row with this key is being renamed.
+    fn renaming(&self, key: &str) -> bool {
+        match self.naming.as_ref().map(|n| &n.what) {
+            Some(NameFor::Rename { ci, what }) => match what {
+                Target::Coll => self.colls.get(*ci).is_some_and(|c| c.id == key),
+                Target::Folder(f) | Target::Req(f) => f == key,
+            },
+            _ => false,
+        }
+    }
+
+    fn cancel_naming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.naming = None;
+        self.rebuild(cx);
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn commit_naming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(n) = self.naming.take() else { return };
+        let name = n.input.read(cx).text().trim().to_string();
+        window.focus(&self.focus);
+        if name.is_empty() {
+            self.rebuild(cx);
+            return cx.notify();
+        }
+        let result = match n.what {
+            NameFor::NewCollection => {
+                let c = Collection::new(&name, self.project());
+                self.open.insert(c.id.clone());
+                self.selected = Some(c.id.clone());
+                api::save_collection(&c)
+            }
+            NameFor::NewFolder { ci, parent } => match self.colls.get_mut(ci) {
+                Some(c) => {
+                    let f = Folder { name, auth: api::Auth::Inherit, ..Default::default() };
+                    self.selected = Some(f.id.clone());
+                    c.root.folder_or_self(Some(&parent)).folders.push(f);
+                    api::save_collection(c)
+                }
+                None => Ok(()),
+            },
+            NameFor::Rename { ci, what } => match self.colls.get_mut(ci) {
+                Some(c) => match what {
+                    Target::Coll => {
+                        c.root.name = name;
+                        api::save_collection(c)
+                    }
+                    Target::Folder(f) => {
+                        if let Some(f) = c.root.find_mut(&f) {
+                            f.name = name;
+                        }
+                        api::save_collection(c)
+                    }
+                    Target::Req(id) => match api::load_request(c, &id) {
+                        Some(mut r) => {
+                            r.name = name;
+                            api::save_request(c, &r, None)
+                        }
+                        None => Ok(()),
+                    },
+                },
+                None => Ok(()),
+            },
+        };
+        if let Err(e) = result {
+            self.status = Some(e);
+        }
         self.reload(cx);
-        cx.emit(open_req(ApiOpen::Folder { coll: cid, folder: fid }));
+        cx.emit(Request::Api(ApiRequest::Changed));
     }
 
     fn new_request(&mut self, coll: Option<String>, folder: Option<String>, cx: &mut Context<Self>) {
@@ -407,11 +560,13 @@ impl ApiPanel {
         let (c1, f1) = (cid.clone(), fid.clone());
         items.push(("New request".into(), Rc::new(move |p, _, cx| p.new_request(Some(c1.clone()), Some(f1.clone()), cx))));
         let f2 = fid.clone();
-        items.push(("New folder".into(), Rc::new(move |p, _, cx| p.new_folder(ci, &f2, cx))));
+        items.push(("New folder".into(), Rc::new(move |p, w, cx| p.new_folder(ci, &f2, w, cx))));
         let (c3, f3) = (cid.clone(), fid.clone());
         items.push(("Run…".into(), Rc::new(move |_, _, cx| cx.emit(open_req(ApiOpen::Runner { coll: c3.clone(), folder: f3.clone() })))));
         let (c4, f4) = (cid.clone(), fid.clone());
-        items.push(("Settings (auth, headers, variables, scripts)".into(), Rc::new(move |_, _, cx| cx.emit(open_req(ApiOpen::Folder { coll: c4.clone(), folder: f4.clone() })))));
+        items.push(("Settings…".into(), Rc::new(move |_, _, cx| cx.emit(open_req(ApiOpen::Folder { coll: c4.clone(), folder: f4.clone() })))));
+        let f6 = fid.clone();
+        items.push(("Rename".into(), Rc::new(move |p, w, cx| p.rename(ci, if is_root { Target::Coll } else { Target::Folder(f6.clone()) }, w, cx))));
         if is_root {
             items.push(("Export as Postman…".into(), Rc::new(move |p, _, cx| p.export(ci, false, cx))));
             items.push(("Export as OpenAPI…".into(), Rc::new(move |p, _, cx| p.export(ci, true, cx))));
@@ -472,10 +627,26 @@ impl ApiPanel {
         let name = |text: String, color: gpui::Hsla| div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(color).child(text);
         let badge = |m: &str| div().flex_none().w(px(38.)).text_size(px(9.5)).font_weight(FontWeight::BOLD).text_color(theme::c(api::method_color(m))).child(if m == "DELETE" { "DEL".to_string() } else if m == "OPTIONS" { "OPT".into() } else { m.to_string() });
         let rk = row.key.clone();
+        // The name box (naming something new, or renaming this row).
+        let name_box = |input: Entity<crate::editor::Editor>| div().flex_1().min_w_0().h(px(20.)).px(px(4.)).flex().items_center().bg(theme::bg_input()).border_1().border_color(theme::focus_border()).child(input).into_any_element();
+        let renaming = self.renaming(&row.key).then(|| self.naming.as_ref().map(|n| n.input.clone())).flatten();
+        let label = |text: String, color: gpui::Hsla| match renaming.clone() {
+            Some(i) => name_box(i),
+            None => name(text, color).into_any_element(),
+        };
         match row.kind {
+            RowKind::Naming => {
+                let Some(n) = &self.naming else { return div().into_any_element() };
+                let icon = if n.what == NameFor::NewCollection { "collection" } else { "folder" };
+                base.cursor_default()
+                    .child(ui::small_icon("chevron-right", theme::fg()))
+                    .child(ui::small_icon(icon, if n.what == NameFor::NewCollection { theme::accent() } else { theme::fg_dim() }))
+                    .child(name_box(n.input.clone()))
+                    .into_any_element()
+            }
             RowKind::Coll(ci) | RowKind::Folder(ci, _) => {
                 let c = &self.colls[ci];
-                let (fid, label, is_root) = match &row.kind {
+                let (fid, label_text, is_root) = match &row.kind {
                     RowKind::Folder(_, f) => (f.clone(), c.root.find(f).map(|x| x.name.clone()).unwrap_or_default(), false),
                     _ => (c.id.clone(), c.name().to_string(), true),
                 };
@@ -484,7 +655,7 @@ impl ApiPanel {
                 let menu = self.coll_menu(ci, fid.clone());
                 let menu2 = menu.clone();
                 let cid2 = cid.clone();
-                let sel = format!("api-coll-{label}");
+                let sel = format!("api-coll-{label_text}");
                 base.debug_selector(move || sel.clone())
                     .on_click(cx.listener(move |p, _, w, cx| {
                         p.selected = Some(rk.clone());
@@ -507,7 +678,7 @@ impl ApiPanel {
                     .drag_over::<DraggedRequest>(|s, _, _, _| s.bg(theme::selected_focused()))
                     .child(chevron(open))
                     .child(ui::small_icon(if is_root { "collection" } else if open { "folder-open" } else { "folder" }, if is_root { theme::accent() } else { theme::fg_dim() }))
-                    .child(name(label, if is_root { theme::fg_bright() } else { theme::fg() }))
+                    .child(label(label_text, if is_root { theme::fg_bright() } else { theme::fg() }))
                     .when(is_root && c.project.is_some(), |d| d.child(div().flex_none().text_size(px(10.)).text_color(theme::fg_muted()).child("workspace")))
                     .when(is_root, |d| d.child(div().flex_none().text_size(px(10.5)).text_color(theme::fg_muted()).child(c.root.count().to_string())))
                     .child(
@@ -521,9 +692,9 @@ impl ApiPanel {
                             })))
                             .child(hover_button(format!("api-new-folder-{ix}"), "new-folder", "New folder").on_click(cx.listener({
                                 let fid = fid.clone();
-                                move |p, _, _, cx| {
+                                move |p, _, w, cx| {
                                     cx.stop_propagation();
-                                    p.new_folder(ci, &fid, cx);
+                                    p.new_folder(ci, &fid, w, cx);
                                 }
                             })))
                             .child(hover_button(format!("api-run-{ix}"), "play", "Run").on_click(cx.listener({
@@ -554,9 +725,22 @@ impl ApiPanel {
                         cx.notify();
                     }))
                     .on_drag(drag, |d: &DraggedRequest, _, _, cx| cx.new(|_| ui::DragChip(d.label.clone())))
+                    .on_mouse_down(MouseButton::Right, cx.listener({
+                        let (rid, it) = (item.id.clone(), item.clone());
+                        move |p, ev: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            let (r1, r2, it2) = (rid.clone(), rid.clone(), it.clone());
+                            let items: Vec<(String, Act)> = vec![
+                                ("Rename".into(), Rc::new(move |p: &mut ApiPanel, w: &mut Window, cx: &mut Context<ApiPanel>| p.rename(ci, Target::Req(r1.clone()), w, cx))),
+                                ("Duplicate".into(), Rc::new(move |p: &mut ApiPanel, _: &mut Window, cx: &mut Context<ApiPanel>| p.duplicate(ci, &r2, cx))),
+                                ("Delete request".into(), Rc::new(move |p: &mut ApiPanel, _: &mut Window, cx: &mut Context<ApiPanel>| p.delete_request(ci, it2.clone(), cx))),
+                            ];
+                            p.open_menu(ev.position, items, cx);
+                        }
+                    }))
                     .child(div().w(px(12.)))
                     .child(badge(&item.method))
-                    .child(name(item.name.clone(), theme::fg()))
+                    .child(label(item.name.clone(), theme::fg()))
                     .child(
                         actions()
                             .child(hover_button(format!("api-dup-{ix}"), "copy", "Duplicate").on_click(cx.listener(move |p, _, _, cx| {
@@ -653,7 +837,8 @@ impl ApiPanel {
         let list = div()
             .id("api-panel-menu")
             .occlude()
-            .w(px(260.))
+            .min_w(px(190.))
+            .whitespace_nowrap()
             .py(px(4.))
             .bg(theme::bg_popup())
             .border_1()
@@ -689,6 +874,10 @@ impl ApiPanel {
             }));
         Some(deferred(anchored().position(*at).snap_to_window().child(list)).with_priority(1).into_any_element())
     }
+}
+
+fn find_item<'a>(f: &'a Folder, id: &str) -> Option<&'a api::Item> {
+    f.requests.iter().find(|r| r.id == id).or_else(|| f.folders.iter().find_map(|s| find_item(s, id)))
 }
 
 fn ago(at: u64) -> String {
@@ -765,7 +954,7 @@ impl Render for ApiPanel {
                             .border_color(theme::border_input())
                             .cursor_pointer()
                             .hover(|s| s.bg(theme::hover()))
-                            .on_click(cx.listener(|p, _, _, cx| p.new_collection(cx)))
+                            .on_click(cx.listener(|p, _, w, cx| p.new_collection(w, cx)))
                             .child("New collection"),
                     )
                     .child(div().text_size(px(11.)).text_color(theme::fg_muted()).child("Or import one: Postman, Insomnia, OpenAPI, Bruno, cURL."))
@@ -793,7 +982,7 @@ impl Render for ApiPanel {
                     .text_size(px(10.5))
                     .child(div().flex_1().child("API"))
                     .child(head_button("api-new", "plus", "New request").on_click(cx.listener(|p, _, _, cx| p.new_request(None, None, cx))))
-                    .child(head_button("api-new-coll", "new-folder", "New collection").on_click(cx.listener(|p, _, _, cx| p.new_collection(cx))))
+                    .child(head_button("api-new-coll", "new-folder", "New collection").on_click(cx.listener(|p, _, w, cx| p.new_collection(w, cx))))
                     .child(head_button("api-import", "arrow-down", "Import: Postman, Insomnia, OpenAPI, Bruno, .env…").on_click(cx.listener(|p, _, _, cx| p.import(cx))))
                     .child(head_button("api-cookies", "cookie", "Cookies").on_click(cx.listener(|_, _, _, cx| cx.emit(open_req(ApiOpen::Cookies)))))
                     .child(match self.tab {

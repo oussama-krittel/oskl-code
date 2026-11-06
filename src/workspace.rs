@@ -7946,6 +7946,38 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     #[gpui::test]
+    fn new_collections_are_named_in_the_tree_and_renamed_there(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let roots = ws.read_with(cx, |ws, cx| ws.api_roots(cx));
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Api, window, cx));
+        cx.run_until_parked();
+        click_on(cx, "api-new-coll");
+        // The name box has the cursor: typing names it, Enter keeps it.
+        cx.simulate_input("Payments");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let names = |roots: &[std::path::PathBuf]| crate::api::collections(roots).iter().map(|c| c.name().to_string()).collect::<Vec<_>>();
+        assert_eq!(names(&roots), ["Payments"]);
+        // Esc on a new one makes nothing.
+        click_on(cx, "api-new-coll");
+        cx.simulate_input("Nope");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(names(&roots), ["Payments"]);
+        // Rename, from the collection's menu.
+        let row = cx.debug_bounds("api-coll-Payments").expect("shown");
+        cx.simulate_event(gpui::MouseDownEvent { button: gpui::MouseButton::Right, position: row.center(), modifiers: gpui::Modifiers::none(), click_count: 1, first_mouse: false });
+        cx.simulate_event(gpui::MouseUpEvent { button: gpui::MouseButton::Right, position: row.center(), modifiers: gpui::Modifiers::none(), click_count: 1 });
+        cx.run_until_parked();
+        let rename = (0..12).find(|i| cx.debug_bounds(Box::leak(format!("api-panel-menu-{i}").into_boxed_str())).is_some() && *i == 4).expect("Rename in the menu");
+        click_on(cx, Box::leak(format!("api-panel-menu-{rename}").into_boxed_str()));
+        cx.simulate_input("Billing");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(names(&roots), ["Billing"], "typing replaces the selected old name");
+    }
+
+    #[gpui::test]
     fn closing_the_folder_leaves_an_empty_window(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));

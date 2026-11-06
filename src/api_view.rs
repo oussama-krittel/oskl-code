@@ -3330,6 +3330,7 @@ impl ApiView {
             .id("api-menu")
             .occlude()
             .min_w(px(160.))
+            .whitespace_nowrap()
             .max_h(px(360.))
             .overflow_y_scroll()
             .py(px(4.))
