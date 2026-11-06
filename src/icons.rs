@@ -78,6 +78,11 @@ pub fn svg(key: &str) -> Option<String> {
         "ft-info" => r#"<path fill="black" stroke="none" fill-rule="evenodd" d="M8 1a7 7 0 1 1 0 14A7 7 0 0 1 8 1zM7.2 7v5h1.6V7zM8 3.8a1 1 0 1 0 0 2 1 1 0 0 0 0-2z"/>"#.into(),
         "ft-lines" => r#"<path fill="black" stroke="none" fill-rule="evenodd" d="M3.5 1h6.2l3.8 3.8V15h-10zM5.3 7.2v1h5.4v-1zM5.3 9.4v1h5.4v-1zM5.3 11.6v1h3.6v-1z"/>"#.into(),
         "ft-db" => r#"<path fill="black" stroke="none" d="M8 1.5c3.3 0 5.5 1 5.5 2.2v8.6c0 1.2-2.2 2.2-5.5 2.2s-5.5-1-5.5-2.2V3.7C2.5 2.5 4.7 1.5 8 1.5z"/>"#.into(),
+        // Documents: a page with its mark punched out.
+        "ft-word" => r#"<path fill="black" stroke="none" fill-rule="evenodd" d="M3.5 1h6.2l3.8 3.8V15h-10zM4.5 6.2h1.4l.8 3.9.9-3.1h.8l.9 3.1.8-3.9h1.4L10 12.6H8.9L8 9.5l-.9 3.1H6z"/>"#.into(),
+        "ft-excel" => r#"<path fill="black" stroke="none" fill-rule="evenodd" d="M3.5 1h6.2l3.8 3.8V15h-10zM4.8 6.4h2.6v1.8H4.8zM8.2 6.4h3v1.8h-3zM4.8 9h2.6v1.8H4.8zM8.2 9h3v1.8h-3zM4.8 11.6h2.6v1.8H4.8zM8.2 11.6h3v1.8h-3z"/>"#.into(),
+        "ft-csv" => r#"<path fill="black" stroke="none" fill-rule="evenodd" d="M3.5 1h6.2l3.8 3.8V15h-10zM4.8 6.8h2v1.1h-2zM7.6 6.8h1.6v1.1H7.6zM10 6.8h1.4v1.1H10zM4.8 9.2h2v1.1h-2zM7.6 9.2h1.6v1.1H7.6zM10 9.2h1.4v1.1H10zM4.8 11.6h2v1.1h-2zM7.6 11.6h1.6v1.1H7.6zM10 11.6h1.4v1.1H10z"/>"#.into(),
+        "ft-pdf" => r#"<path fill="black" stroke="none" fill-rule="evenodd" d="M3.5 1h6.2l3.8 3.8V15h-10zM5.6 6.3h2.8a2 2 0 0 1 0 4H7v2.4H5.6zM7 7.6v1.4h1.4a.7.7 0 0 0 0-1.4z"/>"#.into(),
         "ft-file" => PAGE.into(),
         k if k.starts_with("ft-badge-") => badge(&k["ft-badge-".len()..]),
         _ => return None,
@@ -151,8 +156,10 @@ pub fn file_icon(name: &str) -> (String, u32) {
         "sql" | "db" | "sqlite" | "prisma" => k("ft-db", 0xffca28),
         "graphql" | "gql" => b("GQ", 0xe535ab),
         "txt" | "log" => k("ft-lines", 0x90a4ae),
-        "csv" | "tsv" => k("ft-lines", 0x8bc34a),
-        "pdf" => b("PD", 0xef5350),
+        "csv" | "tsv" | "tab" => k("ft-csv", 0x8bc34a),
+        "pdf" => k("ft-pdf", 0xef5350),
+        "doc" | "docx" | "docm" | "dotx" | "rtf" | "odt" | "pages" => k("ft-word", 0x2b7cd3),
+        "xls" | "xlsx" | "xlsm" | "xltx" | "ods" | "numbers" => k("ft-excel", 0x21a366),
         "zip" | "gz" | "tar" | "tgz" | "rar" | "7z" => k("ft-lock", 0xafb42b),
         _ => k("ft-file", 0x90a4ae),
     }
@@ -199,7 +206,7 @@ mod parse {
     #[test]
     fn all_icons_parse() {
         let names = [
-            "fd-closed", "fd-open", "ft-react", "ft-json", "ft-css", "ft-html", "ft-md", "ft-rust", "ft-shell", "ft-image",
+            "fd-closed", "fd-open", "ft-word", "ft-excel", "ft-csv", "ft-pdf", "ft-react", "ft-json", "ft-css", "ft-html", "ft-md", "ft-rust", "ft-shell", "ft-image",
             "ft-git", "ft-lock", "ft-npm", "ft-gear", "ft-info", "ft-lines", "ft-db", "ft-file", "ft-badge-TS", "ft-badge-C+",
             "files", "git", "check", "filter", "error", "keyboard", "maximize", "chevron-left", "terminal",
         ];
