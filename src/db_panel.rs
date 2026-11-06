@@ -45,6 +45,8 @@ pub struct DbPanel {
     selected: Option<String>,
     scroll: UniformListScrollHandle,
     tasks: HashMap<String, Task<()>>,
+    /// Connections being connected (until their first listing comes back).
+    connecting: HashSet<String>,
 }
 
 /// A node's key: its connection and path.
@@ -72,6 +74,7 @@ impl DbPanel {
             selected: None,
             scroll: UniformListScrollHandle::new(),
             tasks: HashMap::new(),
+            connecting: HashSet::new(),
         };
         p.reload(cx);
         p
@@ -146,7 +149,8 @@ impl DbPanel {
             let depth = group.len();
             let k = key(&c.id, &[]);
             rows.push(Row { depth, kind: RowKind::Conn(ci), key: k.clone() });
-            if self.open.contains(&k) {
+            // While connecting, the row itself says so.
+            if self.open.contains(&k) && !self.connecting.contains(&c.id) {
                 self.push_children(&mut rows, ci, &[], depth + 1);
             }
         }
@@ -185,6 +189,9 @@ impl DbPanel {
                 this.update(cx, |p, cx| {
                     p.tasks.remove(&kk);
                     let root = !kk.contains('\u{1f}');
+                    if root {
+                        p.connecting.remove(&kk);
+                    }
                     match r {
                         Ok(n) => {
                             p.loaded.insert(kk.clone(), Loaded::Ready(n));
@@ -215,6 +222,7 @@ impl DbPanel {
     /// Connects (opens it and lists what's in it); a failure says so in a popup.
     pub fn connect(&mut self, conn_id: &str, cx: &mut Context<Self>) {
         engine::open(conn_id);
+        self.connecting.insert(conn_id.to_string());
         self.forget_tree(conn_id);
         let k = key(conn_id, &[]);
         self.open.insert(k.clone());
@@ -229,14 +237,18 @@ impl DbPanel {
         cx.emit(Request::Ask(crate::dialog::Ask {
             title: format!("Couldn't connect to {name}"),
             detail: error,
-            buttons: vec!["Retry".into()],
+            // The main button first: Retry; then fixing what's wrong.
+            buttons: vec!["Retry".into(), "Edit connection".into()],
             danger: false,
             cancel_default: false,
             cancel_label: Some("Close"),
-            on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
+            on_answer: std::rc::Rc::new(move |choice, _, cx: &mut App| {
                 if let Some(p) = weak.upgrade() {
                     let id = id.clone();
-                    p.update(cx, |p, cx| p.connect(&id, cx));
+                    p.update(cx, |p, cx| match choice {
+                        0 => p.connect(&id, cx),
+                        _ => cx.emit(Request::Db(DbRequest::Open(Open::Edit(id)))),
+                    });
                 }
             }),
         }));
@@ -269,7 +281,14 @@ impl DbPanel {
         self.load(conn_id, path, cx);
     }
 
+    /// Stops connecting: the answer, when it comes, is dropped.
+    fn cancel_connect(&mut self, conn_id: &str, cx: &mut Context<Self>) {
+        self.tasks.remove(&key(conn_id, &[]));
+        self.disconnect(conn_id, cx);
+    }
+
     pub fn disconnect(&mut self, conn_id: &str, cx: &mut Context<Self>) {
+        self.connecting.remove(conn_id);
         engine::forget(conn_id);
         let k = key(conn_id, &[]);
         self.open.retain(|o| o != &k && !o.starts_with(&format!("{k}\u{1f}")));
@@ -372,7 +391,9 @@ impl DbPanel {
                 let c = &self.conns[ci];
                 let id = c.id.clone();
                 let open = self.open.contains(&row.key);
-                let live = engine::connected(&c.id);
+                let connecting = self.connecting.contains(&c.id);
+                // Connected for real once its first listing came back.
+                let live = engine::connected(&c.id) && !connecting;
                 let (i1, i2, i3, i4, i5) = (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
                 let title = c.title();
                 let sel_name = format!("db-conn-{title}");
@@ -388,8 +409,31 @@ impl DbPanel {
                     .child(name(title, theme::fg_bright()))
                     .when(c.project.is_some(), |d| d.child(div().text_size(px(10.)).text_color(theme::fg_muted()).child("workspace")))
                     .when(live, |d| d.child(ui::small_icon("dot", theme::git_added()).size(px(9.))))
+                    // Connecting: says so, with Cancel (shown without hovering); nothing else yet.
+                    .when(connecting, |d| {
+                        let id = id.clone();
+                        d.child(div().flex_none().text_size(px(11.)).text_color(theme::fg_muted()).child("Connecting…")).child(
+                            div()
+                                .id(SharedString::from(format!("db-cancel-{ci}")))
+                                .debug_selector(move || format!("db-cancel-{ci}"))
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .size(px(20.))
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::ca(0x5a5d5e50)))
+                                .tooltip(ui::tooltip("Cancel"))
+                                .on_click(cx.listener(move |p, _, _, cx| {
+                                    cx.stop_propagation();
+                                    p.cancel_connect(&id, cx);
+                                }))
+                                .child(ui::small_icon("close", theme::fg_dim())),
+                        )
+                    })
                     // Not connected: Connect and Edit, always shown; the rest once it's connected.
-                    .when(!live, |d| {
+                    .when(!live && !connecting, |d| {
                         let id = id.clone();
                         d.child(
                             div()

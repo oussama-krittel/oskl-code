@@ -7769,8 +7769,35 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         wait_for(cx, "the popup", |cx| ws.read_with(cx, |ws, _| ws.ask.is_some()));
         assert!(cx.debug_bounds("dialog-button-Retry").is_some() && cx.debug_bounds("dialog-button-Close").is_some(), "Retry and Close");
         assert!(!crate::db::engine::connected(&c.id), "left disconnected");
-        click_on(cx, "dialog-button-Close");
+        // Edit connection: its form, to fix what's wrong.
+        click_on(cx, "dialog-button-Edit connection");
         assert!(ws.read_with(cx, |ws, _| ws.ask.is_none()));
+        let form = db_tab(&ws, cx).expect("the connection's form");
+        assert_eq!(form.read_with(cx, |f, cx| f.form_text("name", cx)), "Nowhere");
+    }
+
+    #[gpui::test]
+    fn connecting_shows_cancel_and_nothing_else(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let mut c = crate::db::Conn::new(crate::db::Kind::Redis);
+        c.name = "Far".into();
+        c.host = "10.255.255.1".into(); // never answers
+        crate::db::save(&c, Some("x")).unwrap();
+        ws.update_in(cx, |ws, window, cx| {
+            ws.db_panel.update(cx, |p, cx| p.reload_and_expand(None, cx));
+            ws.select_side(super::Side::Databases, window, cx)
+        });
+        cx.run_until_parked();
+        click_on(cx, "db-connect-0");
+        let row = cx.debug_bounds("db-conn-Far").unwrap();
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("db-cancel-0").is_some(), "Cancel, without hovering");
+        assert!(cx.debug_bounds("db-query-0").is_none() && cx.debug_bounds("db-disconnect-0").is_none(), "no connected buttons while connecting");
+        click_on(cx, "db-cancel-0");
+        assert!(!crate::db::engine::connected(&c.id), "cancelled: not connected");
+        assert!(cx.debug_bounds("db-connect-0").is_some(), "Connect again");
+        assert!(ws.read_with(cx, |ws, _| ws.ask.is_none()), "no failure popup for a cancel");
     }
 
     /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
