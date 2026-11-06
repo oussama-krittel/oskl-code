@@ -45,6 +45,9 @@ memmap2 = "0.9"
 # Word and Excel files are ZIPs of XML: inflated and read as they stream.
 miniz_oxide = "0.8"
 quick-xml = "0.41"
+# PDF pages drawn by macOS go to the GPU as bitmaps (the same crates GPUI uses).
+image = { version = "0.25", default-features = false }
+smallvec = "1"
 notify = "6"
 objc = "0.2.7"
 pulldown-cmark = { version = "0.13", default-features = false }

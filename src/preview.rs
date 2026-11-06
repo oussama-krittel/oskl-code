@@ -30,6 +30,8 @@ pub enum Kind {
     Doc,
     /// Excel: its sheets as tables.
     Sheet,
+    /// Its pages, drawn by macOS.
+    Pdf,
 }
 
 pub fn kind_of(path: &Path) -> Option<Kind> {
@@ -41,13 +43,14 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
         "csv" | "tsv" | "tab" => Kind::Table,
         "docx" | "docm" | "dotx" | "doc" => Kind::Doc,
         "xlsx" | "xlsm" | "xltx" | "xls" => Kind::Sheet,
+        "pdf" => Kind::Pdf,
         _ => return None,
     })
 }
 
 /// Pictures open as a preview (there's no text to edit). Markdown and SVG open as text.
 pub fn opens_as_preview(path: &Path) -> bool {
-    matches!(kind_of(path), Some(Kind::Image | Kind::Doc | Kind::Sheet))
+    matches!(kind_of(path), Some(Kind::Image | Kind::Doc | Kind::Sheet | Kind::Pdf))
 }
 
 /// Text files that can also be shown rendered.
@@ -71,6 +74,7 @@ pub struct PreviewView {
     table_task: Option<Task<()>>,
     /// A Word document (its text is what it reads as, in Markdown).
     doc: bool,
+    pdf: Option<Entity<crate::pdf::PdfView>>,
     /// The shown picture's own width and height (read once per file).
     natural: std::cell::RefCell<Option<(PathBuf, Option<(f32, f32)>)>>,
     snapshot: Option<PathBuf>,
@@ -123,6 +127,7 @@ impl PreviewView {
             table: None,
             table_task: None,
             doc,
+            pdf: None,
             path,
             kind,
             source,
@@ -156,7 +161,7 @@ impl PreviewView {
     pub fn title(&self) -> String {
         let name = self.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         match self.kind {
-            Kind::Image | Kind::Sheet => name,
+            Kind::Image | Kind::Sheet | Kind::Pdf => name,
             _ if self.doc => name,
             Kind::Table => format!("Table {name}"),
             _ => format!("Preview {name}"),
@@ -277,6 +282,13 @@ impl PreviewView {
                 }));
             }
             Kind::Doc => {}
+            Kind::Pdf => match &self.pdf {
+                Some(p) => p.update(cx, |p, cx| p.reload(cx)),
+                None => {
+                    let path = self.path.clone();
+                    self.pdf = Some(cx.new(|cx| crate::pdf::PdfView::new(path, cx)));
+                }
+            },
             Kind::Svg | Kind::Image => {
                 // The file changed on disk: drop the picture decoded from the old one.
                 release(&self.shown, window, cx);
@@ -289,6 +301,11 @@ impl PreviewView {
     /// A trackpad pinch over the page: zooms all of it (text, tables, code, diagrams), keeping
     /// the spot under the fingers where it is. Returns whether this preview took it.
     pub fn pinch(&mut self, p: crate::pinch::Pinch, cx: &mut Context<Self>) -> bool {
+        if self.kind == Kind::Pdf {
+            let Some(v) = self.pdf.clone().filter(|v| v.read(cx).area.get().contains(&p.at)) else { return false };
+            v.update(cx, |v, cx| v.pinch(p.magnify, cx));
+            return true;
+        }
         if matches!(self.kind, Kind::Table | Kind::Sheet) {
             let Some(t) = self.table.clone().filter(|t| t.read(cx).area.get().contains(&p.at)) else { return false };
             t.update(cx, |t, cx| t.pinch(p.magnify, cx));
@@ -359,6 +376,12 @@ impl PreviewView {
         self.scroll.set_offset(if new <= 1. { point(gpui::px(0.), gpui::px(0.)) } else { to });
         cx.notify();
         true
+    }
+
+    /// A PDF's page count (tests).
+    #[cfg(test)]
+    pub fn pdf_pages(&self, cx: &App) -> Option<usize> {
+        self.pdf.as_ref().map(|p| p.read(cx).pages())
     }
 
     /// The table's rows and zoom (tests).
@@ -748,6 +771,7 @@ impl Render for PreviewView {
             }
             Kind::Image | Kind::Svg => self.render_image(cx),
             Kind::Doc => div().into_any_element(),
+            Kind::Pdf => self.pdf.clone().map(|p| p.into_any_element()).unwrap_or_else(|| div().into_any_element()),
             Kind::Table | Kind::Sheet => match &self.table {
                 Some(t) => t.clone().into_any_element(),
                 None => div().size_full().flex().items_center().justify_center().text_color(theme::fg_dim()).child(if self.info.is_empty() { "Reading…".to_string() } else { self.info.clone() }).into_any_element(),

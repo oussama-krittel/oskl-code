@@ -28,6 +28,7 @@ mod keybindings;
 mod keymap;
 mod merge_view;
 mod office;
+mod pdf;
 mod pinch;
 mod preview;
 mod repo;

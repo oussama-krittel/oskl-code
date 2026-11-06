@@ -6965,6 +6965,22 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     #[gpui::test]
+    fn pdfs_open_as_their_pages(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let page = |n: usize| format!("{} 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]>>endobj\n", n);
+        let pdf = format!("%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R 4 0 R]/Count 2>>endobj\n{}{}trailer<</Root 1 0 R>>\n%%EOF\n", page(3), page(4));
+        std::fs::write(root.join("two.pdf"), pdf).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("two.pdf"), None, false, window, cx));
+        cx.run_until_parked();
+        let preview = ws.read_with(cx, |ws, _| ws.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Preview(v) => Some(v.clone()),
+            _ => None,
+        })).expect("a PDF opens as a preview, not text");
+        assert_eq!(preview.read_with(cx, |v, cx| v.pdf_pages(cx)), Some(2));
+    }
+
+    #[gpui::test]
     fn pictures_fit_the_pane_and_pinch_to_zoom(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));
