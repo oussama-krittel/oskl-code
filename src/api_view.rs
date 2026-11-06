@@ -53,6 +53,36 @@ pub enum ApiRequest {
 
 type Act = Rc<dyn Fn(&mut ApiView, &mut Window, &mut Context<ApiView>)>;
 
+/// Saving a request that isn't in a collection: a name, and a place picked from a list
+/// that can be searched (there may be many collections).
+struct SaveDialog {
+    name: Entity<Editor>,
+    search: Entity<Editor>,
+    /// The collection, and the folder in it (None: the collection itself).
+    choice: Option<(String, Option<String>)>,
+    list_open: bool,
+    _subs: Vec<Subscription>,
+}
+
+/// A place a request can be saved in: (collection, folder, "Collection / Folder", depth).
+type Place = (String, Option<String>, String, usize);
+
+fn places(roots: &[PathBuf]) -> Vec<Place> {
+    fn walk(c: &Collection, f: &api::Folder, path: &str, depth: usize, out: &mut Vec<Place>) {
+        for sub in &f.folders {
+            let p = format!("{path} / {}", sub.name);
+            out.push((c.id.clone(), Some(sub.id.clone()), p.clone(), depth));
+            walk(c, sub, &p, depth + 1, out);
+        }
+    }
+    let mut out = Vec::new();
+    for c in api::collections(roots) {
+        out.push((c.id.clone(), None, c.name().to_string(), 0));
+        walk(&c, &c.root, c.name(), 1, &mut out);
+    }
+    out
+}
+
 struct Menu {
     at: Point<Pixels>,
     items: Vec<(String, Act)>,
@@ -66,6 +96,8 @@ pub struct ApiView {
     menu: Option<Menu>,
     /// Where the last button that opens a menu was pressed.
     menu_at: Option<Point<Pixels>>,
+    /// "Save request": its name and where it goes, for a request not in a collection yet.
+    save_dialog: Option<SaveDialog>,
     status: Option<Result<String, String>>,
     _subs: Vec<Subscription>,
 }
@@ -478,7 +510,7 @@ fn find_coll(roots: &[PathBuf], id: &str) -> Option<Collection> {
 
 impl ApiView {
     pub fn new(open: ApiOpen, roots: Vec<PathBuf>, cx: &mut Context<Self>) -> Self {
-        let mut v = ApiView { focus: cx.focus_handle(), open: open.clone(), roots: roots.clone(), body: Body_::Missing(String::new()), menu: None, menu_at: None, status: None, _subs: Vec::new() };
+        let mut v = ApiView { focus: cx.focus_handle(), open: open.clone(), roots: roots.clone(), body: Body_::Missing(String::new()), menu: None, menu_at: None, save_dialog: None, status: None, _subs: Vec::new() };
         v.body = match open {
             ApiOpen::Request { coll, id } => match find_coll(&roots, &coll).and_then(|c| api::load_request(&c, &id).map(|r| (c, r))) {
                 Some((c, r)) => {
@@ -1256,44 +1288,224 @@ impl ApiView {
         cx.notify();
     }
 
-    /// "Save to…": the collections and their folders.
+    /// "Save request": asks for its name and where it goes.
     fn save_menu(&mut self, cx: &mut Context<Self>) {
-        let mut items: Vec<(String, Act)> = Vec::new();
-        fn walk(c: &Collection, f: &api::Folder, depth: usize, items: &mut Vec<(String, Act)>) {
-            let (cid, fid) = (c.id.clone(), f.id.clone());
-            let label = if depth == 0 { format!("Save to {}", f.name) } else { format!("{}↳ {}", "   ".repeat(depth), f.name) };
-            items.push((
-                label,
-                Rc::new(move |v: &mut ApiView, _, cx| {
-                    if let Body_::Req(t) = &mut v.body {
-                        t.coll = Some(cid.clone());
-                        t.folder = if depth == 0 { None } else { Some(fid.clone()) };
-                    }
-                    v.save_now(None, cx);
-                }),
-            ));
-            for sub in &f.folders {
-                walk(c, sub, depth + 1, items);
-            }
-        }
-        for c in api::collections(&self.roots) {
-            walk(&c, &c.root, 0, &mut items);
-        }
-        let project = self.project();
-        items.push((
-            "New collection…".into(),
-            Rc::new(move |v: &mut ApiView, _, cx| {
-                let c = Collection::new("My Requests", project.clone());
-                api::save_collection(&c).ok();
-                if let Body_::Req(t) = &mut v.body {
-                    t.coll = Some(c.id.clone());
-                    t.folder = None;
-                }
-                v.save_now(None, cx);
+        let Body_::Req(t) = &self.body else { return };
+        let name = t.name.read(cx).text();
+        let name = input("Request name", &name, cx);
+        let search = input("Search collections and folders…", "", cx);
+        let first = places(&self.roots).into_iter().next().map(|p| (p.0, p.1));
+        let subs = vec![
+            cx.subscribe(&name, |v: &mut ApiView, _, ev: &EditorEvent, cx| match ev {
+                EditorEvent::Submit => v.save_dialog_done(cx),
+                EditorEvent::Cancel => v.close_save_dialog(cx),
+                _ => {}
             }),
-        ));
-        self.menu = Some(Menu { at: self.menu_at.unwrap_or_default(), items });
+            cx.subscribe(&search, |v: &mut ApiView, _, ev: &EditorEvent, cx| match ev {
+                EditorEvent::Changed => {
+                    if let Some(d) = &mut v.save_dialog {
+                        d.list_open = true;
+                    }
+                    cx.notify();
+                }
+                // Enter picks the first match.
+                EditorEvent::Submit => {
+                    let first = v.save_dialog.as_ref().map(|d| d.search.read(cx).text().to_lowercase()).map(|q| places(&v.roots).into_iter().find(|p| p.2.to_lowercase().contains(&q)));
+                    if let (Some(Some(p)), Some(d)) = (first, &mut v.save_dialog) {
+                        d.choice = Some((p.0, p.1));
+                        d.list_open = false;
+                    }
+                    cx.notify();
+                }
+                EditorEvent::Cancel => v.close_save_dialog(cx),
+                _ => {}
+            }),
+        ];
+        self.save_dialog = Some(SaveDialog { name, search, choice: first, list_open: false, _subs: subs });
+        self.menu = None;
         cx.notify();
+    }
+
+    fn close_save_dialog(&mut self, cx: &mut Context<Self>) {
+        self.save_dialog = None;
+        cx.notify();
+    }
+
+    fn save_dialog_done(&mut self, cx: &mut Context<Self>) {
+        let Some(d) = self.save_dialog.take() else { return };
+        let name = d.name.read(cx).text();
+        let Some((coll, folder)) = d.choice else {
+            self.save_dialog = Some(d);
+            return;
+        };
+        if let Body_::Req(t) = &mut self.body {
+            if !name.trim().is_empty() {
+                t.name.update(cx, |e, cx| e.set_text(name.trim(), cx));
+            }
+            t.coll = Some(coll);
+            t.folder = folder;
+        }
+        self.save_now(None, cx);
+    }
+
+    fn new_collection_for_save(&mut self, cx: &mut Context<Self>) {
+        let n = api::collections(&self.roots).len() + 1;
+        let c = Collection::new(&if n == 1 { "My Requests".to_string() } else { format!("Collection {n}") }, self.project());
+        api::save_collection(&c).ok();
+        if let Some(d) = &mut self.save_dialog {
+            d.choice = Some((c.id.clone(), None));
+            d.list_open = false;
+        }
+        cx.emit(WsRequest::Api(ApiRequest::Changed));
+        cx.notify();
+    }
+
+    fn render_save_dialog(&self, d: &SaveDialog, cx: &mut Context<Self>) -> AnyElement {
+        let all = places(&self.roots);
+        let chosen = d.choice.as_ref().and_then(|(c, f)| all.iter().find(|p| &p.0 == c && &p.1 == f)).map(|p| p.2.clone());
+        let q = d.search.read(cx).text().to_lowercase();
+        let shown: Vec<&Place> = all.iter().filter(|p| q.is_empty() || p.2.to_lowercase().contains(&q)).collect();
+        let list = d.list_open.then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .mt(px(4.))
+                .rounded(px(5.))
+                .border_1()
+                .border_color(theme::border_input())
+                .bg(theme::bg_popup())
+                .child(div().p(px(6.)).border_b_1().border_color(theme::border()).child(field(&d.search)))
+                .child(
+                    div()
+                        .id("api-save-places")
+                        .max_h(px(240.))
+                        .overflow_y_scroll()
+                        .py(px(4.))
+                        .when(shown.is_empty(), |el| el.child(div().px(px(12.)).py(px(6.)).text_color(theme::fg_muted()).child("Nothing matches")))
+                        .children(shown.iter().enumerate().map(|(i, p)| {
+                            let on = d.choice.as_ref().is_some_and(|(c, f)| *c == p.0 && *f == p.1);
+                            let pick = (p.0.clone(), p.1.clone());
+                            let label = if q.is_empty() { p.2.rsplit(" / ").next().unwrap_or(&p.2).to_string() } else { p.2.clone() };
+                            div()
+                                .id(("api-save-place", i))
+                                .debug_selector(move || format!("api-save-place-{i}"))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .h(px(26.))
+                                .pl(px(10. + if q.is_empty() { p.3 as f32 * 16. } else { 0. }))
+                                .pr(px(10.))
+                                .mx(px(4.))
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .when(on, |el| el.bg(theme::selected_focused()))
+                                .hover(|st| st.bg(theme::hover()))
+                                .on_click(cx.listener(move |v, _, w, cx| {
+                                    if let Some(d) = &mut v.save_dialog {
+                                        d.choice = Some(pick.clone());
+                                        d.list_open = false;
+                                        d.name.read(cx).focus(w);
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(ui::small_icon(if p.1.is_none() { "collection" } else { "folder" }, if p.1.is_none() { theme::accent() } else { theme::fg_dim() }))
+                                .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(label))
+                        })),
+                )
+                .child(
+                    div()
+                        .id("api-save-new-coll")
+                        .debug_selector(|| "api-save-new-coll".into())
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .px(px(12.))
+                        .h(px(30.))
+                        .border_t_1()
+                        .border_color(theme::border())
+                        .cursor_pointer()
+                        .text_color(theme::accent())
+                        .hover(|st| st.bg(theme::hover()))
+                        .on_click(cx.listener(|v, _, _, cx| v.new_collection_for_save(cx)))
+                        .child(ui::small_icon("plus", theme::accent()))
+                        .child("New collection"),
+                )
+        });
+        let card = div()
+            .id("api-save-dialog")
+            .debug_selector(|| "api-save-dialog".into())
+            .occlude()
+            .w(px(460.))
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .p(px(18.))
+            .rounded(px(8.))
+            .bg(theme::bg_popup())
+            .border_1()
+            .border_color(theme::border_input())
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().text_size(px(15.)).text_color(theme::fg_bright()).font_weight(FontWeight::MEDIUM).child("Save request"))
+            .child(div().flex().flex_col().gap(px(5.)).child(div().text_color(theme::fg_dim()).child("Name")).child(field(&d.name).h(px(30.))))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.))
+                    .child(div().text_color(theme::fg_dim()).child("Save in"))
+                    .child(
+                        div()
+                            .id("api-save-in")
+                            .debug_selector(|| "api-save-in".into())
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .h(px(30.))
+                            .px(px(8.))
+                            .rounded(px(4.))
+                            .bg(theme::bg_input())
+                            .border_1()
+                            .border_color(if d.list_open { theme::focus_border() } else { theme::border_input() })
+                            .cursor_pointer()
+                            .on_click(cx.listener(|v, _, w, cx| {
+                                if let Some(d) = &mut v.save_dialog {
+                                    d.list_open = !d.list_open;
+                                    if d.list_open {
+                                        d.search.read(cx).focus(w);
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                            .child(ui::small_icon("collection", theme::accent()))
+                            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(if chosen.is_some() { theme::fg() } else { theme::fg_muted() }).child(chosen.clone().unwrap_or_else(|| "Choose a collection…".into())))
+                            .child(ui::small_icon("chevron-down", theme::fg_dim())),
+                    )
+                    .children(list),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .pt(px(4.))
+                    .child(button("api-save-cancel", "Cancel", None, false).on_click(cx.listener(|v, _, _, cx| v.close_save_dialog(cx))))
+                    .child(button("api-save-ok", "Save", Some("check"), true).when(d.choice.is_none(), |el| el.opacity(0.5)).on_click(cx.listener(|v, _, _, cx| v.save_dialog_done(cx)))),
+            );
+        // Centered over this tab, the rest dimmed (a click outside closes it).
+        div()
+            .id("api-save-overlay")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::ca(0x00000066))
+            .on_mouse_down(MouseButton::Left, cx.listener(|v, _, _, cx| v.close_save_dialog(cx)))
+            .child(card)
+            .into_any_element()
     }
 
     fn send_action(&mut self, _: &SendRequest, _: &mut Window, cx: &mut Context<Self>) {
@@ -1304,7 +1516,7 @@ impl ApiView {
     }
 
     fn close_menu(&mut self, _: &CloseMenu, _: &mut Window, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() {
+        if self.menu.take().is_some() || self.save_dialog.take().is_some() {
             cx.notify();
         } else {
             cx.propagate();
@@ -1455,6 +1667,23 @@ impl ApiView {
         let row = self.test_row(&Test { on: true, what: what.into(), path: String::new(), op: op.into(), value: value.into() }, cx);
         if let Body_::Req(t) = &mut self.body {
             t.tests.push(row);
+        }
+    }
+
+    pub fn save_dialog_open(&self) -> bool {
+        self.save_dialog.is_some()
+    }
+
+    pub fn save_dialog_search(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(d) = &self.save_dialog {
+            d.search.update(cx, |e, cx| e.set_text(text, cx));
+        }
+    }
+
+    pub fn saved_in(&self) -> Option<(Option<String>, Option<String>)> {
+        match &self.body {
+            Body_::Req(t) if t.saved => Some((t.coll.clone(), t.folder.clone())),
+            _ => None,
         }
     }
 
@@ -3141,8 +3370,10 @@ impl Render for ApiView {
             Body_::Missing(m) => div().size_full().flex().items_center().justify_center().text_color(theme::fg_dim()).child(m.clone()).into_any_element(),
         };
         let menu = self.render_menu(cx);
+        let save = self.save_dialog.as_ref().map(|d| self.render_save_dialog(d, cx));
         div()
             .key_context("ApiView")
+            .relative()
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::send_action))
             .on_action(cx.listener(Self::save))
@@ -3152,6 +3383,7 @@ impl Render for ApiView {
             .text_color(theme::fg())
             .text_size(px(13.))
             .child(body)
+            .children(save)
             .children(menu)
     }
 }

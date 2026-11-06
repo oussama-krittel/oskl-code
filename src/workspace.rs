@@ -7911,6 +7911,41 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     #[gpui::test]
+    fn saving_a_new_request_asks_where_in_a_searchable_list(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let roots = ws.read_with(cx, |ws, cx| ws.api_roots(cx));
+        // Plenty of collections; one has an "Orders" folder.
+        let mut target = None;
+        for i in 0..30 {
+            let mut c = crate::api::Collection::new(&format!("Service {i:02}"), roots.first().cloned());
+            if i == 17 {
+                let f = crate::api::Folder { name: "Orders".into(), auth: crate::api::Auth::Inherit, ..Default::default() };
+                target = Some((c.id.clone(), f.id.clone()));
+                c.root.folders.push(f);
+            }
+            crate::api::save_collection(&c).unwrap();
+        }
+        let (cid, fid) = target.unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Api, window, cx));
+        cx.run_until_parked();
+        click_on(cx, "api-new");
+        let tab = api_tab(&ws, cx).unwrap();
+        click_on(cx, "api-save");
+        let dialog = cx.debug_bounds("api-save-dialog").expect("a dialog asks where");
+        let side = cx.debug_bounds("api-new").unwrap();
+        let send = cx.debug_bounds("api-send").unwrap();
+        assert!(dialog.left() > side.right() && dialog.top() > send.top(), "centered over the tab, not the side panel or its corner");
+        click_on(cx, "api-save-in");
+        tab.update(cx, |t, cx| t.save_dialog_search("service 17 / ord", cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("api-save-place-1").is_none(), "the search leaves one match");
+        click_on(cx, "api-save-place-0");
+        click_on(cx, "api-save-ok");
+        assert!(!tab.read_with(cx, |t, _| t.save_dialog_open()), "closed");
+        assert_eq!(tab.read_with(cx, |t, _| t.saved_in()), Some((Some(cid), Some(fid))), "saved in that folder");
+    }
+
+    #[gpui::test]
     fn closing_the_folder_leaves_an_empty_window(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));
