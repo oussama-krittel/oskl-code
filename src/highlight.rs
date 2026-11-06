@@ -21,7 +21,21 @@ pub fn name(ix: u8) -> &'static str {
     NAMES.get(ix as usize).copied().unwrap_or("")
 }
 
+/// Span indexes from here on are CSV columns (their colors cycle).
+pub const COLUMN_BASE: u8 = 200;
+const COLUMN_COLORS: usize = 10;
+
+/// A CSV column's color: the theme's own syntax colors, in turn.
+pub fn column_color(col: usize) -> Hsla {
+    use crate::theme::Syntax::*;
+    const ORDER: [crate::theme::Syntax; COLUMN_COLORS] = [Keyword, String, Number, Function, Type, Property, Builtin, Attribute, StringSpecial, Param];
+    crate::theme::syntax(ORDER[col % COLUMN_COLORS])
+}
+
 pub fn color(ix: u8) -> Hsla {
+    if ix >= COLUMN_BASE {
+        return column_color((ix - COLUMN_BASE) as usize);
+    }
     let name = NAMES.get(ix as usize).copied().unwrap_or("");
     let base = name.split('.').next().unwrap_or("");
     use crate::theme::Syntax::*;
@@ -65,6 +79,9 @@ pub enum Lang {
     Yaml,
     Toml,
     Terraform,
+    /// Comma (or semicolon…) and tab separated values: each column in its own color.
+    Csv,
+    Tsv,
 }
 
 pub fn detect(path: &Path) -> Option<Lang> {
@@ -83,6 +100,8 @@ pub fn detect(path: &Path) -> Option<Lang> {
         "sh" | "bash" | "zsh" => Lang::Bash,
         "yml" | "yaml" => Lang::Yaml,
         "toml" => Lang::Toml,
+        "csv" => Lang::Csv,
+        "tsv" | "tab" => Lang::Tsv,
         "tf" | "tfvars" | "hcl" | "tftest" => Lang::Terraform,
         _ if name == ".zshrc" || name == ".bashrc" || name.ends_with(".env") || name == ".envrc" => Lang::Bash,
         _ if name == "cargo.lock" => Lang::Toml,
@@ -114,6 +133,8 @@ fn build(lang: Lang) -> Option<HighlightConfiguration> {
         Lang::Yaml => (tree_sitter_yaml::LANGUAGE.into(), tree_sitter_yaml::HIGHLIGHTS_QUERY.into(), ""),
         Lang::Toml => (tree_sitter_toml_ng::LANGUAGE.into(), tree_sitter_toml_ng::HIGHLIGHTS_QUERY.into(), ""),
         Lang::Terraform => (tree_sitter_hcl::LANGUAGE.into(), include_str!("hcl_highlights.scm").into(), ""),
+        // Colored by `columns`, not tree-sitter.
+        Lang::Csv | Lang::Tsv => return None,
     };
     let mut config = HighlightConfiguration::new(language, format!("{lang:?}"), &highlights, injections, "").ok()?;
     config.configure(NAMES);
@@ -129,6 +150,11 @@ fn config(lang: Lang) -> Option<&'static HighlightConfiguration> {
 pub type LineSpans = Vec<Vec<(Range<usize>, u8)>>;
 
 pub fn highlight(lang: Lang, text: &str) -> Option<LineSpans> {
+    match lang {
+        Lang::Csv => return Some(columns(text, crate::table::separator(std::path::Path::new("x.csv"), text.lines().next().unwrap_or("")))),
+        Lang::Tsv => return Some(columns(text, b'\t')),
+        _ => {}
+    }
     let config = config(lang)?;
     let mut highlighter = Highlighter::new();
     let events = highlighter.highlight(config, text.as_bytes(), None, None, |_| None).ok()?;
@@ -167,8 +193,53 @@ pub fn highlight(lang: Lang, text: &str) -> Option<LineSpans> {
     Some(out)
 }
 
+/// Colors a delimited file's columns (quoted fields, even over several lines, stay one
+/// column). Huge files are colored up to a point, so the colors cost little memory.
+fn columns(text: &str, sep: u8) -> LineSpans {
+    const MAX_SPANS: usize = 400_000;
+    let delim = NAMES.iter().position(|n| *n == "punctuation.delimiter").unwrap_or(0) as u8;
+    let mut out: LineSpans = Vec::new();
+    let (mut col, mut quoted, mut spans) = (0usize, false, 0usize);
+    for line in text.split('\n') {
+        let mut row = Vec::new();
+        if spans < MAX_SPANS {
+            let (mut start, mut c) = (0usize, 0usize);
+            for ch in line.chars() {
+                if ch == '"' {
+                    quoted = !quoted;
+                } else if ch as u32 == sep as u32 && !quoted {
+                    if c > start {
+                        row.push((start..c, COLUMN_BASE + (col % COLUMN_COLORS) as u8));
+                    }
+                    row.push((c..c + 1, delim));
+                    col += 1;
+                    start = c + 1;
+                }
+                c += 1;
+            }
+            if c > start {
+                row.push((start..c, COLUMN_BASE + (col % COLUMN_COLORS) as u8));
+            }
+            spans += row.len();
+        }
+        if !quoted {
+            col = 0;
+        }
+        out.push(row);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn csv_columns_take_turns_in_colors() {
+        let s = super::columns("a,b,\"c,d\"\nx;y", b',');
+        let cols: Vec<u8> = s[0].iter().map(|(_, h)| *h).filter(|h| *h >= super::COLUMN_BASE).collect();
+        assert_eq!(cols, [200, 201, 202], "the quoted comma stays in its column");
+        assert_eq!(s[1].len(), 1, "a new line starts at the first column again");
+    }
+
     use super::{Lang, highlight, is_comment};
 
     #[test]

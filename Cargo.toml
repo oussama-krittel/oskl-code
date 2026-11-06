@@ -40,6 +40,8 @@ mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 # The one GPUI draws SVGs with: diagrams' text is turned into shapes with a font fallback that works.
 usvg = { version = "0.45.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 mimalloc = "0.1.52"
+# Big CSV files are read from disk as shown, not copied into memory.
+memmap2 = "0.9"
 notify = "6"
 objc = "0.2.7"
 pulldown-cmark = { version = "0.13", default-features = false }

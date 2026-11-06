@@ -6936,6 +6936,35 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     #[gpui::test]
+    fn csv_files_preview_as_a_table_that_follows_edits(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::write(root.join("people.csv"), "name,city,note\nAda,London,\"likes, commas\"\nGrace,NYC,\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("people.csv"), None, false, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-k v");
+        let preview = || ws.read_with(cx, |ws, _| ws.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Preview(v) => Some(v.clone()),
+            _ => None,
+        }));
+        let preview = { cx.run_until_parked(); preview() }.expect("a table preview opens beside it");
+        wait_for(cx, "the table", |cx| preview.read_with(cx, |v, cx| v.table_state(cx)).is_some());
+        assert_eq!(preview.read_with(cx, |v, cx| v.table_state(cx)).map(|t| (t.0, t.1)), Some((3, 3)), "a header and two rows, three columns");
+        // Typing in the file: the table follows.
+        let ed = ws.read_with(cx, |ws, _| ws.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Editor(e) => Some(e.clone()),
+            _ => None,
+        })).unwrap();
+        ed.update(cx, |e, cx| e.replace_range(0..0, "a,b,c,d\n", cx));
+        cx.executor().advance_clock(std::time::Duration::from_millis(300));
+        wait_for(cx, "the table to follow", |cx| preview.read_with(cx, |v, cx| v.table_state(cx)).is_some_and(|t| t.0 == 4 && t.1 == 4));
+        let area = cx.debug_bounds("table").expect("the table on screen");
+        ws.update_in(cx, |ws, window, cx| ws.pinch(crate::pinch::Pinch { magnify: 0.5, at: area.center() }, window, cx));
+        cx.run_until_parked();
+        assert_eq!(preview.read_with(cx, |v, cx| v.table_state(cx)).unwrap().2, 1.5, "pinch zooms it");
+    }
+
+    #[gpui::test]
     fn pictures_fit_the_pane_and_pinch_to_zoom(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));

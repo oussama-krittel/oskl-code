@@ -3676,6 +3676,7 @@ dependencies = [
  "jsonschema",
  "libmimalloc-sys",
  "md-5 0.11.0",
+ "memmap2",
  "mermaid-rs-renderer",
  "mimalloc",
  "mongodb",

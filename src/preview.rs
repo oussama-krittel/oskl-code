@@ -24,6 +24,8 @@ pub enum Kind {
     Image,
     Svg,
     Markdown,
+    /// CSV / TSV, as a table.
+    Table,
 }
 
 pub fn kind_of(path: &Path) -> Option<Kind> {
@@ -32,6 +34,7 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico" => Kind::Image,
         "svg" => Kind::Svg,
         "md" | "markdown" | "mdx" => Kind::Markdown,
+        "csv" | "tsv" | "tab" => Kind::Table,
         _ => return None,
     })
 }
@@ -43,7 +46,7 @@ pub fn opens_as_preview(path: &Path) -> bool {
 
 /// Text files that can also be shown rendered.
 pub fn has_preview(path: &Path) -> bool {
-    matches!(kind_of(path), Some(Kind::Svg | Kind::Markdown))
+    matches!(kind_of(path), Some(Kind::Svg | Kind::Markdown | Kind::Table))
 }
 
 pub struct PreviewView {
@@ -57,6 +60,9 @@ pub struct PreviewView {
     /// What the picture shows: the file, or a snapshot of the SVG being edited (a temp file,
     /// so it's drawn as sharply as files are).
     shown: PathBuf,
+    /// A CSV's (or spreadsheet's) table.
+    table: Option<Entity<crate::table::TableView>>,
+    table_task: Option<Task<()>>,
     /// The shown picture's own width and height (read once per file).
     natural: std::cell::RefCell<Option<(PathBuf, Option<(f32, f32)>)>>,
     snapshot: Option<PathBuf>,
@@ -104,6 +110,8 @@ impl PreviewView {
             focus: cx.focus_handle(),
             shown: path.clone(),
             natural: Default::default(),
+            table: None,
+            table_task: None,
             path,
             kind,
             source,
@@ -136,7 +144,11 @@ impl PreviewView {
 
     pub fn title(&self) -> String {
         let name = self.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        if self.kind == Kind::Image { name } else { format!("Preview {name}") }
+        match self.kind {
+            Kind::Image => name,
+            Kind::Table => format!("Table {name}"),
+            _ => format!("Preview {name}"),
+        }
     }
 
     #[cfg(test)]
@@ -208,6 +220,25 @@ impl PreviewView {
                 }
                 self.info = format!("SVG · {}", human_size(text.len() as u64));
             }
+            Kind::Table => {
+                // Read (and split into rows) off the main thread: a big file takes a moment.
+                let (path, text) = (self.path.clone(), self.source.as_ref().map(|e| e.read(cx).text()));
+                let read = cx.background_executor().spawn(async move { crate::table::Sheet::delimited(&path, text) });
+                self.table_task = Some(cx.spawn(async move |this, cx| {
+                    let sheet = read.await;
+                    this.update(cx, |v, cx| {
+                        match sheet {
+                            Ok(sheet) => match &v.table {
+                                Some(t) => t.update(cx, |t, cx| t.replace(vec![sheet], cx)),
+                                None => v.table = Some(cx.new(|_| crate::table::TableView::new(vec![sheet], true))),
+                            },
+                            Err(e) => v.info = e.to_string(),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+            }
             Kind::Svg | Kind::Image => {
                 // The file changed on disk: drop the picture decoded from the old one.
                 release(&self.shown, window, cx);
@@ -220,6 +251,11 @@ impl PreviewView {
     /// A trackpad pinch over the page: zooms all of it (text, tables, code, diagrams), keeping
     /// the spot under the fingers where it is. Returns whether this preview took it.
     pub fn pinch(&mut self, p: crate::pinch::Pinch, cx: &mut Context<Self>) -> bool {
+        if self.kind == Kind::Table {
+            let Some(t) = self.table.clone().filter(|t| t.read(cx).area.get().contains(&p.at)) else { return false };
+            t.update(cx, |t, cx| t.pinch(p.magnify, cx));
+            return true;
+        }
         let area = self.area.get();
         if !area.contains(&p.at) {
             return false;
@@ -285,6 +321,15 @@ impl PreviewView {
         self.scroll.set_offset(if new <= 1. { point(gpui::px(0.), gpui::px(0.)) } else { to });
         cx.notify();
         true
+    }
+
+    /// The table's rows and zoom (tests).
+    #[cfg(test)]
+    pub fn table_state(&self, cx: &App) -> Option<(usize, usize, f32)> {
+        self.table.as_ref().map(|t| {
+            let t = t.read(cx);
+            (t.sheets[0].rows(), t.sheets[0].cols(), t.zoom)
+        })
     }
 
     /// The page's zoom (tests).
@@ -664,6 +709,10 @@ impl Render for PreviewView {
                 page
             }
             Kind::Image | Kind::Svg => self.render_image(cx),
+            Kind::Table => match &self.table {
+                Some(t) => t.clone().into_any_element(),
+                None => div().size_full().flex().items_center().justify_center().text_color(theme::fg_dim()).child(if self.info.is_empty() { "Reading…".to_string() } else { self.info.clone() }).into_any_element(),
+            },
         };
         div().key_context("Preview").track_focus(&self.focus).size_full().bg(theme::bg_editor()).child(body)
     }

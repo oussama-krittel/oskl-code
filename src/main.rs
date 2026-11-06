@@ -37,6 +37,7 @@ mod secrets;
 mod session;
 mod signature;
 mod settings;
+mod table;
 mod terminal;
 mod theme;
 mod tools;
