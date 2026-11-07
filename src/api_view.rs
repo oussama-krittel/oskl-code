@@ -1968,7 +1968,7 @@ fn icon_btn(id: impl Into<SharedString>, icon: &str, tip: &'static str) -> gpui:
         .rounded(px(3.))
         .cursor_pointer()
         .hover(|s| s.bg(theme::hover()))
-        .tooltip(ui::tooltip(tip))
+        .when(!tip.is_empty(), |d| d.tooltip(ui::tooltip(tip)))
         .child(ui::small_icon(icon, theme::fg_dim()))
 }
 
@@ -2485,7 +2485,8 @@ impl ApiView {
     /// A request's own history, from its clock button.
     fn history_button(&self, req_id: &str, cx: &mut Context<Self>) -> AnyElement {
         let req_id = req_id.to_string();
-        icon_btn("api-history", "clock", "This request's history")
+        // No tooltip: it would sit over the list it opens.
+        icon_btn("api-history", "clock", "")
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |v, ev: &MouseDownEvent, _, cx| {
