@@ -369,6 +369,8 @@ impl DropZone {
 /// Splits are limited by size, not count: an area can be halved until it is 1/8 of the
 /// window (half → quarter → eighth), which also caps the layout at 8 splits.
 const MAX_SPLIT_DEPTH: usize = 3;
+/// How long the pointer stays still on the spaces rail before it opens.
+const RAIL_DWELL_MS: u64 = 70;
 
 /// A space: a main area of its own (its splits, their tabs, the sidebar section it shows).
 /// The current one's state is in the workspace's own fields; the others keep theirs here.
@@ -614,7 +616,10 @@ pub struct Workspace {
     last_space: usize,
     /// The spaces rail is open (hovered), and the overview of all spaces is shown.
     rail_open: bool,
+    rail_hover: bool,
     rail_panel_hover: bool,
+    rail_gen: usize,
+    rail_last_pos: Option<gpui::Point<Pixels>>,
     overview: bool,
     overview_focus: FocusHandle,
     panes: Vec<Pane>,
@@ -756,7 +761,10 @@ impl Workspace {
             space: 0,
             last_space: 0,
             rail_open: false,
+            rail_hover: false,
             rail_panel_hover: false,
+            rail_gen: 0,
+            rail_last_pos: None,
             overview: false,
             overview_focus: cx.focus_handle(),
             focused_pane: 0,
@@ -4641,10 +4649,60 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The spaces rail: a thin strip beside the main area, one mark per space; hovered, it
-    /// opens over the main area (taking no room from it) with each space's name and contents.
-    fn render_space_rail(&self, right: bool, cx: &mut Context<Self>) -> AnyElement {
-        let open = self.rail_open || self.rail_panel_hover;
+    /// The pointer moved on the closed rail: it opens once the pointer stays still a moment,
+    /// so crossing it on the way to the side panel (however slowly) doesn't open it.
+    fn rail_moved(&mut self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        self.rail_hover = true;
+        let last = self.rail_last_pos.replace(pos);
+        if self.rail_open {
+            return;
+        }
+        // Moving along the rail (not across it) means it's wanted: open now.
+        if let Some(l) = last {
+            let (dx, dy) = ((pos.x - l.x).abs(), (pos.y - l.y).abs());
+            if dy > px(2.) && dy > dx * 2. {
+                self.rail_open = true;
+                cx.notify();
+                return;
+            }
+        }
+        self.rail_gen += 1;
+        let gen_ = self.rail_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(RAIL_DWELL_MS)).await;
+            this.update(cx, |ws, cx| {
+                if ws.rail_gen == gen_ && ws.rail_hover && !ws.rail_open {
+                    ws.rail_open = true;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The pointer left the rail or its open column: close unless it came back meanwhile.
+    fn rail_left(&mut self, cx: &mut Context<Self>) {
+        self.rail_gen += 1;
+        let gen_ = self.rail_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(180)).await;
+            this.update(cx, |ws, cx| {
+                if ws.rail_gen == gen_ && !ws.rail_hover && !ws.rail_panel_hover && ws.rail_open {
+                    ws.rail_open = false;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The spaces rail: a thin strip beside the main area, one mark per space. Rested on, it
+    /// opens into a column of pills (over the main area, taking no room from it), each with
+    /// the space's color and its name written downwards.
+    fn render_space_rail(&self, right: bool, top: f32, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.rail_open;
         let marks = div().flex().flex_col().items_center().gap(px(5.)).pt(px(10.)).children(self.spaces.iter().enumerate().map(|(i, sp)| {
             let on = i == self.space;
             div()
@@ -4660,58 +4718,49 @@ impl Workspace {
         // A grip says it opens.
         let grip = div().mt(px(8.)).flex().flex_col().items_center().gap(px(2.)).children((0..3).map(|_| div().size(px(2.)).rounded(px(1.)).bg(theme::fg_muted())));
         let panel = open.then(|| {
-            let rows = self.spaces.iter().enumerate().map(|(i, sp)| {
+            let pills = self.spaces.iter().enumerate().map(|(i, sp)| {
                 let on = i == self.space;
+                let color = space_color(sp.color);
                 let (titles, tabs) = self.space_panes(i, cx);
-                let what = titles.iter().filter(|t| !t.is_empty()).take(3).cloned().collect::<Vec<_>>().join(" · ");
+                let what = titles.iter().filter(|t| !t.is_empty()).take(4).cloned().collect::<Vec<_>>().join(" · ");
+                let key = if i < 9 { format!("  ⌃{}", i + 1) } else { String::new() };
+                let tip = format!(
+                    "{}{key}\n{}\nDouble-click to rename · ⌃⌥{} moves the current tab here{}",
+                    sp.name,
+                    if what.is_empty() { format!("{} split{}, empty", titles.len(), if titles.len() == 1 { "" } else { "s" }) } else { format!("{what} ({tabs} tab{})", if tabs == 1 { "" } else { "s" }) },
+                    i + 1,
+                    if on && self.spaces.len() > 1 { " · ⌘K W closes it" } else { "" }
+                );
+                let name: String = if sp.name.chars().count() > 16 { sp.name.chars().take(15).chain(['…']).collect() } else { sp.name.clone() };
+                let (tw, th) = crate::assets::vtext_size(&name);
                 div()
                     .id(("space-row", i))
                     .debug_selector(move || format!("space-row-{i}"))
-                    .group("space-row")
+                    .flex_none()
+                    .w(px(36.))
                     .flex()
+                    .flex_col()
                     .items_center()
                     .gap(px(8.))
-                    .px(px(8.))
-                    .py(px(5.))
-                    .mx(px(4.))
-                    .rounded(px(4.))
+                    .pt(px(10.))
+                    .pb(px(12.))
+                    .rounded(px(10.))
+                    .border_1()
                     .cursor_pointer()
-                    .when(on, |d| d.bg(theme::selected_focused()))
-                    .hover(|s| s.bg(theme::hover()))
+                    .when(on, |d| d.bg(color.opacity(0.14)).border_color(color).shadow(vec![gpui::BoxShadow { color: color.opacity(0.45), offset: gpui::point(px(0.), px(0.)), blur_radius: px(10.), spread_radius: px(0.) }]))
+                    .when(!on, |d| d.bg(theme::bg_side()).border_color(theme::border()).hover(|s| s.bg(theme::hover()).border_color(color.opacity(0.6))))
+                    .tooltip(ui::tooltip_text(tip))
                     .on_click(cx.listener(move |ws, ev: &gpui::ClickEvent, w, cx| {
+                        ws.switch_space(i, w, cx);
                         if ev.click_count() >= 2 {
-                            ws.switch_space(i, w, cx);
                             ws.open_cmd(CmdMode::Command, "space rename ", w, cx);
-                        } else {
-                            ws.switch_space(i, w, cx);
                         }
                     }))
-                    .child(div().w(px(4.)).h(px(28.)).rounded(px(2.)).bg(space_color(sp.color)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(div().flex().items_center().gap(px(6.)).child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(if on { theme::fg_bright() } else { theme::fg() }).child(sp.name.clone())).when(i < 9, |d| d.child(div().text_size(px(10.)).text_color(theme::fg_muted()).child(format!("⌃{}", i + 1)))))
-                            .child(div().text_size(px(10.5)).text_color(theme::fg_muted()).overflow_hidden().text_ellipsis().whitespace_nowrap().child(if what.is_empty() { format!("{} split{} · empty", titles.len(), if titles.len() == 1 { "" } else { "s" }) } else { format!("{} · {tabs} tab{}", what, if tabs == 1 { "" } else { "s" }) })),
-                    )
+                    .child(div().size(px(9.)).rounded_full().bg(color).when(on, |d| d.shadow(vec![gpui::BoxShadow { color: color.opacity(0.7), offset: gpui::point(px(0.), px(0.)), blur_radius: px(6.), spread_radius: px(0.) }])))
+                    .child(svg().path(crate::assets::vtext_path(&name)).w(px(tw)).h(px(th)).flex_none().text_color(if on { theme::fg_bright() } else { theme::fg_dim() }))
+                    .when(i < 9, |d| d.child(div().text_size(px(9.5)).text_color(if on { color } else { theme::fg_muted() }).child(format!("⌃{}", i + 1))))
             });
-            let link = |id: &'static str, label: &'static str, keys: &'static str| {
-                div()
-                    .id(id)
-                    .debug_selector(move || id.to_string())
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .px(px(12.))
-                    .py(px(5.))
-                    .cursor_pointer()
-                    .text_color(theme::fg_dim())
-                    .hover(|s| s.bg(theme::hover()).text_color(theme::fg_bright()))
-                    .child(div().flex_1().child(label))
-                    .child(div().text_size(px(10.)).text_color(theme::fg_muted()).child(keys))
-            };
+            let keys = |k: &'static str| div().text_size(px(9.)).text_color(theme::fg_muted()).child(k);
             deferred(
                 div()
                     .id("space-panel")
@@ -4721,35 +4770,72 @@ impl Workspace {
                     .top_0()
                     .when(!right, |d| d.left_0())
                     .when(right, |d| d.right_0())
-                    .w(px(230.))
+                    .w(px(58.))
                     .h_full()
+                    .pt(px(top))
                     .flex()
                     .flex_col()
-                    .py(px(8.))
-                    .bg(theme::bg_popup())
+                    .items_center()
+                    .bg(theme::bg_side())
                     .when(!right, |d| d.border_r_1())
                     .when(right, |d| d.border_l_1())
-                    .border_color(theme::border_input())
+                    .border_color(theme::border())
                     .shadow_lg()
-                    .text_size(px(12.))
                     .on_hover(cx.listener(|ws, h: &bool, _, cx| {
                         ws.rail_panel_hover = *h;
+                        if !*h {
+                            ws.rail_left(cx);
+                        }
                         cx.notify();
                     }))
-                    .child(div().px(px(12.)).pb(px(6.)).text_size(px(10.5)).text_color(theme::fg_muted()).child("SPACES"))
-                    .children(rows)
-                    .child(div().h(px(1.)).mx(px(8.)).my(px(6.)).bg(theme::border()))
-                    .child(link("space-new", "New space", "⌘K N").on_click(cx.listener(|ws, _, w, cx| {
-                        ws.new_space(None, w, cx);
-                    })))
-                    .child(link("space-overview", "Overview", "⌘K O").on_click(cx.listener(|ws, _, w, cx| {
-                        ws.rail_open = false;
-                        ws.rail_panel_hover = false;
-                        ws.toggle_overview(w, cx);
-                    })))
-                    .when(self.spaces.len() > 1, |d| d.child(link("space-close", "Close this space", "⌘K W").on_click(cx.listener(|ws, _, w, cx| ws.close_space(w, cx)))))
-                    .child(div().flex_1())
-                    .child(div().px(px(12.)).text_size(px(10.5)).text_color(theme::fg_muted()).child("⌃1–9 go · ⌃⌥1–9 move the tab · ⌃0 last")),
+                    .child(
+                        div()
+                            .id("space-overview")
+                            .debug_selector(|| "space-overview".into())
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .gap(px(2.))
+                            .py(px(9.))
+                            .text_size(px(9.5))
+                            .text_color(theme::fg_dim())
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme::fg_bright()))
+                            .tooltip(ui::tooltip("Overview of all spaces (⌘K O)"))
+                            .flex_col()
+                            .child(div().flex().items_center().gap(px(2.)).child("SPACES").child(ui::icon("chevron-right", theme::fg_muted()).size(px(9.))))
+                            .child(keys("⌘K O"))
+                            .on_click(cx.listener(|ws, _, w, cx| {
+                                ws.rail_open = false;
+                                ws.toggle_overview(w, cx);
+                            })),
+                    )
+                    .child(div().id("space-pills").flex_1().min_h_0().w_full().overflow_y_scroll().flex().flex_col().items_center().gap(px(10.)).pt(px(4.)).pb(px(10.)).children(pills))
+                    .child(
+                        div()
+                            .id("space-new")
+                            .debug_selector(|| "space-new".into())
+                            .mt(px(10.))
+                            .mb(px(4.))
+                            .size(px(28.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(theme::border_input())
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            .tooltip(ui::tooltip("New space (⌘K N)"))
+                            .child(ui::icon("plus", theme::fg()).size(px(13.)))
+                            .on_click(cx.listener(|ws, _, w, cx| {
+                                ws.new_space(None, w, cx);
+                            })),
+                    )
+                    .child(div().mb(px(4.)).child(keys("⌘K N")))
+                    .child(div().mb(px(10.)).text_size(px(9.)).text_color(theme::fg_muted()).child("⌃⌥←→")),
             )
             .with_priority(3)
         });
@@ -4760,6 +4846,7 @@ impl Workspace {
             .flex_none()
             .w(px(12.))
             .h_full()
+            .pt(px(top))
             .flex()
             .flex_col()
             .items_center()
@@ -4769,9 +4856,13 @@ impl Workspace {
             .border_color(theme::border())
             .cursor_pointer()
             .hover(|s| s.bg(theme::hover()))
+            .on_mouse_move(cx.listener(|ws, ev: &gpui::MouseMoveEvent, _, cx| ws.rail_moved(ev.position, cx)))
             .on_hover(cx.listener(|ws, h: &bool, _, cx| {
-                ws.rail_open = *h;
-                cx.notify();
+                ws.rail_hover = *h;
+                if !*h {
+                    ws.rail_last_pos = None;
+                    ws.rail_left(cx);
+                }
             }))
             .child(marks)
             .child(grip)
@@ -6050,7 +6141,9 @@ impl Render for Workspace {
             .when(self.output_visible, |d| d.child(self.render_output(cx)))
             .into_any_element();
         let activity = self.render_activity_bar(window, cx).into_any_element();
-        let rail = self.render_space_rail(right, cx);
+        // Beside the activity bar alone (no side panel), the rail is under the window's buttons.
+        let rail_top = if !right && !self.side_visible && !window.is_fullscreen() { LIGHTS_H } else { 0. };
+        let rail = self.render_space_rail(right, rail_top, cx);
         let overview = self.overview.then(|| self.render_overview(cx));
         div()
             .key_context("Workspace")
@@ -8800,7 +8893,15 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(cx.debug_bounds("space-panel").is_none(), "closed until hovered");
         cx.simulate_mouse_move(rail.center(), None, gpui::Modifiers::none());
         cx.run_until_parked();
-        assert!(ws.read_with(cx, |ws, _| ws.rail_open), "hovered: open");
+        assert!(!ws.read_with(cx, |ws, _| ws.rail_open), "passing over: still shut");
+        cx.executor().advance_clock(std::time::Duration::from_millis(40));
+        cx.simulate_mouse_move(rail.center() + gpui::point(gpui::px(1.), gpui::px(0.)), None, gpui::Modifiers::none());
+        cx.executor().advance_clock(std::time::Duration::from_millis(40));
+        cx.run_until_parked();
+        assert!(!ws.read_with(cx, |ws, _| ws.rail_open), "still moving: still shut");
+        cx.executor().advance_clock(std::time::Duration::from_millis(super::RAIL_DWELL_MS + 50));
+        cx.run_until_parked();
+        assert!(ws.read_with(cx, |ws, _| ws.rail_open), "rested on: open");
         cx.update(|w, _| w.refresh());
         cx.run_until_parked();
         let row = cx.debug_bounds("space-row-0").expect("a row per space");
@@ -8809,8 +8910,25 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         // Moving away closes it.
         let far = rail.center() + gpui::point(gpui::px(700.), gpui::px(0.));
         cx.simulate_mouse_move(far, None, gpui::Modifiers::none());
+        cx.executor().advance_clock(std::time::Duration::from_millis(300));
         cx.run_until_parked();
         assert!(!ws.read_with(cx, |ws, _| ws.rail_open || ws.rail_panel_hover));
+        // Moving along the rail opens it at once.
+        cx.simulate_mouse_move(rail.center(), None, gpui::Modifiers::none());
+        cx.simulate_mouse_move(rail.center() + gpui::point(gpui::px(0.), gpui::px(12.)), None, gpui::Modifiers::none());
+        assert!(ws.read_with(cx, |ws, _| ws.rail_open), "moving along: open now");
+        cx.simulate_mouse_move(far, None, gpui::Modifiers::none());
+        cx.executor().advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        // With the side panel hidden it sits clear of the window's buttons.
+        cx.simulate_keystrokes("cmd-b");
+        cx.run_until_parked();
+        assert!(!ws.read_with(cx, |ws, _| ws.side_visible));
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+        let mark = cx.debug_bounds("space-mark-0").expect("a mark");
+        assert!(mark.origin.y >= gpui::px(super::LIGHTS_H), "below the window buttons: {:?}", mark.origin);
+        cx.simulate_keystrokes("cmd-b");
         // The overview: a card per space and one to make a new one.
         cx.simulate_keystrokes("cmd-k o");
         cx.run_until_parked();

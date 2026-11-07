@@ -164,6 +164,11 @@ pub fn tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView 
     move |_, cx| cx.new(|_| TextTooltip(text.into())).into()
 }
 
+pub fn tooltip_text(text: String) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let text: SharedString = text.into();
+    move |_, cx| cx.new(|_| TextTooltip(text.clone())).into()
+}
+
 /// A pane item (file, diff, terminal…) being dragged by its title-bar chip.
 #[derive(Clone)]
 pub struct DraggedItem {

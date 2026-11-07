@@ -87,6 +87,9 @@ fn icon_body(name: &str) -> Option<&'static str> {
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(hex) = path.strip_prefix("vtext/").and_then(|p| p.strip_suffix(".svg")) {
+            return Ok(vtext_svg(hex).map(|s| Cow::Owned(s.into_bytes())));
+        }
         let name = path
             .strip_prefix("icons/")
             .and_then(|p| p.strip_suffix(".svg"))
@@ -100,6 +103,31 @@ impl AssetSource for Assets {
     }
 }
 
+/// Text written downwards (turned a quarter clockwise), drawn as an SVG: GPUI can't turn
+/// text, but its SVGs draw text with the system's fonts. Size it with [`vtext_size`].
+pub fn vtext_path(text: &str) -> SharedString {
+    let hex: String = text.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("vtext/{hex}.svg").into()
+}
+
+const VTEXT_PX: f32 = 13.;
+
+/// (width, height) of [`vtext_path`]'s drawing, at 13 px Menlo.
+pub fn vtext_size(text: &str) -> (f32, f32) {
+    (VTEXT_PX * 1.25, text.chars().count() as f32 * VTEXT_PX * 0.602 + 2.)
+}
+
+fn vtext_svg(hex: &str) -> Option<String> {
+    let bytes = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect::<Option<Vec<u8>>>()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let (w, h) = vtext_size(&text);
+    let esc = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    Some(format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}"><text transform="translate({x} 1) rotate(90)" font-family="Menlo" font-size="{VTEXT_PX}" fill="black" xml:space="preserve">{esc}</text></svg>"#,
+        x = VTEXT_PX * 0.3
+    ))
+}
+
 pub fn icon_path(name: &str) -> SharedString {
     format!("icons/{name}.svg").into()
 }
@@ -107,6 +135,17 @@ pub fn icon_path(name: &str) -> SharedString {
 #[cfg(test)]
 mod tests {
     use gpui::AssetSource;
+
+    #[test]
+    fn downward_text_draws_with_a_system_font() {
+        let svg = super::Assets.load(&super::vtext_path("Main & <db>")).unwrap().unwrap();
+        let mut opt = usvg::Options::default();
+        opt.fontdb_mut().load_system_fonts();
+        let tree = usvg::Tree::from_data(&svg, &opt).unwrap();
+        assert!(tree.root().has_children(), "the name is drawn");
+        let (w, h) = super::vtext_size("Main & <db>");
+        assert!(h > w * 3., "taller than wide");
+    }
 
     #[test]
     fn every_database_type_has_its_icon() {
