@@ -473,7 +473,7 @@ impl Folder {
 #[serde(default)]
 pub struct Collection {
     pub id: String,
-    /// Saved in this project (its `.oskl/api`), else for every window.
+    /// Saved for this project (shown only in its windows), else for every window.
     pub project: Option<PathBuf>,
     /// The collection's own folder: its name, settings, and everything in it.
     pub root: Folder,
@@ -516,18 +516,74 @@ pub fn new_id() -> String {
 
 // ---------------------------------------------------------------- where things are kept
 
-/// `~/.config/kite/api`, or a project's `.oskl/api` (shared with its Git repository).
+/// Where API data is kept: `~/.config/kite/api`, and under it `projects/<name>-<id>` for each
+/// project's own (nothing is written into the projects themselves).
 pub fn base(project: Option<&Path>) -> Option<PathBuf> {
     #[cfg(test)]
-    if let Some(t) = TEST_BASE.with(|b| b.borrow().clone()) {
-        return Some(match project {
-            Some(p) => p.join(".oskl/api"),
-            None => t,
-        });
-    }
+    let global = TEST_BASE.with(|b| b.borrow().clone()).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/kite/api")))?;
+    #[cfg(not(test))]
+    let global = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/kite/api"))?;
     match project {
-        Some(p) => Some(p.join(".oskl/api")),
-        None => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/kite/api")),
+        None => Some(global),
+        Some(p) => {
+            let dir = project_dir(&global, p);
+            move_from_project(p, &dir);
+            Some(dir)
+        }
+    }
+}
+
+/// A project's folder in the store: its name (to find it by eye) and a short id from its full
+/// path (two projects with one name don't mix).
+fn project_dir(global: &Path, project: &Path) -> PathBuf {
+    let full = project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
+    let key = full.to_string_lossy();
+    // FNV-1a: stable across runs and versions.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in key.as_bytes() {
+        h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
+    }
+    let name: String = full.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default().chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).take(40).collect();
+    global.join("projects").join(format!("{name}-{:08x}", h as u32))
+}
+
+/// Collections and environments that used to be kept in the project (`.oskl/api`) move to the
+/// store, once; the project's `.oskl` folder goes if nothing else is in it.
+fn move_from_project(project: &Path, to: &Path) {
+    static DONE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::LazyLock::new(Default::default);
+    if !DONE.lock().unwrap().insert(project.to_path_buf()) {
+        return;
+    }
+    let old = project.join(".oskl/api");
+    if !old.is_dir() {
+        return;
+    }
+    if to.exists() {
+        // Both: what's only in the old place is added.
+        merge_dir(&old, to);
+        std::fs::remove_dir_all(&old).ok();
+    } else {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if std::fs::rename(&old, to).is_err() {
+            merge_dir(&old, to);
+            std::fs::remove_dir_all(&old).ok();
+        }
+    }
+    std::fs::remove_dir(project.join(".oskl")).ok();
+}
+
+fn merge_dir(from: &Path, to: &Path) {
+    let Ok(rd) = std::fs::read_dir(from) else { return };
+    std::fs::create_dir_all(to).ok();
+    for e in rd.flatten() {
+        let dest = to.join(e.file_name());
+        if e.path().is_dir() {
+            merge_dir(&e.path(), &dest);
+        } else if !dest.exists() {
+            std::fs::copy(e.path(), &dest).ok();
+        }
     }
 }
 
@@ -872,7 +928,8 @@ mod store_tests {
         let proj = d.join("proj");
         let w = Collection::new("Local", Some(proj.clone()));
         save_collection(&w).unwrap();
-        assert!(proj.join(".oskl/api/collections").join(&w.id).join("collection.json").exists());
+        assert!(base(Some(&proj)).unwrap().join("collections").join(&w.id).join("collection.json").exists(), "kept in the store, under the project");
+        assert!(!proj.join(".oskl").exists(), "nothing written into the project");
         assert_eq!(collections(&[proj.clone()]).len(), 2);
         assert_eq!(collections(&[]).len(), 1, "not in other windows");
         let copy = duplicate_request(&mut c, &r.id).unwrap();
@@ -883,6 +940,20 @@ mod store_tests {
         assert_eq!(c.root.requests.len(), 1);
         delete_folder(&mut c, &fid).unwrap();
         assert!(load_request(&c, &r.id).is_none(), "its requests go with it");
+        std::fs::remove_dir_all(d).ok();
+    }
+
+    #[test]
+    fn data_kept_in_a_project_moves_to_the_store() {
+        let d = temp();
+        let proj = d.join("old-proj");
+        let old = proj.join(".oskl/api/collections/c1");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("collection.json"), r#"{"id":"c1","root":{"id":"c1","name":"Legacy"}}"#).unwrap();
+        let found = collections(&[proj.clone()]);
+        assert_eq!(found.iter().map(|c| c.name()).collect::<Vec<_>>(), ["Legacy"]);
+        assert!(!proj.join(".oskl").exists(), "moved out of the project");
+        assert!(d.join("global/projects").read_dir().unwrap().next().unwrap().unwrap().file_name().to_string_lossy().starts_with("old-proj-"));
         std::fs::remove_dir_all(d).ok();
     }
 
