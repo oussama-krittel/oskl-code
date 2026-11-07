@@ -31,6 +31,25 @@ pub struct Done {
     pub var_changes: Vec<(String, String, String)>,
     pub missing: Vec<String>,
     pub ready: Option<Ready>,
+    /// The variables the request used: (name, value, where from), secrets masked.
+    pub vars_used: Vec<(String, String, String)>,
+}
+
+/// The `{{names}}` a request uses, in order, once each.
+fn names_used(r: &Request) -> Vec<String> {
+    let text = serde_json::to_string(r).unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find("{{") {
+        let after = &rest[i + 2..];
+        let Some(end) = after.find("}}") else { break };
+        let name = after[..end].trim().to_string();
+        if !name.is_empty() && name.len() < 100 && !out.contains(&name) {
+            out.push(name);
+        }
+        rest = &after[end + 2..];
+    }
+    out
 }
 
 /// The folders a request is in (outermost, the collection, first). A request not saved in
@@ -185,6 +204,15 @@ pub async fn execute(plan: Plan) -> Done {
     apply_request_json(&mut req, &rj);
 
     let ready = send::prepare(&req, &inner_first, &vars);
+    let secret: std::collections::HashSet<&str> = env.iter().chain(global.iter()).flat_map(|e| e.vars.iter()).filter(|r| r.flag).map(|r| r.key.as_str()).collect();
+    for name in names_used(&req) {
+        if let Some((value, scope)) = vars.get(&name) {
+            let shown = if secret.contains(name.as_str()) { "••••••••".to_string() } else { value };
+            done.vars_used.push((name, shown, scope));
+        } else if name.starts_with('$') {
+            done.vars_used.push((name, String::new(), "dynamic".into()));
+        }
+    }
     done.missing = ready.missing.clone();
     done.ready = Some(ready.clone());
     let resp = match send::send(ready).await {

@@ -8728,6 +8728,22 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         cx.run_until_parked();
         click_on(cx, "api-send");
         wait_for(cx, "the second response", |cx| tab.read_with(cx, |t, cx| t.response(cx).is_some_and(|r| r.1.contains("from=env"))));
+        // Its own history: the clock lists its sends; one opens as it was, read-only.
+        cx.run_until_parked();
+        click_on(cx, "api-history");
+        assert!(cx.debug_bounds("api-menu-item-1").is_some() && cx.debug_bounds("api-menu-item-2").is_none(), "this request's two sends");
+        click_on(cx, "api-menu-item-0");
+        cx.run_until_parked();
+        let visit = api_tab(&ws, cx).expect("the send opens");
+        assert_ne!(visit.entity_id(), tab.entity_id(), "in a tab of its own");
+        let (title, _, dirty) = visit.read_with(cx, |t, cx| t.title(cx));
+        assert!(title.starts_with("Echo · Today ") && !dirty, "{title}");
+        assert!(visit.read_with(cx, |t, cx| t.response(cx)).is_some_and(|r| r.0 == 200 && r.1.contains("from=env")), "the answer as it came");
+        let used = visit.read_with(cx, |t, _| t.visit_vars());
+        assert_eq!(used, [("base".to_string(), format!("http://127.0.0.1:{port}"), "Local".to_string())], "the variables it used");
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("api-visit-open").is_some(), "it opens the saved request");
     }
 
     #[gpui::test]

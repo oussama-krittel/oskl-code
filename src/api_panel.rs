@@ -762,7 +762,6 @@ impl ApiPanel {
                     api::Kind::Websocket => "WS".into(),
                     api::Kind::Sse => "SSE".into(),
                 };
-                let req = v.request.clone();
                 let vid = v.id.clone();
                 let url = v.request.url.split_once("://").map(|(_, r)| r.to_string()).unwrap_or_else(|| v.request.url.clone());
                 let status_color = match v.status {
@@ -772,11 +771,11 @@ impl ApiPanel {
                     400..=499 => theme::c(0xd29922),
                     _ => theme::git_deleted(),
                 };
+                let vid2 = vid.clone();
                 base.on_click(cx.listener(move |p, _, _, cx| {
                     p.selected = Some(rk.clone());
-                    let mut r = req.clone();
-                    r.id = api::new_id();
-                    cx.emit(open_req(ApiOpen::New { coll: None, folder: None, req: Some(Box::new(r)) }));
+                    // As it was: what was sent and what came back (read-only).
+                    cx.emit(open_req(ApiOpen::Visit(vid2.clone())));
                     cx.notify();
                 }))
                 .child(badge(&m))

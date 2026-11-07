@@ -840,6 +840,104 @@ pub struct Visit {
     pub size: u64,
     /// What was sent (as written, with its {{variables}}).
     pub request: Request,
+    /// The request it was sent from (its id stays when it's saved), and its collection.
+    pub req_id: String,
+    pub coll: Option<String>,
+    /// All of it (what was sent, the answer…) is in its own file: [`visit_detail`].
+    pub detail: bool,
+}
+
+/// One send, all of it: the request as written, the variables and environment it used,
+/// what went out (variables and auth filled in), and the answer.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct VisitDetail {
+    pub env: Option<String>,
+    /// (name, value, where from); secrets are masked.
+    pub vars: Vec<(String, String, String)>,
+    pub missing: Vec<String>,
+    pub sent_method: String,
+    pub sent_url: String,
+    pub sent_headers: Vec<(String, String)>,
+    pub sent_body: String,
+    /// No answer: why.
+    pub error: Option<String>,
+    pub status: u16,
+    pub reason: String,
+    pub version: String,
+    pub headers: Vec<(String, String)>,
+    /// The body (its first MB), as text; a binary one in base64 (`body_b64`).
+    pub body: String,
+    pub body_b64: bool,
+    pub truncated: bool,
+    pub size: u64,
+    pub ms: u64,
+    pub ttfb_ms: u64,
+    pub redirects: Vec<String>,
+    /// (name, passed, why not)
+    pub tests: Vec<(String, bool, String)>,
+    pub logs: Vec<String>,
+}
+
+/// How much of a response body history keeps.
+pub const HISTORY_BODY_MAX: usize = 1 << 20;
+
+fn visits_dir() -> Option<PathBuf> {
+    Some(base(None)?.join("history"))
+}
+
+fn visit_file(id: &str) -> Option<PathBuf> {
+    // Ids are ours (letters and digits), but never let one leave the folder.
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return None;
+    }
+    Some(visits_dir()?.join(format!("{id}.json")))
+}
+
+/// Back from [`send::base64`].
+pub fn unbase64(s: &str) -> Vec<u8> {
+    let val = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0);
+    for v in s.bytes().filter_map(val) {
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+pub fn visit_detail(id: &str) -> Option<VisitDetail> {
+    serde_json::from_slice(&std::fs::read(visit_file(id)?).ok()?).ok()
+}
+
+/// A request's own history (newest first).
+pub fn history_of(req_id: &str) -> Vec<Visit> {
+    history().into_iter().filter(|v| v.req_id == req_id || (v.req_id.is_empty() && v.request.id == req_id)).collect()
+}
+
+/// Detail files whose entry is gone.
+fn prune_visits(keep: &[Visit]) {
+    let Some(dir) = visits_dir() else { return };
+    let ids: std::collections::HashSet<&str> = keep.iter().map(|v| v.id.as_str()).collect();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if let Some(id) = name.strip_suffix(".json")
+            && !ids.contains(id)
+        {
+            std::fs::remove_file(e.path()).ok();
+        }
+    }
 }
 
 fn history_path() -> Option<PathBuf> {
@@ -860,6 +958,18 @@ pub fn history() -> Vec<Visit> {
     out
 }
 
+/// Adds a send to history, with all of it when given.
+pub fn add_history_with(v: &Visit, detail: Option<&VisitDetail>) {
+    let mut v = v.clone();
+    if let (Some(d), Some(file)) = (detail, visit_file(&v.id)) {
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        v.detail = serde_json::to_vec(d).ok().and_then(|b| std::fs::write(&file, b).ok()).is_some();
+    }
+    add_history(&v);
+}
+
 pub fn add_history(v: &Visit) {
     let Some(path) = history_path() else { return };
     if let Some(d) = path.parent() {
@@ -878,6 +988,7 @@ pub fn add_history(v: &Visit) {
         keep.reverse();
         let text: String = keep.iter().filter_map(|v| serde_json::to_string(v).ok()).map(|l| l + "\n").collect();
         std::fs::write(&path, text).ok();
+        prune_visits(&keep);
     }
 }
 
@@ -886,6 +997,7 @@ pub fn delete_history(id: Option<&str>) {
     match id {
         None => {
             std::fs::remove_file(&path).ok();
+            prune_visits(&[]);
         }
         Some(id) => {
             let mut keep = history();
@@ -893,6 +1005,9 @@ pub fn delete_history(id: Option<&str>) {
             keep.reverse();
             let text: String = keep.iter().filter_map(|v| serde_json::to_string(v).ok()).map(|l| l + "\n").collect();
             std::fs::write(&path, text).ok();
+            if let Some(f) = visit_file(id) {
+                std::fs::remove_file(f).ok();
+            }
         }
     }
 }
@@ -988,6 +1103,25 @@ mod store_tests {
         assert_eq!(history().len(), 4);
         delete_history(None);
         assert!(history().is_empty());
+        std::fs::remove_dir_all(d).ok();
+    }
+
+    #[test]
+    fn a_send_keeps_all_of_it_and_its_request_has_its_own_list() {
+        let d = temp();
+        let det = VisitDetail { status: 201, body: "{\"ok\":1}".into(), vars: vec![("host".into(), "x".into(), "Dev".into())], ..Default::default() };
+        add_history_with(&Visit { id: "a1".into(), at: now_secs(), req_id: "r1".into(), ..Default::default() }, Some(&det));
+        add_history_with(&Visit { id: "a2".into(), at: now_secs(), req_id: "r2".into(), ..Default::default() }, Some(&det));
+        add_history_with(&Visit { id: "a3".into(), at: now_secs(), req_id: "r1".into(), ..Default::default() }, None);
+        assert_eq!(history_of("r1").iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), ["a3", "a1"]);
+        assert_eq!(visit_detail("a1"), Some(det));
+        assert!(history()[0].detail == false && history()[2].detail);
+        assert!(visit_detail("../x").is_none());
+        delete_history(Some("a1"));
+        assert!(visit_detail("a1").is_none(), "its file goes with it");
+        delete_history(None);
+        assert!(visit_detail("a2").is_none());
+        assert_eq!(unbase64(&send::base64(b"hello, world!")), b"hello, world!");
         std::fs::remove_dir_all(d).ok();
     }
 }

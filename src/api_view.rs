@@ -41,6 +41,8 @@ pub enum ApiOpen {
     Env(String),
     Runner { coll: String, folder: String },
     Cookies,
+    /// One send from history, as it was (read-only).
+    Visit(String),
 }
 
 /// What API tabs ask of the workspace and the panel.
@@ -225,6 +227,13 @@ struct AuthEd {
 }
 
 impl AuthEd {
+    /// Read-only (history).
+    fn freeze(&self, cx: &mut Context<ApiView>) {
+        for e in self.f.values().chain([&self.redirect]) {
+            e.update(cx, |e, _| e.read_only = true);
+        }
+    }
+
     fn new(auth: &Auth, allow_inherit: bool, cx: &mut Context<ApiView>) -> AuthEd {
         let mut vals: HashMap<&'static str, String> = HashMap::new();
         let (mut query, mut pkce, mut basic, mut grant, mut redirect) = (false, true, false, "client_credentials".to_string(), "http://127.0.0.1:53682/callback".to_string());
@@ -340,6 +349,8 @@ enum Section {
     Settings,
     Code,
     Docs,
+    /// History: the variables a send used.
+    Used,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -408,6 +419,8 @@ struct ReqTab {
     folder: Option<String>,
     /// Non-text parts (kinds, switches, settings that aren't typed).
     req: api::Request,
+    /// From history: the send it shows (read-only).
+    hist: Option<Box<(api::Visit, api::VisitDetail)>>,
     saved: bool,
     dirty: bool,
     name: Entity<Editor>,
@@ -549,8 +562,64 @@ impl ApiView {
                 None => Body_::Missing("This collection was deleted.".into()),
             },
             ApiOpen::Cookies => Body_::Cookies,
+            ApiOpen::Visit(id) => match api::history().into_iter().find(|h| h.id == id) {
+                Some(visit) => Body_::Req(Box::new(v.visit_tab(visit, cx))),
+                None => Body_::Missing("This send isn't in history any more.".into()),
+            },
         };
         v
+    }
+
+    /// A send from history: the request as it was written, the answer as it came, read-only.
+    fn visit_tab(&mut self, visit: api::Visit, cx: &mut Context<Self>) -> ReqTab {
+        let det = if visit.detail { api::visit_detail(&visit.id) } else { None };
+        let has_detail = det.is_some();
+        let det = det.unwrap_or_else(|| api::VisitDetail { status: visit.status, ms: visit.ms, size: visit.size, sent_method: visit.request.method.clone(), sent_url: visit.request.url.clone(), ..Default::default() });
+        let mut t = self.req_tab(visit.coll.clone(), None, visit.request.clone(), true, cx);
+        let editors = [&t.name, &t.url, &t.body_text, &t.gql_vars, &t.binary, &t.pre, &t.post, &t.docs, &t.s_timeout, &t.s_max, &t.s_proxy, &t.s_noproxy, &t.s_cert, &t.s_cert_pass, &t.s_ca, &t.ws_msg];
+        let rows = [&t.params, &t.path, &t.headers, &t.form, &t.multipart].into_iter().flat_map(|k| k.rows.iter()).flat_map(|r| [&r.key, &r.value, &r.desc]);
+        let more = t.tests.iter().flat_map(|r| [&r.path, &r.value]).chain(t.vars.iter().flat_map(|r| [&r.var, &r.path]));
+        for e in editors.into_iter().chain(rows).chain(more) {
+            e.update(cx, |e, _| e.read_only = true);
+        }
+        t.auth.freeze(cx);
+        if has_detail && det.error.is_none() {
+            let body = if det.body_b64 { api::unbase64(&det.body) } else { det.body.clone().into_bytes() };
+            let r = send::Response {
+                status: det.status,
+                reason: det.reason.clone(),
+                version: det.version.clone(),
+                headers: det.headers.clone(),
+                body,
+                body_file: None,
+                size: det.size,
+                ms: det.ms,
+                ttfb_ms: det.ttfb_ms,
+                sent: send::Sent { method: det.sent_method.clone(), url: det.sent_url.clone(), headers: det.sent_headers.clone(), body: det.sent_body.clone() },
+                redirects: det.redirects.clone(),
+            };
+            let ct = r.content_type();
+            let image = if ct.starts_with("image/") && !det.truncated {
+                let ext = ct.trim_start_matches("image/").split([';', '+']).next().unwrap_or("png").to_string();
+                let p = std::env::temp_dir().join(format!("kite-image-{}.{ext}", api::new_id()));
+                std::fs::write(&p, &r.body).ok().map(|_| p)
+            } else {
+                None
+            };
+            let tests = det.tests.iter().map(|(name, pass, detail)| tests::Outcome { name: name.clone(), pass: *pass, detail: detail.clone() }).collect();
+            let resp = Resp { r, tests, logs: det.logs.clone(), missing: det.missing.clone(), image, pretty: true };
+            Self::show_body(&t.resp_body, &resp, cx);
+            t.resp = Some(resp);
+        } else if let Some(e) = &det.error {
+            t.error = Some(if det.logs.is_empty() { e.clone() } else { format!("{e}\n\n{}", det.logs.join("\n")) });
+        } else if !has_detail {
+            t.error = Some("Only the request was kept for this send (it's from before history kept answers).".into());
+        }
+        if has_detail {
+            t.section = Section::Used;
+        }
+        t.hist = Some(Box::new((visit, det)));
+        t
     }
 
     fn req_tab(&mut self, coll: Option<String>, folder: Option<String>, r: api::Request, saved: bool, cx: &mut Context<Self>) -> ReqTab {
@@ -631,6 +700,7 @@ impl ApiView {
             stacked: false,
             live_scroll: ScrollHandle::new(),
             req: r.clone(),
+            hist: None,
         };
         t.s_cert_pass.update(cx, |e, _| e.secret = true);
         t.code.update(cx, |e, _| e.read_only = true);
@@ -746,6 +816,9 @@ impl ApiView {
             Body_::Req(t) => {
                 let name = t.name.read(cx).text();
                 let name = if name.trim().is_empty() { "Request".to_string() } else { name };
+                if let Some(h) = &t.hist {
+                    return (format!("{name} · {}", local_stamp(h.0.at)), h.1.sent_url.clone(), false);
+                }
                 (name, t.url.read(cx).text(), t.dirty || !t.saved)
             }
             Body_::Env(t) => (format!("Env: {}", t.env.name), String::new(), t.dirty),
@@ -768,6 +841,14 @@ impl ApiView {
         }
     }
 
+    #[cfg(test)]
+    pub fn visit_vars(&self) -> Vec<(String, String, String)> {
+        match &self.body {
+            Body_::Req(t) => t.hist.as_ref().map(|h| h.1.vars.clone()).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn shows(&self, open: &ApiOpen) -> bool {
         !matches!(open, ApiOpen::New { .. }) && &self.open == open
     }
@@ -775,7 +856,7 @@ impl ApiView {
     /// Unsaved changes (closing asks first).
     pub fn is_dirty(&self) -> bool {
         match &self.body {
-            Body_::Req(t) => t.dirty && t.saved,
+            Body_::Req(t) => t.dirty && t.saved && t.hist.is_none(),
             Body_::Env(t) => t.dirty,
             Body_::Folder(t) => t.dirty,
             _ => false,
@@ -1026,8 +1107,42 @@ impl ApiView {
     }
 
     fn finish(&mut self, sent: api::Request, done: run::Done, cx: &mut Context<Self>) {
+        let env_name = self.envs().1.map(|e| e.name);
         let Body_::Req(t) = &mut self.body else { return };
         t.sending = None;
+        // All of it, for history.
+        let mut det = api::VisitDetail { env: env_name, vars: done.vars_used.clone(), missing: done.missing.clone(), error: done.error.clone(), logs: done.logs.clone(), tests: done.tests.iter().map(|o| (o.name.clone(), o.pass, o.detail.clone())).collect(), ..Default::default() };
+        if let Some(rd) = &done.ready {
+            det.sent_method = rd.method.clone();
+            det.sent_url = rd.url.clone();
+            det.sent_headers = rd.headers.clone();
+        }
+        if let Some(r) = &done.resp {
+            det.sent_method = r.sent.method.clone();
+            det.sent_url = r.sent.url.clone();
+            det.sent_headers = r.sent.headers.clone();
+            det.sent_body = r.sent.body.chars().take(api::HISTORY_BODY_MAX).collect();
+            (det.status, det.reason, det.version, det.headers) = (r.status, r.reason.clone(), r.version.clone(), r.headers.clone());
+            (det.size, det.ms, det.ttfb_ms, det.redirects) = (r.size, r.ms, r.ttfb_ms, r.redirects.clone());
+            let bytes = &r.body[..r.body.len().min(api::HISTORY_BODY_MAX)];
+            det.truncated = (bytes.len() as u64) < r.size;
+            match std::str::from_utf8(bytes) {
+                Ok(text) => det.body = text.to_string(),
+                // Cut inside a character: the text up to it.
+                Err(e) if e.error_len().is_none() => det.body = String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned(),
+                Err(_) => {
+                    det.body = send::base64(bytes);
+                    det.body_b64 = true;
+                }
+            }
+        }
+        // Tokens stay out of the file: the start of an Authorization header is enough to tell.
+        for (k, v) in det.sent_headers.iter_mut() {
+            if (k.eq_ignore_ascii_case("authorization") || k.eq_ignore_ascii_case("proxy-authorization")) && v.chars().count() > 16 {
+                *v = format!("{}…", v.chars().take(12).collect::<String>());
+            }
+        }
+        let (req_id, coll) = (t.req.id.clone(), t.coll.clone());
         let mut status = 0;
         let (mut ms, mut size) = (0, 0);
         match done.resp {
@@ -1059,7 +1174,7 @@ impl ApiView {
                 t.error = None;
             }
         }
-        api::add_history(&api::Visit { id: api::new_id(), at: api::now_secs(), status, ms, size, request: sent });
+        api::add_history_with(&api::Visit { id: api::new_id(), at: api::now_secs(), status, ms, size, request: sent, req_id, coll, detail: false }, Some(&det));
         cx.emit(WsRequest::Api(ApiRequest::Changed));
         cx.notify();
     }
@@ -1153,7 +1268,7 @@ impl ApiView {
         });
         t.live = Some(Live { commands: live.commands, connected: false, status: None, events: Vec::new(), _task: task });
         t.error = None;
-        api::add_history(&api::Visit { id: api::new_id(), at: api::now_secs(), request: req, ..Default::default() });
+        api::add_history(&api::Visit { id: api::new_id(), at: api::now_secs(), req_id: req.id.clone(), coll: t.coll.clone(), request: req, ..Default::default() });
         cx.notify();
     }
 
@@ -2265,6 +2380,7 @@ impl ApiView {
                 None => "Not saved yet".into(),
             }))
             .child(opens(dropdown("api-env", active.as_ref().map(|e| e.name.clone()).unwrap_or_else(|| "No environment".into()), None), env_items, cx))
+            .child(self.history_button(&t.req.id, cx))
             .child(icon_btn("api-layout", if t.stacked { "split" } else { "inline" }, "Response beside / below").on_click(cx.listener(|v, _, _, cx| {
                 if let Body_::Req(t) = &mut v.body {
                     t.stacked = !t.stacked;
@@ -2286,6 +2402,10 @@ impl ApiView {
                     .on_mouse_down(MouseButton::Left, cx.listener(|v, ev: &MouseDownEvent, _, _| v.menu_at = Some(ev.position)))
                     .on_click(cx.listener(|v, _, _, cx| v.save_now(None, cx))),
             );
+        let (top, url_bar) = match &t.hist {
+            Some(h) => self.visit_header(&h.0, &h.1, &method, cx),
+            None => (top.into_any_element(), url_bar.into_any_element()),
+        };
         let count = |n: usize| (n > 0).then(|| n.to_string());
         let sections = [
             (Section::Params, "Params", count(t.params.rows(cx).iter().filter(|r| r.on).count() + t.path.rows.len())),
@@ -2299,6 +2419,11 @@ impl ApiView {
             (Section::Code, "Code", None),
             (Section::Docs, "Docs", None),
         ];
+        let sections: Vec<_> = match &t.hist {
+            // History: what went out first, then the request as it was written.
+            Some(h) => std::iter::once((Section::Used, "Sent", count(h.1.vars.len()))).chain(sections.into_iter().filter(|(s, ..)| !matches!(s, Section::Code))).collect(),
+            None => sections.into_iter().collect(),
+        };
         let tabs = div().id("api-sections").flex().flex_none().items_center().gap(px(2.)).border_b_1().border_color(theme::border()).overflow_x_scroll().children(sections.into_iter().map(|(s, name, c)| {
             sub_tab(format!("api-sec-{name}"), name, c, t.section == s).on_click(cx.listener(move |v, _, _, cx| {
                 if let Body_::Req(t) = &mut v.body {
@@ -2357,6 +2482,155 @@ impl ApiView {
             .into_any_element()
     }
 
+    /// A request's own history, from its clock button.
+    fn history_button(&self, req_id: &str, cx: &mut Context<Self>) -> AnyElement {
+        let req_id = req_id.to_string();
+        icon_btn("api-history", "clock", "This request's history")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |v, ev: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    let visits = api::history_of(&req_id);
+                    let mut items: Vec<(String, Act)> = visits
+                        .iter()
+                        .take(100)
+                        .map(|h| {
+                            let id = h.id.clone();
+                            let status = if h.status > 0 { h.status.to_string() } else { "—".into() };
+                            let label = format!("{status:<4} {:<7} {:<16} {}", h.request.method, local_stamp(h.at), if h.status > 0 { format!("{} ms", h.ms) } else { String::new() });
+                            (label, Rc::new(move |_: &mut ApiView, _: &mut Window, cx: &mut Context<ApiView>| cx.emit(WsRequest::Api(ApiRequest::Open(ApiOpen::Visit(id.clone()))))) as Act)
+                        })
+                        .collect();
+                    if items.is_empty() {
+                        items.push(("Not sent yet: each send shows here".into(), Rc::new(|_: &mut ApiView, _: &mut Window, _: &mut Context<ApiView>| {}) as Act));
+                    }
+                    v.open_menu(ev.position, items, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// A history tab's top: what was sent, when, how it went, and where to go from it.
+    fn visit_header(&self, visit: &api::Visit, det: &api::VisitDetail, method: &str, cx: &mut Context<Self>) -> (AnyElement, AnyElement) {
+        let where_ = visit.coll.as_ref().and_then(|id| find_coll(&self.roots, id)).map(|c| {
+            let mut path: Vec<String> = c.root.chain_to(&visit.req_id).iter().map(|f| f.name.clone()).collect();
+            if path.is_empty() {
+                path.push(c.name().to_string());
+            }
+            path.join(" / ")
+        });
+        let saved_exists = visit.coll.as_ref().and_then(|id| find_coll(&self.roots, id)).is_some_and(|c| api::load_request(&c, &visit.req_id).is_some());
+        let mut bits = vec![format!("Sent {}", local_stamp(visit.at))];
+        bits.push(where_.unwrap_or_else(|| "not saved".into()));
+        bits.push(match &det.env {
+            Some(e) => format!("environment: {e}"),
+            None => "no environment".into(),
+        });
+        let (req, coll, rid) = (visit.request.clone(), visit.coll.clone(), visit.req_id.clone());
+        let top = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(div().flex_none().px(px(6.)).py(px(2.)).rounded(px(3.)).bg(theme::hover()).text_size(px(11.)).text_color(theme::fg_dim()).child("HISTORY"))
+            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(12.)).text_color(theme::fg_muted()).child(bits.join("  ·  ")))
+            .when(saved_exists, |d| {
+                d.child(button("api-visit-open", "Open request", Some("go-to-file"), false).on_click(cx.listener(move |_, _, _, cx| {
+                    if let Some(c) = coll.clone() {
+                        cx.emit(WsRequest::Api(ApiRequest::Open(ApiOpen::Request { coll: c, id: rid.clone() })));
+                    }
+                })))
+            })
+            .child(button("api-visit-again", "Send again…", Some("play"), false).on_click(cx.listener(move |_, _, _, cx| {
+                let mut r = req.clone();
+                r.id = api::new_id();
+                cx.emit(WsRequest::Api(ApiRequest::Open(ApiOpen::New { coll: None, folder: None, req: Some(Box::new(r)) })));
+            })))
+            .into_any_element();
+        let url = if det.sent_url.is_empty() { visit.request.url.clone() } else { det.sent_url.clone() };
+        let m = if det.sent_method.is_empty() { method.to_string() } else { det.sent_method.clone() };
+        let line = div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .h(px(30.))
+            .px(px(10.))
+            .rounded(px(4.))
+            .bg(theme::bg_input())
+            .border_1()
+            .border_color(theme::border_input())
+            .child(div().flex_none().font_weight(FontWeight::BOLD).text_size(px(12.5)).text_color(method_color(&m)).child(m))
+            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().font_family(theme::MONO_FONT).text_size(px(12.5)).text_color(theme::fg()).child(url))
+            .when(det.status > 0, |d| d.child(div().flex_none().font_weight(FontWeight::BOLD).text_size(px(12.)).text_color(status_color(det.status)).child(format!("{} {}", det.status, det.reason))))
+            .when(det.error.is_some(), |d| d.child(div().flex_none().text_size(px(12.)).text_color(theme::git_deleted()).child("failed")))
+            .when(det.status > 0, |d| d.child(div().flex_none().text_size(px(11.5)).text_color(theme::fg_muted()).child(format!("{} ms · {}", det.ms, human_size(det.size)))))
+            .into_any_element();
+        (top, line)
+    }
+
+    /// History's "Sent": the environment, the variables used, and the request as it went out.
+    fn render_sent(&self, t: &ReqTab, _cx: &mut Context<Self>) -> AnyElement {
+        let Some(h) = &t.hist else { return div().into_any_element() };
+        let det = &h.1;
+        let title = |s: &str| div().text_size(px(11.)).text_color(theme::fg_muted()).child(s.to_uppercase());
+        let row = |i: usize, cells: Vec<String>, head: bool| {
+            let n = cells.len();
+            div()
+                .id(SharedString::from(format!("api-sent-{}-{i}", if head { "h" } else { "r" })))
+                .flex()
+                .gap(px(12.))
+                .py(px(4.))
+                .border_b_1()
+                .border_color(theme::border())
+                .text_size(px(12.))
+                .children(cells.into_iter().enumerate().map(move |(c, v)| {
+                    let d = div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap();
+                    let d = if c == 0 { d.w(px(170.)).flex_none() } else if c + 1 == n && n > 2 { d.w(px(110.)).flex_none() } else { d.flex_1() };
+                    d.when(head, |d| d.text_color(theme::fg_muted()).text_size(px(11.)))
+                        .when(!head && c == 1, |d| d.font_family(theme::MONO_FONT).text_color(theme::fg()))
+                        .when(!head && c != 1, |d| d.text_color(theme::fg_dim()))
+                        .child(v)
+                }))
+        };
+        let vars: Vec<AnyElement> = if det.vars.is_empty() {
+            vec![div().text_size(px(12.)).text_color(theme::fg_dim()).child("No {{variables}} in this request.").into_any_element()]
+        } else {
+            std::iter::once(row(0, vec!["NAME".into(), "VALUE".into(), "FROM".into()], true).into_any_element())
+                .chain(det.vars.iter().enumerate().map(|(i, (k, v, from))| row(i + 1, vec![format!("{{{{{k}}}}}"), if from == "dynamic" { "(made when sent)".into() } else { v.clone() }, from.clone()], false).into_any_element()))
+                .collect()
+        };
+        let headers: Vec<AnyElement> = det.sent_headers.iter().enumerate().map(|(i, (k, v))| row(i, vec![k.clone(), v.clone()], false).into_any_element()).collect();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .pr(px(4.))
+            .child(title("Environment"))
+            .child(div().text_size(px(12.5)).text_color(theme::fg()).child(det.env.clone().unwrap_or_else(|| "None".into())))
+            .child(div().h(px(6.)))
+            .child(title("Variables used"))
+            .children(vars)
+            .when(!det.missing.is_empty(), |d| d.child(div().text_size(px(12.)).text_color(theme::c(0xd29922)).child(format!("Not set (sent as written): {}", det.missing.join(", ")))))
+            .child(div().h(px(6.)))
+            .child(title("Sent: variables and auth filled in"))
+            .child(div().font_family(theme::MONO_FONT).text_size(px(12.5)).text_color(theme::fg()).child(format!("{} {}", det.sent_method, det.sent_url)))
+            .children(headers)
+            .when(!det.sent_body.is_empty(), |d| {
+                d.child(title("Body")).child(
+                    div()
+                        .p(px(8.))
+                        .rounded(px(4.))
+                        .bg(theme::bg_input())
+                        .font_family(theme::MONO_FONT)
+                        .text_size(px(12.))
+                        .text_color(theme::fg())
+                        .child(det.sent_body.chars().take(20_000).collect::<String>()),
+                )
+            })
+            .child(div().h(px(6.)))
+            .child(div().text_size(px(11.5)).text_color(theme::fg_muted()).child("The other tabs show the request as it was written then. Tokens are kept short; secret variables aren't kept."))
+            .into_any_element()
+    }
+
     fn refresh_code(&mut self, cx: &mut Context<Self>) {
         let (_, env, global) = self.envs();
         let roots = self.roots.clone();
@@ -2388,6 +2662,7 @@ impl ApiView {
     fn render_section(&self, t: &ReqTab, cx: &mut Context<Self>) -> AnyElement {
         let hint = |text: &str| div().text_size(px(11.5)).text_color(theme::fg_muted()).child(text.to_string());
         match t.section {
+            Section::Used => self.render_sent(t, cx),
             Section::Params => div()
                 .flex()
                 .flex_col()
@@ -3428,5 +3703,43 @@ impl Render for ApiView {
             .child(body)
             .children(save)
             .children(menu)
+    }
+}
+
+/// "Today 14:03:22", "Nov 7 14:03:22" or "Nov 7 2025 14:03" in local time.
+pub fn local_stamp(secs: u64) -> String {
+    #[repr(C)]
+    struct Tm {
+        sec: i32,
+        min: i32,
+        hour: i32,
+        mday: i32,
+        mon: i32,
+        year: i32,
+        wday: i32,
+        yday: i32,
+        isdst: i32,
+        gmtoff: std::ffi::c_long,
+        zone: *const std::ffi::c_char,
+    }
+    unsafe extern "C" {
+        fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
+    }
+    let tm = |s: u64| {
+        let mut out = Tm { sec: 0, min: 0, hour: 0, mday: 0, mon: 0, year: 0, wday: 0, yday: 0, isdst: 0, gmtoff: 0, zone: std::ptr::null() };
+        let t = s as i64;
+        // SAFETY: both pointers are to live values of the C layout.
+        unsafe { localtime_r(&t, &mut out) };
+        out
+    };
+    let (a, now) = (tm(secs), tm(api::now_secs()));
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let mon = MONTHS[a.mon.clamp(0, 11) as usize];
+    if a.year == now.year && a.yday == now.yday {
+        format!("Today {:02}:{:02}:{:02}", a.hour, a.min, a.sec)
+    } else if a.year == now.year {
+        format!("{mon} {} {:02}:{:02}:{:02}", a.mday, a.hour, a.min, a.sec)
+    } else {
+        format!("{mon} {} {} {:02}:{:02}", a.mday, a.year + 1900, a.hour, a.min)
     }
 }
