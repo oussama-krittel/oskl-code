@@ -41,6 +41,25 @@ pub struct Session {
     /// What each repository's graph shows, when not Auto.
     #[serde(default)]
     pub graph: Vec<GraphScope>,
+    /// The first space is the fields above; these are the others, and which one was shown.
+    #[serde(default)]
+    pub spaces: Vec<SpaceSession>,
+    #[serde(default)]
+    pub space: usize,
+    #[serde(default)]
+    pub first_space_name: Option<String>,
+}
+
+/// A space besides the first: its name and color, its splits and their items, its sidebar.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SpaceSession {
+    pub name: String,
+    pub color: usize,
+    pub layout: LayoutState,
+    pub panes: Vec<PaneState>,
+    pub focused: usize,
+    pub side: String,
+    pub side_visible: bool,
 }
 
 /// The branches a repository's graph shows: all of them, or a pick (both off: Auto).
@@ -152,6 +171,9 @@ mod tests {
             folders: vec![],
             window: Some(super::WindowPlace { display: Some("ABC".into()), state: "fullscreen".into(), x: 10., y: 20., w: 1200., h: 800. }),
             graph: vec![super::GraphScope { root: "/p".into(), all: false, only: vec!["main".into(), "origin/java".into()] }],
+            spaces: vec![super::SpaceSession { name: "DB".into(), color: 2, layout: LayoutState::Pane(0), panes: vec![PaneState::default()], focused: 0, side: "databases".into(), side_visible: true }],
+            space: 1,
+            first_space_name: Some("Code".into()),
         };
         let text = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<Session>(&text).unwrap(), s);

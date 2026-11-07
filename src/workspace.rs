@@ -46,6 +46,9 @@ actions!(
         GoBack, GoForward, TogglePreview, PreviewToSide,
         MoveItemLeft, MoveItemRight, MoveItemUp, MoveItemDown,
         Buffer1, Buffer2, Buffer3, Buffer4, Buffer5, Buffer6, Buffer7, Buffer8, Buffer9,
+        Space1, Space2, Space3, Space4, Space5, Space6, Space7, Space8, Space9,
+        ToSpace1, ToSpace2, ToSpace3, ToSpace4, ToSpace5, ToSpace6, ToSpace7, ToSpace8, ToSpace9,
+        LastSpace, NextSpace, PrevSpace, NewSpace, CloseSpace, SpaceOverview,
     ]
 );
 
@@ -73,6 +76,31 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-7", Buffer7, None),
         crate::keybindings::kb("cmd-8", Buffer8, None),
         crate::keybindings::kb("cmd-9", Buffer9, None),
+        // Spaces: ⌃1–9 go to one, ⌃⌥1–9 move the tab there, ⌃0 the last one.
+        crate::keybindings::kb("ctrl-1", Space1, None),
+        crate::keybindings::kb("ctrl-2", Space2, None),
+        crate::keybindings::kb("ctrl-3", Space3, None),
+        crate::keybindings::kb("ctrl-4", Space4, None),
+        crate::keybindings::kb("ctrl-5", Space5, None),
+        crate::keybindings::kb("ctrl-6", Space6, None),
+        crate::keybindings::kb("ctrl-7", Space7, None),
+        crate::keybindings::kb("ctrl-8", Space8, None),
+        crate::keybindings::kb("ctrl-9", Space9, None),
+        crate::keybindings::kb("ctrl-alt-1", ToSpace1, None),
+        crate::keybindings::kb("ctrl-alt-2", ToSpace2, None),
+        crate::keybindings::kb("ctrl-alt-3", ToSpace3, None),
+        crate::keybindings::kb("ctrl-alt-4", ToSpace4, None),
+        crate::keybindings::kb("ctrl-alt-5", ToSpace5, None),
+        crate::keybindings::kb("ctrl-alt-6", ToSpace6, None),
+        crate::keybindings::kb("ctrl-alt-7", ToSpace7, None),
+        crate::keybindings::kb("ctrl-alt-8", ToSpace8, None),
+        crate::keybindings::kb("ctrl-alt-9", ToSpace9, None),
+        crate::keybindings::kb("ctrl-0", LastSpace, None),
+        crate::keybindings::kb("ctrl-alt-right", NextSpace, None),
+        crate::keybindings::kb("ctrl-alt-left", PrevSpace, None),
+        crate::keybindings::kb("cmd-k n", NewSpace, None),
+        crate::keybindings::kb("cmd-k w", CloseSpace, None),
+        crate::keybindings::kb("cmd-k o", SpaceOverview, None),
         crate::keybindings::kb("cmd-alt-enter", ZoomPane, None),
         crate::keybindings::kb("cmd-0", FocusSidebar, None),
         // Directions: arrows, or j ← · k ↓ · l ↑ · ; → (home row).
@@ -342,6 +370,59 @@ impl DropZone {
 /// window (half → quarter → eighth), which also caps the layout at 8 splits.
 const MAX_SPLIT_DEPTH: usize = 3;
 
+/// A space: a main area of its own (its splits, their tabs, the sidebar section it shows).
+/// The current one's state is in the workspace's own fields; the others keep theirs here.
+struct SpaceSlot {
+    name: String,
+    /// Index into SPACE_COLORS.
+    color: usize,
+    saved: Option<SpaceState>,
+}
+
+struct SpaceState {
+    panes: Vec<Pane>,
+    layout: Layout,
+    focused_pane: usize,
+    prev_pane: usize,
+    zoomed: bool,
+    side: Side,
+    side_visible: bool,
+}
+
+fn side_name(s: Side) -> &'static str {
+    match s {
+        Side::Files => "files",
+        Side::Search => "search",
+        Side::Git => "git",
+        Side::Databases => "databases",
+        Side::Api => "api",
+        Side::Settings => "settings",
+        Side::Keys => "keys",
+    }
+}
+
+fn side_of(name: &str) -> Side {
+    match name {
+        "search" => Side::Search,
+        "git" => Side::Git,
+        "databases" => Side::Databases,
+        "api" => Side::Api,
+        "keys" => Side::Keys,
+        "settings" => Side::Settings,
+        _ => Side::Files,
+    }
+}
+
+/// Each space's color, in turn (the first is the theme's own).
+const SPACE_COLORS: [u32; 7] = [0, 0x4c9ffe, 0x3fb950, 0xd29922, 0xa371f7, 0xf85149, 0x39c5cf];
+
+fn space_color(i: usize) -> Hsla {
+    match SPACE_COLORS[i % SPACE_COLORS.len()] {
+        0 => theme::frame_focused(),
+        c => theme::c(c),
+    }
+}
+
 struct Pane {
     id: usize,
     /// Tab ids open in this pane (its "buffers").
@@ -432,6 +513,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("split", "Split down (⌘⇧\\), optionally opening a file: split <path>", true),
     ("term", "Terminal in this pane (⌘T); term <cmd> runs a command", true),
     ("close", "Close this pane (⌘⇧W)", false),
+    ("space", "Spaces: space new [name] · rename <name> · close · move <n> · <n> (⌃1–9 go, ⌃⌥1–9 move, ⌘K O overview)", true),
     ("only", "Close all other panes", false),
     ("max", "Maximize / restore this pane (⌘⌥Enter)", false),
     ("buffers", "Files open in this pane (⌘E)", false),
@@ -526,6 +608,15 @@ pub struct Workspace {
     tsc_again: Option<PathBuf>,
     /// False when the app was opened without a folder (start screen with Open Folder / Recent).
     has_project: bool,
+    /// Spaces (main areas of their own); `space` is the one shown, `last_space` the one before.
+    spaces: Vec<SpaceSlot>,
+    space: usize,
+    last_space: usize,
+    /// The spaces rail is open (hovered), and the overview of all spaces is shown.
+    rail_open: bool,
+    rail_panel_hover: bool,
+    overview: bool,
+    overview_focus: FocusHandle,
     panes: Vec<Pane>,
     layout: Layout,
     focused_pane: usize,
@@ -661,6 +752,13 @@ impl Workspace {
             has_project,
             panes: vec![Pane { id: 0, items: Vec::new(), active: None, back: Vec::new(), fwd: Vec::new() }],
             layout: Layout::Pane(0),
+            spaces: vec![SpaceSlot { name: "Main".into(), color: 0, saved: None }],
+            space: 0,
+            last_space: 0,
+            rail_open: false,
+            rail_panel_hover: false,
+            overview: false,
+            overview_focus: cx.focus_handle(),
             focused_pane: 0,
             prev_pane: 0,
             next_id: 1,
@@ -1239,7 +1337,8 @@ impl Workspace {
 
     /// Removes a tab everywhere (no dirty check).
     fn drop_tab(&mut self, id: usize) {
-        for pane in &mut self.panes {
+        let stored = self.spaces.iter_mut().filter_map(|s| s.saved.as_mut()).flat_map(|st| st.panes.iter_mut());
+        for pane in self.panes.iter_mut().chain(stored) {
             pane.back.retain(|n| n.tab != id);
             pane.fwd.retain(|n| n.tab != id);
             if let Some(pos) = pane.items.iter().position(|x| *x == id) {
@@ -1277,6 +1376,11 @@ impl Workspace {
                 }
             }
             None => {
+                // It's in another space: go there (a file is open in one place only).
+                if let Some(sp) = self.stored_space_of_tab(id) {
+                    self.switch_space(sp, window, cx);
+                    return self.activate(ix, window, cx);
+                }
                 let fp = self.focused_pane;
                 if let Some(pane) = self.pane_mut(fp) {
                     pane.items.push(id);
@@ -1296,20 +1400,202 @@ impl Workspace {
         cx.notify();
     }
 
+    // ------------------------------------------------------------ spaces
+
+    /// The space (not the current one) a tab is in.
+    fn stored_space_of_tab(&self, tab: usize) -> Option<usize> {
+        self.spaces.iter().position(|s| s.saved.as_ref().is_some_and(|st| st.panes.iter().any(|p| p.items.contains(&tab))))
+    }
+
+    fn take_space_state(&mut self) -> SpaceState {
+        SpaceState {
+            panes: std::mem::take(&mut self.panes),
+            layout: std::mem::replace(&mut self.layout, Layout::Pane(0)),
+            focused_pane: self.focused_pane,
+            prev_pane: self.prev_pane,
+            zoomed: self.zoomed,
+            side: self.side,
+            side_visible: self.side_visible,
+        }
+    }
+
+    fn put_space_state(&mut self, st: SpaceState) {
+        self.panes = st.panes;
+        self.layout = st.layout;
+        self.focused_pane = st.focused_pane;
+        self.prev_pane = st.prev_pane;
+        self.zoomed = st.zoomed;
+        self.side = st.side;
+        self.side_visible = st.side_visible;
+    }
+
+    /// Shows space `i`: its splits and tabs, and the sidebar section it had.
+    fn switch_space(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if i >= self.spaces.len() || i == self.space {
+            return;
+        }
+        let cur = self.take_space_state();
+        self.spaces[self.space].saved = Some(cur);
+        let Some(next) = self.spaces[i].saved.take() else { return };
+        self.put_space_state(next);
+        self.last_space = self.space;
+        self.space = i;
+        self.drop_hint = None;
+        self.find_on = None;
+        self.overview = false;
+        self.sync_active();
+        self.focus_active(window, cx);
+        if self.active.is_none() {
+            window.focus(&self.focus);
+        }
+        cx.notify();
+    }
+
+    /// A new, empty space, shown (its sidebar as this one's).
+    fn new_space(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        let n = self.spaces.len();
+        let st = SpaceState {
+            panes: vec![Pane { id, items: Vec::new(), active: None, back: Vec::new(), fwd: Vec::new() }],
+            layout: Layout::Pane(id),
+            focused_pane: id,
+            prev_pane: id,
+            zoomed: false,
+            side: self.side,
+            side_visible: self.side_visible,
+        };
+        let color = (0..).find(|c| !self.spaces.iter().any(|s| s.color == c % SPACE_COLORS.len())).unwrap_or(n) % SPACE_COLORS.len();
+        self.spaces.push(SpaceSlot { name: name.unwrap_or_else(|| format!("Space {}", n + 1)), color, saved: Some(st) });
+        self.switch_space(n, window, cx);
+        n
+    }
+
+    /// Moves the shown tab to space `i` (a new one past the last), and goes there.
+    fn move_tab_to_space(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(a) = self.active else { return self.flash("No tab to move".into(), true, cx) };
+        let tid = self.tabs[a].id;
+        if i == self.space {
+            return;
+        }
+        let from = self.space;
+        let target = if i >= self.spaces.len() { self.new_space(None, window, cx) } else { i };
+        // Out of where it was (now stored, if a new space was just made and shown)…
+        let stored = self.spaces.iter_mut().filter_map(|s| s.saved.as_mut()).flat_map(|st| st.panes.iter_mut());
+        for pane in self.panes.iter_mut().chain(stored) {
+            if let Some(pos) = pane.items.iter().position(|x| *x == tid) {
+                pane.items.remove(pos);
+                pane.back.retain(|n| n.tab != tid);
+                pane.fwd.retain(|n| n.tab != tid);
+                if pane.active == Some(tid) {
+                    pane.active = pane.items.get(pos.min(pane.items.len().saturating_sub(1))).copied();
+                }
+            }
+        }
+        let _ = from;
+        // …into the target's focused split.
+        if target == self.space {
+            let fp = self.focused_pane;
+            if let Some(p) = self.pane_mut(fp) {
+                p.items.push(tid);
+                p.active = Some(tid);
+            }
+            self.sync_active();
+            self.focus_active(window, cx);
+        } else {
+            if let Some(st) = self.spaces[target].saved.as_mut() {
+                let fp = st.focused_pane;
+                if let Some(p) = st.panes.iter_mut().find(|p| p.id == fp) {
+                    p.items.push(tid);
+                    p.active = Some(tid);
+                }
+            }
+            self.switch_space(target, window, cx);
+        }
+        let name = self.spaces[self.space].name.clone();
+        self.flash(format!("Moved to {name}"), false, cx);
+        cx.notify();
+    }
+
+    /// Closes the shown space; its tabs go to the space shown before it.
+    fn close_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.spaces.len() < 2 {
+            return self.flash("This is the only space".into(), true, cx);
+        }
+        let closing = self.space;
+        let to = if self.last_space != closing && self.last_space < self.spaces.len() { self.last_space } else if closing > 0 { closing - 1 } else { 1 };
+        let tabs: Vec<usize> = self.panes.iter().flat_map(|p| p.items.iter().copied()).collect();
+        self.switch_space(to, window, cx);
+        self.spaces.remove(closing);
+        if self.space > closing {
+            self.space -= 1;
+        }
+        self.last_space = self.space;
+        let fp = self.focused_pane;
+        if let Some(p) = self.pane_mut(fp) {
+            for t in tabs {
+                if !p.items.contains(&t) {
+                    p.items.push(t);
+                }
+            }
+        }
+        self.sync_active();
+        cx.notify();
+    }
+
+    fn rename_space(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim();
+        if !name.is_empty() {
+            self.spaces[self.space].name = name.to_string();
+        }
+        cx.notify();
+    }
+
+    fn cycle_space(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.spaces.len() as isize;
+        if n < 2 {
+            return;
+        }
+        let i = (self.space as isize + step).rem_euclid(n) as usize;
+        self.switch_space(i, window, cx);
+    }
+
+    /// ⌃N: that space (making one if it's the next number).
+    fn go_space(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if i < self.spaces.len() {
+            self.switch_space(i, window, cx);
+        } else if i == self.spaces.len() {
+            self.new_space(None, window, cx);
+        }
+    }
+
+    /// What a space's split shows (its tab's title), for the rail and the overview.
+    fn space_panes(&self, i: usize, cx: &App) -> (Vec<String>, usize) {
+        let (panes, n_tabs): (Vec<&Pane>, usize) = if i == self.space {
+            (self.panes.iter().collect(), self.panes.iter().map(|p| p.items.len()).sum())
+        } else {
+            let st = self.spaces[i].saved.as_ref();
+            (st.map(|st| st.panes.iter().collect()).unwrap_or_default(), st.map(|st| st.panes.iter().map(|p| p.items.len()).sum()).unwrap_or(0))
+        };
+        let titles = panes.iter().map(|p| p.active.and_then(|t| self.tab_ix(t)).map(|ix| self.tab_title(&self.tabs[ix], cx).0).unwrap_or_default()).collect();
+        (titles, n_tabs)
+    }
+
     // ------------------------------------------------------------ session
 
     pub fn has_project(&self) -> bool {
         self.has_project
     }
 
-    fn snapshot(&self, cx: &App) -> crate::session::Session {
-        use crate::session::{ItemState, LayoutState, PaneState, Session};
+    /// A space's splits and their files and terminals, as saved.
+    fn layout_snapshot(&self, layout: &Layout, panes: &[Pane], focused: usize, cx: &App) -> (crate::session::LayoutState, Vec<crate::session::PaneState>, usize) {
+        use crate::session::{ItemState, LayoutState, PaneState};
         let mut order = Vec::new();
-        self.layout.panes(&mut order);
+        layout.panes(&mut order);
         let pane_states: Vec<PaneState> = order
             .iter()
             .map(|pid| {
-                let Some(pane) = self.pane(*pid) else { return PaneState::default() };
+                let Some(pane) = panes.iter().find(|p| p.id == *pid) else { return PaneState::default() };
                 let mut items = Vec::new();
                 let mut active = None;
                 for tid in &pane.items {
@@ -1339,21 +1625,37 @@ impl Workspace {
                 Layout::Split { vertical, ratio, a, b } => LayoutState::Split { vertical: *vertical, ratio: *ratio, a: Box::new(convert(a, order)), b: Box::new(convert(b, order)) },
             }
         }
+        (convert(layout, &order), pane_states, order.iter().position(|p| *p == focused).unwrap_or(0))
+    }
+
+    /// Space `i`'s state: the workspace's own fields for the shown one.
+    fn space_parts(&self, i: usize) -> (&Layout, &[Pane], usize, Side, bool) {
+        match self.spaces.get(i).and_then(|s| s.saved.as_ref()) {
+            Some(st) if i != self.space => (&st.layout, st.panes.as_slice(), st.focused_pane, st.side, st.side_visible),
+            _ => (&self.layout, self.panes.as_slice(), self.focused_pane, self.side, self.side_visible),
+        }
+    }
+
+    fn snapshot(&self, cx: &App) -> crate::session::Session {
+        use crate::session::Session;
+        let (l0, p0, f0, s0, v0) = self.space_parts(0);
+        let (layout, panes, focused) = self.layout_snapshot(l0, p0, f0, cx);
+        let spaces = (1..self.spaces.len())
+            .map(|i| {
+                let (l, p, f, side, vis) = self.space_parts(i);
+                let (layout, panes, focused) = self.layout_snapshot(l, p, f, cx);
+                crate::session::SpaceSession { name: self.spaces[i].name.clone(), color: self.spaces[i].color, layout, panes, focused, side: side_name(side).into(), side_visible: vis }
+            })
+            .collect();
         Session {
-            layout: convert(&self.layout, &order),
-            panes: pane_states,
-            focused: order.iter().position(|p| *p == self.focused_pane).unwrap_or(0),
-            side: match self.side {
-                Side::Files => "files",
-                Side::Search => "search",
-                Side::Git => "git",
-                Side::Databases => "databases",
-                Side::Api => "api",
-                Side::Settings => "settings",
-                Side::Keys => "keys",
-            }
-            .into(),
-            side_visible: self.side_visible,
+            layout,
+            panes,
+            focused,
+            side: side_name(s0).into(),
+            side_visible: v0,
+            spaces,
+            space: self.space,
+            first_space_name: Some(self.spaces[0].name.clone()),
             side_w: self.side_w,
             folders: self.folders.iter().map(|f| f.read(cx).root.clone()).collect(),
             window: self.place.clone(),
@@ -1388,7 +1690,6 @@ impl Workspace {
 
     /// Rebuilds the saved layout: splits, files (cursor positions) and terminals.
     pub fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::session::{ItemState, LayoutState};
         if !self.has_project {
             return;
         }
@@ -1401,10 +1702,46 @@ impl Workspace {
         if saved.panes.is_empty() {
             return;
         }
+        self.restore_layout(&saved.layout, &saved.panes, saved.focused, window, cx);
+        self.side = side_of(&saved.side);
+        self.side_visible = saved.side_visible;
+        if let Some(n) = saved.first_space_name.clone() {
+            self.spaces[0].name = n;
+        }
+        // The other spaces, each rebuilt the same way, then the one that was shown.
+        for sp in &saved.spaces {
+            let i = self.new_space(Some(sp.name.clone()), window, cx);
+            self.spaces[i].color = sp.color;
+            if !sp.panes.is_empty() {
+                self.restore_layout(&sp.layout, &sp.panes, sp.focused, window, cx);
+            }
+            self.side = side_of(&sp.side);
+            self.side_visible = sp.side_visible;
+        }
+        if self.spaces.len() > 1 {
+            let target = saved.space.min(self.spaces.len() - 1);
+            if target == self.space {
+                self.last_space = 0;
+            } else {
+                self.switch_space(target, window, cx);
+            }
+        }
+        self.side_w = saved.side_w;
+        self.sync_active();
+        self.focus_active(window, cx);
+        self.session_saved = serde_json::to_string(&self.snapshot(cx)).unwrap_or_default();
+        cx.notify();
+    }
+
+
+    /// Rebuilds a saved layout into the shown space (which has one empty pane): splits,
+    /// files (cursor positions) and terminals.
+    fn restore_layout(&mut self, layout: &crate::session::LayoutState, panes: &[crate::session::PaneState], focused: usize, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::session::{ItemState, LayoutState};
         // Fresh pane ids for every saved pane (the first reuses the existing one).
         let first = self.panes[0].id;
         let mut ids = vec![first];
-        for _ in 1..saved.panes.len() {
+        for _ in 1..panes.len() {
             let id = self.next_id;
             self.next_id += 1;
             self.panes.push(Pane { id, items: Vec::new(), active: None, back: Vec::new(), fwd: Vec::new() });
@@ -1416,9 +1753,9 @@ impl Workspace {
                 LayoutState::Split { vertical, ratio, a, b } => Layout::Split { vertical: *vertical, ratio: *ratio, a: Box::new(convert(a, ids)), b: Box::new(convert(b, ids)) },
             }
         }
-        self.layout = convert(&saved.layout, &ids);
+        self.layout = convert(layout, &ids);
         let mut shown = Vec::new();
-        for (pi, pane) in saved.panes.iter().enumerate() {
+        for (pi, pane) in panes.iter().enumerate() {
             self.focused_pane = ids[pi];
             let mut opened = Vec::new();
             for item in &pane.items {
@@ -1450,22 +1787,7 @@ impl Workspace {
                 pane.back.clear();
             }
         }
-        self.focused_pane = ids.get(saved.focused).copied().unwrap_or(first);
-        self.side = match saved.side.as_str() {
-            "search" => Side::Search,
-            "git" => Side::Git,
-            "databases" => Side::Databases,
-            "api" => Side::Api,
-            "keys" => Side::Keys,
-            "settings" => Side::Settings,
-            _ => Side::Files,
-        };
-        self.side_visible = saved.side_visible;
-        self.side_w = saved.side_w;
-        self.sync_active();
-        self.focus_active(window, cx);
-        self.session_saved = serde_json::to_string(&self.snapshot(cx)).unwrap_or_default();
-        cx.notify();
+        self.focused_pane = ids.get(focused).copied().unwrap_or(first);
     }
 
     // ------------------------------------------------------------ panes
@@ -3844,6 +4166,28 @@ impl Workspace {
                 });
                 self.focus_sidebar(window, cx);
             }
+            "space" | "spaces" => {
+                let (sub, arg) = rest.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((rest, ""));
+                match sub {
+                    "" | "list" | "overview" => self.toggle_overview(window, cx),
+                    "new" => {
+                        self.new_space((!arg.is_empty()).then(|| arg.to_string()), window, cx);
+                    }
+                    "rename" | "name" => self.rename_space(arg, cx),
+                    "close" => self.close_space(window, cx),
+                    "move" => match arg.parse::<usize>() {
+                        Ok(n) if n >= 1 => self.move_tab_to_space(n - 1, window, cx),
+                        _ => self.flash("space move <number>".into(), true, cx),
+                    },
+                    n => match n.parse::<usize>() {
+                        Ok(n) if n >= 1 => self.go_space(n - 1, window, cx),
+                        _ => match self.spaces.iter().position(|s| s.name.eq_ignore_ascii_case(rest)) {
+                            Some(i) => self.switch_space(i, window, cx),
+                            None => self.flash(format!("No space called {rest}"), true, cx),
+                        },
+                    },
+                }
+            }
             "vsplit" | "vs" | "split" | "sp" => {
                 let vertical = cmd.starts_with('v');
                 self.split(vertical, window, cx);
@@ -4285,6 +4629,265 @@ impl Workspace {
                 Layout::Split { a, .. } => node = a,
             }
         }
+    }
+
+    fn toggle_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.overview = !self.overview;
+        if self.overview {
+            window.focus(&self.overview_focus);
+        } else {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// The spaces rail: a thin strip beside the main area, one mark per space; hovered, it
+    /// opens over the main area (taking no room from it) with each space's name and contents.
+    fn render_space_rail(&self, right: bool, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.rail_open || self.rail_panel_hover;
+        let marks = div().flex().flex_col().items_center().gap(px(5.)).pt(px(10.)).children(self.spaces.iter().enumerate().map(|(i, sp)| {
+            let on = i == self.space;
+            div()
+                .id(("space-mark", i))
+                .debug_selector(move || format!("space-mark-{i}"))
+                .w(px(if on { 4. } else { 3. }))
+                .h(px(on.then_some(26.).unwrap_or(18.)))
+                .rounded(px(2.))
+                .cursor_pointer()
+                .bg(space_color(sp.color).opacity(if on { 1. } else { 0.4 }))
+                .on_click(cx.listener(move |ws, _, w, cx| ws.switch_space(i, w, cx)))
+        }));
+        // A grip says it opens.
+        let grip = div().mt(px(8.)).flex().flex_col().items_center().gap(px(2.)).children((0..3).map(|_| div().size(px(2.)).rounded(px(1.)).bg(theme::fg_muted())));
+        let panel = open.then(|| {
+            let rows = self.spaces.iter().enumerate().map(|(i, sp)| {
+                let on = i == self.space;
+                let (titles, tabs) = self.space_panes(i, cx);
+                let what = titles.iter().filter(|t| !t.is_empty()).take(3).cloned().collect::<Vec<_>>().join(" · ");
+                div()
+                    .id(("space-row", i))
+                    .debug_selector(move || format!("space-row-{i}"))
+                    .group("space-row")
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .py(px(5.))
+                    .mx(px(4.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(theme::selected_focused()))
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(move |ws, ev: &gpui::ClickEvent, w, cx| {
+                        if ev.click_count() >= 2 {
+                            ws.switch_space(i, w, cx);
+                            ws.open_cmd(CmdMode::Command, "space rename ", w, cx);
+                        } else {
+                            ws.switch_space(i, w, cx);
+                        }
+                    }))
+                    .child(div().w(px(4.)).h(px(28.)).rounded(px(2.)).bg(space_color(sp.color)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().flex().items_center().gap(px(6.)).child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(if on { theme::fg_bright() } else { theme::fg() }).child(sp.name.clone())).when(i < 9, |d| d.child(div().text_size(px(10.)).text_color(theme::fg_muted()).child(format!("⌃{}", i + 1)))))
+                            .child(div().text_size(px(10.5)).text_color(theme::fg_muted()).overflow_hidden().text_ellipsis().whitespace_nowrap().child(if what.is_empty() { format!("{} split{} · empty", titles.len(), if titles.len() == 1 { "" } else { "s" }) } else { format!("{} · {tabs} tab{}", what, if tabs == 1 { "" } else { "s" }) })),
+                    )
+            });
+            let link = |id: &'static str, label: &'static str, keys: &'static str| {
+                div()
+                    .id(id)
+                    .debug_selector(move || id.to_string())
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(12.))
+                    .py(px(5.))
+                    .cursor_pointer()
+                    .text_color(theme::fg_dim())
+                    .hover(|s| s.bg(theme::hover()).text_color(theme::fg_bright()))
+                    .child(div().flex_1().child(label))
+                    .child(div().text_size(px(10.)).text_color(theme::fg_muted()).child(keys))
+            };
+            deferred(
+                div()
+                    .id("space-panel")
+                    .debug_selector(|| "space-panel".into())
+                    .occlude()
+                    .absolute()
+                    .top_0()
+                    .when(!right, |d| d.left_0())
+                    .when(right, |d| d.right_0())
+                    .w(px(230.))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .py(px(8.))
+                    .bg(theme::bg_popup())
+                    .when(!right, |d| d.border_r_1())
+                    .when(right, |d| d.border_l_1())
+                    .border_color(theme::border_input())
+                    .shadow_lg()
+                    .text_size(px(12.))
+                    .on_hover(cx.listener(|ws, h: &bool, _, cx| {
+                        ws.rail_panel_hover = *h;
+                        cx.notify();
+                    }))
+                    .child(div().px(px(12.)).pb(px(6.)).text_size(px(10.5)).text_color(theme::fg_muted()).child("SPACES"))
+                    .children(rows)
+                    .child(div().h(px(1.)).mx(px(8.)).my(px(6.)).bg(theme::border()))
+                    .child(link("space-new", "New space", "⌘K N").on_click(cx.listener(|ws, _, w, cx| {
+                        ws.new_space(None, w, cx);
+                    })))
+                    .child(link("space-overview", "Overview", "⌘K O").on_click(cx.listener(|ws, _, w, cx| {
+                        ws.rail_open = false;
+                        ws.rail_panel_hover = false;
+                        ws.toggle_overview(w, cx);
+                    })))
+                    .when(self.spaces.len() > 1, |d| d.child(link("space-close", "Close this space", "⌘K W").on_click(cx.listener(|ws, _, w, cx| ws.close_space(w, cx)))))
+                    .child(div().flex_1())
+                    .child(div().px(px(12.)).text_size(px(10.5)).text_color(theme::fg_muted()).child("⌃1–9 go · ⌃⌥1–9 move the tab · ⌃0 last")),
+            )
+            .with_priority(3)
+        });
+        div()
+            .id("space-rail")
+            .debug_selector(|| "space-rail".into())
+            .relative()
+            .flex_none()
+            .w(px(12.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .bg(theme::bg_side())
+            .when(!right, |d| d.border_r_1())
+            .when(right, |d| d.border_l_1())
+            .border_color(theme::border())
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::hover()))
+            .on_hover(cx.listener(|ws, h: &bool, _, cx| {
+                ws.rail_open = *h;
+                cx.notify();
+            }))
+            .child(marks)
+            .child(grip)
+            .children(panel)
+            .into_any_element()
+    }
+
+    /// A space's splits, drawn small (the overview).
+    fn mini_layout(&self, node: &Layout, panes: &[Pane], color: Hsla, cx: &App) -> AnyElement {
+        match node {
+            Layout::Pane(id) => {
+                let title = panes.iter().find(|p| p.id == *id).and_then(|p| p.active).and_then(|t| self.tab_ix(t)).map(|ix| self.tab_title(&self.tabs[ix], cx).0).unwrap_or_default();
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .m(px(2.))
+                    .p(px(5.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(color.opacity(0.5))
+                    .bg(theme::bg_editor())
+                    .overflow_hidden()
+                    .text_size(px(10.5))
+                    .text_color(theme::fg_dim())
+                    .child(div().overflow_hidden().text_ellipsis().whitespace_nowrap().child(title))
+                    .into_any_element()
+            }
+            Layout::Split { vertical, ratio, a, b } => div()
+                .flex()
+                .when(!*vertical, |d| d.flex_col())
+                .size_full()
+                .child(div().flex().min_w_0().min_h_0().when(*vertical, |d| d.w(relative(*ratio)).h_full()).when(!*vertical, |d| d.h(relative(*ratio)).w_full()).child(self.mini_layout(a, panes, color, cx)))
+                .child(div().flex().flex_1().min_w_0().min_h_0().child(self.mini_layout(b, panes, color, cx)))
+                .into_any_element(),
+        }
+    }
+
+    /// Every space at a glance: click one (or press its number) to go there.
+    fn render_overview(&self, cx: &mut Context<Self>) -> AnyElement {
+        let cards = self.spaces.iter().enumerate().map(|(i, sp)| {
+            let on = i == self.space;
+            let color = space_color(sp.color);
+            let (layout, panes): (&Layout, &[Pane]) = if on { (&self.layout, &self.panes) } else { sp.saved.as_ref().map(|st| (&st.layout, st.panes.as_slice())).unwrap_or((&self.layout, &self.panes)) };
+            div()
+                .id(("space-card", i))
+                .debug_selector(move || format!("space-card-{i}"))
+                .w(px(300.))
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .p(px(10.))
+                .rounded(px(8.))
+                .bg(theme::bg_popup())
+                .border_2()
+                .border_color(if on { color } else { theme::border_input() })
+                .cursor_pointer()
+                .hover(|s| s.border_color(color))
+                .on_click(cx.listener(move |ws, _, w, cx| ws.switch_space(i, w, cx)))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().size(px(9.)).rounded(px(5.)).bg(color))
+                        .child(div().flex_1().text_color(theme::fg_bright()).font_weight(FontWeight::MEDIUM).child(sp.name.clone()))
+                        .when(i < 9, |d| d.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(format!("⌃{}", i + 1)))),
+                )
+                .child(div().h(px(170.)).flex().child(self.mini_layout(layout, panes, color, cx)))
+        });
+        let new_card = div()
+            .id("space-card-new")
+            .debug_selector(|| "space-card-new".into())
+            .w(px(300.))
+            .h(px(214.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.))
+            .border_2()
+            .border_dashed()
+            .border_color(theme::border_input())
+            .text_color(theme::fg_dim())
+            .cursor_pointer()
+            .hover(|s| s.border_color(theme::focus_border()).text_color(theme::fg_bright()))
+            .on_click(cx.listener(|ws, _, w, cx| {
+                ws.new_space(None, w, cx);
+            }))
+            .child("+  New space");
+        div()
+            .id("space-overview")
+            .debug_selector(|| "space-overview".into())
+            .track_focus(&self.overview_focus)
+            .on_key_down(cx.listener(|ws, ev: &KeyDownEvent, w, cx| {
+                let k = ev.keystroke.key.as_str();
+                if k == "escape" {
+                    ws.toggle_overview(w, cx);
+                } else if let Ok(n) = k.parse::<usize>()
+                    && (1..=9).contains(&n)
+                {
+                    ws.go_space(n - 1, w, cx);
+                }
+                cx.stop_propagation();
+            }))
+            .on_mouse_down(MouseButton::Left, cx.listener(|ws, _, w, cx| ws.toggle_overview(w, cx)))
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(14.))
+            .bg(theme::ca(0x000000aa))
+            .child(div().text_size(px(13.)).text_color(theme::fg_dim()).child("Spaces — click one, or press its number · Esc"))
+            .child(div().max_w(px(960.)).flex().flex_wrap().justify_center().gap(px(14.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).children(cards).child(new_card))
+            .into_any_element()
     }
 
     fn render_layout(&self, node: &Layout, path: String, focused_area: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -5447,6 +6050,8 @@ impl Render for Workspace {
             .when(self.output_visible, |d| d.child(self.render_output(cx)))
             .into_any_element();
         let activity = self.render_activity_bar(window, cx).into_any_element();
+        let rail = self.render_space_rail(right, cx);
+        let overview = self.overview.then(|| self.render_overview(cx));
         div()
             .key_context("Workspace")
             .track_focus(&self.focus)
@@ -5533,6 +6138,32 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &Buffer7, w, cx| ws.show_buffer(6, w, cx)))
             .on_action(cx.listener(|ws, _: &Buffer8, w, cx| ws.show_buffer(7, w, cx)))
             .on_action(cx.listener(|ws, _: &Buffer9, w, cx| ws.show_buffer(usize::MAX, w, cx)))
+            .on_action(cx.listener(|ws, _: &Space1, w, cx| ws.go_space(0, w, cx)))
+            .on_action(cx.listener(|ws, _: &Space2, w, cx| ws.go_space(1, w, cx)))
+            .on_action(cx.listener(|ws, _: &Space3, w, cx| ws.go_space(2, w, cx)))
+            .on_action(cx.listener(|ws, _: &Space4, w, cx| ws.go_space(3, w, cx)))
+            .on_action(cx.listener(|ws, _: &Space5, w, cx| ws.go_space(4, w, cx)))
+            .on_action(cx.listener(|ws, _: &Space6, w, cx| ws.go_space(5, w, cx)))
+            .on_action(cx.listener(|ws, _: &Space7, w, cx| ws.go_space(6, w, cx)))
+            .on_action(cx.listener(|ws, _: &Space8, w, cx| ws.go_space(7, w, cx)))
+            .on_action(cx.listener(|ws, _: &Space9, w, cx| ws.go_space(8, w, cx)))
+            .on_action(cx.listener(|ws, _: &ToSpace1, w, cx| ws.move_tab_to_space(0, w, cx)))
+            .on_action(cx.listener(|ws, _: &ToSpace2, w, cx| ws.move_tab_to_space(1, w, cx)))
+            .on_action(cx.listener(|ws, _: &ToSpace3, w, cx| ws.move_tab_to_space(2, w, cx)))
+            .on_action(cx.listener(|ws, _: &ToSpace4, w, cx| ws.move_tab_to_space(3, w, cx)))
+            .on_action(cx.listener(|ws, _: &ToSpace5, w, cx| ws.move_tab_to_space(4, w, cx)))
+            .on_action(cx.listener(|ws, _: &ToSpace6, w, cx| ws.move_tab_to_space(5, w, cx)))
+            .on_action(cx.listener(|ws, _: &ToSpace7, w, cx| ws.move_tab_to_space(6, w, cx)))
+            .on_action(cx.listener(|ws, _: &ToSpace8, w, cx| ws.move_tab_to_space(7, w, cx)))
+            .on_action(cx.listener(|ws, _: &ToSpace9, w, cx| ws.move_tab_to_space(8, w, cx)))
+            .on_action(cx.listener(|ws, _: &LastSpace, w, cx| ws.go_space(ws.last_space, w, cx)))
+            .on_action(cx.listener(|ws, _: &NextSpace, w, cx| ws.cycle_space(1, w, cx)))
+            .on_action(cx.listener(|ws, _: &PrevSpace, w, cx| ws.cycle_space(-1, w, cx)))
+            .on_action(cx.listener(|ws, _: &NewSpace, w, cx| {
+                ws.new_space(None, w, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &CloseSpace, w, cx| ws.close_space(w, cx)))
+            .on_action(cx.listener(|ws, _: &SpaceOverview, w, cx| ws.toggle_overview(w, cx)))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_output))
             .on_action(cx.listener(Self::on_focus_editor))
@@ -5608,12 +6239,13 @@ impl Render for Workspace {
             .text_size(theme::ui_text())
             .child(canvas(move |b, _, _| bounds_cell.set(b), |_, _, _, _| {}).absolute().size_full())
             .child(if right {
-                div().flex().flex_1().min_h_0().child(main).children(side_block).child(activity)
+                div().flex().flex_1().min_h_0().child(main).child(rail).children(side_block).child(activity)
             } else {
-                div().flex().flex_1().min_h_0().child(activity).children(side_block).child(main)
+                div().flex().flex_1().min_h_0().child(activity).children(side_block).child(rail).child(main)
             })
             .child(self.render_status(window, cx))
             .children(self.render_cmd_popup(cx))
+            .children(overview)
             .children(self.render_ask(cx))
     }
 }
@@ -8098,6 +8730,93 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         let colls = crate::api::collections(&roots);
         let made = colls.iter().find(|c| c.name() == "Payments").expect("made with the typed name");
         assert_eq!(tab.read_with(cx, |t, _| t.saved_in()), Some((Some(made.id.clone()), None)), "and the request is saved in it");
+    }
+
+    #[gpui::test]
+    fn spaces_keep_their_own_splits_and_tabs(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        for f in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(root.join(f), "x").unwrap();
+        }
+        let open = |cx: &mut VisualTestContext, f: &str| ws.update_in(cx, |ws, w, cx| ws.open_file(root.join(f), None, false, w, cx));
+        let shown = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.active.and_then(|a| match &ws.tabs[a].kind {
+            TabKind::Editor(e) => e.read(cx).path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()),
+            _ => None,
+        }));
+        open(cx, "a.rs");
+        // A second space: empty, split in two, its own files.
+        cx.simulate_keystrokes("cmd-k n");
+        cx.run_until_parked();
+        assert_eq!(ws.read_with(cx, |ws, _| (ws.spaces.len(), ws.space, ws.active)), (2, 1, None), "a new, empty space");
+        open(cx, "b.rs");
+        cx.simulate_keystrokes("cmd-\\");
+        open(cx, "c.rs");
+        assert_eq!(ws.read_with(cx, |ws, _| ws.panes.len()), 2);
+        // ⌃1 back: one pane, a.rs.
+        cx.simulate_keystrokes("ctrl-1");
+        assert_eq!(ws.read_with(cx, |ws, _| (ws.space, ws.panes.len())), (0, 1));
+        assert_eq!(shown(cx).as_deref(), Some("a.rs"));
+        // A file open in another space: opening it goes there (one tab per file).
+        open(cx, "b.rs");
+        assert_eq!(ws.read_with(cx, |ws, _| ws.space), 1);
+        assert_eq!(shown(cx).as_deref(), Some("b.rs"));
+        assert_eq!(ws.read_with(cx, |ws, _| ws.tabs.len()), 3, "not opened twice");
+        // ⌃0: the last space.
+        cx.simulate_keystrokes("ctrl-0");
+        assert_eq!(ws.read_with(cx, |ws, _| ws.space), 0);
+        // Saved and restored: both spaces, their splits and files.
+        let snap = ws.read_with(cx, |ws, cx| ws.snapshot(cx));
+        assert_eq!(snap.spaces.len(), 1);
+        assert_eq!(snap.spaces[0].panes.len(), 2);
+        ws.update(cx, |ws, cx| ws.save_session(cx));
+        // ⌃⌥2: a.rs moves to space 2, and we follow it.
+        cx.simulate_keystrokes("ctrl-alt-2");
+        assert_eq!(ws.read_with(cx, |ws, _| ws.space), 1);
+        assert_eq!(shown(cx).as_deref(), Some("a.rs"));
+        // Closing space 2: its tabs go to space 1.
+        cx.simulate_keystrokes("cmd-k w");
+        assert_eq!(ws.read_with(cx, |ws, _| (ws.spaces.len(), ws.space)), (1, 0));
+        let in_main: usize = ws.read_with(cx, |ws, _| ws.panes.iter().map(|p| p.items.len()).sum());
+        assert_eq!(in_main, 3, "nothing lost");
+        // The session saved with two spaces comes back as two spaces, the same splits and files.
+        let (ws2, cx2) = cx.add_window_view(|window, cx| Workspace::new(root.clone(), window, cx));
+        ws2.update_in(cx2, |ws, window, cx| ws.restore_session(window, cx));
+        cx2.run_until_parked();
+        assert_eq!(ws2.read_with(cx2, |ws, _| (ws.spaces.len(), ws.space)), (2, 0));
+        ws2.update_in(cx2, |ws, w, cx| ws.switch_space(1, w, cx));
+        assert_eq!(ws2.read_with(cx2, |ws, _| ws.panes.len()), 2, "space 2's split");
+    }
+
+    #[gpui::test]
+    fn the_spaces_rail_opens_on_hover_and_switches(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        cx.simulate_keystrokes("cmd-k n");
+        cx.simulate_keystrokes("cmd-k n");
+        cx.run_until_parked();
+        assert_eq!(ws.read_with(cx, |ws, _| (ws.spaces.len(), ws.space)), (3, 2));
+        let rail = cx.debug_bounds("space-rail").expect("the rail");
+        assert!(rail.size.width < gpui::px(16.), "thin: {:?}", rail.size.width);
+        assert!(cx.debug_bounds("space-panel").is_none(), "closed until hovered");
+        cx.simulate_mouse_move(rail.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(ws.read_with(cx, |ws, _| ws.rail_open), "hovered: open");
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+        let row = cx.debug_bounds("space-row-0").expect("a row per space");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        assert_eq!(ws.read_with(cx, |ws, _| ws.space), 0, "a click goes there");
+        // Moving away closes it.
+        let far = rail.center() + gpui::point(gpui::px(700.), gpui::px(0.));
+        cx.simulate_mouse_move(far, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(!ws.read_with(cx, |ws, _| ws.rail_open || ws.rail_panel_hover));
+        // The overview: a card per space and one to make a new one.
+        cx.simulate_keystrokes("cmd-k o");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("space-card-2").is_some() && cx.debug_bounds("space-card-new").is_some());
+        cx.simulate_keystrokes("2");
+        assert_eq!(ws.read_with(cx, |ws, _| (ws.space, ws.overview)), (1, false), "its number goes there");
     }
 
     #[gpui::test]

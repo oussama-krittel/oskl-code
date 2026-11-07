@@ -7,7 +7,7 @@ use crate::theme;
 use crate::ui::px;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Bounds, Context, FontStyle, FontWeight, HighlightStyle, Hsla, ListAlignment, ListState, Pixels, SharedString, StrikethroughStyle, StyledText, UnderlineStyle, Window, div, img, list,
+    AnyElement, Bounds, Context, FontStyle, FontWeight, HighlightStyle, ListAlignment, ListState, Pixels, SharedString, StrikethroughStyle, StyledText, UnderlineStyle, Window, div, img, list,
 };
 use quick_xml::Reader;
 use quick_xml::events::Event;
