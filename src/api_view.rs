@@ -1347,7 +1347,8 @@ impl ApiView {
             t.coll = Some(coll);
             t.folder = folder;
         }
-        self.save_now(None, cx);
+        // After the name change's own event (which marks it changed), so it ends up saved.
+        cx.spawn(async move |this, cx| this.update(cx, |v, cx| v.save_now(None, cx)).ok()).detach();
     }
 
     /// "New collection": a name box in the list, the cursor in it.

@@ -96,8 +96,8 @@ pub fn bind_keys() {
         crate::keybindings::kb("ctrl-alt-8", ToSpace8, None),
         crate::keybindings::kb("ctrl-alt-9", ToSpace9, None),
         crate::keybindings::kb("ctrl-0", LastSpace, None),
-        crate::keybindings::kb("ctrl-alt-right", NextSpace, None),
-        crate::keybindings::kb("ctrl-alt-left", PrevSpace, None),
+        crate::keybindings::kb("ctrl-cmd-down", NextSpace, None),
+        crate::keybindings::kb("ctrl-cmd-up", PrevSpace, None),
         crate::keybindings::kb("cmd-k n", NewSpace, None),
         crate::keybindings::kb("cmd-k w", CloseSpace, None),
         crate::keybindings::kb("cmd-k o", SpaceOverview, None),
@@ -416,6 +416,8 @@ fn side_of(name: &str) -> Side {
 }
 
 /// Each space's color, in turn (the first is the theme's own).
+/// One per ⌃1–9.
+const MAX_SPACES: usize = 9;
 const SPACE_COLORS: [u32; 7] = [0, 0x4c9ffe, 0x3fb950, 0xd29922, 0xa371f7, 0xf85149, 0x39c5cf];
 
 fn space_color(i: usize) -> Hsla {
@@ -1461,6 +1463,10 @@ impl Workspace {
 
     /// A new, empty space, shown (its sidebar as this one's).
     fn new_space(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        if self.spaces.len() >= MAX_SPACES {
+            self.flash(format!("{MAX_SPACES} spaces at most (⌃1–9)"), true, cx);
+            return self.space;
+        }
         let id = self.next_id;
         self.next_id += 1;
         let n = self.spaces.len();
@@ -1473,7 +1479,8 @@ impl Workspace {
             side: self.side,
             side_visible: self.side_visible,
         };
-        let color = (0..).find(|c| !self.spaces.iter().any(|s| s.color == c % SPACE_COLORS.len())).unwrap_or(n) % SPACE_COLORS.len();
+        // The first color not in use (they repeat past seven).
+        let color = (0..SPACE_COLORS.len()).find(|c| !self.spaces.iter().any(|s| s.color == *c)).unwrap_or(n % SPACE_COLORS.len());
         self.spaces.push(SpaceSlot { name: name.unwrap_or_else(|| format!("Space {}", n + 1)), color, saved: Some(st) });
         self.switch_space(n, window, cx);
         n
@@ -1485,6 +1492,9 @@ impl Workspace {
         let tid = self.tabs[a].id;
         if i == self.space {
             return;
+        }
+        if i >= self.spaces.len() && self.spaces.len() >= MAX_SPACES {
+            return self.flash(format!("{MAX_SPACES} spaces at most (⌃1–9)"), true, cx);
         }
         let from = self.space;
         let target = if i >= self.spaces.len() { self.new_space(None, window, cx) } else { i };
@@ -1717,7 +1727,7 @@ impl Workspace {
             self.spaces[0].name = n;
         }
         // The other spaces, each rebuilt the same way, then the one that was shown.
-        for sp in &saved.spaces {
+        for sp in saved.spaces.iter().take(MAX_SPACES - 1) {
             let i = self.new_space(Some(sp.name.clone()), window, cx);
             self.spaces[i].color = sp.color;
             if !sp.panes.is_empty() {
@@ -4731,20 +4741,20 @@ impl Workspace {
                     i + 1,
                     if on && self.spaces.len() > 1 { " · ⌘K W closes it" } else { "" }
                 );
-                let name: String = if sp.name.chars().count() > 16 { sp.name.chars().take(15).chain(['…']).collect() } else { sp.name.clone() };
+                let name: String = if sp.name.chars().count() > 14 { sp.name.chars().take(13).chain(['…']).collect() } else { sp.name.clone() };
                 let (tw, th) = crate::assets::vtext_size(&name);
                 div()
                     .id(("space-row", i))
                     .debug_selector(move || format!("space-row-{i}"))
                     .flex_none()
-                    .w(px(36.))
+                    .w(px(28.))
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(8.))
-                    .pt(px(10.))
-                    .pb(px(12.))
-                    .rounded(px(10.))
+                    .gap(px(5.))
+                    .pt(px(7.))
+                    .pb(px(7.))
+                    .rounded(px(8.))
                     .border_1()
                     .cursor_pointer()
                     .when(on, |d| d.bg(color.opacity(0.14)).border_color(color).shadow(vec![gpui::BoxShadow { color: color.opacity(0.45), offset: gpui::point(px(0.), px(0.)), blur_radius: px(10.), spread_radius: px(0.) }]))
@@ -4756,9 +4766,9 @@ impl Workspace {
                             ws.open_cmd(CmdMode::Command, "space rename ", w, cx);
                         }
                     }))
-                    .child(div().size(px(9.)).rounded_full().bg(color).when(on, |d| d.shadow(vec![gpui::BoxShadow { color: color.opacity(0.7), offset: gpui::point(px(0.), px(0.)), blur_radius: px(6.), spread_radius: px(0.) }])))
+                    .child(div().size(px(7.)).rounded_full().bg(color).when(on, |d| d.shadow(vec![gpui::BoxShadow { color: color.opacity(0.7), offset: gpui::point(px(0.), px(0.)), blur_radius: px(6.), spread_radius: px(0.) }])))
                     .child(svg().path(crate::assets::vtext_path(&name)).w(px(tw)).h(px(th)).flex_none().text_color(if on { theme::fg_bright() } else { theme::fg_dim() }))
-                    .when(i < 9, |d| d.child(div().text_size(px(9.5)).text_color(if on { color } else { theme::fg_muted() }).child(format!("⌃{}", i + 1))))
+                    .when(i < 9, |d| d.child(div().text_size(px(9.)).text_color(if on { color } else { theme::fg_muted() }).child(format!("⌃{}", i + 1))))
             });
             let keys = |k: &'static str| div().text_size(px(9.)).text_color(theme::fg_muted()).child(k);
             deferred(
@@ -4770,8 +4780,9 @@ impl Workspace {
                     .top_0()
                     .when(!right, |d| d.left_0())
                     .when(right, |d| d.right_0())
-                    .w(px(58.))
+                    .w(px(50.))
                     .h_full()
+                    .overflow_hidden()
                     .pt(px(top))
                     .flex()
                     .flex_col()
@@ -4811,7 +4822,7 @@ impl Workspace {
                                 ws.toggle_overview(w, cx);
                             })),
                     )
-                    .child(div().id("space-pills").flex_1().min_h_0().w_full().overflow_y_scroll().flex().flex_col().items_center().gap(px(10.)).pt(px(4.)).pb(px(10.)).children(pills))
+                    .child(div().id("space-pills").flex_1().min_h_0().w_full().overflow_y_scroll().flex().flex_col().items_center().gap(px(7.)).pt(px(4.)).pb(px(8.)).children(pills))
                     .child(
                         div()
                             .id("space-new")
@@ -4835,7 +4846,9 @@ impl Workspace {
                             })),
                     )
                     .child(div().mb(px(4.)).child(keys("⌘K N")))
-                    .child(div().mb(px(10.)).text_size(px(9.)).text_color(theme::fg_muted()).child("⌃⌥←→")),
+                    .child(div().mb(px(10.)).text_size(px(9.)).text_color(theme::fg_muted()).child("⌃⌘↑↓"))
+                    // Slides out of the strip.
+                    .with_animation("space-panel-open", gpui::Animation::new(Duration::from_millis(130)).with_easing(gpui::ease_out_quint()), |d, t| d.w(px(12. + 38. * t)).opacity(0.35 + 0.65 * t)),
             )
             .with_priority(3)
         });
@@ -4856,7 +4869,12 @@ impl Workspace {
             .border_color(theme::border())
             .cursor_pointer()
             .hover(|s| s.bg(theme::hover()))
-            .on_mouse_move(cx.listener(|ws, ev: &gpui::MouseMoveEvent, _, cx| ws.rail_moved(ev.position, cx)))
+            .on_mouse_move(cx.listener(|ws, ev: &gpui::MouseMoveEvent, _, cx| {
+                // Not while dragging (the side panel's edge, a tab…): only a free pointer opens it.
+                if ev.pressed_button.is_none() && !cx.has_active_drag() {
+                    ws.rail_moved(ev.position, cx);
+                }
+            }))
             .on_hover(cx.listener(|ws, h: &bool, _, cx| {
                 ws.rail_hover = *h;
                 if !*h {
@@ -8743,7 +8761,9 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(cx.debug_bounds("api-save-place-1").is_none(), "the search leaves one match");
         click_on(cx, "api-save-place-0");
         click_on(cx, "api-save-ok");
+        cx.run_until_parked();
         assert!(!tab.read_with(cx, |t, _| t.save_dialog_open()), "closed");
+        assert!(!tab.read_with(cx, |t, _| t.is_dirty()), "saved: no unsaved dot");
         assert_eq!(tab.read_with(cx, |t, _| t.saved_in()), Some((Some(cid), Some(fid))), "saved in that folder");
     }
 
@@ -8879,6 +8899,22 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert_eq!(ws2.read_with(cx2, |ws, _| (ws.spaces.len(), ws.space)), (2, 0));
         ws2.update_in(cx2, |ws, w, cx| ws.switch_space(1, w, cx));
         assert_eq!(ws2.read_with(cx2, |ws, _| ws.panes.len()), 2, "space 2's split");
+    }
+
+    #[gpui::test]
+    fn spaces_stop_at_nine(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        for _ in 0..12 {
+            cx.simulate_keystrokes("cmd-k n");
+        }
+        cx.run_until_parked();
+        let colors = ws.read_with(cx, |ws, _| ws.spaces.iter().map(|s| s.color).collect::<Vec<_>>());
+        assert_eq!(colors.len(), super::MAX_SPACES, "one per ⌃1–9");
+        assert!(colors.iter().all(|c| *c < super::SPACE_COLORS.len()));
+        cx.simulate_keystrokes("ctrl-cmd-up");
+        assert_eq!(ws.read_with(cx, |ws, _| ws.space), 7, "⌃⌘↑: the one before");
+        cx.simulate_keystrokes("ctrl-cmd-down");
+        assert_eq!(ws.read_with(cx, |ws, _| ws.space), 8, "⌃⌘↓: the one after");
     }
 
     #[gpui::test]

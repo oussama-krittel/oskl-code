@@ -110,9 +110,9 @@ pub fn vtext_path(text: &str) -> SharedString {
     format!("vtext/{hex}.svg").into()
 }
 
-const VTEXT_PX: f32 = 13.;
+const VTEXT_PX: f32 = 11.;
 
-/// (width, height) of [`vtext_path`]'s drawing, at 13 px Menlo.
+/// (width, height) of [`vtext_path`]'s drawing, at 11 px Menlo.
 pub fn vtext_size(text: &str) -> (f32, f32) {
     (VTEXT_PX * 1.25, text.chars().count() as f32 * VTEXT_PX * 0.602 + 2.)
 }
