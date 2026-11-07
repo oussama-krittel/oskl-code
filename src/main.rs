@@ -15,6 +15,7 @@ mod dialog;
 mod diagnostics;
 mod diff_edit;
 mod diff_view;
+mod docx;
 mod editor;
 mod emmet;
 mod file_tree;

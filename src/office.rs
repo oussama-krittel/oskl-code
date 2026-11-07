@@ -89,16 +89,16 @@ impl Zip {
     }
 }
 
-fn local(name: &[u8]) -> &[u8] {
+pub(crate) fn local(name: &[u8]) -> &[u8] {
     name.rsplit(|c| *c == b':').next().unwrap_or(name)
 }
 
-fn attr(e: &quick_xml::events::BytesStart, key: &[u8]) -> Option<String> {
+pub(crate) fn attr(e: &quick_xml::events::BytesStart, key: &[u8]) -> Option<String> {
     e.attributes().flatten().find(|a| local(a.key.as_ref()) == key).map(|a| unescape(&a.value))
 }
 
 /// An entity (`&amp;`, `&#233;`…) as its text: quick-xml gives them apart from the text.
-fn entity(g: &quick_xml::events::BytesRef) -> String {
+pub(crate) fn entity(g: &quick_xml::events::BytesRef) -> String {
     if let Ok(Some(c)) = g.resolve_char_ref() {
         return c.to_string();
     }
@@ -113,7 +113,7 @@ fn entity(g: &quick_xml::events::BytesRef) -> String {
     .to_string()
 }
 
-fn unescape(raw: &[u8]) -> String {
+pub(crate) fn unescape(raw: &[u8]) -> String {
     let s = String::from_utf8_lossy(raw);
     quick_xml::escape::unescape(&s).map(|c| c.into_owned()).unwrap_or_else(|_| s.into_owned())
 }
@@ -137,7 +137,7 @@ fn excel_date(v: f64) -> String {
 }
 
 /// Runs a reader so that a file it trips over is an error, never a crash.
-fn guarded<T>(what: impl FnOnce() -> Result<T, String> + std::panic::UnwindSafe) -> Result<T, String> {
+pub(crate) fn guarded<T>(what: impl FnOnce() -> Result<T, String> + std::panic::UnwindSafe) -> Result<T, String> {
     std::panic::catch_unwind(what).unwrap_or_else(|_| Err("this file has something this reader doesn't understand".into()))
 }
 
@@ -379,7 +379,7 @@ struct Styles {
 
 /// The theme's colors, in the order cells name them: light 1, dark 1, light 2, dark 2,
 /// accents 1–6, link, followed link.
-fn theme_colors(x: &[u8]) -> Vec<u32> {
+pub(crate) fn theme_colors(x: &[u8]) -> Vec<u32> {
     let mut found: Vec<(String, u32)> = Vec::new();
     let mut r = Reader::from_reader(x);
     let mut buf = Vec::new();
@@ -761,212 +761,6 @@ fn date_pattern(n: f64, pattern: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------- Word
-
-/// A Word document as Markdown.
-pub fn docx_markdown(path: &Path) -> Result<String, String> {
-    let path = path.to_path_buf();
-    guarded(move || read_docx(&path))
-}
-
-fn read_docx(path: &Path) -> Result<String, String> {
-    let mut z = Zip::open(path)?;
-    let x = z.read("word/document.xml").ok_or("no document in this file (is it the old .doc format?)")?;
-    // Numbered lists vs bullets: numbering definitions say which.
-    let mut ordered: HashMap<String, bool> = HashMap::new();
-    if let Some(n) = z.read("word/numbering.xml") {
-        let mut abs_ordered: HashMap<String, bool> = HashMap::new();
-        let mut r = Reader::from_reader(n.as_slice());
-        let mut buf = Vec::new();
-        let (mut cur_abs, mut first_lvl, mut cur_num) = (String::new(), false, String::new());
-        loop {
-            match r.read_event_into(&mut buf) {
-                Ok(Event::Start(e) | Event::Empty(e)) => match local(e.name().as_ref()) {
-                    b"abstractNum" => {
-                        cur_abs = attr(&e, b"abstractNumId").unwrap_or_default();
-                        first_lvl = true;
-                    }
-                    b"numFmt" if first_lvl => {
-                        abs_ordered.insert(cur_abs.clone(), attr(&e, b"val").is_some_and(|v| v != "bullet" && v != "none"));
-                        first_lvl = false;
-                    }
-                    b"num" => cur_num = attr(&e, b"numId").unwrap_or_default(),
-                    b"abstractNumId" => {
-                        let a = attr(&e, b"val").unwrap_or_default();
-                        ordered.insert(cur_num.clone(), abs_ordered.get(&a).copied().unwrap_or(false));
-                    }
-                    _ => {}
-                },
-                Ok(Event::Eof) | Err(_) => break,
-                _ => {}
-            }
-            buf.clear();
-        }
-    }
-    let mut md = String::new();
-    let mut r = Reader::from_reader(x.as_slice());
-    let mut buf = Vec::new();
-    // Paragraph state.
-    let (mut para, mut style, mut level, mut num_id) = (String::new(), String::new(), None::<usize>, String::new());
-    let (mut bold, mut italic, mut in_text) = (false, false, false);
-    let mut run = String::new();
-    // Tables: rows of cells; nested tables flatten into their cell.
-    let mut tables: Vec<Vec<Vec<String>>> = Vec::new();
-    let mut counters: HashMap<(String, usize), usize> = HashMap::new();
-    let flush_run = |para: &mut String, run: &mut String, bold: bool, italic: bool| {
-        if run.is_empty() {
-            return;
-        }
-        let t = std::mem::take(run);
-        // Only spaces: nothing to mark (and no inside to cut out).
-        if t.trim().is_empty() {
-            para.push_str(&t);
-            return;
-        }
-        let (lead, body, trail) = {
-            let start = t.len() - t.trim_start().len();
-            let end = t.trim_end().len();
-            (&t[..start], &t[start..end], &t[end..])
-        };
-        if body.is_empty() {
-            para.push_str(&t);
-            return;
-        }
-        let mark = match (bold, italic) {
-            (true, true) => "***",
-            (true, false) => "**",
-            (false, true) => "*",
-            _ => "",
-        };
-        para.push_str(lead);
-        para.push_str(mark);
-        para.push_str(&body.replace('*', "\\*"));
-        para.push_str(mark);
-        para.push_str(trail);
-    };
-    loop {
-        match r.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match local(e.name().as_ref()) {
-                b"p" => {
-                    para.clear();
-                    style.clear();
-                    level = None;
-                    num_id.clear();
-                }
-                b"r" => {
-                    bold = false;
-                    italic = false;
-                    run.clear();
-                }
-                b"t" => in_text = true,
-                b"tbl" => tables.push(Vec::new()),
-                b"tr" => {
-                    if let Some(t) = tables.last_mut() {
-                        t.push(Vec::new());
-                    }
-                }
-                b"tc" => {
-                    if let Some(row) = tables.last_mut().and_then(|t| t.last_mut()) {
-                        row.push(String::new());
-                    }
-                }
-                _ => {}
-            },
-            Ok(Event::Empty(e)) => match local(e.name().as_ref()) {
-                b"pStyle" => style = attr(&e, b"val").unwrap_or_default(),
-                b"ilvl" => level = Some(attr(&e, b"val").and_then(|v| v.parse().ok()).unwrap_or(0)),
-                b"numId" => {
-                    num_id = attr(&e, b"val").unwrap_or_default();
-                    level.get_or_insert(0);
-                }
-                b"b" => bold = attr(&e, b"val").is_none_or(|v| v != "0" && v != "false"),
-                b"i" => italic = attr(&e, b"val").is_none_or(|v| v != "0" && v != "false"),
-                b"tab" => run.push('\t'),
-                b"br" | b"cr" => run.push_str("  \n"),
-                b"drawing" | b"pict" => run.push_str("[picture]"),
-                _ => {}
-            },
-            Ok(Event::Text(t)) if in_text => run.push_str(&unescape(&t)),
-                Ok(Event::GeneralRef(g)) if in_text => run.push_str(&entity(&g)),
-            Ok(Event::End(e)) => match local(e.name().as_ref()) {
-                b"t" => in_text = false,
-                b"r" => flush_run(&mut para, &mut run, bold, italic),
-                b"p" => {
-                    let text = para.trim_end().to_string();
-                    if let Some(cell) = tables.last_mut().and_then(|t| t.last_mut()).and_then(|r| r.last_mut()) {
-                        if !cell.is_empty() && !text.is_empty() {
-                            cell.push_str("<br>");
-                        }
-                        cell.push_str(&text.replace('|', "\\|").replace('\n', " "));
-                        continue;
-                    }
-                    let s = style.to_lowercase();
-                    let heading = if s == "title" {
-                        Some(1)
-                    } else if s == "subtitle" {
-                        Some(2)
-                    } else {
-                        s.strip_prefix("heading").and_then(|n| n.trim().parse::<usize>().ok()).map(|n| n.clamp(1, 6))
-                    };
-                    if text.is_empty() {
-                        continue;
-                    }
-                    match (heading, level) {
-                        (Some(h), _) => md.push_str(&format!("{} {}\n\n", "#".repeat(h), text.replace("**", ""))),
-                        (None, Some(l)) if !num_id.is_empty() || s.contains("list") => {
-                            let indent = "  ".repeat(l);
-                            if ordered.get(&num_id).copied().unwrap_or(false) {
-                                let n = counters.entry((num_id.clone(), l)).or_insert(0);
-                                *n += 1;
-                                md.push_str(&format!("{indent}{}. {text}\n", n));
-                            } else {
-                                md.push_str(&format!("{indent}- {text}\n"));
-                            }
-                        }
-                        _ if s.contains("quote") => md.push_str(&format!("> {text}\n\n")),
-                        _ => {
-                            if md.ends_with("\n") && !md.ends_with("\n\n") && !md.is_empty() {
-                                md.push('\n');
-                            }
-                            md.push_str(&text);
-                            md.push_str("\n\n");
-                        }
-                    }
-                }
-                b"tbl" => {
-                    let Some(t) = tables.pop() else { continue };
-                    if let Some(cell) = tables.last_mut().and_then(|t| t.last_mut()).and_then(|r| r.last_mut()) {
-                        // A table in a table: its text goes in the cell.
-                        cell.push_str(&t.iter().map(|r| r.join(" · ")).collect::<Vec<_>>().join("<br>"));
-                        continue;
-                    }
-                    let cols = t.iter().map(|r| r.len()).max().unwrap_or(0);
-                    if cols == 0 {
-                        continue;
-                    }
-                    if !md.ends_with("\n\n") && !md.is_empty() {
-                        md.push('\n');
-                    }
-                    for (i, row) in t.iter().enumerate() {
-                        let mut cells = row.clone();
-                        cells.resize(cols, String::new());
-                        md.push_str(&format!("| {} |\n", cells.join(" | ")));
-                        if i == 0 {
-                            md.push_str(&format!("|{}\n", " --- |".repeat(cols)));
-                        }
-                    }
-                    md.push('\n');
-                }
-                _ => {}
-            },
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-    Ok(md)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1044,22 +838,4 @@ pub(crate) mod tests {
         std::fs::remove_file(p).ok();
     }
 
-    #[test]
-    fn documents_read_as_markdown() {
-        let p = std::env::temp_dir().join(format!("kite-{}.docx", std::process::id()));
-        zip(&p, &[
-            ("word/document.xml", r#"<w:document><w:body>
-                <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Plan</w:t></w:r></w:p>
-                <w:p><w:r><w:t xml:space="preserve">Ship it </w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>today</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve"> </w:t></w:r><w:r><w:t>.</w:t></w:r></w:p>
-                <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>First</w:t></w:r></w:p>
-                <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Second</w:t></w:r></w:p>
-                <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Qty</w:t></w:r></w:p></w:tc></w:tr>
-                <w:tr><w:tc><w:p><w:r><w:t>Pen</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>2</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
-            </w:body></w:document>"#),
-            ("word/numbering.xml", r#"<w:numbering><w:abstractNum w:abstractNumId="7"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="7"/></w:num></w:numbering>"#),
-        ]);
-        let md = docx_markdown(&p).unwrap();
-        assert_eq!(md, "# Plan\n\nShip it **today** .\n\n1. First\n2. Second\n\n| Name | Qty |\n| --- | --- |\n| Pen | 2 |\n\n");
-        std::fs::remove_file(p).ok();
-    }
 }

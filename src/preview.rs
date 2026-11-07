@@ -72,8 +72,8 @@ pub struct PreviewView {
     /// A CSV's (or spreadsheet's) table.
     table: Option<Entity<crate::table::TableView>>,
     table_task: Option<Task<()>>,
-    /// A Word document (its text is what it reads as, in Markdown).
-    doc: bool,
+    /// A Word document, as Word shows it.
+    doc: Option<Entity<crate::docx::DocView>>,
     pdf: Option<Entity<crate::pdf::PdfView>>,
     /// The shown picture's own width and height (read once per file).
     natural: std::cell::RefCell<Option<(PathBuf, Option<(f32, f32)>)>>,
@@ -117,8 +117,6 @@ impl EventEmitter<Request> for PreviewView {}
 impl PreviewView {
     pub fn new(path: PathBuf, source: Option<Entity<Editor>>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let kind = kind_of(&path).unwrap_or(Kind::Markdown);
-        // A Word file is read as Markdown and shown like it.
-        let (kind, doc) = if kind == Kind::Doc { (Kind::Markdown, true) } else { (kind, false) };
         let sub = source.as_ref().map(|ed| cx.observe_in(ed, window, |view, _, window, cx| view.source_changed(window, cx)));
         let mut view = Self {
             focus: cx.focus_handle(),
@@ -126,7 +124,7 @@ impl PreviewView {
             natural: Default::default(),
             table: None,
             table_task: None,
-            doc,
+            doc: None,
             pdf: None,
             path,
             kind,
@@ -161,8 +159,7 @@ impl PreviewView {
     pub fn title(&self) -> String {
         let name = self.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         match self.kind {
-            Kind::Image | Kind::Sheet | Kind::Pdf => name,
-            _ if self.doc => name,
+            Kind::Image | Kind::Sheet | Kind::Pdf | Kind::Doc => name,
             Kind::Table => format!("Table {name}"),
             _ => format!("Preview {name}"),
         }
@@ -178,9 +175,6 @@ impl PreviewView {
     }
 
     fn text(&self, cx: &App) -> String {
-        if self.doc {
-            return crate::office::docx_markdown(&self.path).unwrap_or_else(|e| format!("*Can't show this document: {e}.*"));
-        }
         match &self.source {
             Some(ed) => ed.read(cx).text(),
             None => std::fs::read_to_string(&self.path).unwrap_or_default(),
@@ -281,7 +275,22 @@ impl PreviewView {
                     .ok();
                 }));
             }
-            Kind::Doc => {}
+            Kind::Doc => {
+                // Read off the main thread (its pictures are unzipped to a temporary folder).
+                let path = self.path.clone();
+                let read = cx.background_executor().spawn(async move { crate::docx::read(&path) });
+                self.table_task = Some(cx.spawn(async move |this, cx| {
+                    let doc = read.await;
+                    this.update(cx, |v, cx| {
+                        match &v.doc {
+                            Some(d) => d.update(cx, |d, cx| d.replace(doc, cx)),
+                            None => v.doc = Some(cx.new(|_| crate::docx::DocView::new(doc))),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+            }
             Kind::Pdf => match &self.pdf {
                 Some(p) => p.update(cx, |p, cx| p.reload(cx)),
                 None => {
@@ -301,6 +310,11 @@ impl PreviewView {
     /// A trackpad pinch over the page: zooms all of it (text, tables, code, diagrams), keeping
     /// the spot under the fingers where it is. Returns whether this preview took it.
     pub fn pinch(&mut self, p: crate::pinch::Pinch, cx: &mut Context<Self>) -> bool {
+        if self.kind == Kind::Doc {
+            let Some(v) = self.doc.clone().filter(|v| v.read(cx).area.get().contains(&p.at)) else { return false };
+            v.update(cx, |v, cx| v.pinch(p.magnify, cx));
+            return true;
+        }
         if self.kind == Kind::Pdf {
             let Some(v) = self.pdf.clone().filter(|v| v.read(cx).area.get().contains(&p.at)) else { return false };
             v.update(cx, |v, cx| v.pinch(p.magnify, cx));
@@ -776,7 +790,10 @@ impl Render for PreviewView {
                 page
             }
             Kind::Image | Kind::Svg => self.render_image(cx),
-            Kind::Doc => div().into_any_element(),
+            Kind::Doc => match &self.doc {
+                Some(d) => d.clone().into_any_element(),
+                None => div().size_full().flex().items_center().justify_center().text_color(theme::fg_dim()).child("Reading…").into_any_element(),
+            },
             Kind::Pdf => self.pdf.clone().map(|p| p.into_any_element()).unwrap_or_else(|| div().into_any_element()),
             Kind::Table | Kind::Sheet => match &self.table {
                 Some(t) => t.clone().into_any_element(),
@@ -788,7 +805,7 @@ impl Render for PreviewView {
 }
 
 /// Drops a picture from the image cache and the GPU (it's shown no more, or changed).
-fn release(path: &Path, window: &mut Window, cx: &mut App) {
+pub(crate) fn release(path: &Path, window: &mut Window, cx: &mut App) {
     let resource = Resource::Path(Arc::from(path));
     if let Some(Ok(image)) = window.get_asset::<ImgResourceLoader>(&resource, cx) {
         window.drop_image(image).ok();
@@ -2011,9 +2028,8 @@ mod tests {
             let path = std::path::Path::new(p.trim());
             eprintln!("-- {p}");
             if p.ends_with(".docx") {
-                let md = crate::office::docx_markdown(path).unwrap();
-                eprintln!("{} chars", md.len());
-                let _ = super::parse(&md);
+                let d = crate::docx::read(path).unwrap();
+                eprintln!("{} blocks", d.blocks.len());
             } else {
                 let (s, _, _) = crate::office::xlsx(path).unwrap();
                 eprintln!("{} sheets", s.len());
