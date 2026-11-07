@@ -5,7 +5,7 @@
 use crate::theme;
 use crate::ui::px;
 use gpui::prelude::*;
-use gpui::{App, Bounds, Context, FontWeight, Pixels, ScrollHandle, SharedString, UniformListScrollHandle, Window, div, uniform_list};
+use gpui::{Bounds, Context, FontWeight, Pixels, SharedString, UniformListScrollHandle, Window, div, uniform_list};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -50,6 +50,8 @@ pub struct Look {
     /// Borders drawn: left 1, right 2, top 4, bottom 8.
     pub borders: u8,
     pub border_color: Option<u32>,
+    /// How heavy the borders are (points): thin, medium, thick.
+    pub border_w: f32,
     /// 0 as usual (numbers right, text left), 1 left, 2 center, 3 right.
     pub align: u8,
     pub wrap: bool,
@@ -166,12 +168,6 @@ impl Sheet {
         Ok(s)
     }
 
-    pub fn cells(name: String, rows: Vec<Vec<String>>) -> Sheet {
-        let mut s = Sheet { name, store: Store::Cells(rows), cols: 0, header: false, widths: Vec::new(), paper: None };
-        s.measure();
-        s
-    }
-
     /// A workbook's sheet, with its looks, column widths and merged cells.
     pub fn spreadsheet(d: crate::office::SheetData, palette: Arc<Vec<Look>>) -> Sheet {
         let mut merges = std::collections::HashMap::new();
@@ -251,6 +247,7 @@ impl Sheet {
         self.widths.resize(self.cols, 60.);
     }
 
+    #[cfg(test)]
     pub fn cols(&self) -> usize {
         self.cols
     }
@@ -274,16 +271,71 @@ pub struct TableView {
     pub sheets: Vec<Sheet>,
     pub current: usize,
     list: UniformListScrollHandle,
-    hscroll: ScrollHandle,
     pub zoom: f32,
     /// Columns in colors (CSV, like the editor shows them).
     rainbow: bool,
     pub area: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
+    /// The selected cell (row, column), as in a spreadsheet.
+    pub sel: Option<(usize, usize)>,
+    /// A column being resized: (column, where the drag started, its width then).
+    resizing: Option<(usize, Pixels, f32)>,
+    focus: gpui::FocusHandle,
+    /// Scrolled sideways (points), and the most it can be.
+    hx: f32,
+    hx_max: f32,
+    /// A gesture's direction, decided when it starts: true sideways, false up and down.
+    sideways: Option<bool>,
+    last_scroll: Option<std::time::Instant>,
 }
 
 impl TableView {
-    pub fn new(sheets: Vec<Sheet>, rainbow: bool) -> TableView {
-        TableView { sheets, current: 0, list: UniformListScrollHandle::new(), hscroll: ScrollHandle::new(), zoom: 1., rainbow, area: Default::default() }
+    pub fn new(sheets: Vec<Sheet>, rainbow: bool, cx: &mut Context<Self>) -> TableView {
+        TableView { sheets, current: 0, list: UniformListScrollHandle::new(), zoom: 1., rainbow, area: Default::default(), sel: None, resizing: None, focus: cx.focus_handle(), hx: 0., hx_max: 0., sideways: None, last_scroll: None }
+    }
+
+    #[cfg(test)]
+    pub fn width(&self, c: usize) -> f32 {
+        self.sheets[self.current].widths[c]
+    }
+
+    /// The text of a cell, as shown (whole).
+    pub fn cell_text(&self, r: usize, c: usize) -> String {
+        let Some(s) = self.sheets.get(self.current) else { return String::new() };
+        s.row(r).get(c).map(|t| t.trim_start_matches(crate::office::NUMBER).to_string()).unwrap_or_default()
+    }
+
+    fn select(&mut self, r: usize, c: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // A merged range selects as its first cell.
+        let (r, c) = self.sheets.get(self.current).and_then(|s| s.paper.as_ref()).and_then(|p| p.covered.get(&(r, c)).copied()).unwrap_or((r, c));
+        self.sel = Some((r, c));
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// Arrow keys move the selection, the view follows it down.
+    fn key(&mut self, ev: &gpui::KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((r, c)) = self.sel else { return };
+        let Some(s) = self.sheets.get(self.current) else { return };
+        let header = s.header as usize;
+        let last_row = if s.paper.is_some() { s.rows().max(1) + 29 } else { s.rows().saturating_sub(1).max(header) };
+        let (nr, nc) = match ev.keystroke.key.as_str() {
+            "up" => (r.saturating_sub(1).max(header), c),
+            "down" => ((r + 1).min(last_row), c),
+            "left" => (r, c.saturating_sub(1)),
+            "right" | "tab" => (r, (c + 1).min(s.cols.saturating_sub(1))),
+            "escape" => {
+                self.sel = None;
+                cx.notify();
+                return;
+            }
+            _ => return,
+        };
+        // Past a merged range it covers, to the next cell.
+        let (nr, nc) = s.paper.as_ref().and_then(|p| p.covered.get(&(nr, nc)).copied()).filter(|o| *o != (r, c)).unwrap_or((nr, nc));
+        self.sel = Some((nr, nc));
+        self.list.scroll_to_item(nr - header, gpui::ScrollStrategy::Top);
+        cx.stop_propagation();
+        cx.notify();
     }
 
     /// Replaces the content (the file changed), keeping the sheet and the scroll.
@@ -299,11 +351,10 @@ impl TableView {
         cx.notify();
     }
 
-    fn render_row(&self, ix: usize, cx: &App) -> gpui::AnyElement {
-        let _ = cx;
+    fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(s) = self.sheets.get(self.current) else { return div().into_any_element() };
         if s.paper.is_some() {
-            return self.render_paper_row(s, ix);
+            return self.render_paper_row(s, ix, cx);
         }
         let z = self.zoom;
         let r = if s.header { ix + 1 } else { ix };
@@ -319,7 +370,33 @@ impl TableView {
             .children((0..s.cols).map(|c| {
                 let text = cells.get(c).map(|t| cut(t)).unwrap_or_default();
                 let numeric = !text.is_empty() && text.trim().parse::<f64>().is_ok();
+                let on = self.sel == Some((r, c));
+                let full = cells.get(c).cloned().unwrap_or_default();
+                let cw = s.widths[c] * z;
+                let long = on && (full.contains('\n') || full.chars().count() as f32 * 12.5 * z * 0.62 > cw - 14. * z);
                 div()
+                    .relative()
+                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |t, _, w, cx| t.select(r, c, w, cx)))
+                    .when(on, |d| d.bg(theme::selected_focused()))
+                    .when(long, |d| {
+                        d.child(gpui::deferred(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .w(px(cw))
+                                .min_h(px(22. * z))
+                                .px(px(7. * z))
+                                .py(px(3. * z))
+                                .bg(theme::bg_popup())
+                                .border_1()
+                                .border_color(theme::focus_border())
+                                .shadow_md()
+                                .whitespace_normal()
+                                .text_color(if self.rainbow { crate::highlight::column_color(c) } else { theme::fg() })
+                                .child(full),
+                        ).with_priority(1))
+                    })
                     .w(px(s.widths[c] * z))
                     .flex_none()
                     .flex()
@@ -344,8 +421,67 @@ const HEAD: u32 = 0xF3F3F3;
 const HEAD_TEXT: u32 = 0x5C5C5C;
 const INK: u32 = 0x000000;
 
+/// One device pixel on a Retina screen: the line Excel draws for a thin border.
+const HAIR: f32 = 0.5;
+/// Excel's selection.
+const SELECT: u32 = 0x217346;
+const HEAD_SEL: u32 = 0xD3E3D6;
+
+/// Borders of `w` points on these sides (left 1, right 2, top 4, bottom 8).
+fn edges<E: Styled>(mut el: E, sides: u8, w: f32) -> E {
+    let w: gpui::AbsoluteLength = gpui::px(w).into();
+    let b = &mut el.style().border_widths;
+    if sides & 1 != 0 {
+        b.left = Some(w);
+    }
+    if sides & 2 != 0 {
+        b.right = Some(w);
+    }
+    if sides & 4 != 0 {
+        b.top = Some(w);
+    }
+    if sides & 8 != 0 {
+        b.bottom = Some(w);
+    }
+    el
+}
+
 impl TableView {
-    fn render_paper_row(&self, s: &Sheet, r: usize) -> gpui::AnyElement {
+    /// How far the sheet is scrolled sideways (row numbers stay put by that much).
+    fn hoff(&self) -> f32 {
+        self.hx
+    }
+
+    /// Scrolling: each gesture goes one way, the way it mostly goes when it starts, so
+    /// scrolling down never drifts sideways (Shift + wheel scrolls sideways).
+    fn scroll(&mut self, ev: &gpui::ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let d = ev.delta.pixel_delta(window.line_height());
+        let (mut dx, dy) = (d.x / gpui::px(1.), d.y / gpui::px(1.));
+        if ev.modifiers.shift && dx == 0. {
+            dx = dy;
+        }
+        // A new gesture: the fingers went down, or (a mouse wheel) scrolling paused.
+        let paused = self.last_scroll.is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(150));
+        self.last_scroll = Some(std::time::Instant::now());
+        if matches!(ev.touch_phase, gpui::TouchPhase::Started) || paused {
+            self.sideways = None;
+        }
+        let side = *self.sideways.get_or_insert(dx.abs() > dy.abs() || ev.modifiers.shift);
+        if matches!(ev.touch_phase, gpui::TouchPhase::Ended) {
+            self.sideways = None;
+        }
+        if side {
+            // Sideways only: the rows don't move up or down meanwhile.
+            cx.stop_propagation();
+            let hx = (self.hx - dx).clamp(0., self.hx_max.max(0.));
+            if hx != self.hx {
+                self.hx = hx;
+                cx.notify();
+            }
+        }
+    }
+
+    fn render_paper_row(&self, s: &Sheet, r: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let z = self.zoom;
         let p = s.paper.as_ref().unwrap();
         let h = p.row_h * 1.333 * z;
@@ -375,8 +511,10 @@ impl TableView {
             };
             let size = look.size.unwrap_or(11.) * 1.2 * z;
             let b = look.borders;
-            let bc = theme::c(look.border_color.unwrap_or(INK));
+            let selected = self.sel == Some((r, c));
+            let col = c;
             let mut cell = div()
+                .relative()
                 .w(px(w))
                 .h(px(h))
                 .flex_none()
@@ -393,26 +531,67 @@ impl TableView {
                 .when(look.bold, |d| d.font_weight(FontWeight::BOLD))
                 .when(look.italic, |d| d.italic())
                 .when(look.underline, |d| d.underline())
-                .when(look.strike, |d| d.line_through());
-            // Its own borders where it has them; light gridlines elsewhere.
+                .when(look.strike, |d| d.line_through())
+                .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |t, _, w, cx| t.select(r, col, w, cx)));
+            // Its own borders where it has them (as heavy as set); hairline gridlines elsewhere.
             cell = if b == 0 {
-                cell.border_r_1().border_b_1().border_color(theme::c(GRID))
+                edges(cell, 2 | 8, HAIR).border_color(theme::c(GRID))
             } else {
-                // One color per cell: the border's (sides it doesn't set show no line).
-                cell.border_color(bc).when(b & 1 != 0, |d| d.border_l_1()).when(b & 2 != 0, |d| d.border_r_1()).when(b & 4 != 0, |d| d.border_t_1()).when(b & 8 != 0, |d| d.border_b_1())
+                edges(cell, b, look.border_w.max(HAIR)).border_color(theme::c(look.border_color.unwrap_or(INK)))
             };
+            // The selected cell: Excel's green frame. Text too long for it opens in place, as
+            // wide as its column, down over the cells below until it all shows.
+            let full = raw.trim_start_matches(crate::office::NUMBER);
+            let long = selected && (full.contains('\n') || full.chars().count() as f32 * size * 0.55 > w - 8. * z);
+            let cell = cell.when(selected && !long, |d| d.child(div().absolute().top_0().left_0().size_full().border_2().border_color(theme::c(SELECT))));
+            let cell = cell.when(long, |d| {
+                d.child(gpui::deferred(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w(px(w))
+                        .min_h(px(h))
+                        .px(px(4. * z))
+                        .py(px(3. * z))
+                        .bg(theme::c(look.fill.unwrap_or(PAPER)))
+                        .border_2()
+                        .border_color(theme::c(SELECT))
+                        .shadow_md()
+                        .text_size(px(size))
+                        .text_color(theme::c(look.color.unwrap_or(INK)))
+                        .when(look.bold, |d| d.font_weight(FontWeight::BOLD))
+                        .when(look.italic, |d| d.italic())
+                        .whitespace_normal()
+                        .child(full.to_string()),
+                ).with_priority(1))
+            });
             out.push(cell.child(text).into_any_element());
             c = span_end + 1;
         }
+        let row_on = self.sel.is_some_and(|(sr, _)| sr == r);
         div()
             .id(("tbl-row", r))
+            .relative()
             .flex()
             .h(px(h))
             .bg(theme::c(PAPER))
-            .child(div().w(px(46. * z)).h(px(h)).flex_none().flex().items_center().justify_center().border_r_1().border_b_1().border_color(theme::c(0xC8C8C8)).bg(theme::c(HEAD)).text_size(px(11. * z)).text_color(theme::c(HEAD_TEXT)).child((r + 1).to_string()))
+            .child(div().w(px(46. * z)).flex_none())
             .children(out)
+            // The row's number, pinned at the left however far the sheet scrolls sideways.
+            .child(row_number(r + 1, h, z, row_on).absolute().top_0().left(px(self.hoff())))
             .into_any_element()
     }
+}
+
+fn row_number(n: usize, h: f32, z: f32, on: bool) -> gpui::Div {
+    edges(div().w(px(46. * z)).h(px(h)).flex().items_center().justify_center(), 2 | 8, HAIR)
+        .border_color(theme::c(0xC8C8C8))
+        .bg(theme::c(if on { HEAD_SEL } else { HEAD }))
+        .text_size(px(11. * z))
+        .text_color(theme::c(if on { SELECT } else { HEAD_TEXT }))
+        .when(on, |d| d.font_weight(FontWeight::BOLD))
+        .child(n.to_string())
 }
 
 fn cut(t: &str) -> String {
@@ -432,17 +611,46 @@ impl Render for TableView {
         let paper = s.paper.is_some();
         let total_w: f32 = (s.widths.iter().sum::<f32>() + if paper { 46. } else { 52. }) * z;
         let head_cells: Vec<String> = if s.header { s.row(0) } else { (0..s.cols).map(column_name).collect() };
+        let sel_col = self.sel.map(|(_, c)| c);
+        let hoff = self.hoff();
         let paper_header = div()
+            .relative()
             .flex()
             .flex_none()
             .h(px(20. * z))
             .bg(theme::c(HEAD))
             .text_size(px(11. * z))
             .text_color(theme::c(HEAD_TEXT))
-            .child(div().w(px(46. * z)).h_full().flex_none().border_r_1().border_b_1().border_color(theme::c(0xC8C8C8)))
+            .child(div().w(px(46. * z)).h_full().flex_none())
             .children((0..s.cols).map(|c| {
-                div().w(px(s.widths[c] * z)).h_full().flex_none().flex().items_center().justify_center().border_r_1().border_b_1().border_color(theme::c(0xC8C8C8)).overflow_hidden().child(column_name(c))
-            }));
+                let on = sel_col == Some(c);
+                edges(div().relative().w(px(s.widths[c] * z)).h_full().flex_none().flex().items_center().justify_center(), 2 | 8, HAIR)
+                    .border_color(theme::c(0xC8C8C8))
+                    .when(on, |d| d.bg(theme::c(HEAD_SEL)).text_color(theme::c(SELECT)).font_weight(FontWeight::BOLD))
+                    .overflow_hidden()
+                    .child(column_name(c))
+                    // Drag its right edge to make the column wider or narrower.
+                    .child(
+                        div()
+                            .id(("tbl-resize", c))
+                            .debug_selector(move || format!("tbl-resize-{c}"))
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(8.))
+                            .h_full()
+                            .cursor_col_resize()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |t, ev: &gpui::MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    let w = t.sheets.get(t.current).and_then(|s| s.widths.get(c).copied()).unwrap_or(64.);
+                                    t.resizing = Some((c, ev.position.x, w));
+                                }),
+                            ),
+                    )
+            }))
+            .child(edges(div().absolute().top_0().left(px(hoff)).w(px(46. * z)).h_full().bg(theme::c(HEAD)), 2 | 8, HAIR).border_color(theme::c(0xC8C8C8)));
         let header = div()
             .flex()
             .flex_none()
@@ -471,6 +679,7 @@ impl Render for TableView {
         // A spreadsheet goes on past its last row, empty, like Excel's does.
         let shown_rows = if paper { (rows + 30).max(100) } else { rows };
         let body = uniform_list("tbl-rows", shown_rows, cx.processor(|t: &mut TableView, range: Range<usize>, _, cx| range.map(|ix| t.render_row(ix, cx)).collect::<Vec<_>>())).track_scroll(self.list.clone()).flex_1();
+        let _ = &mut *cx;
         let tabs = (self.sheets.len() > 1).then(|| {
             div().flex().flex_none().gap(px(2.)).px(px(6.)).h(px(28.)).items_center().border_t_1().border_color(theme::border()).bg(theme::bg_side()).children(self.sheets.iter().enumerate().map(|(i, sh)| {
                 let on = i == self.current;
@@ -492,7 +701,30 @@ impl Render for TableView {
             }))
         });
         let area = self.area.clone();
+        let me = cx.entity().downgrade();
+        // At least as wide as the pane; scrolled sideways no further than its edge.
+        let pane_w = self.area.get().size.width / gpui::px(1.);
+        let total_w = total_w.max(pane_w);
+        self.hx_max = (total_w - pane_w).max(0.);
+        self.hx = self.hx.min(self.hx_max);
+        let hx = self.hx;
         div()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::key))
+            .on_mouse_move(cx.listener(|t, ev: &gpui::MouseMoveEvent, _, cx| {
+                if let Some((c, x0, w0)) = t.resizing {
+                    if !ev.dragging() {
+                        t.resizing = None;
+                        return;
+                    }
+                    let z = t.zoom;
+                    if let Some(w) = t.sheets.get_mut(t.current).and_then(|s| s.widths.get_mut(c)) {
+                        *w = (w0 + (ev.position.x - x0) / gpui::px(1.) / z).max(16.);
+                    }
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|t, _, _, _| t.resizing = None))
             .size_full()
             .flex()
             .flex_col()
@@ -503,14 +735,37 @@ impl Render for TableView {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_x_scroll()
-                    .track_scroll(&self.hscroll)
-                    .child(gpui::canvas(move |b, _, _| area.set(b), |_, _, _, _| {}).absolute().top_0().left_0().size_full())
+                    .overflow_hidden()
+                    .child(
+                        gpui::canvas(
+                            move |b, window, _| {
+                                if area.get() != b {
+                                    area.set(b);
+                                    window.refresh();
+                                }
+                                b
+                            },
+                            // Scrolling is seen here first (before the rows' list), so each gesture
+                            // goes only the way it's going: up and down, or sideways.
+                            move |_, b, window, _| {
+                                let me = me.clone();
+                                window.on_mouse_event(move |ev: &gpui::ScrollWheelEvent, phase, window, cx| {
+                                    if phase == gpui::DispatchPhase::Capture && b.contains(&ev.position) {
+                                        me.update(cx, |t, cx| t.scroll(ev, window, cx)).ok();
+                                    }
+                                });
+                            },
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
                     .child(if paper {
                         // A spreadsheet: Excel's look, its own font.
-                        div().min_w(px(total_w)).w(px(total_w)).h_full().flex().flex_col().bg(theme::c(PAPER)).font_family(".SystemUIFont").child(paper_header).child(body)
+                        div().absolute().top_0().left(px(-hx)).min_w(px(total_w)).w(px(total_w)).h_full().flex().flex_col().bg(theme::c(PAPER)).font_family(".SystemUIFont").child(paper_header).child(body)
                     } else {
-                        div().min_w(px(total_w)).w(px(total_w)).h_full().flex().flex_col().font_family(theme::MONO_FONT).text_size(px(12.5 * z)).child(header).child(body)
+                        div().absolute().top_0().left(px(-hx)).min_w(px(total_w)).w(px(total_w)).h_full().flex().flex_col().font_family(theme::MONO_FONT).text_size(px(12.5 * z)).child(header).child(body)
                     }),
             )
             .children(tabs)

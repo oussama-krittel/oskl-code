@@ -250,7 +250,7 @@ impl PreviewView {
                         match sheet {
                             Ok(sheet) => match &v.table {
                                 Some(t) => t.update(cx, |t, cx| t.replace(vec![sheet], cx)),
-                                None => v.table = Some(cx.new(|_| crate::table::TableView::new(vec![sheet], true))),
+                                None => v.table = Some(cx.new(|cx| crate::table::TableView::new(vec![sheet], true, cx))),
                             },
                             Err(e) => v.info = e.to_string(),
                         }
@@ -271,7 +271,7 @@ impl PreviewView {
                                 let sheets: Vec<crate::table::Sheet> = sheets.into_iter().map(|d| crate::table::Sheet::spreadsheet(d, palette.clone())).collect();
                                 match &v.table {
                                     Some(t) => t.update(cx, |t, cx| t.replace(sheets, cx)),
-                                    None => v.table = Some(cx.new(|_| crate::table::TableView::new(sheets, false))),
+                                    None => v.table = Some(cx.new(|cx| crate::table::TableView::new(sheets, false, cx))),
                                 }
                             }
                             Err(e) => v.info = format!("Can't show this workbook: {e}."),
@@ -376,6 +376,12 @@ impl PreviewView {
         self.scroll.set_offset(if new <= 1. { point(gpui::px(0.), gpui::px(0.)) } else { to });
         cx.notify();
         true
+    }
+
+    /// The table view (tests).
+    #[cfg(test)]
+    pub fn table(&self) -> Option<Entity<crate::table::TableView>> {
+        self.table.clone()
     }
 
     /// A PDF's page count (tests).

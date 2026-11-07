@@ -6981,6 +6981,44 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     #[gpui::test]
+    fn spreadsheet_cells_select_and_columns_resize(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        crate::office::tests::zip(&root.join("book.xlsx"), &[
+            ("xl/workbook.xml", r#"<workbook><sheets><sheet name="S" r:id="rId1"/></sheets></workbook>"#),
+            ("xl/_rels/workbook.xml.rels", r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#),
+            ("xl/worksheets/sheet1.xml", r#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>short</t></is></c><c r="B1" t="inlineStr"><is><t>a long piece of text that does not fit in its cell at all</t></is></c></row></sheetData></worksheet>"#),
+        ]);
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("book.xlsx"), None, false, window, cx));
+        let preview = || ws.read_with(cx, |ws, _| ws.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Preview(v) => Some(v.clone()),
+            _ => None,
+        }));
+        let preview = { cx.run_until_parked(); preview() }.expect("opens");
+        wait_for(cx, "the sheet", |cx| preview.read_with(cx, |v, _| v.table()).is_some());
+        let table = preview.read_with(cx, |v, _| v.table()).unwrap();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        // Dragging B's right edge 100 points makes it 100 points wider.
+        let before = table.read_with(cx, |t, _| t.width(1));
+        let edge = cx.debug_bounds("tbl-resize-1").expect("B's edge").center();
+        cx.simulate_mouse_down(edge, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(edge + gpui::point(gpui::px(50.), gpui::px(0.)), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_move(edge + gpui::point(gpui::px(100.), gpui::px(0.)), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_up(edge + gpui::point(gpui::px(100.), gpui::px(0.)), gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let after = table.read_with(cx, |t, _| t.width(1));
+        assert!((after - before - 100.).abs() < 1., "{before} → {after}");
+        // A click selects the cell; arrows move it.
+        let below = edge + gpui::point(gpui::px(-20.), gpui::px(24.));
+        cx.simulate_click(below, gpui::Modifiers::none());
+        assert_eq!(table.read_with(cx, |t, _| t.sel), Some((0, 1)));
+        assert_eq!(table.read_with(cx, |t, _| t.cell_text(0, 1)), "a long piece of text that does not fit in its cell at all");
+        cx.simulate_keystrokes("down right");
+        assert_eq!(table.read_with(cx, |t, _| t.sel), Some((1, 2)));
+    }
+
+    #[gpui::test]
     fn pictures_fit_the_pane_and_pinch_to_zoom(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));

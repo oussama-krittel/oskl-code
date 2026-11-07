@@ -473,13 +473,13 @@ fn read_styles(x: &[u8], theme: &[u32]) -> Styles {
     }
     let mut fonts: Vec<Font> = Vec::new();
     let mut fills: Vec<Option<u32>> = Vec::new();
-    let mut borders: Vec<(u8, Option<u32>)> = Vec::new();
+    let mut borders: Vec<(u8, Option<u32>, f32)> = Vec::new();
     let mut formats: HashMap<u32, String> = HashMap::new();
     let mut xfs = Vec::new();
     let mut r = Reader::from_reader(x);
     let mut buf = Vec::new();
     // Where in the file we are.
-    let (mut sect, mut font, mut fill, mut border, mut side) = (String::new(), Font::default(), None::<u32>, (0u8, None::<u32>), 0u8);
+    let (mut sect, mut font, mut fill, mut border, mut side) = (String::new(), Font::default(), None::<u32>, (0u8, None::<u32>, 0f32), 0u8);
     let mut xf: Option<(Look, String)> = None;
     loop {
         let ev = r.read_event_into(&mut buf);
@@ -513,7 +513,7 @@ fn read_styles(x: &[u8], theme: &[u32]) -> Styles {
                 b"fgColor" if sect == "fills" => fill = color_of(&e, theme),
                 b"bgColor" if sect == "fills" && fill.is_none() => fill = color_of(&e, theme).filter(|c| *c != 0),
                 b"stop" if sect == "fills" => {}
-                b"border" if sect == "borders" => border = (0, None),
+                b"border" if sect == "borders" => border = (0, None, 0.),
                 b"left" | b"start" | b"right" | b"end" | b"top" | b"bottom" if sect == "borders" => {
                     side = match name.as_slice() {
                         b"left" | b"start" => 1,
@@ -521,8 +521,16 @@ fn read_styles(x: &[u8], theme: &[u32]) -> Styles {
                         b"top" => 4,
                         _ => 8,
                     };
-                    if attr(&e, b"style").is_some_and(|s| s != "none") {
+                    let style = attr(&e, b"style").unwrap_or_default();
+                    if !style.is_empty() && style != "none" {
                         border.0 |= side;
+                        // One pixel for thin lines; medium and thick ones are heavier.
+                        let w = match style.as_str() {
+                            "medium" | "mediumDashed" | "mediumDashDot" | "mediumDashDotDot" | "slantDashDot" => 1.,
+                            "thick" | "double" => 1.5,
+                            _ => 0.5,
+                        };
+                        border.2 = border.2.max(w);
                     } else {
                         side = 0;
                     }
@@ -535,8 +543,8 @@ fn read_styles(x: &[u8], theme: &[u32]) -> Styles {
                 b"xf" if sect == "cellXfs" => {
                     let n = |k: &[u8]| attr(&e, k).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
                     let f = fonts.get(n(b"fontId")).cloned().unwrap_or_default();
-                    let (sides, bcolor) = borders.get(n(b"borderId")).copied().unwrap_or((0, None));
-                    let look = Look { bold: f.bold, italic: f.italic, underline: f.underline, strike: f.strike, color: f.color, size: f.size, fill: fills.get(n(b"fillId")).copied().flatten(), borders: sides, border_color: bcolor, align: 0, wrap: false };
+                    let (sides, bcolor, bw) = borders.get(n(b"borderId")).copied().unwrap_or((0, None, 0.));
+                    let look = Look { bold: f.bold, italic: f.italic, underline: f.underline, strike: f.strike, color: f.color, size: f.size, fill: fills.get(n(b"fillId")).copied().flatten(), borders: sides, border_color: bcolor, border_w: bw, align: 0, wrap: false };
                     let id = n(b"numFmtId") as u32;
                     let format = formats.get(&id).cloned().unwrap_or_else(|| builtin_format(id).to_string());
                     if empty {
@@ -960,7 +968,7 @@ fn read_docx(path: &Path) -> Result<String, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -976,7 +984,7 @@ mod tests {
     }
 
     /// A ZIP with these files, stored (and one deflated).
-    fn zip(path: &Path, files: &[(&str, &str)]) {
+    pub(crate) fn zip(path: &Path, files: &[(&str, &str)]) {
         let mut out = Vec::new();
         let mut dir = Vec::new();
         for (i, (name, text)) in files.iter().enumerate() {
