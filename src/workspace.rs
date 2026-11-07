@@ -1767,6 +1767,22 @@ impl Workspace {
         self.open_file(path, None, false, window, cx);
     }
 
+    /// Files dropped from outside the app: the first opens as `drop_file` says (in the pane,
+    /// or a new one beside it), the rest in the same place; folders join the workspace.
+    fn drop_paths(&mut self, paths: Vec<PathBuf>, pane: usize, zone: DropZone, window: &mut Window, cx: &mut Context<Self>) {
+        self.drop_hint = None;
+        let (dirs, files): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| p.is_dir());
+        let mut target = (pane, zone);
+        for f in files {
+            self.drop_file(f, target.0, target.1, window, cx);
+            target = (self.focused_pane, DropZone::Center);
+        }
+        for d in dirs {
+            self.add_folder(d, window, cx);
+        }
+        cx.notify();
+    }
+
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let focused_is_term = self.active.is_some_and(|a| matches!(self.tabs[a].kind, TabKind::Terminal(_)));
         if focused_is_term {
@@ -4648,6 +4664,13 @@ impl Workspace {
                         let zone = ws.drop_hint.filter(|(p, _)| *p == id).map(|(_, z)| z).unwrap_or(DropZone::Center);
                         ws.drop_file(d.path.clone(), id, zone, w, cx);
                     }))
+                    // From Finder (or anywhere): files open where they're dropped, inside the
+                    // workspace or not; a folder is added to the workspace.
+                    .on_drag_move(cx.listener(move |ws, ev: &DragMoveEvent<gpui::ExternalPaths>, _, cx| ws.update_drop_hint(id, ev.bounds, ev.event.position, cx)))
+                    .on_drop(cx.listener(move |ws, d: &gpui::ExternalPaths, w, cx| {
+                        let zone = ws.drop_hint.filter(|(p, _)| *p == id).map(|(_, z)| z).unwrap_or(DropZone::Center);
+                        ws.drop_paths(d.paths().to_vec(), id, zone, w, cx);
+                    }))
                     .child(header)
                     .child(
                         div()
@@ -4659,7 +4682,7 @@ impl Workspace {
                                 d.child(div().absolute().top(px(4.)).right(px(14.)).child(self.find.clone()))
                             }),
                     )
-                    .when_some(self.drop_hint.filter(|(p, _)| *p == id).map(|(_, z)| z), |d, zone| {
+                    .when_some(self.drop_hint.filter(|(p, _)| *p == id && cx.has_active_drag()).map(|(_, z)| z), |d, zone| {
                         // Shows where the drop lands: the whole pane, or the half that becomes a new split.
                         let overlay = div().absolute().bg(theme::frame_focused().opacity(0.16)).border_2().border_color(theme::frame_focused()).rounded(px(4.));
                         let overlay = match zone {
@@ -8029,6 +8052,30 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
         assert_eq!(names(&roots), ["Billing"], "typing replaces the selected old name");
+    }
+
+    #[gpui::test]
+    fn files_dropped_from_finder_open_where_dropped(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        // A file outside the workspace.
+        let outside = std::env::temp_dir().join(format!("kite-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("notes.txt"), "hello").unwrap();
+        std::fs::write(outside.join("todo.txt"), "later").unwrap();
+        let pane = ws.read_with(cx, |ws, _| ws.focused_pane);
+        ws.update_in(cx, |ws, window, cx| ws.drop_paths(vec![outside.join("notes.txt")], pane, super::DropZone::Center, window, cx));
+        cx.run_until_parked();
+        let open = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.tabs.iter().filter_map(|t| match &t.kind {
+            TabKind::Editor(e) => e.read(cx).path.clone(),
+            _ => None,
+        }).collect::<Vec<_>>());
+        assert_eq!(open(cx), [outside.join("notes.txt")], "opened, though it's not in the workspace");
+        // Dropped on a pane's right half: a new pane beside it.
+        ws.update_in(cx, |ws, window, cx| ws.drop_paths(vec![outside.join("todo.txt")], pane, super::DropZone::Right, window, cx));
+        cx.run_until_parked();
+        assert_eq!(ws.read_with(cx, |ws, _| ws.panes.len()), 2, "split");
+        assert_ne!(ws.read_with(cx, |ws, _| ws.focused_pane), pane, "in the new pane");
+        std::fs::remove_dir_all(outside).ok();
     }
 
     #[gpui::test]
