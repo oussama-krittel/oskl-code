@@ -621,6 +621,7 @@ pub struct Workspace {
     rail_hover: bool,
     rail_panel_hover: bool,
     rail_gen: usize,
+    rail_pill_hover: Option<usize>,
     rail_last_pos: Option<gpui::Point<Pixels>>,
     overview: bool,
     overview_focus: FocusHandle,
@@ -766,6 +767,7 @@ impl Workspace {
             rail_hover: false,
             rail_panel_hover: false,
             rail_gen: 0,
+            rail_pill_hover: None,
             rail_last_pos: None,
             overview: false,
             overview_focus: cx.focus_handle(),
@@ -1536,6 +1538,19 @@ impl Workspace {
     }
 
     /// Closes the shown space; its tabs go to the space shown before it.
+    /// Closes space `i` (going back where you were if it wasn't the shown one).
+    fn close_space_at(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if i >= self.spaces.len() {
+            return;
+        }
+        let back = self.space;
+        if i != back {
+            self.switch_space(i, window, cx);
+            self.last_space = back;
+        }
+        self.close_space(window, cx);
+    }
+
     fn close_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.spaces.len() < 2 {
             return self.flash("This is the only space".into(), true, cx);
@@ -4766,7 +4781,38 @@ impl Workspace {
                             ws.open_cmd(CmdMode::Command, "space rename ", w, cx);
                         }
                     }))
-                    .child(div().size(px(7.)).rounded_full().bg(color).when(on, |d| d.shadow(vec![gpui::BoxShadow { color: color.opacity(0.7), offset: gpui::point(px(0.), px(0.)), blur_radius: px(6.), spread_radius: px(0.) }])))
+                    .on_hover(cx.listener(move |ws, h: &bool, _, cx| {
+                        if *h {
+                            ws.rail_pill_hover = Some(i);
+                        } else if ws.rail_pill_hover == Some(i) {
+                            ws.rail_pill_hover = None;
+                        }
+                        cx.notify();
+                    }))
+                    // Hovered, the dot becomes its close button.
+                    .child(if self.rail_pill_hover == Some(i) && self.spaces.len() > 1 {
+                        div()
+                            .id(("space-close", i))
+                            .debug_selector(move || format!("space-close-{i}"))
+                            .size(px(16.))
+                            .my(px(-4.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .hover(|s| s.bg(theme::git_deleted().opacity(0.25)))
+                            .tooltip(ui::tooltip("Close this space (its tabs move to another)"))
+                            .child(ui::icon("close", theme::fg_bright()).size(px(10.)))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |ws, _, w, cx| {
+                                cx.stop_propagation();
+                                ws.rail_pill_hover = None;
+                                ws.close_space_at(i, w, cx);
+                            }))
+                            .into_any_element()
+                    } else {
+                        div().size(px(7.)).rounded_full().bg(color).when(on, |d| d.shadow(vec![gpui::BoxShadow { color: color.opacity(0.7), offset: gpui::point(px(0.), px(0.)), blur_radius: px(6.), spread_radius: px(0.) }])).into_any_element()
+                    })
                     .child(svg().path(crate::assets::vtext_path(&name)).w(px(tw)).h(px(th)).flex_none().text_color(if on { theme::fg_bright() } else { theme::fg_dim() }))
                     .when(i < 9, |d| d.child(div().text_size(px(9.)).text_color(if on { color } else { theme::fg_muted() }).child(format!("⌃{}", i + 1))))
             });
@@ -8981,6 +9027,16 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         let row = cx.debug_bounds("space-row-0").expect("a row per space");
         cx.simulate_click(row.center(), gpui::Modifiers::none());
         assert_eq!(ws.read_with(cx, |ws, _| ws.space), 0, "a click goes there");
+        // Hovering a pill shows its close button; it closes that space, not the shown one.
+        let pill = cx.debug_bounds("space-row-2").expect("the third pill");
+        cx.simulate_mouse_move(pill.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+        let x = cx.debug_bounds("space-close-2").expect("its close button");
+        cx.simulate_click(x.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(ws.read_with(cx, |ws, _| (ws.spaces.len(), ws.space)), (2, 0), "closed; still in the first");
         // Moving away closes it.
         let far = rail.center() + gpui::point(gpui::px(700.), gpui::px(0.));
         cx.simulate_mouse_move(far, None, gpui::Modifiers::none());
@@ -9006,7 +9062,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         // The overview: a card per space and one to make a new one.
         cx.simulate_keystrokes("cmd-k o");
         cx.run_until_parked();
-        assert!(cx.debug_bounds("space-card-2").is_some() && cx.debug_bounds("space-card-new").is_some());
+        assert!(cx.debug_bounds("space-card-1").is_some() && cx.debug_bounds("space-card-new").is_some());
         cx.simulate_keystrokes("2");
         assert_eq!(ws.read_with(cx, |ws, _| (ws.space, ws.overview)), (1, false), "its number goes there");
     }
