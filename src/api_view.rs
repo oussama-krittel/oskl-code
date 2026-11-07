@@ -61,6 +61,8 @@ struct SaveDialog {
     /// The collection, and the folder in it (None: the collection itself).
     choice: Option<(String, Option<String>)>,
     list_open: bool,
+    /// Naming a new collection (the box in the list), with its subscriptions.
+    new_name: Option<(Entity<Editor>, Vec<Subscription>)>,
     _subs: Vec<Subscription>,
 }
 
@@ -1321,7 +1323,7 @@ impl ApiView {
                 _ => {}
             }),
         ];
-        self.save_dialog = Some(SaveDialog { name, search, choice: first, list_open: false, _subs: subs });
+        self.save_dialog = Some(SaveDialog { name, search, choice: first, list_open: false, new_name: None, _subs: subs });
         self.menu = None;
         cx.notify();
     }
@@ -1348,14 +1350,39 @@ impl ApiView {
         self.save_now(None, cx);
     }
 
-    fn new_collection_for_save(&mut self, cx: &mut Context<Self>) {
-        let n = api::collections(&self.roots).len() + 1;
-        let c = Collection::new(&if n == 1 { "My Requests".to_string() } else { format!("Collection {n}") }, self.project());
-        api::save_collection(&c).ok();
-        if let Some(d) = &mut self.save_dialog {
-            d.choice = Some((c.id.clone(), None));
-            d.list_open = false;
+    /// "New collection": a name box in the list, the cursor in it.
+    fn new_collection_for_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = &mut self.save_dialog else { return };
+        let input = input("Collection name", "", cx);
+        let subs = vec![cx.subscribe(&input, |v: &mut ApiView, _, ev: &EditorEvent, cx| match ev {
+            EditorEvent::Submit => v.create_collection_for_save(cx),
+            EditorEvent::Cancel => {
+                if let Some(d) = &mut v.save_dialog {
+                    d.new_name = None;
+                }
+                cx.notify();
+            }
+            _ => {}
+        })];
+        input.read(cx).focus(window);
+        d.new_name = Some((input, subs));
+        cx.notify();
+    }
+
+    /// The typed name makes the collection, and it's where the request goes.
+    fn create_collection_for_save(&mut self, cx: &mut Context<Self>) {
+        let project = self.project();
+        let Some(d) = &mut self.save_dialog else { return };
+        let Some((input, _)) = &d.new_name else { return };
+        let name = input.read(cx).text().trim().to_string();
+        if name.is_empty() {
+            return;
         }
+        let c = Collection::new(&name, project);
+        api::save_collection(&c).ok();
+        d.choice = Some((c.id.clone(), None));
+        d.new_name = None;
+        d.list_open = false;
         cx.emit(WsRequest::Api(ApiRequest::Changed));
         cx.notify();
     }
@@ -1412,8 +1439,21 @@ impl ApiView {
                                 .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(label))
                         })),
                 )
-                .child(
-                    div()
+                .child(match &d.new_name {
+                    // Naming it: a box with the cursor in it (Enter makes it, Esc doesn't).
+                    Some((input, _)) => div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .px(px(10.))
+                        .py(px(5.))
+                        .border_t_1()
+                        .border_color(theme::border())
+                        .child(ui::small_icon("collection", theme::accent()))
+                        .child(div().flex_1().min_w_0().child(field(input)))
+                        .child(button("api-save-new-coll-ok", "Create", None, true).on_click(cx.listener(|v, _, _, cx| v.create_collection_for_save(cx))))
+                        .into_any_element(),
+                    None => div()
                         .id("api-save-new-coll")
                         .debug_selector(|| "api-save-new-coll".into())
                         .flex()
@@ -1426,10 +1466,11 @@ impl ApiView {
                         .cursor_pointer()
                         .text_color(theme::accent())
                         .hover(|st| st.bg(theme::hover()))
-                        .on_click(cx.listener(|v, _, _, cx| v.new_collection_for_save(cx)))
+                        .on_click(cx.listener(|v, _, w, cx| v.new_collection_for_save(w, cx)))
                         .child(ui::small_icon("plus", theme::accent()))
-                        .child("New collection"),
-                )
+                        .child("New collection")
+                        .into_any_element(),
+                })
         });
         let card = div()
             .id("api-save-dialog")

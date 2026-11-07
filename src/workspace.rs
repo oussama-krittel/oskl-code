@@ -8079,6 +8079,28 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     #[gpui::test]
+    fn a_new_collection_made_while_saving_is_named_there(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let roots = ws.read_with(cx, |ws, cx| ws.api_roots(cx));
+        crate::api::save_collection(&crate::api::Collection::new("Existing", roots.first().cloned())).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Api, window, cx));
+        cx.run_until_parked();
+        click_on(cx, "api-new");
+        let tab = api_tab(&ws, cx).unwrap();
+        click_on(cx, "api-save");
+        click_on(cx, "api-save-in");
+        click_on(cx, "api-save-new-coll");
+        // The cursor is in the name box: typing names it, Enter makes it.
+        cx.simulate_input("Payments");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        click_on(cx, "api-save-ok");
+        let colls = crate::api::collections(&roots);
+        let made = colls.iter().find(|c| c.name() == "Payments").expect("made with the typed name");
+        assert_eq!(tab.read_with(cx, |t, _| t.saved_in()), Some((Some(made.id.clone()), None)), "and the request is saved in it");
+    }
+
+    #[gpui::test]
     fn closing_the_folder_leaves_an_empty_window(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));
