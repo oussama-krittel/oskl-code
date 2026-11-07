@@ -8747,6 +8747,28 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     #[gpui::test]
+    fn the_request_and_response_sides_resize_by_dragging(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Api, window, cx));
+        cx.run_until_parked();
+        click_on(cx, "api-empty-new");
+        let tab = api_tab(&ws, cx).expect("a request tab");
+        assert_eq!(tab.read_with(cx, |t, _| t.split()), 0.5, "halves to start");
+        let d = cx.debug_bounds("api-split").expect("a divider");
+        let to = d.center() + gpui::point(gpui::px(-150.), gpui::px(0.));
+        cx.simulate_event(gpui::MouseDownEvent { button: gpui::MouseButton::Left, position: d.center(), modifiers: gpui::Modifiers::none(), click_count: 1, first_mouse: false });
+        cx.simulate_event(gpui::MouseMoveEvent { position: to, pressed_button: Some(gpui::MouseButton::Left), modifiers: gpui::Modifiers::none() });
+        cx.simulate_event(gpui::MouseUpEvent { button: gpui::MouseButton::Left, position: to, modifiers: gpui::Modifiers::none(), click_count: 1 });
+        cx.run_until_parked();
+        let f = tab.read_with(cx, |t, _| t.split());
+        assert!(f < 0.45 && f > 0.15, "dragged left: a bigger response ({f})");
+        // A new request tab starts where the last drag left it.
+        click_on(cx, "api-new");
+        let tab2 = api_tab(&ws, cx).unwrap();
+        assert!(tab2.entity_id() != tab.entity_id() && (tab2.read_with(cx, |t, _| t.split()) - f).abs() < 0.001);
+    }
+
+    #[gpui::test]
     fn saving_a_new_request_asks_where_in_a_searchable_list(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let roots = ws.read_with(cx, |ws, cx| ws.api_roots(cx));

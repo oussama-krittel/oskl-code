@@ -460,6 +460,22 @@ struct ReqTab {
     schema_task: Option<Task<()>>,
     stacked: bool,
     live_scroll: ScrollHandle,
+    /// The request side's share of the width (or height, stacked); the divider drags it.
+    split: f32,
+    /// Dragging the divider: where it started, the share then.
+    split_drag: Option<(Point<Pixels>, f32)>,
+    /// Where the two sides are (for turning a drag into a share).
+    split_area: std::rc::Rc<std::cell::Cell<gpui::Bounds<Pixels>>>,
+}
+
+/// The last share the divider was dragged to: new request tabs start with it.
+static LAST_SPLIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn last_split() -> f32 {
+    match f32::from_bits(LAST_SPLIT.load(std::sync::atomic::Ordering::Relaxed)) {
+        f if f > 0.1 && f < 0.9 => f,
+        _ => 0.5,
+    }
 }
 
 fn body_lang(b: &Body) -> &'static str {
@@ -699,6 +715,9 @@ impl ApiView {
             schema_task: None,
             stacked: false,
             live_scroll: ScrollHandle::new(),
+            split: last_split(),
+            split_drag: None,
+            split_area: Default::default(),
             req: r.clone(),
             hist: None,
         };
@@ -838,6 +857,14 @@ impl ApiView {
                 Kind::Sse => "SSE".into(),
             }),
             _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn split(&self) -> f32 {
+        match &self.body {
+            Body_::Req(t) => t.split,
+            _ => 0.,
         }
     }
 
@@ -2436,7 +2463,7 @@ impl ApiView {
             }))
         }));
         let section = self.render_section(t, cx);
-        let req_pane = div().flex().flex_col().flex_1().min_w_0().min_h_0().child(tabs).child(div().id("api-sec-body").flex_1().min_h_0().overflow_y_scroll().pt(px(10.)).child(section));
+        let req_pane = div().flex().flex_col().flex_none().when(t.stacked, |d| d.h(gpui::relative(t.split))).when(!t.stacked, |d| d.w(gpui::relative(t.split))).min_w_0().min_h_0().child(tabs).child(div().id("api-sec-body").flex_1().min_h_0().overflow_y_scroll().pt(px(10.)).child(section));
         let resp_pane = self.render_response(t, window, cx);
         let missing = t.resp.as_ref().map(|r| r.missing.clone()).unwrap_or_default();
         div()
@@ -2468,17 +2495,75 @@ impl ApiView {
                 };
                 d.child(div().text_size(px(12.)).text_color(if ok { theme::fg_dim() } else { theme::git_deleted() }).child(text))
             })
-            .child(
+            .child({
+                let stacked = t.stacked;
+                let area = t.split_area.clone();
+                // The divider: drag it to give either side more room.
+                let divider = div()
+                    .id("api-split")
+                    .debug_selector(|| "api-split".into())
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .when(stacked, |d| d.h(px(15.)).w_full().cursor_row_resize())
+                    .when(!stacked, |d| d.w(px(15.)).h_full().cursor_col_resize())
+                    .group("api-split")
+                    .child(div().bg(theme::border()).group_hover("api-split", |s| s.bg(theme::accent())).when(stacked, |d| d.h(px(1.)).w_full()).when(!stacked, |d| d.w(px(1.)).h_full()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|v, ev: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            if let Body_::Req(t) = &mut v.body {
+                                t.split_drag = Some((ev.position, t.split));
+                            }
+                        }),
+                    )
+                    .on_click(cx.listener(|v, ev: &gpui::ClickEvent, _, cx| {
+                        // Double-click: back to halves.
+                        if ev.click_count() >= 2
+                            && let Body_::Req(t) = &mut v.body
+                        {
+                            t.split = 0.5;
+                            LAST_SPLIT.store(0.5f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                            cx.notify();
+                        }
+                    }));
                 div()
+                    .id("api-split-area")
+                    .relative()
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .gap(px(14.))
-                    .when(t.stacked, |d| d.flex_col())
+                    .when(stacked, |d| d.flex_col())
+                    .child(gpui::canvas(move |b, _, _| area.set(b), |_, _, _, _| {}).absolute().size_full())
                     .child(req_pane)
-                    .child(if t.stacked { div().h(px(1.)).bg(theme::border()) } else { div().w(px(1.)).bg(theme::border()) })
-                    .child(resp_pane),
-            )
+                    .child(divider)
+                    .child(resp_pane)
+                    .on_mouse_move(cx.listener(|v, ev: &gpui::MouseMoveEvent, _, cx| {
+                        let Body_::Req(t) = &mut v.body else { return };
+                        let Some((p0, f0)) = t.split_drag else { return };
+                        if ev.pressed_button != Some(MouseButton::Left) {
+                            t.split_drag = None;
+                            return;
+                        }
+                        let b = t.split_area.get();
+                        let (moved, total) = if t.stacked { (ev.position.y - p0.y, b.size.height) } else { (ev.position.x - p0.x, b.size.width) };
+                        if total > px(1.) {
+                            t.split = (f0 + moved / total).clamp(0.15, 0.85);
+                            LAST_SPLIT.store(t.split.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|v, _, _, _| {
+                            if let Body_::Req(t) = &mut v.body {
+                                t.split_drag = None;
+                            }
+                        }),
+                    )
+            })
             .into_any_element()
     }
 
