@@ -122,6 +122,15 @@ Works like VS Code's:
 - ⌘⌥Enter (or double-click a split header) maximizes a split and back.
 - The terminal is a full terminal (vim, htop, less, mouse and scrolling work). ⌘-click a `file:line` it printed to open it.
 
+### Claude (⌘Esc)
+
+Chats with the Claude Code installed on your Mac (`claude` on your PATH, signed in once in a terminal). The ✦ button in the activity bar or ⌘Esc opens the chat, ⌘⇧Esc a new one, ⌘K ⌘A mentions the selected lines; `:claude <message>` asks from the command line. Claude Code only runs while a chat is in use: it's stopped after two idle minutes and the next message picks the conversation up again.
+
+- The open file and selection go with each message (click the chip to stop that). `@` mentions files, `/` lists commands, ⇧⇥ switches between Ask before edits, Edit automatically and Plan mode. Paste or drop pictures and files.
+- Claude asks before tools run: Yes, Yes and don't ask again, or No (type in the box what to do instead). Questions, plans and edits (as diffs) show as cards. File names open in the editor; ⌘-click opens them in their default app.
+- Pickers for model, effort and output style list what your Claude Code offers. The ⋯ menu has MCP servers, context and usage, compact, export and "continue in terminal". The clock lists past conversations. The tree icon (with the number running) maps subagents and background commands, nested under what started them: Stop ends one, and a stopped subagent can Resume. Subagent cards in the chat have the same buttons.
+- On your messages: edit or retry (continues as a new conversation), fork into a new tab, or rewind code to before that message.
+
 ### Command line (⌘⇧P or ⌘;)
 
 Type commands; Tab completes paths and branches:

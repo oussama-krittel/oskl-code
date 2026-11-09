@@ -115,7 +115,7 @@ impl TerminalView {
             while let Some(ev) = rx.next().await {
                 // Coalesce bursts of output into one repaint.
                 let mut batch = vec![ev];
-                while let Ok(Some(more)) = rx.try_next() {
+                while let Ok(more) = rx.try_recv() {
                     batch.push(more);
                 }
                 let alive = this

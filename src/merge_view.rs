@@ -26,7 +26,6 @@ struct Choice {
 
 pub struct MergeView {
     focus: FocusHandle,
-    pub path: PathBuf,
     pub rel: String,
     snapshot: String,
     blocks: Vec<Block>,
@@ -68,7 +67,6 @@ impl MergeView {
         let subs = vec![cx.observe(&result, |_, _, cx| cx.notify())];
         Self {
             focus: cx.focus_handle(),
-            path,
             rel,
             choices: vec![Choice::default(); blocks.len()],
             generated: snapshot.clone(),

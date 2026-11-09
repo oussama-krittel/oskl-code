@@ -42,7 +42,7 @@ actions!(
         OpenFolder, OpenFolderNewWindow, CloseFolder, NextWindow, SearchAll, ShowKeysPanel, ToggleSidebarSide,
         UiZoomIn, UiZoomOut, UiZoomReset, ShowSettings,
         SplitRight, SplitDown, ClosePane, ZoomPane, FocusLeft, FocusRight, FocusUp, FocusDown,
-        NewTerminal, ToggleTerminal, PaneBuffers,
+        NewTerminal, ToggleTerminal, PaneBuffers, OpenClaude, NewClaude, MentionInClaude,
         GoBack, GoForward, TogglePreview, PreviewToSide,
         MoveItemLeft, MoveItemRight, MoveItemUp, MoveItemDown,
         Buffer1, Buffer2, Buffer3, Buffer4, Buffer5, Buffer6, Buffer7, Buffer8, Buffer9,
@@ -127,6 +127,9 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-|", SplitDown, None),
         crate::keybindings::kb("cmd-shift-w", ClosePane, None),
         crate::keybindings::kb("cmd-t", NewTerminal, None),
+        crate::keybindings::kb("cmd-escape", OpenClaude, None),
+        crate::keybindings::kb("cmd-shift-escape", NewClaude, None),
+        crate::keybindings::kb("cmd-k cmd-a", MentionInClaude, Some("Editor")),
         crate::keybindings::kb("cmd-e", PaneBuffers, None),
         crate::keybindings::kb("cmd-s", Save, None),
         crate::keybindings::kb("cmd-w", CloseTab, None),
@@ -244,6 +247,7 @@ enum TabKind {
     Preview(Entity<PreviewView>),
     Db(Entity<crate::db_view::DbView>),
     Api(Entity<crate::api_view::ApiView>),
+    Agent(Entity<crate::agent_view::AgentView>),
 }
 
 /// What the find bar (⌘F) searches: a text editor, or a read-only diff.
@@ -516,6 +520,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("vsplit", "Split right (⌘\\), optionally opening a file: vsplit <path>", true),
     ("split", "Split down (⌘⇧\\), optionally opening a file: split <path>", true),
     ("term", "Terminal in this pane (⌘T); term <cmd> runs a command", true),
+    ("claude", "Chat with Claude Code (⌘Esc; ⌘⇧Esc a new chat); claude <message> asks right away", true),
     ("close", "Close this pane (⌘⇧W)", false),
     ("space", "Spaces: space new [name] · rename <name> · close · move <n> · <n> (⌃1–9 go, ⌃⌥1–9 move, ⌘K O overview)", true),
     ("only", "Close all other panes", false),
@@ -646,6 +651,8 @@ pub struct Workspace {
     _quit_sub: Option<Subscription>,
     drop_hint: Option<(usize, DropZone)>,
     extra_subs: Vec<Subscription>,
+    /// The editor last in front: its file and selection go along with Claude chat messages.
+    agent_editor: Rc<RefCell<Option<WeakEntity<Editor>>>>,
     /// Each pane's row of tabs: its scroll, and the tab last scrolled into view.
     tab_rows: std::cell::RefCell<HashMap<usize, (ScrollHandle, Option<usize>)>>,
 }
@@ -787,6 +794,7 @@ impl Workspace {
             _quit_sub: None,
             drop_hint: None,
             extra_subs: Vec::new(),
+            agent_editor: Default::default(),
             tab_rows: Default::default(),
         };
         ws.start_watcher(cx);
@@ -1129,6 +1137,13 @@ impl Workspace {
             Request::Deleted(paths) => self.paths_deleted(paths, window, cx),
             Request::Ask(ask) => self.open_ask(ask.clone(), window, cx),
             Request::OpenTerminal(dir) => self.open_terminal_in(dir.clone(), None, window, cx),
+            Request::RunInTerminal { dir, command } => self.open_terminal_in(dir.clone(), Some(command.clone()), window, cx),
+            Request::ForkChat { session, uuid } => {
+                self.open_agent(true, Some(session.clone()), window, cx);
+                if let Some(TabKind::Agent(v)) = self.active.map(|a| &self.tabs[a].kind) {
+                    v.update(cx, |v, _| v.fork_from(uuid.clone()));
+                }
+            }
             Request::SelectRepo(root) => self.select_repo(root, window, cx),
             Request::AddFolder => self.add_folder_prompt(window, cx),
             Request::RemoveFolder(dir) => self.remove_folder(dir, window, cx),
@@ -1640,6 +1655,7 @@ impl Workspace {
                             e.path.clone().map(|path| ItemState::File { path, row, col })
                         }
                         TabKind::Terminal(t) => Some(ItemState::Terminal { cwd: t.read(cx).cwd.clone() }),
+                        TabKind::Agent(a) => Some(ItemState::Agent { session: a.read(cx).session() }),
                         _ => None,
                     };
                     if let Some(item) = item {
@@ -1799,6 +1815,10 @@ impl Workspace {
                             let (row, col) = (*row, *col);
                             ed.update(cx, |ed, cx| ed.go_to(row, col, cx));
                         }
+                        opened.push(self.active.map(|a| self.tabs[a].id));
+                    }
+                    ItemState::Agent { session } => {
+                        self.open_agent(true, session.clone(), window, cx);
                         opened.push(self.active.map(|a| self.tabs[a].id));
                     }
                     ItemState::Terminal { cwd } => {
@@ -2236,6 +2256,7 @@ impl Workspace {
             TabKind::Preview(v) => v.read(cx).focus(window),
             TabKind::Db(v) => v.read(cx).focus(window, cx),
             TabKind::Api(v) => v.read(cx).focus(window, cx),
+            TabKind::Agent(v) => v.read(cx).focus(window, cx),
         }
     }
 
@@ -2426,6 +2447,35 @@ impl Workspace {
         });
         self.add_tab(TabKind::Api(view), sub, false, window, cx);
         cx.notify();
+    }
+
+    /// ⌘Esc: the Claude chat (the one open, else a new one); `new` always starts another.
+    fn open_agent(&mut self, new: bool, session: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if !new && let Some(ix) = self.tabs.iter().rposition(|t| matches!(t.kind, TabKind::Agent(_))) {
+            return self.activate(ix, window, cx);
+        }
+        let root = self.root(cx);
+        let editor = self.agent_editor.clone();
+        let view = cx.new(|cx| crate::agent_view::AgentView::new(root, session, editor, window, cx));
+        let sub = cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx));
+        self.add_tab(TabKind::Agent(view), sub, false, window, cx);
+        cx.notify();
+    }
+
+    /// ⌘K ⌘A: the editor's file and selected lines as an @-mention in the Claude chat.
+    fn mention_in_claude(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ed) = self.active_editor() else { return };
+        let root = self.root(cx);
+        let ed = ed.read(cx);
+        let Some(path) = ed.path.clone() else { return };
+        let rel = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+        let r = ed.buf.sel.range();
+        let (a, b) = (ed.buf.pos_to_rc(r.start).0 + 1, ed.buf.pos_to_rc(r.end).0 + 1);
+        let mention = if r.is_empty() { format!("@{rel} ") } else if a == b { format!("@{rel}#L{a} ") } else { format!("@{rel}#L{a}-{b} ") };
+        self.open_agent(false, None, window, cx);
+        if let Some(TabKind::Agent(v)) = self.active.map(|a| &self.tabs[a].kind) {
+            v.clone().update(cx, |v, cx| v.insert(&mention, window, cx));
+        }
     }
 
     /// Opens a database tab (or shows the one already showing the same thing).
@@ -2700,6 +2750,7 @@ impl Workspace {
                 let (title, _, dirty) = v.title(cx);
                 (title, format!("api:{}", v.method().unwrap_or_default()), dirty)
             }
+            TabKind::Agent(v) => (v.read(cx).title(), "agent:".into(), false),
         }
     }
 
@@ -2955,7 +3006,7 @@ impl Workspace {
                 d.update(cx, |d, cx| d.set_blame(on, cx));
                 self.blame_default = on;
             }
-            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Preview(_) | TabKind::Db(_) | TabKind::Api(_) => {}
+            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Preview(_) | TabKind::Db(_) | TabKind::Api(_) | TabKind::Agent(_) => {}
         }
         self.settings.blame_default = self.blame_default;
         self.settings.save();
@@ -3818,7 +3869,7 @@ impl Workspace {
                     self.cmd.update(cx, |c, cx| c.set_text(&value, cx));
                 }
             }
-            EditorEvent::OpenCommit(_) | EditorEvent::Saved | EditorEvent::CompareConflict | EditorEvent::OpenMergeEditor | EditorEvent::OpenAt(_) | EditorEvent::Notice(_) => {}
+            EditorEvent::OpenCommit(_) | EditorEvent::Saved | EditorEvent::CompareConflict | EditorEvent::OpenMergeEditor | EditorEvent::OpenAt(_) | EditorEvent::Notice(_) | EditorEvent::Image(_) => {}
         }
     }
 
@@ -4234,6 +4285,19 @@ impl Workspace {
                 let command = (!rest.is_empty()).then(|| rest.to_string());
                 self.open_terminal_view(command, window, cx);
             }
+            "claude" => {
+                self.close_cmd(window, cx);
+                self.open_agent(false, None, window, cx);
+                if !rest.is_empty()
+                    && let Some(TabKind::Agent(v)) = self.active.map(|a| &self.tabs[a].kind)
+                {
+                    let rest = rest.to_string();
+                    v.clone().update(cx, |v, cx| {
+                        v.insert(&rest, window, cx);
+                        v.send_now(window, cx);
+                    });
+                }
+            }
             "close" => self.close_pane(self.focused_pane, window, cx),
             "only" => {
                 let others: Vec<usize> = self.panes.iter().map(|p| p.id).filter(|p| *p != self.focused_pane).collect();
@@ -4477,7 +4541,7 @@ impl Workspace {
             while let Some(first) = rx.next().await {
                 let mut paths: HashSet<PathBuf> = first.into_iter().collect();
                 cx.background_executor().timer(Duration::from_millis(150)).await;
-                while let Ok(Some(more)) = rx.try_next() {
+                while let Ok(more) = rx.try_recv() {
                     paths.extend(more);
                 }
                 if this.update(cx, |ws, cx| ws.on_fs_change(paths, cx)).is_err() {
@@ -4561,7 +4625,7 @@ impl Workspace {
                         v.update(cx, |v, cx| v.mark_stale(cx));
                     }
                 }
-                TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Db(_) | TabKind::Api(_) => {}
+                TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Db(_) | TabKind::Api(_) | TabKind::Agent(_) => {}
             }
         }
         for r in &meta_repos {
@@ -4641,6 +4705,14 @@ impl Workspace {
             }))
             .child(item("act-databases", "database", Side::Databases, "Databases", self, cx))
             .child(item("act-api", "api", Side::Api, "API: requests, collections, environments", self, cx))
+            .child({
+                let shown = self.active.is_some_and(|a| matches!(self.tabs[a].kind, TabKind::Agent(_)));
+                tool("act-claude", "sparkle", "Claude (⌘Esc; ⌘⇧Esc a new chat)", 19.)
+                    .h(px(40.))
+                    .when(shown && !right, |d| d.border_l_2().border_color(theme::fg_bright()))
+                    .when(shown && right, |d| d.border_r_2().border_color(theme::fg_bright()))
+                    .on_click(cx.listener(|ws, _, w, cx| ws.open_agent(false, None, w, cx)))
+            })
             .child(div().flex_1())
             .child(tool("tb-open", "folder", "Open Folder here (⌘O)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))))
             .child(tool("tb-add-folder", "new-folder", "Add Folder to Workspace…", 16.).on_click(cx.listener(|ws, _, w, cx| ws.add_folder_prompt(w, cx))))
@@ -5091,9 +5163,6 @@ impl Workspace {
         let focused = focused_area && id == self.focused_pane;
         let active_ix = pane.active.and_then(|t| self.tab_ix(t));
         let count = pane.items.len();
-        let pos = pane.active.and_then(|a| pane.items.iter().position(|x| *x == a)).map(|p| p + 1).unwrap_or(0);
-        let (title, icon_name, dirty) = active_ix.map(|ix| self.tab_title(&self.tabs[ix], cx)).unwrap_or_else(|| ("empty".into(), String::new(), false));
-        let is_term = active_ix.is_some_and(|ix| matches!(self.tabs[ix].kind, TabKind::Terminal(_)));
         let is_editor = active_ix.is_some_and(|ix| matches!(self.tabs[ix].kind, TabKind::Editor(_) | TabKind::Merge(_)));
         let can_preview = active_ix.is_some_and(|ix| matches!(&self.tabs[ix].kind, TabKind::Editor(e) if e.read(cx).path.as_deref().is_some_and(preview::has_preview)));
         let frame = if focused { theme::frame_focused() } else { theme::frame() };
@@ -5108,6 +5177,7 @@ impl Workspace {
             Some(TabKind::Preview(v)) => v.clone().into_any_element(),
             Some(TabKind::Db(v)) => v.clone().into_any_element(),
             Some(TabKind::Api(v)) => v.clone().into_any_element(),
+            Some(TabKind::Agent(v)) => v.clone().into_any_element(),
             None if self.panes.len() == 1 => self.render_welcome(cx),
             None => self.render_empty_pane(),
         };
@@ -5219,7 +5289,7 @@ impl Workspace {
                                 }
                             }))
                             .child(div().text_color(if active { theme::frame_focused() } else { theme::fg_muted() }).child(if i < 9 { format!("{}", i + 1) } else { "·".into() }))
-                            .child(if term { ui::small_icon("terminal", theme::frame_focused()).size(px(12.)) } else if let Some(m) = icon_name.strip_prefix("api:") {
+                            .child(if term { ui::small_icon("terminal", theme::frame_focused()).size(px(12.)) } else if icon_name == "agent:" { ui::small_icon("sparkle", theme::accent()).size(px(12.)) } else if let Some(m) = icon_name.strip_prefix("api:") {
                                 ui::icon("api", if m.is_empty() { theme::accent() } else { theme::c(crate::api::method_color(m)) }).size(px(13.))
                             } else { match icon_name.strip_prefix("db:") {
                                 Some(kind) => ui::icon(&format!("db-{kind}"), theme::c(crate::db::Kind::ALL.into_iter().find(|k| k.id() == kind).map(|k| k.color()).unwrap_or(0x888888))).size(px(12.)),
@@ -6125,6 +6195,9 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(ed) = self.active_editor() {
+            *self.agent_editor.borrow_mut() = Some(ed.downgrade());
+        }
         let bounds_cell = self.window_bounds.clone();
         let sidebar: AnyElement = match self.side {
             Side::Files => self.tree.clone().into_any_element(),
@@ -6284,6 +6357,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &FocusUp, w, cx| ws.focus_dir(0, -1, w, cx)))
             .on_action(cx.listener(|ws, _: &FocusDown, w, cx| ws.focus_dir(0, 1, w, cx)))
             .on_action(cx.listener(|ws, _: &NewTerminal, w, cx| ws.new_terminal(w, cx)))
+            .on_action(cx.listener(|ws, _: &OpenClaude, w, cx| ws.open_agent(false, None, w, cx)))
+            .on_action(cx.listener(|ws, _: &NewClaude, w, cx| ws.open_agent(true, None, w, cx)))
+            .on_action(cx.listener(|ws, _: &MentionInClaude, w, cx| ws.mention_in_claude(w, cx)))
             .on_action(cx.listener(|ws, _: &ToggleTerminal, w, cx| ws.toggle_terminal(w, cx)))
             .on_action(cx.listener(|ws, _: &PaneBuffers, w, cx| ws.open_cmd(CmdMode::Buffers, "", w, cx)))
             .on_action(cx.listener(|ws, _: &Buffer1, w, cx| ws.show_buffer(0, w, cx)))

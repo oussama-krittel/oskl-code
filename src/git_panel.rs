@@ -1437,7 +1437,6 @@ impl GitPanel {
                 let (c1, c2, c3) = (change.clone(), change.clone(), change.clone());
                 let root = self.repo.read(cx).root.clone();
                 let path_open = root.join(&change.path);
-                let untracked = change.status == FileStatus::Untracked;
                 let selector = format!("change-row-{}", c1.path);
                 div()
                     .id(("file", ix))
@@ -2235,7 +2234,6 @@ mod tree_tests {
             sha: sha.into(),
             parents: parents.iter().map(|p| p.to_string()).collect(),
             author: String::new(),
-            email: String::new(),
             time: 0,
             refs: Vec::new(),
             subject: String::new(),

@@ -66,10 +66,6 @@ pub fn status_color(s: FileStatus) -> Hsla {
     }
 }
 
-pub fn file_color(name: &str) -> Hsla {
-    theme::c(crate::icons::file_icon(name).1)
-}
-
 /// Material-style icon for a file name.
 pub fn file_icon(name: &str) -> Svg {
     let (key, color) = crate::icons::file_icon(name);

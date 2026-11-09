@@ -501,6 +501,7 @@ mod defaults {
         crate::commit_view::bind_keys();
         crate::search::bind_keys();
         crate::diff_edit::bind_keys();
+        crate::agent_view::bind_keys();
     }
 
     /// Default shortcuts must all parse, never collide, and avoid macOS-owned keys.

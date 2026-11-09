@@ -162,6 +162,7 @@ fn new_id() -> String {
 
 // ---------------------------------------------------------------- saved connections
 
+#[cfg(not(test))]
 fn store_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/kite/connections.json"))
 }
@@ -227,8 +228,10 @@ pub fn delete(id: &str) -> Result<(), String> {
 /// Passwords are kept in the login Keychain through macOS's `security` tool: the entries
 /// belong to that tool, which never changes, so macOS doesn't ask again each time this app
 /// is updated (entries made by the app itself are tied to its exact build).
+#[cfg(not(test))]
 const KEYCHAIN_SERVICE: &str = "OSKL Code connections";
 /// Where earlier builds kept them (moved over when first read).
+#[cfg(not(test))]
 const OLD_KEYCHAIN_SERVICE: &str = "OSKL Code database";
 
 #[cfg(test)]

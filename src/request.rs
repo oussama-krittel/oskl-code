@@ -52,6 +52,10 @@ pub enum Request {
     Ask(crate::dialog::Ask),
     /// A terminal in this folder.
     OpenTerminal(PathBuf),
+    /// A terminal in this folder running a command.
+    RunInTerminal { dir: PathBuf, command: String },
+    /// A Claude chat forked into a new tab: the session, continued from before the message `uuid`.
+    ForkChat { session: String, uuid: String },
     /// Show this repository in the Source Control panel.
     SelectRepo(PathBuf),
     /// Pick a folder to add to the workspace.

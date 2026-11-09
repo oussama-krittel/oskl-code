@@ -1,6 +1,9 @@
 mod api;
 mod api_panel;
 mod api_view;
+mod agent;
+mod agent_view;
+
 mod assets;
 mod buffer;
 mod colors;
@@ -156,6 +159,7 @@ fn main() {
     let opened = opened_from_os.clone();
     app.run(move |cx: &mut App| {
         editor::bind_keys();
+        agent_view::bind_keys();
         workspace::bind_keys();
         file_tree::bind_keys();
         git_panel::bind_keys();

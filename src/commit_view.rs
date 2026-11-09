@@ -236,17 +236,6 @@ impl CommitView {
         self.step(-1, cx);
     }
 
-    #[cfg(test)]
-    pub fn row_labels(&self) -> Vec<String> {
-        let Some(d) = &self.details else { return Vec::new() };
-        self.rows()
-            .into_iter()
-            .map(|r| match r {
-                FileRow::Folder { label, depth, .. } => format!("{}{label}/", "  ".repeat(depth)),
-                FileRow::File { ix, depth } => format!("{}{}", "  ".repeat(depth), ui::file_name(&d.files[ix].path)),
-            })
-            .collect()
-    }
     fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
         self.open(self.selected, true, cx);
     }
