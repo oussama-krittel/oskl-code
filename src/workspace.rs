@@ -8743,6 +8743,92 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     /// The open database tab.
+    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    #[gpui::test]
+    fn a_mongodb_collection_has_compass_tabs(cx: &mut TestAppContext) {
+        if std::env::var_os("KITE_DB_LIVE").is_none() {
+            return;
+        }
+        use crate::db_view::CTab;
+        let (ws, cx) = setup(cx);
+        let id = live_mongo_docs("compass_ui", 40, cx);
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["kite_test".into(), "compass_ui".into()] }, window, cx));
+        let tab = db_tab(&ws, cx).expect("a data tab");
+        wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
+        for t in ["db-tab-data", "db-tab-aggregations", "db-tab-schema", "db-tab-indexes", "db-tab-validation", "db-tab-query", "db-filter", "db-find", "db-explain", "db-reset", "db-options", "db-history-button", "db-range"] {
+            assert!(cx.debug_bounds(t).is_some(), "{t} on screen");
+        }
+        assert!(cx.debug_bounds("db-range").is_some());
+
+        // Find with a filter and the options: skip and limit.
+        tab.update(cx, |t, cx| t.type_in_bar("filter", "{n: {$gte: 10}}", cx));
+        click_on(cx, "db-find");
+        wait_for(cx, "the filtered documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.2 == Some(30)));
+        click_on(cx, "db-options");
+        assert!(cx.debug_bounds("db-options-panel").is_some(), "Project, Sort, Collation, Index Hint, Max Time, Skip, Limit");
+        tab.update(cx, |t, cx| {
+            t.type_in_bar("sort", "{n: -1}", cx);
+            t.type_in_bar("skip", "1", cx);
+            t.type_in_bar("limit", "3", cx);
+            t.type_in_bar("project", "{n: 1, _id: 0}", cx);
+        });
+        click_on(cx, "db-find");
+        wait_for(cx, "skip and limit", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.2 == Some(3)));
+        let (cols, rows, _) = tab.read_with(cx, |t, _| t.data_summary()).unwrap();
+        assert_eq!((cols, rows), (vec!["n".to_string()], 3), "projected");
+        // A typo says where, and runs nothing.
+        tab.update(cx, |t, cx| t.type_in_bar("filter", "{n: }", cx));
+        click_on(cx, "db-find");
+        assert!(tab.read_with(cx, |t, _| t.compass_state().0).is_some_and(|e| e.starts_with("Filter")), "the error names the field");
+        assert!(cx.debug_bounds("db-bar-error").is_some());
+        // Explain.
+        tab.update(cx, |t, cx| t.type_in_bar("filter", "{n: 5}", cx));
+        click_on(cx, "db-explain");
+        wait_for(cx, "the plan", |cx| tab.read_with(cx, |t, _| t.compass_state().4.is_some()));
+        assert!(cx.debug_bounds("db-explain-panel").is_some() && cx.debug_bounds("db-explain-verdict").is_some());
+        click_on(cx, "db-explain-close");
+        // History: the queries found.
+        click_on(cx, "db-history-button");
+        assert!(cx.debug_bounds("db-recent-0").is_some(), "recent queries");
+        click_on(cx, "db-recent-0");
+        // Reset: every document again.
+        click_on(cx, "db-reset");
+        wait_for(cx, "all of them", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.2 == Some(40)));
+
+        // Aggregations.
+        click_on(cx, "db-tab-aggregations");
+        assert_eq!(tab.read_with(cx, |t, _| t.compass_tab()), Some(CTab::Aggregations));
+        tab.update(cx, |t, cx| t.type_in_bar("pipeline", "[{$group: {_id: null, total: {$sum: '$n'}}}]", cx));
+        click_on(cx, "db-agg-run");
+        wait_for(cx, "the pipeline's result", |cx| tab.read_with(cx, |t, _| t.compass_state().3) == Some(1));
+
+        // Schema.
+        click_on(cx, "db-tab-schema");
+        wait_for(cx, "the schema", |cx| tab.read_with(cx, |t, _| t.compass_state().2.is_some()));
+        assert_eq!(tab.read_with(cx, |t, _| t.compass_state().2), Some(Ok(8)), "_id addr addr.city addr.zip n name note tags");
+        assert!(cx.debug_bounds("db-schema-field-0").is_some());
+
+        // Indexes: create one, drop it.
+        click_on(cx, "db-tab-indexes");
+        wait_for(cx, "the indexes", |cx| tab.read_with(cx, |t, _| t.compass_state().1.is_some()));
+        click_on(cx, "db-index-new");
+        tab.update(cx, |t, cx| t.type_in_bar("indexKeys", "{name: 1}", cx));
+        click_on(cx, "db-index-create");
+        wait_for(cx, "the new index", |cx| tab.read_with(cx, |t, _| t.compass_state().1).is_some_and(|r| r.is_ok_and(|l| l.contains(&"name_1".to_string()))));
+        let row = cx.debug_bounds("db-index-1").unwrap();
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
+        click_on(cx, "db-index-drop-1");
+        assert!(ws.read_with(cx, |ws, _| ws.ask.is_some()), "asks before dropping");
+        click_on(cx, "dialog-button-Drop Index");
+        wait_for(cx, "the index gone", |cx| tab.read_with(cx, |t, _| t.compass_state().1).is_some_and(|r| r.is_ok_and(|l| l == ["_id_"])));
+
+        // Validation.
+        click_on(cx, "db-tab-validation");
+        click_on(cx, "db-val-warn");
+        click_on(cx, "db-val-update");
+        wait_for(cx, "the rules saved", |cx| cx.debug_bounds("db-val-status").is_some() && tab.read_with(cx, |t, _| t.compass_tab()) == Some(CTab::Validation));
+    }
+
     /// The test MongoDB, connected: a collection of `n` documents in kite_test. Its connection id.
     fn live_mongo_docs(coll: &str, n: usize, _cx: &mut VisualTestContext) -> String {
         let mut c = crate::db::Conn::new(crate::db::Kind::MongoDb);

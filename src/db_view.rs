@@ -16,6 +16,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod compass_ui;
+use compass_ui::{AGG, Compass};
+pub use compass_ui::CTab;
+
 actions!(db_view, [RunQuery, CopyCell, RefreshData, RowUp, RowDown, CloseDetail]);
 
 pub fn bind_keys() {
@@ -121,6 +125,8 @@ struct Data {
     exporting: bool,
     /// How MongoDB documents show.
     doc_mode: DocMode,
+    /// A MongoDB collection: Compass's tabs (query bar, aggregations, schema, indexes, validation).
+    compass: Option<Box<Compass>>,
 }
 
 /// MongoDB documents as cards of fields (like Compass's List), as JSON, or as a table.
@@ -213,12 +219,13 @@ impl DbView {
                         EditorEvent::Changed => v.search_soon(cx),
                         _ => {}
                     }));
+                    let compass = (has_data && c.kind == Kind::MongoDb && path.len() == 2).then(|| Box::new(Compass::new(&mut subs, window, cx)));
                     let data = Data {
                         conn: c,
                         path: path.clone(),
                         has_data,
                         inner: if has_data { Inner::DataView } else { Inner::Query },
-                        spec: PageSpec { limit: PAGE_SIZES[0], ..Default::default() },
+                        spec: PageSpec { limit: PAGE_SIZES[0], mongo: compass.as_ref().map(|_| Default::default()), ..Default::default() },
                         page: None,
                         grid: None,
                         loading: false,
@@ -236,6 +243,7 @@ impl DbView {
                         tick: None,
                         exporting: false,
                         doc_mode: DocMode::List,
+                        compass,
                     };
                     Body::Data(Box::new(data))
                 }
@@ -244,6 +252,10 @@ impl DbView {
         };
         let mut v = DbView { focus: cx.focus_handle(), open, body, _subs: subs };
         v.load(cx);
+        // The Indexes tab shows how many there are, like Compass.
+        if matches!(&v.body, Body::Data(d) if d.compass.is_some()) {
+            v.load_indexes(cx);
+        }
         v.load_secret(cx);
         v
     }
@@ -275,6 +287,7 @@ impl DbView {
         match &self.body {
             Body::Form(f) => f.name.read(cx).focus_target(cx),
             Body::Data(d) if d.inner == Inner::Query => d.query.read(cx).focus_target(cx),
+            Body::Data(d) if d.compass.as_ref().and_then(|c| c.focus_target(cx)).is_some() => d.compass.as_ref().and_then(|c| c.focus_target(cx)).unwrap(),
             _ => self.focus.clone(),
         }
     }
@@ -486,7 +499,18 @@ impl DbView {
 
     // ------------------------------------------------------------ query
 
+    /// ⌘↵: runs what's on show (a MongoDB collection's find or pipeline, else the query).
     fn run(&mut self, _: &RunQuery, _: &mut Window, cx: &mut Context<Self>) {
+        if let Body::Data(d) = &self.body
+            && d.inner == Inner::DataView
+            && let Some(c) = &d.compass
+        {
+            match c.tab {
+                CTab::Documents => return self.find(cx),
+                CTab::Aggregations => return self.run_pipeline(cx),
+                _ => return,
+            }
+        }
         self.run_query(&RunQuery, &mut None, cx);
     }
 
@@ -567,6 +591,13 @@ impl DbView {
         if d.menu.take().is_some() {
             return cx.notify();
         }
+        if let Some(c) = d.compass.as_deref_mut()
+            && (c.history || c.explain.is_some())
+        {
+            c.history = false;
+            c.explain = None;
+            return cx.notify();
+        }
         if let Some((which, Some(r))) = self.shown_grid()
             && let Some(gv) = self.grid_of_mut(which)
         {
@@ -580,7 +611,8 @@ impl DbView {
     fn set_doc_mode(&mut self, mode: DocMode, cx: &mut Context<Self>) {
         let Body::Data(d) = &mut self.body else { return };
         d.doc_mode = mode;
-        for gv in d.grid.iter_mut().chain(d.results.iter_mut()) {
+        let agg = d.compass.as_deref_mut().and_then(|c| c.agg.as_mut());
+        for gv in d.grid.iter_mut().chain(d.results.iter_mut()).chain(agg) {
             gv.list.reset(gv.grid.rows.len());
         }
         cx.notify();
@@ -1230,6 +1262,7 @@ impl DbView {
     fn grid_of(&self, which: Option<usize>) -> Option<&GridView> {
         let Body::Data(d) = &self.body else { return None };
         match which {
+            Some(AGG) => d.compass.as_ref().and_then(|c| c.agg.as_ref()),
             Some(i) => d.results.get(i),
             None => d.grid.as_ref(),
         }
@@ -1238,6 +1271,7 @@ impl DbView {
     fn grid_of_mut(&mut self, which: Option<usize>) -> Option<&mut GridView> {
         let Body::Data(d) = &mut self.body else { return None };
         match which {
+            Some(AGG) => d.compass.as_deref_mut().and_then(|c| c.agg.as_mut()),
             Some(i) => d.results.get_mut(i),
             None => d.grid.as_mut(),
         }
@@ -1615,6 +1649,8 @@ impl DbView {
                 ).with_priority(1))
             }
         };
+        // The rows menu opens under its own button: in the search row, or (MongoDB) in the toolbar.
+        let (menu, toolbar_menu) = if d.compass.is_some() { (None, menu) } else { (menu, None) };
         let body: gpui::AnyElement = match (&d.page, &d.grid) {
             (Some(Err(e)), _) => div().p(px(14.)).min_w_0().text_color(theme::git_deleted()).child(e.clone()).into_any_element(),
             (_, Some(gv)) if !gv.grid.columns.is_empty() => div().flex().flex_col().flex_1().min_h_0().child(self.render_grid(None, gv, kind != Kind::RabbitMq && kind != Kind::Redis, cx)).into_any_element(),
@@ -1639,7 +1675,8 @@ impl DbView {
                     .child(button("db-refresh", if d.loading { "Loading…" } else { "Refresh" }, Some("refresh"), true).on_click(cx.listener(|v, _, _, cx| v.load(cx))))
                     .when(pageable, |d2| d2.child(button("db-export", if d.exporting { "Exporting…" } else { "Export CSV" }, Some("arrow-down"), true).on_click(cx.listener(|v, _, _, cx| v.export_csv(cx))))),
             )
-            .when(searchable || pageable, |el| {
+            .when_some(d.compass.as_deref(), |el, c| el.child(self.render_query_bar(c, cx)))
+            .when(d.compass.is_none() && (searchable || pageable), |el| {
                 el.child(
                     div()
                         .relative()
@@ -1665,11 +1702,31 @@ impl DbView {
                         .child(showing)
                         .when_some(note, |d, n| d.child(div().text_color(theme::fg_muted()).child(format!("· {n}"))))
                         .child(div().flex_1())
-                        .when(docs, |el| el.child(mode_switch(d.doc_mode, cx))),
+                        .when(d.compass.is_some(), |el| {
+                            let limit = d.spec.limit.max(1);
+                            let offset = d.spec.offset;
+                            let last = pages.unwrap_or(1);
+                            let arrow = |id: &'static str, icon: &'static str, on: bool| {
+                                div().id(id).debug_selector(move || id.to_string()).p(px(4.)).rounded(px(4.)).when(on, |d| d.cursor_pointer().hover(|s| s.bg(theme::hover()))).when(!on, |d| d.opacity(0.35)).child(ui::small_icon(icon, theme::fg()))
+                            };
+                            el.child(div().relative().child(dropdown("db-sizes", format!("{}", d.spec.limit), Menu::Sizes, cx)).children(toolbar_menu))
+                                .child(div().debug_selector(|| "db-range".into()).text_color(theme::fg()).child(match total {
+                                    Some(0) | None if shown == 0 => "0 – 0 of 0".to_string(),
+                                    Some(t) => format!("{} – {} of {}{}", group_digits((offset + 1) as u64), group_digits((offset + shown) as u64), if estimate { "≈ " } else { "" }, group_digits(t)),
+                                    None => format!("{} – {}", offset + 1, offset + shown),
+                                }))
+                                .child(arrow("db-reload", "refresh", true).tooltip(ui::tooltip("Refresh")).on_click(cx.listener(|v, _, _, cx| v.load(cx))))
+                                .child(arrow("db-prev", "chevron-left", page_no > 1).when(page_no > 1, |b| b.on_click(cx.listener(move |v, _, _, cx| v.set_page(offset.saturating_sub(limit), cx)))))
+                                .child(arrow("db-next", "chevron-right", page_no < last).when(page_no < last, |b| b.on_click(cx.listener(move |v, _, _, cx| v.set_page(offset + limit, cx)))))
+                        })
+                        .when(docs || d.compass.is_some(), |el| el.child(mode_switch(d.doc_mode, cx))),
                 )
             })
-            .child(body)
-            .when(pageable && pages.is_some_and(|p| p > 1), |el| {
+            .child(match d.compass.as_deref().and_then(|c| self.render_explain(c, cx)) {
+                Some(explain) => explain,
+                None => body,
+            })
+            .when(d.compass.is_none() && pageable && pages.is_some_and(|p| p > 1), |el| {
                 let pages = pages.unwrap_or(1);
                 let limit = d.spec.limit.max(1);
                 let offset = d.spec.offset;
@@ -1686,7 +1743,7 @@ impl DbView {
                         .child(button("db-next", "Next", Some("chevron-right"), false).when(page_no < pages, |b| b.on_click(cx.listener(move |v, _, _, cx| v.set_page(offset + limit, cx)))).when(page_no >= pages, |b| b.opacity(0.4))),
                 )
             })
-            .when(!(pageable && pages.is_some_and(|p| p > 1)), |el| el.child(div().h(px(10.))))
+            .when(d.compass.is_some() || !(pageable && pages.is_some_and(|p| p > 1)), |el| el.child(div().h(px(10.))))
             .into_any_element()
     }
 
@@ -1942,15 +1999,17 @@ impl Render for DbView {
                         .child(ui::small_icon(icon, if on { theme::accent() } else { theme::fg_dim() }))
                         .child(text)
                 };
-                let inner = match d.inner {
-                    Inner::DataView => self.render_data_view(d, cx),
-                    Inner::Query => self.render_query(d, cx),
+                let inner = match (d.inner, d.compass.as_deref()) {
+                    (Inner::DataView, Some(c)) => self.render_compass_tab(d, c, cx),
+                    (Inner::DataView, None) => self.render_data_view(d, cx),
+                    (Inner::Query, _) => self.render_query(d, cx),
                 };
                 div()
                     .flex()
                     .flex_col()
                     .size_full()
-                    .when(d.has_data, |el| {
+                    .when_some(d.compass.as_deref(), |el, c| el.child(self.render_compass_tabs(d, c, cx)))
+                    .when(d.has_data && d.compass.is_none(), |el| {
                         el.child(
                             div()
                                 .flex()
@@ -1978,11 +2037,11 @@ impl Render for DbView {
             .on_action(cx.listener(Self::row_down))
             .on_action(cx.listener(Self::close_detail))
             .on_mouse_down(MouseButton::Left, cx.listener(|v, _, _, cx| {
-                if let Body::Data(d) = &mut v.body
-                    && d.menu.is_some()
-                {
-                    d.menu = None;
-                    cx.notify();
+                if let Body::Data(d) = &mut v.body {
+                    let history = d.compass.as_deref_mut().map(|c| std::mem::take(&mut c.history)).unwrap_or(false);
+                    if d.menu.take().is_some() || history {
+                        cx.notify();
+                    }
                 }
             }))
             .size_full()

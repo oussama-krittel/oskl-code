@@ -209,6 +209,19 @@ pub async fn page(conn: Conn, path: Vec<String>, spec: PageSpec) -> Result<Page>
     }
 }
 
+/// Runs `work` with a MongoDB connection's client (Compass's tabs).
+pub async fn mongo<T, F, Fut>(conn: Conn, work: F) -> Result<T>
+where
+    F: FnOnce(mongodb::Client) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let client = session(&conn, "").await?;
+    match &*client {
+        Client::Mongo(c) => work(c.clone()).await,
+        _ => Err(anyhow!("not a MongoDB connection")),
+    }
+}
+
 /// Runs a query (SQL, a MongoDB shell command, Redis commands, RabbitMQ API calls): one
 /// result per statement.
 pub async fn query(conn: Conn, scope: Scope, text: String) -> Result<Vec<Grid>> {

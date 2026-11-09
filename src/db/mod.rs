@@ -4,6 +4,7 @@
 //! the window, and an open connection costs little: a socket and a small buffer. Results are
 //! capped (`MAX_ROWS`, `MAX_CELL`) so a big table never fills memory.
 
+pub mod compass;
 pub mod engine;
 mod mongo;
 mod mssql;
@@ -641,6 +642,29 @@ pub struct PageSpec {
     pub column: Option<String>,
     /// Sorted by this column (true: descending).
     pub sort: Option<(String, bool)>,
+    /// MongoDB: a find from the query bar (instead of `search`).
+    pub mongo: Option<FindQuery>,
+}
+
+/// MongoDB Compass's query bar, as typed (the shell's syntax; empty fields are left out).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct FindQuery {
+    pub filter: String,
+    pub project: String,
+    pub sort: String,
+    pub collation: String,
+    pub hint: String,
+    pub max_time_ms: String,
+    pub skip: String,
+    pub limit: String,
+}
+
+impl FindQuery {
+    /// Nothing typed: every document.
+    pub fn is_empty(&self) -> bool {
+        [&self.filter, &self.project, &self.sort, &self.collation, &self.hint, &self.max_time_ms, &self.skip, &self.limit].iter().all(|f| f.trim().is_empty() || f.trim() == "{}")
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

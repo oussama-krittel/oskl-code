@@ -103,8 +103,16 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
+/// A value in the shell's syntax (`{age: {$gt: 30}}`, `'name'`…).
+pub(super) fn parse_value(s: &str) -> Result<Bson> {
+    Parser::new(s).whole()
+}
+
 pub async fn page(c: &Client, path: &[String], spec: &PageSpec) -> Result<Page> {
     let [db, name] = path else { bail!("not a collection") };
+    if let Some(q) = &spec.mongo {
+        return super::compass::find_page(c, db, name, q, spec.offset, spec.limit, spec.sort.as_ref()).await;
+    }
     let coll = c.database(db).collection::<Document>(name);
     let filter = if spec.search.trim().is_empty() {
         Document::new()
@@ -147,7 +155,7 @@ fn columns(docs: &[Document]) -> Vec<String> {
     cols
 }
 
-fn grid(docs: &[Document]) -> Grid {
+pub(super) fn grid(docs: &[Document]) -> Grid {
     let mut g = Grid { columns: columns(docs), ..Default::default() };
     let mut trees = Vec::new();
     for d in docs {
