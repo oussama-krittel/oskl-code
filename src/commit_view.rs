@@ -187,8 +187,8 @@ impl CommitView {
         }
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus_target(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 
     fn open(&self, ix: usize, preview: bool, cx: &mut Context<Self>) {
@@ -236,17 +236,6 @@ impl CommitView {
         self.step(-1, cx);
     }
 
-    #[cfg(test)]
-    pub fn row_labels(&self) -> Vec<String> {
-        let Some(d) = &self.details else { return Vec::new() };
-        self.rows()
-            .into_iter()
-            .map(|r| match r {
-                FileRow::Folder { label, depth, .. } => format!("{}{label}/", "  ".repeat(depth)),
-                FileRow::File { ix, depth } => format!("{}{}", "  ".repeat(depth), ui::file_name(&d.files[ix].path)),
-            })
-            .collect()
-    }
     fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
         self.open(self.selected, true, cx);
     }
@@ -435,7 +424,7 @@ impl Render for CommitView {
             .on_action(cx.listener(Self::prev))
             .on_action(cx.listener(Self::open_selected))
             .on_action(cx.listener(Self::copy_sha))
-            .on_mouse_down(MouseButton::Left, cx.listener(|v, _, w, _| w.focus(&v.focus)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|v, _, w, cx| w.focus(&v.focus, cx)))
             .size_full()
             .bg(theme::bg_editor());
 

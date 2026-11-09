@@ -820,12 +820,12 @@ impl ApiView {
         }
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &App) {
+    pub fn focus_target(&self, cx: &App) -> FocusHandle {
         match &self.body {
-            Body_::Req(t) => t.url.read(cx).focus(window),
-            Body_::Env(t) => t.name.read(cx).focus(window),
-            Body_::Folder(t) => t.name.read(cx).focus(window),
-            _ => window.focus(&self.focus),
+            Body_::Req(t) => t.url.read(cx).focus_target(cx),
+            Body_::Env(t) => t.name.read(cx).focus_target(cx),
+            Body_::Folder(t) => t.name.read(cx).focus_target(cx),
+            _ => self.focus.clone(),
         }
     }
 
@@ -1507,7 +1507,7 @@ impl ApiView {
             }
             _ => {}
         })];
-        input.read(cx).focus(window);
+        window.focus(&input.read(cx).focus_target(cx), cx);
         d.new_name = Some((input, subs));
         cx.notify();
     }
@@ -1574,7 +1574,7 @@ impl ApiView {
                                     if let Some(d) = &mut v.save_dialog {
                                         d.choice = Some(pick.clone());
                                         d.list_open = false;
-                                        d.name.read(cx).focus(w);
+                                        w.focus(&d.name.read(cx).focus_target(cx), cx);
                                     }
                                     cx.notify();
                                 }))
@@ -1656,7 +1656,7 @@ impl ApiView {
                                 if let Some(d) = &mut v.save_dialog {
                                     d.list_open = !d.list_open;
                                     if d.list_open {
-                                        d.search.read(cx).focus(w);
+                                        w.focus(&d.search.read(cx).focus_target(cx), cx);
                                     }
                                 }
                                 cx.notify();

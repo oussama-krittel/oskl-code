@@ -38,7 +38,7 @@ fn shell_path() -> Option<&'static String> {
         .as_ref()
 }
 
-fn command(program: &Path) -> Command {
+pub(crate) fn command(program: &Path) -> Command {
     let mut cmd = Command::new(program);
     if let Some(path) = shell_path() {
         cmd.env("PATH", path);
@@ -47,7 +47,7 @@ fn command(program: &Path) -> Command {
     cmd
 }
 
-fn search_path() -> Vec<PathBuf> {
+pub(crate) fn search_path() -> Vec<PathBuf> {
     let path = match shell_path() {
         Some(p) => p.clone(),
         None => std::env::var("PATH").unwrap_or_default(),

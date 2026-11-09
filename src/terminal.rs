@@ -115,7 +115,7 @@ impl TerminalView {
             while let Some(ev) = rx.next().await {
                 // Coalesce bursts of output into one repaint.
                 let mut batch = vec![ev];
-                while let Ok(Some(more)) = rx.try_next() {
+                while let Ok(more) = rx.try_recv() {
                     batch.push(more);
                 }
                 let alive = this
@@ -149,8 +149,8 @@ impl TerminalView {
         }
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus_target(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
@@ -304,7 +304,7 @@ impl TerminalView {
     }
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         let Some((col, row)) = self.grid_point(ev.position) else { return };
         let mode = *self.term.lock().mode();
         if ev.modifiers.platform {
@@ -367,7 +367,7 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn scroll(&mut self, ev: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn scroll(&mut self, ev: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         let lh = self.geometry.as_ref().map(|g| g.line_h).unwrap_or(16.);
         self.scroll_acc += ev.delta.pixel_delta(px(lh)).y / px(1.);
         let lines = (self.scroll_acc / lh) as i32;
@@ -685,7 +685,7 @@ impl Element for TerminalElement {
                 window.paint_quad(c);
             }
             for (origin, line) in &p.lines {
-                line.paint(*origin, p.line_h, window, cx).ok();
+                line.paint(*origin, p.line_h, gpui::TextAlign::Left, None, window, cx).ok();
             }
         });
     }
@@ -838,7 +838,7 @@ impl Render for TerminalView {
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
-            .on_scroll_wheel(cx.listener(Self::scroll))
+            .on_scroll(cx.listener(Self::scroll))
             .child(TerminalElement { view: cx.entity() })
     }
 }

@@ -470,13 +470,15 @@ pub enum Ctx {
     Path { typed: String },
     /// `useSt|`, `: Us|`
     Word { prefix: String, type_pos: bool },
+    /// Suggestions given by the editor's owner (`Editor::suggest`).
+    Custom { prefix: String },
 }
 
 impl Ctx {
     /// The text the chosen item replaces (just before the cursor).
     pub fn prefix(&self) -> &str {
         match self {
-            Ctx::TagName { prefix } | Ctx::Attr { prefix, .. } | Ctx::Word { prefix, .. } => prefix,
+            Ctx::TagName { prefix } | Ctx::Attr { prefix, .. } | Ctx::Word { prefix, .. } | Ctx::Custom { prefix } => prefix,
             Ctx::Path { typed } => typed.rsplit('/').next().unwrap_or(""),
         }
     }
@@ -709,6 +711,7 @@ pub fn candidates(buf: &Buffer, ctx: &Ctx, fl: Flavor, file: Option<&Path>, root
         }
         Ctx::Attr { tag, .. } => attrs(buf, tag, fl),
         Ctx::Path { typed } => paths(typed, file, root),
+        Ctx::Custom { .. } => Vec::new(),
         Ctx::Word { type_pos, .. } => {
             let (words, types) = file_words(buf);
             let mut out: Vec<Item> = Vec::new();

@@ -271,11 +271,11 @@ impl DbView {
         }));
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &App) {
+    pub fn focus_target(&self, cx: &App) -> FocusHandle {
         match &self.body {
-            Body::Form(f) => f.name.read(cx).focus(window),
-            Body::Data(d) if d.inner == Inner::Query => d.query.read(cx).focus(window),
-            _ => window.focus(&self.focus),
+            Body::Form(f) => f.name.read(cx).focus_target(cx),
+            Body::Data(d) if d.inner == Inner::Query => d.query.read(cx).focus_target(cx),
+            _ => self.focus.clone(),
         }
     }
 
@@ -1176,7 +1176,7 @@ impl DbView {
                     .id(SharedString::from(id.clone()))
                     .debug_selector(move || id.clone())
                     .flex_basis(px(gv.widths[i]))
-                    .flex_grow()
+                    .flex_grow(1.)
                     .flex_shrink_0()
                     .flex()
                     .items_center()
@@ -1317,7 +1317,7 @@ impl DbView {
                 div()
                     .id(("db-cell", r * 1000 + c))
                     .flex_basis(px(widths.get(c).copied().unwrap_or(100.)))
-                    .flex_grow()
+                    .flex_grow(1.)
                     .flex_shrink_0()
                     .flex()
                     .items_center()
@@ -1329,7 +1329,7 @@ impl DbView {
                     .text_color(color)
                     .when(italic, |d| d.italic())
                     .on_click(cx.listener(move |v, _: &ClickEvent, window, cx| {
-                        window.focus(&v.focus);
+                        window.focus(&v.focus, cx);
                         v.toggle_row(which, r, Some(c), cx);
                     }))
                     .child(div().min_w_0().overflow_hidden().text_ellipsis().child(text))
@@ -1792,7 +1792,7 @@ fn one_line(id: impl Into<gpui::ElementId>, child: gpui::Div) -> gpui::Stateful<
         .min_w_0()
         .overflow_x_scroll()
         .whitespace_nowrap()
-        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .on_scroll(|_, _, cx| cx.stop_propagation())
         .child(child)
 }
 
@@ -1910,7 +1910,7 @@ impl Render for DbView {
                             if let Body::Data(d) = &mut v.body {
                                 d.inner = which;
                                 if which == Inner::Query {
-                                    d.query.read(cx).focus(window);
+                                    window.focus(&d.query.read(cx).focus_target(cx), cx);
                                 }
                             }
                             cx.notify();

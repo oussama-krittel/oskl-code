@@ -250,6 +250,7 @@ impl Config {
 }
 
 thread_local! {
+    static KIT: RefCell<Vec<KeyBinding>> = const { RefCell::new(Vec::new()) };
     static CURRENT: RefCell<Config> = RefCell::new(Config::default());
     static LABELS: RefCell<BTreeMap<String, String>> = const { RefCell::new(BTreeMap::new()) };
 }
@@ -295,10 +296,17 @@ pub fn translate_arrow(ks: &Keystroke) -> Option<Keystroke> {
 
 /// Whether `keys` is one of the letter-as-arrow combinations (so it can't be assigned).
 pub fn is_arrow_alias(keys: &str) -> bool {
-    keys.split_whitespace().count() == 1 && Keystroke::parse(keys).ok().is_some_and(|ks| translate_arrow(&ks).is_some())
+    keys.split_whitespace().count() == 1 && Keystroke::parse_with_os(keys, gpui::OperatingSystem::Mac).ok().is_some_and(|ks| translate_arrow(&ks).is_some())
 }
 
-/// Rebinds everything from defaults + the user's config.
+/// Sets up gpui-kit and keeps the key bindings its widgets installed, since `apply` clears them all.
+pub fn init_kit(cx: &mut App) {
+    gpui_kit::init(cx);
+    let kit = cx.key_bindings().borrow().bindings().cloned().collect();
+    KIT.with(|k| *k.borrow_mut() = kit);
+}
+
+/// Rebinds everything from gpui-kit's widgets, defaults + the user's config (later bindings win).
 pub fn apply(cx: &mut App) {
     let cfg = Config::load();
     // Cache labels for UI hints (status bar) so rendering never touches disk.
@@ -312,8 +320,7 @@ pub fn apply(cx: &mut App) {
     LABELS.with(|l| *l.borrow_mut() = labels);
     CURRENT.with(|c| *c.borrow_mut() = cfg.clone());
     cx.clear_key_bindings();
-    let mapper = cx.keyboard_mapper().clone();
-    let mut bindings = Vec::new();
+    let mut bindings = KIT.with(|k| k.borrow().clone());
     for e in entries() {
         let predicate = e.ctx.as_deref().and_then(|c| KeyBindingContextPredicate::parse(c).ok()).map(Rc::new);
         for keys in cfg.effective(&e) {
@@ -323,7 +330,7 @@ pub fn apply(cx: &mut App) {
                 variants.push(keys.replace("shift-;", ":"));
             }
             for k in variants {
-                if let Ok(b) = KeyBinding::load(&k, e.action.boxed_clone(), predicate.clone(), false, None, mapper.as_ref()) {
+                if let Ok(b) = KeyBinding::load(&k, e.action.boxed_clone(), predicate.clone(), false, None, cx) {
                     bindings.push(b);
                 }
             }
@@ -339,7 +346,7 @@ pub fn apply(cx: &mut App) {
 
 /// Canonical form ("shift-cmd-P" → "cmd-shift-p"), or None if it doesn't parse.
 pub fn normalize(keys: &str) -> Option<String> {
-    let parts: Option<Vec<String>> = keys.split_whitespace().map(|k| Keystroke::parse(k).ok().map(|ks| ks.unparse())).collect();
+    let parts: Option<Vec<String>> = keys.split_whitespace().map(|k| Keystroke::parse_with_os(k, gpui::OperatingSystem::Mac).ok().map(|ks| ks.unparse(gpui::OperatingSystem::Mac))).collect();
     parts.map(|p| p.join(" "))
 }
 
@@ -371,7 +378,7 @@ pub fn blocks_typing(keys: &str, ctx: Option<&str>) -> bool {
     if !matches!(ctx, None | Some("Editor")) {
         return false;
     }
-    let Some(first) = keys.split_whitespace().next().and_then(|k| Keystroke::parse(k).ok()) else { return false };
+    let Some(first) = keys.split_whitespace().next().and_then(|k| Keystroke::parse_with_os(k, gpui::OperatingSystem::Mac).ok()) else { return false };
     let m = &first.modifiers;
     let special = first.key.len() > 1 && first.key != "space"; // f1, pageup, escape, enter…
     !(m.control || m.alt || m.platform || m.function || special)
@@ -397,7 +404,7 @@ pub fn conflict<'a>(cfg: &Config, entries: &'a [Entry], keys: &str, ctx: Option<
 pub fn label(keys: &str) -> String {
     keys.split_whitespace()
         .map(|k| {
-            let Ok(ks) = Keystroke::parse(k) else { return k.to_string() };
+            let Ok(ks) = Keystroke::parse_with_os(k, gpui::OperatingSystem::Mac) else { return k.to_string() };
             let m = &ks.modifiers;
             let mut s = String::new();
             if m.function {
@@ -467,7 +474,7 @@ mod tests {
     fn letters_become_arrows() {
         use super::translate_arrow;
         use gpui::Keystroke;
-        let t = |k: &str| translate_arrow(&Keystroke::parse(k).unwrap()).map(|ks| ks.unparse());
+        let t = |k: &str| translate_arrow(&Keystroke::parse_with_os(k, gpui::OperatingSystem::Mac).unwrap()).map(|ks| ks.unparse(gpui::OperatingSystem::Mac));
         assert_eq!(t("ctrl-alt-i").as_deref(), Some("up"));
         assert_eq!(t("ctrl-alt-shift-j").as_deref(), Some("shift-left"));
         assert_eq!(t("alt-l").as_deref(), Some("alt-right"));
@@ -486,6 +493,17 @@ mod tests {
         cfg.dirs = ["h".into(), "j".into(), "k".into(), "l".into()];
         assert_eq!(cfg.resolve("cmd-alt-shift-{right}"), "cmd-alt-shift-l");
     }
+
+    #[gpui::test]
+    fn kit_bindings_survive_apply(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            super::init_kit(cx);
+            let kit = cx.key_bindings().borrow().bindings().count();
+            assert!(kit > 0, "gpui-kit's widgets bind keys");
+            super::apply(cx);
+            assert!(cx.key_bindings().borrow().bindings().count() >= kit, "apply cleared gpui-kit's bindings");
+        });
+    }
 }
 
 #[cfg(test)]
@@ -501,6 +519,7 @@ mod defaults {
         crate::commit_view::bind_keys();
         crate::search::bind_keys();
         crate::diff_edit::bind_keys();
+        crate::agent_view::bind_keys();
     }
 
     /// Default shortcuts must all parse, never collide, and avoid macOS-owned keys.

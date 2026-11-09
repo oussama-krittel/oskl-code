@@ -26,7 +26,6 @@ struct Choice {
 
 pub struct MergeView {
     focus: FocusHandle,
-    pub path: PathBuf,
     pub rel: String,
     snapshot: String,
     blocks: Vec<Block>,
@@ -68,7 +67,6 @@ impl MergeView {
         let subs = vec![cx.observe(&result, |_, _, cx| cx.notify())];
         Self {
             focus: cx.focus_handle(),
-            path,
             rel,
             choices: vec![Choice::default(); blocks.len()],
             generated: snapshot.clone(),
@@ -85,8 +83,8 @@ impl MergeView {
         format!("Merging {}", ui::file_name(&self.rel))
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &App) {
-        self.result.read(cx).focus(window);
+    pub fn focus_target(&self, cx: &App) -> FocusHandle {
+        self.result.read(cx).focus_target(cx)
     }
 
     /// The snapshot with every ticked conflict replaced by its chosen side(s).

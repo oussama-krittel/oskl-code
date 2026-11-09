@@ -139,8 +139,8 @@ impl FileTree {
         tree
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus_target(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 
     #[cfg(test)]
@@ -418,12 +418,12 @@ impl FileTree {
         if let Some(ix) = ix {
             self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
         }
-        input.read(cx).focus(window);
+        window.focus(&input.read(cx).focus_target(cx), cx);
         // And again once the box is on screen: focus given to something not yet drawn can be lost.
         let again = input.clone();
         cx.on_next_frame(window, move |tree, window, cx| {
             if tree.editing.as_ref().is_some_and(|e| e.input == again) {
-                again.read(cx).focus(window);
+                window.focus(&again.read(cx).focus_target(cx), cx);
             }
         });
         cx.notify();
@@ -432,14 +432,14 @@ impl FileTree {
     fn cancel_inline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing = None;
         self.rebuild();
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
     fn commit_inline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ed) = self.editing.take() else { return };
         let name = ed.input.read(cx).text().trim().to_string();
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         if name.is_empty() || name.contains('\0') {
             self.rebuild();
             return cx.notify();
@@ -670,7 +670,7 @@ impl FileTree {
         if self.editing.is_some() {
             self.commit_inline(window, cx);
         }
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         self.selected = Some(path.clone());
         self.menu = Some((at, path));
         cx.notify();
@@ -815,7 +815,7 @@ impl FileTree {
             .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
             .on_click(cx.listener(move |tree, ev: &ClickEvent, window, cx| {
                 tree.menu = None;
-                window.focus(&tree.focus);
+                window.focus(&tree.focus, cx);
                 tree.activate(ix, ev.click_count() < 2, cx);
             }))
             .when(!row.pending, |d| {
@@ -968,7 +968,7 @@ impl Render for FileTree {
                         cx.listener(|tree, _, window, cx| {
                             tree.menu = None;
                             tree.selected = Some(tree.root.clone());
-                            window.focus(&tree.focus);
+                            window.focus(&tree.focus, cx);
                             cx.notify();
                         }),
                     )
@@ -985,7 +985,7 @@ impl Render for FileTree {
                             self.rows.len(),
                             cx.processor(move |tree, range: Range<usize>, _window, cx| range.map(|ix| tree.render_row(ix, focused, cx)).collect::<Vec<_>>()),
                         )
-                        .track_scroll(self.scroll.clone())
+                        .track_scroll(&self.scroll)
                         .flex_1(),
                     ),
             )

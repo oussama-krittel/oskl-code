@@ -15,6 +15,8 @@ pub enum LayoutState {
 pub enum ItemState {
     File { path: PathBuf, row: usize, col: usize },
     Terminal { cwd: PathBuf },
+    /// A Claude chat, and its Claude Code session.
+    Agent { session: Option<String> },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]

@@ -31,7 +31,7 @@ pub fn layout(commits: &[Commit], palette_len: usize) -> Vec<GraphRow> {
     let mut lanes: Vec<Option<Lane>> = Vec::new();
     // Color 0 is reserved for the first-parent chain of the first commit (HEAD side).
     let mut next_color = 1;
-    let mut new_color = |next: &mut usize| {
+    let new_color = |next: &mut usize| {
         let c = *next;
         *next = if *next + 1 >= palette_len { 1 } else { *next + 1 };
         c
@@ -143,7 +143,6 @@ mod tests {
             sha: sha.into(),
             parents: parents.iter().map(|p| p.to_string()).collect(),
             author: String::new(),
-            email: String::new(),
             time: 0,
             refs: vec![],
             subject: String::new(),

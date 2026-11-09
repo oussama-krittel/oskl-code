@@ -170,8 +170,8 @@ impl PreviewView {
         self.blocks.len()
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus_target(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 
     fn text(&self, cx: &App) -> String {
@@ -433,6 +433,7 @@ impl PreviewView {
         self.diagrams.clone()
     }
 
+    #[cfg(test)]
     pub fn pictures_decoded(&self) -> usize {
         self.decoded.len()
     }
@@ -446,7 +447,7 @@ impl PreviewView {
 
     /// How far the page scrolls each way, and how far it can (tests).
     #[cfg(test)]
-    pub fn page_scroll(&self) -> (Point<Pixels>, Size<Pixels>) {
+    pub fn page_scroll(&self) -> (Point<Pixels>, Point<Pixels>) {
         (self.scroll.offset(), self.scroll.max_offset())
     }
 
@@ -665,10 +666,14 @@ impl PreviewView {
         PAGE_SCALE.with(|s| s.set(self.zoom));
         let mut r = Renderer {
             base: self.path.parent().map(Path::to_path_buf).unwrap_or_default(),
-            weak: cx.entity().downgrade(),
+            open: {
+                let weak = cx.entity().downgrade();
+                Rc::new(move |path, line, _, cx| {
+                    weak.update(cx, |_, cx| cx.emit(Request::OpenFile { path, line, preview: false })).ok();
+                })
+            },
             n: 0,
             color: theme::fg(),
-            zoom: self.zoom,
             boxes: self.boxes.clone(),
             ready: self.ready.clone(),
             decoded: self.decoded.clone(),
@@ -681,6 +686,7 @@ impl PreviewView {
             near: around(self.area.get(), 1.5),
             keep: around(self.area.get(), 4.),
             paras: 0,
+            wrap: false,
         };
         let children: Vec<AnyElement> = blocks.iter().map(|b| r.block(b)).collect();
         let area = self.area.clone();
@@ -1166,7 +1172,7 @@ fn diagram_order(blocks: &[Block]) -> Vec<Option<Diagram>> {
     for b in blocks {
         match b {
             Block::Mermaid(d, _) => out.push(d.as_ref().ok().cloned()),
-            Block::MermaidPending(_) => out.push(None),
+            Block::MermaidPending => out.push(None),
             Block::Quote(inner) => out.extend(diagram_order(inner)),
             Block::List(_, items) => out.extend(items.iter().flat_map(|i| diagram_order(&i.blocks))),
             _ => {}
@@ -1306,6 +1312,41 @@ pub fn image_size(path: &Path) -> Option<(u32, u32)> {
     None
 }
 
+// ---------------------------------------------------------------- Markdown elsewhere
+
+/// Markdown parsed once and drawn in another view (the Claude chat). Diagrams stay code.
+pub struct Markdown(Vec<Block>);
+
+impl Markdown {
+    /// Inline code naming a file under `root` links to it.
+    pub fn parse(text: &str, root: &Path) -> Self {
+        Markdown(parse_with(text, Some(root)))
+    }
+
+    /// The blocks in a column; relative links and pictures are from `base`, files open with `open`.
+    pub fn render(&self, base: &Path, images: &Entity<RetainAllImageCache>, open: Opener) -> AnyElement {
+        let mut r = Renderer {
+            base: base.to_path_buf(),
+            open,
+            n: 0,
+            color: theme::fg(),
+            boxes: Default::default(),
+            ready: Default::default(),
+            decoded: Default::default(),
+            sharp_zoom: 1.,
+            wanted: Vec::new(),
+            images: images.clone(),
+            shown: Vec::new(),
+            near: Bounds::default(),
+            keep: Bounds::default(),
+            paras: 0,
+            wrap: true,
+        };
+        let children: Vec<AnyElement> = self.0.iter().map(|b| r.block(b)).collect();
+        div().flex().flex_col().gap(px(8.)).font_family(PROSE_FONT).text_size(px(13.)).line_height(relative(1.5)).text_color(theme::fg()).children(children).into_any_element()
+    }
+}
+
 // ---------------------------------------------------------------- Markdown model
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1347,7 +1388,7 @@ enum Block {
     /// A ```mermaid fence: the drawn diagram, or why it couldn't be (and its source).
     Mermaid(Result<Diagram, String>, String),
     /// A diagram still being drawn (in the background), by its text.
-    MermaidPending(String),
+    MermaidPending,
 }
 
 /// A Mermaid diagram drawn to an SVG file (temporary, freed when no longer shown).
@@ -1372,6 +1413,10 @@ enum Frame {
 #[derive(Default)]
 struct Builder {
     out: Vec<Block>,
+    /// ```mermaid fences stay code (the chat draws no diagrams).
+    no_diagrams: bool,
+    /// Inline code naming a file in this folder becomes a link to it (the chat).
+    files_in: Option<PathBuf>,
     /// Diagrams met so far.
     diagrams: usize,
     stack: Vec<Frame>,
@@ -1389,7 +1434,11 @@ struct Builder {
 }
 
 fn parse(text: &str) -> Vec<Block> {
-    let mut b = Builder::default();
+    parse_with(text, None)
+}
+
+fn parse_with(text: &str, files_in: Option<&Path>) -> Vec<Block> {
+    let mut b = Builder { no_diagrams: files_in.is_some(), files_in: files_in.map(Path::to_path_buf), ..Default::default() };
     for ev in Parser::new_ext(text, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS) {
         b.event(ev);
     }
@@ -1437,10 +1486,16 @@ impl Builder {
     }
 
     fn text(&mut self, t: &str, code: bool) {
-        let st = Style { bold: self.bold > 0, italic: self.italic > 0, strike: self.strike > 0, code, link: !self.links.is_empty() };
+        let file = code && self.links.is_empty() && self.files_in.as_deref().is_some_and(|b| is_file_ref(t, b));
+        let st = Style { bold: self.bold > 0, italic: self.italic > 0, strike: self.strike > 0, code, link: !self.links.is_empty() || file };
         let inl = self.inline.get_or_insert_with(Inline::default);
         let start = inl.text.len();
         inl.text.push_str(t);
+        if file {
+            inl.runs.push((t.len(), st));
+            inl.links.push((start..inl.text.len(), t.trim().to_string()));
+            return;
+        }
         match inl.runs.last_mut() {
             Some((len, s)) if *s == st => *len += t.len(),
             _ => inl.runs.push((t.len(), st)),
@@ -1505,7 +1560,7 @@ impl Builder {
                 }
                 TagEnd::CodeBlock => {
                     if let Some((lang, text)) = self.code.take() {
-                        if lang.as_deref().is_some_and(|l| l.eq_ignore_ascii_case("mermaid")) {
+                        if !self.no_diagrams && lang.as_deref().is_some_and(|l| l.eq_ignore_ascii_case("mermaid")) {
                             let src = text.trim_end().to_string();
                             let prev = PREVIOUS.with(|p| p.borrow().get(self.diagrams).cloned().flatten());
                             self.diagrams += 1;
@@ -1518,7 +1573,7 @@ impl Builder {
                                 (Some(d), _) => Block::Mermaid(d, src),
                                 // Being drawn: the one before shows meanwhile, else a placeholder.
                                 (None, Some(p)) => Block::Mermaid(Ok(p), src),
-                                (None, None) => Block::MermaidPending(src),
+                                (None, None) => Block::MermaidPending,
                             });
                             return;
                         }
@@ -1622,11 +1677,11 @@ impl Builder {
 struct Renderer {
     /// The folder of the Markdown file (relative links and images).
     base: PathBuf,
-    weak: WeakEntity<PreviewView>,
+    /// Opens a linked file.
+    open: Opener,
     n: usize,
     color: Hsla,
-    /// The page zoom, and the picture each diagram showed last (covering while a sharper loads).
-    zoom: f32,
+    /// The picture each diagram showed last (covering while a sharper loads).
     boxes: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, Bounds<Pixels>>>>,
     ready: Rc<std::cell::RefCell<std::collections::HashMap<PathBuf, f32>>>,
     decoded: std::collections::HashSet<PathBuf>,
@@ -1642,19 +1697,46 @@ struct Renderer {
     keep: Bounds<Pixels>,
     /// Paragraphs drawn so far (for their test names).
     paras: usize,
+    /// Code blocks wrap their long lines (the chat) instead of scrolling sideways.
+    wrap: bool,
 }
 
-fn open_link(url: &str, base: &Path, weak: &WeakEntity<PreviewView>, cx: &mut App) {
+/// Opens a file link: the file and the line it names, if any.
+pub type Opener = Rc<dyn Fn(PathBuf, Option<usize>, &mut Window, &mut App)>;
+
+fn open_link(url: &str, base: &Path, open: &Opener, window: &mut Window, cx: &mut App) {
     if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
         return cx.open_url(url);
     }
-    let rel = url.split('#').next().unwrap_or("");
+    let (rel, line) = split_file_ref(url);
     if rel.is_empty() {
         return;
     }
     let path = base.join(rel);
     if path.exists() {
-        weak.update(cx, |_, cx| cx.emit(Request::OpenFile { path, line: None, preview: false })).ok();
+        open(path, line, window, cx);
+    }
+}
+
+/// `src/a.rs:12:3`, `src/a.rs#L12-20`, `a.md#part` → the path and the line (1-based).
+fn split_file_ref(url: &str) -> (&str, Option<usize>) {
+    let (path, frag) = url.split_once('#').unwrap_or((url, ""));
+    let line = frag.strip_prefix('L').and_then(|l| l.split('-').next()?.parse().ok());
+    let mut parts = path.splitn(3, ':');
+    let p = parts.next().unwrap_or("");
+    match parts.next().and_then(|l| l.parse().ok()) {
+        Some(l) => (p, Some(l)),
+        None => (path, line),
+    }
+}
+
+/// Inline code naming a file under `base` (`src/a.rs`, `src/a.rs:12`): drawn as a link to it.
+fn is_file_ref(t: &str, base: &Path) -> bool {
+    let t = t.trim();
+    let inside = |p: &Path| p.canonicalize().ok().zip(base.canonicalize().ok()).is_some_and(|(p, b)| p.starts_with(b));
+    !t.is_empty() && t.len() < 300 && !t.contains(char::is_whitespace) && (t.contains('/') || t.contains('.')) && !t.contains("://") && {
+        let p = base.join(split_file_ref(t).0);
+        p.is_file() && inside(&p)
     }
 }
 
@@ -1691,11 +1773,11 @@ impl Renderer {
         }
         let ranges: Vec<Range<usize>> = inl.links.iter().map(|(r, _)| r.clone()).collect();
         let urls: Vec<String> = inl.links.iter().map(|(_, u)| u.clone()).collect();
-        let (base, weak) = (self.base.clone(), self.weak.clone());
+        let (base, open) = (self.base.clone(), self.open.clone());
         InteractiveText::new(("md-text", self.id()), styled)
-            .on_click(ranges, move |ix, _, cx| {
+            .on_click(ranges, move |ix, window, cx| {
                 if let Some(url) = urls.get(ix) {
-                    open_link(url, &base, &weak, cx);
+                    open_link(url, &base, &open, window, cx);
                 }
             })
             .into_any_element()
@@ -1727,7 +1809,7 @@ impl Renderer {
                 self.paras += 1;
                 div().debug_selector(move || format!("md-para-{n}")).child(self.inline(inl, false)).into_any_element()
             }
-            Block::Code(text, spans) => code_block(self.id(), text, spans.as_deref()),
+            Block::Code(text, spans) => code_block(self.id(), text, spans.as_deref(), self.wrap),
             Block::Quote(blocks) => {
                 let color = std::mem::replace(&mut self.color, theme::fg_dim());
                 let children: Vec<AnyElement> = blocks.iter().map(|b| self.block(b)).collect();
@@ -1897,7 +1979,7 @@ impl Renderer {
                     .child(div().relative().flex_none().w(w).h(h).child(body).child(measure))
                     .into_any_element()
             }
-            Block::MermaidPending(_) => {
+            Block::MermaidPending => {
                 let id = self.id();
                 div()
                     .debug_selector(move || format!("md-mermaid-pending-{id}"))
@@ -1920,7 +2002,7 @@ impl Renderer {
                     .flex_col()
                     .gap(px(6.))
                     .child(div().debug_selector(move || format!("md-mermaid-error-{id}")).text_size(px(12.)).text_color(theme::git_deleted()).child(format!("Mermaid diagram not drawn: {e}")))
-                    .child(code_block(self.id(), src, None))
+                    .child(code_block(self.id(), src, None, self.wrap))
                     .into_any_element()
             }
             Block::Html(text) => div().font_family(theme::MONO_FONT).text_size(px(12.)).text_color(theme::fg_muted()).child(text.trim().to_string()).into_any_element(),
@@ -1967,14 +2049,14 @@ fn string_index() -> u8 {
     (0..u8::MAX).find(|i| highlight::name(*i) == "string").unwrap_or(0)
 }
 
-fn code_block(id: usize, text: &str, spans: Option<&LineSpans>) -> AnyElement {
+fn code_block(id: usize, text: &str, spans: Option<&LineSpans>, wrap: bool) -> AnyElement {
     let lines: Vec<AnyElement> = text
         .split('\n')
         .enumerate()
         .map(|(i, line)| {
             let shown = if line.is_empty() { " " } else { line };
             let runs = code_runs(shown, spans.and_then(|s| s.get(i)));
-            div().whitespace_nowrap().child(StyledText::new(shown.to_string()).with_runs(runs)).into_any_element()
+            div().when(!wrap, |d| d.whitespace_nowrap()).child(StyledText::new(shown.to_string()).with_runs(runs)).into_any_element()
         })
         .collect();
     div()
@@ -1985,7 +2067,7 @@ fn code_block(id: usize, text: &str, spans: Option<&LineSpans>) -> AnyElement {
         .border_color(theme::border())
         .px(px(14.))
         .py(px(10.))
-        .overflow_x_scroll()
+        .when(!wrap, |d| d.overflow_x_scroll())
         .font_family(theme::MONO_FONT)
         .text_size(px(12.5))
         .line_height(relative(1.45))
@@ -2038,6 +2120,18 @@ mod tests {
     }
 
     use super::{Block, Diagram, PENDING, PREVIOUS, TILE, crop_svg, emoji_in_emoji_font, image_size, mermaid_now, outline_text, parse, tiles};
+
+    #[test]
+    fn chat_code_spans_naming_files_become_links() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(super::split_file_ref("src/a.rs:12:3"), ("src/a.rs", Some(12)));
+        assert_eq!(super::split_file_ref("src/a.rs#L4-9"), ("src/a.rs", Some(4)));
+        assert_eq!(super::split_file_ref("a.md#part"), ("a.md", None));
+        let blocks = super::parse_with("See `src/main.rs:3` and `not/here.rs` and `x` and `/etc/hosts` and `../oskl-code/Cargo.toml`.", Some(root));
+        let Block::Para(inl) = &blocks[0] else { panic!("{blocks:?}") };
+        // `/etc/hosts` is outside the project; `../oskl-code/Cargo.toml` is inside it.
+        assert_eq!(inl.links.iter().map(|(_, u)| u.as_str()).collect::<Vec<_>>(), ["src/main.rs:3", "../oskl-code/Cargo.toml"]);
+    }
 
     #[test]
     fn big_diagrams_are_drawn_in_tiles_that_cover_them_exactly() {
@@ -2130,7 +2224,7 @@ mod tests {
         assert!(mermaid_now("flowchart LR\n  A --> ").is_err() || mermaid_now("this is not mermaid").is_err(), "nonsense is an error, not a panic");
         let md = "Before\n\n```mermaid\ngraph TD; A-->B\n```\n\n```mermaid\nnot a diagram at all\n```\n";
         let b = parse(md);
-        assert!(matches!(&b[1], Block::MermaidPending(_)) && matches!(&b[2], Block::MermaidPending(_)), "not drawn while the page is built: {:?}", &b[1..]);
+        assert!(matches!(&b[1], Block::MermaidPending) && matches!(&b[2], Block::MermaidPending), "not drawn while the page is built: {:?}", &b[1..]);
         let jobs = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
         assert_eq!(jobs.len(), 2, "both queued to draw");
         for j in jobs {

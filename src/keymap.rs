@@ -255,8 +255,8 @@ impl KeysPanel {
         }
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &App) {
-        self.filter.read(cx).focus(window);
+    pub fn focus_target(&self, cx: &App) -> FocusHandle {
+        self.filter.read(cx).focus_target(cx)
     }
 
     pub fn is_recording(&self) -> bool {
@@ -266,7 +266,7 @@ impl KeysPanel {
     fn start(&mut self, rec: Rec, window: &mut Window, cx: &mut Context<Self>) {
         self.recording = Some(rec);
         self.message = Some(("Press the new shortcut… (Esc cancels)".into(), false));
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -306,7 +306,7 @@ impl KeysPanel {
         }
         // fn is implied by Page Up/Down, Home/End and ⌦ on Mac keyboards.
         ks.modifiers.function = false;
-        let key = ks.unparse();
+        let key = ks.unparse(gpui::OperatingSystem::Mac);
         match rec {
             Rec::Dir(i) => self.record_direction(i, &ks, cx),
             Rec::Key { entry, slot } => self.record_key(entry, slot, key, cx),

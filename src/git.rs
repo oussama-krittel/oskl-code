@@ -429,7 +429,6 @@ pub struct Commit {
     pub sha: String,
     pub parents: Vec<String>,
     pub author: String,
-    pub email: String,
     pub time: i64,
     pub refs: Vec<Ref>,
     pub subject: String,
@@ -521,7 +520,6 @@ pub fn log(root: &Path, limit: usize, all: bool, only: &[String]) -> Result<Vec<
             sha: f[0].to_string(),
             parents: f[1].split(' ').filter(|p| !p.is_empty()).map(String::from).collect(),
             author: f[2].to_string(),
-            email: f[3].to_string(),
             time: f[4].parse().unwrap_or(0),
             refs: parse_refs(f[5], &remotes),
             subject: f[6].to_string(),
@@ -671,10 +669,6 @@ pub struct BlameCommit {
 impl BlameCommit {
     pub fn is_uncommitted(&self) -> bool {
         self.sha == UNCOMMITTED
-    }
-
-    pub fn short(&self) -> &str {
-        &self.sha[..7]
     }
 }
 

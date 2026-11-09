@@ -63,7 +63,7 @@ impl FindBar {
                 EditorEvent::Changed => bar.refresh(true, cx),
                 EditorEvent::Submit | EditorEvent::Down => bar.step(true, cx),
                 EditorEvent::Up => bar.step(false, cx),
-                EditorEvent::Tab if bar.show_replace => bar.replace.read(cx).focus(window),
+                EditorEvent::Tab if bar.show_replace => window.focus(&bar.replace.read(cx).focus_target(cx), cx),
                 EditorEvent::Cancel => cx.emit(FindEvent::Close),
                 _ => {}
             }),
@@ -71,7 +71,7 @@ impl FindBar {
                 EditorEvent::Submit => bar.replace_one(cx),
                 EditorEvent::Down => bar.step(true, cx),
                 EditorEvent::Up => bar.step(false, cx),
-                EditorEvent::Tab => bar.query.read(cx).focus(window),
+                EditorEvent::Tab => window.focus(&bar.query.read(cx).focus_target(cx), cx),
                 EditorEvent::Cancel => cx.emit(FindEvent::Close),
                 _ => {}
             }),
@@ -118,7 +118,7 @@ impl FindBar {
             q.buf.select_all();
             cx.notify();
         });
-        focus.read(cx).focus(window);
+        window.focus(&focus.read(cx).focus_target(cx), cx);
         self.refresh(true, cx);
     }
 
@@ -131,7 +131,7 @@ impl FindBar {
             q.buf.select_all();
             cx.notify();
         });
-        self.query.read(cx).focus(window);
+        window.focus(&self.query.read(cx).focus_target(cx), cx);
         self.refresh(true, cx);
     }
 

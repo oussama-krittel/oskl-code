@@ -80,8 +80,8 @@ impl DbPanel {
         p
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus_target(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 
     /// The workspace's folders (which workspace connections show).
@@ -401,7 +401,7 @@ impl DbPanel {
                 base.debug_selector(move || sel_name)
                     .on_click(cx.listener(move |p, _, w, cx| {
                         p.selected = Some(rk.clone());
-                        w.focus(&p.focus);
+                        w.focus(&p.focus, cx);
                         p.toggle(&i1, Vec::new(), cx);
                     }))
                     .child(chevron(open))
@@ -536,7 +536,7 @@ impl DbPanel {
                 base.debug_selector(move || format!("db-node-{label}"))
                     .on_click(cx.listener(move |p, _, w, cx| {
                         p.selected = Some(rk.clone());
-                        w.focus(&p.focus);
+                        w.focus(&p.focus, cx);
                         if leaf {
                             cx.emit(Request::Db(DbRequest::Open(Open::Data { conn: id.clone(), path: path.clone() })));
                         } else {
@@ -652,7 +652,7 @@ impl Render for DbPanel {
                     .flex()
                     .flex_col()
                     .text_size(px(13.))
-                    .child(uniform_list("db-tree", self.rows.len(), cx.processor(move |p, range: Range<usize>, _, cx| range.map(|ix| p.render_row(ix, cx)).collect::<Vec<_>>())).track_scroll(self.scroll.clone()).flex_1())
+                    .child(uniform_list("db-tree", self.rows.len(), cx.processor(move |p, range: Range<usize>, _, cx| range.map(|ix| p.render_row(ix, cx)).collect::<Vec<_>>())).track_scroll(&self.scroll).flex_1())
                     .into_any_element()
             })
     }

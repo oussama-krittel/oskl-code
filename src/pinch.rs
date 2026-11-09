@@ -14,7 +14,8 @@ pub struct Pinch {
 /// Starts listening (once); each pinch is sent down `tx`.
 #[cfg(target_os = "macos")]
 pub fn listen(tx: futures::channel::mpsc::UnboundedSender<Pinch>) {
-    use block::ConcreteBlock;
+    use block2::RcBlock;
+    use std::ffi::c_void;
     use objc::runtime::Object;
     use objc::{class, msg_send, sel, sel_impl};
 
@@ -39,7 +40,8 @@ pub fn listen(tx: futures::channel::mpsc::UnboundedSender<Pinch>) {
     // NSEventMaskMagnify (1 << NSEventTypeMagnify, which is 30).
     const MASK_MAGNIFY: u64 = 1 << 30;
 
-    let handler = ConcreteBlock::new(move |event: *mut Object| -> *mut Object {
+    let handler = RcBlock::new(move |event: *mut c_void| -> *mut c_void {
+        let event = event as *mut Object;
         unsafe {
             let magnify: f64 = msg_send![event, magnification];
             let loc: NSPoint = msg_send![event, locationInWindow];
@@ -53,9 +55,8 @@ pub fn listen(tx: futures::channel::mpsc::UnboundedSender<Pinch>) {
             }
         }
         // Handed on as usual.
-        event
-    })
-    .copy();
+        event as *mut c_void
+    });
     unsafe {
         let _: *mut Object = msg_send![class!(NSEvent), addLocalMonitorForEventsMatchingMask: MASK_MAGNIFY handler: &*handler];
     }

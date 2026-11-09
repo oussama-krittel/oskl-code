@@ -130,8 +130,8 @@ impl DiffView {
         format!("{name} ({} ↔ {})", self.spec.left.label(), self.spec.right.label())
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus_target(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
@@ -758,7 +758,7 @@ impl Render for DiffView {
                             .collect::<Vec<_>>()
                     }),
                 )
-                .track_scroll(self.scroll.clone())
+                .track_scroll(&self.scroll)
                 .flex_1()
                 .into_any_element()
             }
@@ -785,7 +785,7 @@ impl Render for DiffView {
             .on_action(cx.listener(Self::bottom))
             .on_action(cx.listener(Self::page_down))
             .on_action(cx.listener(Self::page_up))
-            .on_mouse_down(MouseButton::Left, cx.listener(|view, _, window, _| window.focus(&view.focus)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|view, _, window, cx| window.focus(&view.focus, cx)))
             .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _, cx| {
                 if !view.dragging_split {
                     return;
@@ -801,7 +801,7 @@ impl Render for DiffView {
                 }
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, _| view.dragging_split = false))
-            .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|view, ev: &ScrollEvent, _, cx| {
                 let d = ev.delta.pixel_delta(px(ROW_H));
                 let dx = d.x / px(1.);
                 if dx.abs() > 0.5 {

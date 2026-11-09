@@ -42,7 +42,7 @@ actions!(
         OpenFolder, OpenFolderNewWindow, CloseFolder, NextWindow, SearchAll, ShowKeysPanel, ToggleSidebarSide,
         UiZoomIn, UiZoomOut, UiZoomReset, ShowSettings,
         SplitRight, SplitDown, ClosePane, ZoomPane, FocusLeft, FocusRight, FocusUp, FocusDown,
-        NewTerminal, ToggleTerminal, PaneBuffers,
+        NewTerminal, ToggleTerminal, PaneBuffers, OpenClaude, NewClaude, MentionInClaude,
         GoBack, GoForward, TogglePreview, PreviewToSide,
         MoveItemLeft, MoveItemRight, MoveItemUp, MoveItemDown,
         Buffer1, Buffer2, Buffer3, Buffer4, Buffer5, Buffer6, Buffer7, Buffer8, Buffer9,
@@ -127,6 +127,9 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-|", SplitDown, None),
         crate::keybindings::kb("cmd-shift-w", ClosePane, None),
         crate::keybindings::kb("cmd-t", NewTerminal, None),
+        crate::keybindings::kb("cmd-escape", OpenClaude, None),
+        crate::keybindings::kb("cmd-shift-escape", NewClaude, None),
+        crate::keybindings::kb("cmd-k cmd-a", MentionInClaude, Some("Editor")),
         crate::keybindings::kb("cmd-e", PaneBuffers, None),
         crate::keybindings::kb("cmd-s", Save, None),
         crate::keybindings::kb("cmd-w", CloseTab, None),
@@ -211,6 +214,8 @@ enum Side {
     Databases,
     /// API requests: collections, history, environments.
     Api,
+    /// Claude Code: sessions, usage, skills, MCP servers…
+    Claude,
     /// Settings, and its Shortcuts tab (the shortcuts list).
     Settings,
     Keys,
@@ -244,6 +249,7 @@ enum TabKind {
     Preview(Entity<PreviewView>),
     Db(Entity<crate::db_view::DbView>),
     Api(Entity<crate::api_view::ApiView>),
+    Agent(Entity<crate::agent_view::AgentView>),
 }
 
 /// What the find bar (⌘F) searches: a text editor, or a read-only diff.
@@ -398,6 +404,7 @@ fn side_name(s: Side) -> &'static str {
         Side::Git => "git",
         Side::Databases => "databases",
         Side::Api => "api",
+        Side::Claude => "claude",
         Side::Settings => "settings",
         Side::Keys => "keys",
     }
@@ -409,6 +416,7 @@ fn side_of(name: &str) -> Side {
         "git" => Side::Git,
         "databases" => Side::Databases,
         "api" => Side::Api,
+        "claude" => Side::Claude,
         "keys" => Side::Keys,
         "settings" => Side::Settings,
         _ => Side::Files,
@@ -516,6 +524,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("vsplit", "Split right (⌘\\), optionally opening a file: vsplit <path>", true),
     ("split", "Split down (⌘⇧\\), optionally opening a file: split <path>", true),
     ("term", "Terminal in this pane (⌘T); term <cmd> runs a command", true),
+    ("claude", "Chat with Claude Code (⌘Esc; ⌘⇧Esc a new chat); claude <message> asks right away", true),
     ("close", "Close this pane (⌘⇧W)", false),
     ("space", "Spaces: space new [name] · rename <name> · close · move <n> · <n> (⌃1–9 go, ⌃⌥1–9 move, ⌘K O overview)", true),
     ("only", "Close all other panes", false),
@@ -545,6 +554,7 @@ pub struct Workspace {
     git_panel: Entity<GitPanel>,
     db_panel: Entity<crate::db_panel::DbPanel>,
     api_panel: Entity<crate::api_panel::ApiPanel>,
+    claude_panel: Entity<crate::claude_panel::ClaudePanel>,
     search: Entity<SearchPanel>,
     keys: Entity<KeysPanel>,
     settings: Settings,
@@ -646,6 +656,8 @@ pub struct Workspace {
     _quit_sub: Option<Subscription>,
     drop_hint: Option<(usize, DropZone)>,
     extra_subs: Vec<Subscription>,
+    /// The editor last in front: its file and selection go along with Claude chat messages.
+    agent_editor: Rc<RefCell<Option<WeakEntity<Editor>>>>,
     /// Each pane's row of tabs: its scroll, and the tab last scrolled into view.
     tab_rows: std::cell::RefCell<HashMap<usize, (ScrollHandle, Option<usize>)>>,
 }
@@ -658,6 +670,7 @@ impl Workspace {
         let db_root = repo.read(cx).root.clone();
         let db_panel = cx.new(|cx| crate::db_panel::DbPanel::new(vec![db_root.clone()], cx));
         let api_panel = cx.new(|cx| crate::api_panel::ApiPanel::new(if root_is_project(&db_root) { vec![db_root] } else { Vec::new() }, cx));
+        let claude_panel = cx.new(|cx| crate::claude_panel::ClaudePanel::new(repo.read(cx).root.clone(), window, cx));
         let cmd = cx.new(|cx| Editor::new(EditorMode::SingleLine, cx));
         let search = cx.new(|cx| SearchPanel::new(repo.clone(), window, cx));
         let keys = cx.new(|cx| KeysPanel::new(window, cx));
@@ -684,6 +697,7 @@ impl Workspace {
             cx.subscribe_in(&git_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&db_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&api_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
+            cx.subscribe_in(&claude_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&cmd, window, |ws, _, ev: &EditorEvent, window, cx| ws.on_cmd_event(ev, window, cx)),
         ];
         let project = repo.read(cx).root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -699,6 +713,7 @@ impl Workspace {
             git_panel,
             db_panel,
             api_panel,
+            claude_panel,
             search,
             keys,
             tabs: Vec::new(),
@@ -787,6 +802,7 @@ impl Workspace {
             _quit_sub: None,
             drop_hint: None,
             extra_subs: Vec::new(),
+            agent_editor: Default::default(),
             tab_rows: Default::default(),
         };
         ws.start_watcher(cx);
@@ -813,7 +829,7 @@ impl Workspace {
         // (or takes it back) at once, not on the next click.
         ws.extra_subs.push(cx.observe_window_bounds(window, |_, _, cx| cx.notify()));
         register_workspace(cx.entity().downgrade());
-        ws.tree.read(cx).focus(window);
+        window.focus(&ws.tree.read(cx).focus_target(cx), cx);
         ws
     }
 
@@ -1129,6 +1145,17 @@ impl Workspace {
             Request::Deleted(paths) => self.paths_deleted(paths, window, cx),
             Request::Ask(ask) => self.open_ask(ask.clone(), window, cx),
             Request::OpenTerminal(dir) => self.open_terminal_in(dir.clone(), None, window, cx),
+            Request::RunInTerminal { dir, command } => self.open_terminal_in(dir.clone(), Some(command.clone()), window, cx),
+            Request::ForkChat { session, uuid } => {
+                self.open_agent(true, Some(session.clone()), window, cx);
+                if let Some(TabKind::Agent(v)) = self.active.map(|a| &self.tabs[a].kind) {
+                    v.update(cx, |v, _| v.fork_from(uuid.clone()));
+                }
+            }
+            Request::OpenChat(session) => match session.as_ref().and_then(|id| self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Agent(v) if v.read(cx).session().as_ref() == Some(id)))) {
+                Some(ix) => self.activate(ix, window, cx),
+                None => self.open_agent(true, session.clone(), window, cx),
+            },
             Request::SelectRepo(root) => self.select_repo(root, window, cx),
             Request::AddFolder => self.add_folder_prompt(window, cx),
             Request::RemoveFolder(dir) => self.remove_folder(dir, window, cx),
@@ -1140,7 +1167,7 @@ impl Workspace {
     fn open_ask(&mut self, ask: crate::dialog::Ask, window: &mut Window, cx: &mut Context<Self>) {
         let focus = cx.focus_handle();
         let restore = window.focused(cx);
-        window.focus(&focus);
+        window.focus(&focus, cx);
         let sel = if ask.cancel_default { ask.buttons.len() } else { 0 };
         self.ask = Some(AskState { ask, sel, focus, restore });
         cx.notify();
@@ -1151,7 +1178,7 @@ impl Workspace {
     pub(crate) fn answer_ask(&mut self, choice: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(st) = self.ask.take() else { return };
         match &st.restore {
-            Some(f) => window.focus(f),
+            Some(f) => window.focus(f, cx),
             None => self.focus_active(window, cx),
         }
         cx.notify();
@@ -1458,7 +1485,7 @@ impl Workspace {
         self.sync_active();
         self.focus_active(window, cx);
         if self.active.is_none() {
-            window.focus(&self.focus);
+            window.focus(&self.focus, cx);
         }
         cx.notify();
     }
@@ -1640,6 +1667,7 @@ impl Workspace {
                             e.path.clone().map(|path| ItemState::File { path, row, col })
                         }
                         TabKind::Terminal(t) => Some(ItemState::Terminal { cwd: t.read(cx).cwd.clone() }),
+                        TabKind::Agent(a) => Some(ItemState::Agent { session: a.read(cx).session() }),
                         _ => None,
                     };
                     if let Some(item) = item {
@@ -1801,6 +1829,10 @@ impl Workspace {
                         }
                         opened.push(self.active.map(|a| self.tabs[a].id));
                     }
+                    ItemState::Agent { session } => {
+                        self.open_agent(true, session.clone(), window, cx);
+                        opened.push(self.active.map(|a| self.tabs[a].id));
+                    }
                     ItemState::Terminal { cwd } => {
                         let cwd = if cwd.is_dir() { cwd.clone() } else { self.root(cx) };
                         self.open_terminal_in(cwd, None, window, cx);
@@ -1855,7 +1887,7 @@ impl Workspace {
         if self.split_pane(vertical).is_none() {
             return self.split_limit_message(cx);
         }
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         // A new pane asks what to show, like a fresh terminal split.
         self.open_cmd(CmdMode::Files, "", window, cx);
         self.flash("New pane — pick a file (Esc for an empty pane, ⌘T for a terminal)".into(), false, cx);
@@ -2224,18 +2256,19 @@ impl Workspace {
     fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active.and_then(|a| self.tabs.get(a)) else {
             // Empty pane: keep keys working (⌘P, ⌘T, : …).
-            return window.focus(&self.focus);
+            return window.focus(&self.focus, cx);
         };
         match &tab.kind {
-            TabKind::Editor(e) => e.read(cx).focus(window),
-            TabKind::Diff(d) => d.read(cx).focus(window),
-            TabKind::DiffEdit(d) => d.read(cx).focus(window, cx),
-            TabKind::Commit(c) => c.read(cx).focus(window),
-            TabKind::Terminal(t) => t.read(cx).focus(window),
-            TabKind::Merge(m) => m.read(cx).focus(window, cx),
-            TabKind::Preview(v) => v.read(cx).focus(window),
-            TabKind::Db(v) => v.read(cx).focus(window, cx),
-            TabKind::Api(v) => v.read(cx).focus(window, cx),
+            TabKind::Editor(e) => window.focus(&e.read(cx).focus_target(cx), cx),
+            TabKind::Diff(d) => window.focus(&d.read(cx).focus_target(cx), cx),
+            TabKind::DiffEdit(d) => window.focus(&d.read(cx).focus_target(cx), cx),
+            TabKind::Commit(c) => window.focus(&c.read(cx).focus_target(cx), cx),
+            TabKind::Terminal(t) => window.focus(&t.read(cx).focus_target(cx), cx),
+            TabKind::Merge(m) => window.focus(&m.read(cx).focus_target(cx), cx),
+            TabKind::Preview(v) => window.focus(&v.read(cx).focus_target(cx), cx),
+            TabKind::Db(v) => window.focus(&v.read(cx).focus_target(cx), cx),
+            TabKind::Api(v) => window.focus(&v.read(cx).focus_target(cx), cx),
+            TabKind::Agent(v) => window.focus(&v.read(cx).focus_target(cx), cx),
         }
     }
 
@@ -2426,6 +2459,35 @@ impl Workspace {
         });
         self.add_tab(TabKind::Api(view), sub, false, window, cx);
         cx.notify();
+    }
+
+    /// ⌘Esc: the Claude chat (the one open, else a new one); `new` always starts another.
+    fn open_agent(&mut self, new: bool, session: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if !new && let Some(ix) = self.tabs.iter().rposition(|t| matches!(t.kind, TabKind::Agent(_))) {
+            return self.activate(ix, window, cx);
+        }
+        let root = self.root(cx);
+        let editor = self.agent_editor.clone();
+        let view = cx.new(|cx| crate::agent_view::AgentView::new(root, session, editor, window, cx));
+        let sub = cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx));
+        self.add_tab(TabKind::Agent(view), sub, false, window, cx);
+        cx.notify();
+    }
+
+    /// ⌘K ⌘A: the editor's file and selected lines as an @-mention in the Claude chat.
+    fn mention_in_claude(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ed) = self.active_editor() else { return };
+        let root = self.root(cx);
+        let ed = ed.read(cx);
+        let Some(path) = ed.path.clone() else { return };
+        let rel = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+        let r = ed.buf.sel.range();
+        let (a, b) = (ed.buf.pos_to_rc(r.start).0 + 1, ed.buf.pos_to_rc(r.end).0 + 1);
+        let mention = if r.is_empty() { format!("@{rel} ") } else if a == b { format!("@{rel}#L{a} ") } else { format!("@{rel}#L{a}-{b} ") };
+        self.open_agent(false, None, window, cx);
+        if let Some(TabKind::Agent(v)) = self.active.map(|a| &self.tabs[a].kind) {
+            v.clone().update(cx, |v, cx| v.insert(&mention, window, cx));
+        }
     }
 
     /// Opens a database tab (or shows the one already showing the same thing).
@@ -2659,7 +2721,7 @@ impl Workspace {
         if self.active.is_some() {
             self.focus_active(window, cx);
         } else {
-            window.focus(&self.focus);
+            window.focus(&self.focus, cx);
         }
         cx.notify();
     }
@@ -2700,6 +2762,7 @@ impl Workspace {
                 let (title, _, dirty) = v.title(cx);
                 (title, format!("api:{}", v.method().unwrap_or_default()), dirty)
             }
+            TabKind::Agent(v) => (v.read(cx).title(), "agent:".into(), false),
         }
     }
 
@@ -2822,20 +2885,21 @@ impl Workspace {
     fn focus_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.side_visible = true;
         match self.side {
-            Side::Files => self.tree.read(cx).focus(window),
-            Side::Git => self.git_panel.read(cx).focus(window),
-            Side::Databases => self.db_panel.read(cx).focus(window),
-            Side::Api => self.api_panel.read(cx).focus(window),
+            Side::Files => window.focus(&self.tree.read(cx).focus_target(cx), cx),
+            Side::Git => window.focus(&self.git_panel.read(cx).focus_target(cx), cx),
+            Side::Databases => window.focus(&self.db_panel.read(cx).focus_target(cx), cx),
+            Side::Api => window.focus(&self.api_panel.read(cx).focus_target(cx), cx),
+            Side::Claude => window.focus(&self.claude_panel.read(cx).focus_target(cx), cx),
             Side::Search => {
                 let query = self.search.read(cx).query.clone();
                 query.update(cx, |q, cx| {
                     q.buf.select_all();
                     cx.notify();
                 });
-                query.read(cx).focus(window);
+                window.focus(&query.read(cx).focus_target(cx), cx);
             }
-            Side::Keys => self.keys.read(cx).focus(window, cx),
-            Side::Settings => window.focus(&self.focus),
+            Side::Keys => window.focus(&self.keys.read(cx).focus_target(cx), cx),
+            Side::Settings => window.focus(&self.focus, cx),
         }
         cx.notify();
     }
@@ -2862,7 +2926,7 @@ impl Workspace {
     fn toggle_output(&mut self, _: &ToggleOutput, window: &mut Window, cx: &mut Context<Self>) {
         self.output_visible = !self.output_visible;
         if self.output_visible {
-            window.focus(&self.output_focus);
+            window.focus(&self.output_focus, cx);
         } else if self.output_focus.is_focused(window) {
             self.focus_active(window, cx);
         }
@@ -2928,7 +2992,7 @@ impl Workspace {
     fn on_focus_commit(&mut self, _: &FocusCommit, window: &mut Window, cx: &mut Context<Self>) {
         self.side = Side::Git;
         self.side_visible = true;
-        self.git_panel.read(cx).focus_commit_input(window, cx);
+        self.git_panel.update(cx, |p, cx| p.focus_commit_input(window, cx));
         cx.notify();
     }
 
@@ -2955,7 +3019,7 @@ impl Workspace {
                 d.update(cx, |d, cx| d.set_blame(on, cx));
                 self.blame_default = on;
             }
-            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Preview(_) | TabKind::Db(_) | TabKind::Api(_) => {}
+            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Preview(_) | TabKind::Db(_) | TabKind::Api(_) | TabKind::Agent(_) => {}
         }
         self.settings.blame_default = self.blame_default;
         self.settings.save();
@@ -3062,6 +3126,12 @@ impl Workspace {
         }
         self.side = side;
         self.focus_sidebar(window, cx);
+        // Claude: its panel read afresh, and the chat (the one open, else a new one) beside it.
+        if side == Side::Claude {
+            let root = self.root(cx);
+            self.claude_panel.update(cx, |p, cx| p.refresh(root, cx));
+            self.open_agent(false, None, window, cx);
+        }
     }
 
     fn search_all(&mut self, _: &SearchAll, window: &mut Window, cx: &mut Context<Self>) {
@@ -3698,12 +3768,12 @@ impl Workspace {
         match on {
             FindOn::Editor(ed) => {
                 if let Some(ed) = ed.upgrade() {
-                    ed.read(cx).focus(window);
+                    window.focus(&ed.read(cx).focus_target(cx), cx);
                 }
             }
             FindOn::Diff(d) => {
                 if let Some(d) = d.upgrade() {
-                    d.read(cx).focus(window);
+                    window.focus(&d.read(cx).focus_target(cx), cx);
                 }
             }
         }
@@ -3760,7 +3830,7 @@ impl Workspace {
                 CmdMode::CompareTo => format!("compare {} to which branch?", self.compare_from.clone().unwrap_or_default()).into(),
             };
             c.set_text(text, cx);
-            c.focus(window);
+            window.focus(&c.focus_target(cx), cx);
         });
         self.update_items(cx);
         cx.notify();
@@ -3770,7 +3840,7 @@ impl Workspace {
         self.cmd_mode = None;
         self.cmd_items.clear();
         if let Some(f) = self.return_focus.take() {
-            window.focus(&f);
+            window.focus(&f, cx);
         } else {
             self.focus_active(window, cx);
         }
@@ -3818,7 +3888,7 @@ impl Workspace {
                     self.cmd.update(cx, |c, cx| c.set_text(&value, cx));
                 }
             }
-            EditorEvent::OpenCommit(_) | EditorEvent::Saved | EditorEvent::CompareConflict | EditorEvent::OpenMergeEditor | EditorEvent::OpenAt(_) | EditorEvent::Notice(_) => {}
+            EditorEvent::OpenCommit(_) | EditorEvent::Saved | EditorEvent::CompareConflict | EditorEvent::OpenMergeEditor | EditorEvent::OpenAt(_) | EditorEvent::Notice(_) | EditorEvent::Image(_) => {}
         }
     }
 
@@ -4077,7 +4147,7 @@ impl Workspace {
         if let Ok(n) = line.parse::<usize>() {
             if let Some(ed) = self.active_editor() {
                 ed.update(cx, |ed, cx| ed.go_to(n.saturating_sub(1), 0, cx));
-                ed.read(cx).focus(window);
+                window.focus(&ed.read(cx).focus_target(cx), cx);
             }
             return;
         }
@@ -4233,6 +4303,19 @@ impl Workspace {
             "term" | "terminal" => {
                 let command = (!rest.is_empty()).then(|| rest.to_string());
                 self.open_terminal_view(command, window, cx);
+            }
+            "claude" => {
+                self.close_cmd(window, cx);
+                self.open_agent(false, None, window, cx);
+                if !rest.is_empty()
+                    && let Some(TabKind::Agent(v)) = self.active.map(|a| &self.tabs[a].kind)
+                {
+                    let rest = rest.to_string();
+                    v.clone().update(cx, |v, cx| {
+                        v.insert(&rest, window, cx);
+                        v.send_now(window, cx);
+                    });
+                }
             }
             "close" => self.close_pane(self.focused_pane, window, cx),
             "only" => {
@@ -4477,7 +4560,7 @@ impl Workspace {
             while let Some(first) = rx.next().await {
                 let mut paths: HashSet<PathBuf> = first.into_iter().collect();
                 cx.background_executor().timer(Duration::from_millis(150)).await;
-                while let Ok(Some(more)) = rx.try_next() {
+                while let Ok(more) = rx.try_recv() {
                     paths.extend(more);
                 }
                 if this.update(cx, |ws, cx| ws.on_fs_change(paths, cx)).is_err() {
@@ -4561,7 +4644,7 @@ impl Workspace {
                         v.update(cx, |v, cx| v.mark_stale(cx));
                     }
                 }
-                TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Db(_) | TabKind::Api(_) => {}
+                TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Db(_) | TabKind::Api(_) | TabKind::Agent(_) => {}
             }
         }
         for r in &meta_repos {
@@ -4641,6 +4724,7 @@ impl Workspace {
             }))
             .child(item("act-databases", "database", Side::Databases, "Databases", self, cx))
             .child(item("act-api", "api", Side::Api, "API: requests, collections, environments", self, cx))
+            .child(item("act-claude", "sparkle", Side::Claude, "Claude: sessions, usage, skills, MCP (⌘Esc chat; ⌘⇧Esc a new one)", self, cx))
             .child(div().flex_1())
             .child(tool("tb-open", "folder", "Open Folder here (⌘O)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))))
             .child(tool("tb-add-folder", "new-folder", "Add Folder to Workspace…", 16.).on_click(cx.listener(|ws, _, w, cx| ws.add_folder_prompt(w, cx))))
@@ -4667,7 +4751,7 @@ impl Workspace {
     fn toggle_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.overview = !self.overview;
         if self.overview {
-            window.focus(&self.overview_focus);
+            window.focus(&self.overview_focus, cx);
         } else {
             self.focus_active(window, cx);
         }
@@ -4772,7 +4856,7 @@ impl Workspace {
                     .rounded(px(8.))
                     .border_1()
                     .cursor_pointer()
-                    .when(on, |d| d.bg(color.opacity(0.14)).border_color(color).shadow(vec![gpui::BoxShadow { color: color.opacity(0.45), offset: gpui::point(px(0.), px(0.)), blur_radius: px(10.), spread_radius: px(0.) }]))
+                    .when(on, |d| d.bg(color.opacity(0.14)).border_color(color).shadow(vec![gpui::BoxShadow { inset: false, color: color.opacity(0.45), offset: gpui::point(px(0.), px(0.)), blur_radius: px(10.), spread_radius: px(0.) }]))
                     .when(!on, |d| d.bg(theme::bg_side()).border_color(theme::border()).hover(|s| s.bg(theme::hover()).border_color(color.opacity(0.6))))
                     .tooltip(ui::tooltip_text(tip))
                     .on_click(cx.listener(move |ws, ev: &gpui::ClickEvent, w, cx| {
@@ -4811,7 +4895,7 @@ impl Workspace {
                             }))
                             .into_any_element()
                     } else {
-                        div().size(px(7.)).rounded_full().bg(color).when(on, |d| d.shadow(vec![gpui::BoxShadow { color: color.opacity(0.7), offset: gpui::point(px(0.), px(0.)), blur_radius: px(6.), spread_radius: px(0.) }])).into_any_element()
+                        div().size(px(7.)).rounded_full().bg(color).when(on, |d| d.shadow(vec![gpui::BoxShadow { inset: false, color: color.opacity(0.7), offset: gpui::point(px(0.), px(0.)), blur_radius: px(6.), spread_radius: px(0.) }])).into_any_element()
                     })
                     .child(svg().path(crate::assets::vtext_path(&name)).w(px(tw)).h(px(th)).flex_none().text_color(if on { theme::fg_bright() } else { theme::fg_dim() }))
                     .when(i < 9, |d| d.child(div().text_size(px(9.)).text_color(if on { color } else { theme::fg_muted() }).child(format!("⌃{}", i + 1))))
@@ -5091,9 +5175,6 @@ impl Workspace {
         let focused = focused_area && id == self.focused_pane;
         let active_ix = pane.active.and_then(|t| self.tab_ix(t));
         let count = pane.items.len();
-        let pos = pane.active.and_then(|a| pane.items.iter().position(|x| *x == a)).map(|p| p + 1).unwrap_or(0);
-        let (title, icon_name, dirty) = active_ix.map(|ix| self.tab_title(&self.tabs[ix], cx)).unwrap_or_else(|| ("empty".into(), String::new(), false));
-        let is_term = active_ix.is_some_and(|ix| matches!(self.tabs[ix].kind, TabKind::Terminal(_)));
         let is_editor = active_ix.is_some_and(|ix| matches!(self.tabs[ix].kind, TabKind::Editor(_) | TabKind::Merge(_)));
         let can_preview = active_ix.is_some_and(|ix| matches!(&self.tabs[ix].kind, TabKind::Editor(e) if e.read(cx).path.as_deref().is_some_and(preview::has_preview)));
         let frame = if focused { theme::frame_focused() } else { theme::frame() };
@@ -5108,6 +5189,7 @@ impl Workspace {
             Some(TabKind::Preview(v)) => v.clone().into_any_element(),
             Some(TabKind::Db(v)) => v.clone().into_any_element(),
             Some(TabKind::Api(v)) => v.clone().into_any_element(),
+            Some(TabKind::Agent(v)) => v.clone().into_any_element(),
             None if self.panes.len() == 1 => self.render_welcome(cx),
             None => self.render_empty_pane(),
         };
@@ -5168,11 +5250,11 @@ impl Workspace {
                         .min_w_0()
                         .overflow_x_scroll()
                         .track_scroll(&handle)
-                        .on_scroll_wheel(move |ev, window, cx| {
+                        .on_scroll(move |ev, window, cx| {
                             // An up/down wheel moves the row sideways (a sideways swipe already does).
                             let d = ev.delta.pixel_delta(window.line_height());
                             if d.y.abs() > d.x.abs() {
-                                let max = wheel.max_offset().width;
+                                let max = wheel.max_offset().x;
                                 let off = wheel.offset();
                                 let x = (off.x + d.y).clamp(-max, gpui::px(0.));
                                 if x != off.x {
@@ -5219,7 +5301,7 @@ impl Workspace {
                                 }
                             }))
                             .child(div().text_color(if active { theme::frame_focused() } else { theme::fg_muted() }).child(if i < 9 { format!("{}", i + 1) } else { "·".into() }))
-                            .child(if term { ui::small_icon("terminal", theme::frame_focused()).size(px(12.)) } else if let Some(m) = icon_name.strip_prefix("api:") {
+                            .child(if term { ui::small_icon("terminal", theme::frame_focused()).size(px(12.)) } else if icon_name == "agent:" { ui::small_icon("sparkle", theme::accent()).size(px(12.)) } else if let Some(m) = icon_name.strip_prefix("api:") {
                                 ui::icon("api", if m.is_empty() { theme::accent() } else { theme::c(crate::api::method_color(m)) }).size(px(13.))
                             } else { match icon_name.strip_prefix("db:") {
                                 Some(kind) => ui::icon(&format!("db-{kind}"), theme::c(crate::db::Kind::ALL.into_iter().find(|k| k.id() == kind).map(|k| k.color()).unwrap_or(0x888888))).size(px(12.)),
@@ -5592,7 +5674,7 @@ impl Workspace {
             .on_action(cx.listener(|ws, _: &OutputBottom, _, cx| ws.output_move(isize::MAX / 2, cx)))
             .on_action(cx.listener(|ws, _: &OutputOpen, w, cx| ws.output_open(w, cx)))
             .on_action(cx.listener(|ws, _: &OutputLeave, w, cx| ws.focus_active(w, cx)))
-            .on_mouse_down(MouseButton::Left, cx.listener(|ws, _, w, _| w.focus(&ws.output_focus)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|ws, _, w, cx| w.focus(&ws.output_focus, cx)))
             .flex()
             .flex_col()
             .flex_none()
@@ -5698,7 +5780,7 @@ impl Workspace {
                             .collect::<Vec<_>>()
                     }),
                 )
-                .track_scroll(self.output_scroll.clone())
+                .track_scroll(&self.output_scroll)
                 .flex_1(),
             )
     }
@@ -6125,6 +6207,9 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(ed) = self.active_editor() {
+            *self.agent_editor.borrow_mut() = Some(ed.downgrade());
+        }
         let bounds_cell = self.window_bounds.clone();
         let sidebar: AnyElement = match self.side {
             Side::Files => self.tree.clone().into_any_element(),
@@ -6140,6 +6225,14 @@ impl Render for Workspace {
                 self.api_panel.clone().into_any_element()
             }
             Side::Search => self.search.clone().into_any_element(),
+            Side::Claude => {
+                // Shown without a click (a restored window or space): read it the first time.
+                if !self.claude_panel.read(cx).loaded() {
+                    let root = self.root(cx);
+                    self.claude_panel.update(cx, |p, cx| p.refresh(root, cx));
+                }
+                self.claude_panel.clone().into_any_element()
+            }
             Side::Keys => div().flex().flex_col().size_full().child(self.render_settings_tabs(cx)).child(div().flex_1().min_h_0().child(self.keys.clone())).into_any_element(),
             Side::Settings => self.render_settings(cx).into_any_element(),
         };
@@ -6224,7 +6317,7 @@ impl Render for Workspace {
                     return;
                 }
                 if std::env::var_os("KITE_DEBUG").is_some() {
-                    eprintln!("[kite] key {}", ev.keystroke.unparse());
+                    eprintln!("[kite] key {}", ev.keystroke.unparse(gpui::OperatingSystem::Mac));
                 }
                 // Direction letters with ⌃⌥ / ⌥ / ⌃⌥⌘ act as real arrow keys everywhere
                 // (editor, inputs, popups, terminal, lists). Not while recording a shortcut.
@@ -6284,6 +6377,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &FocusUp, w, cx| ws.focus_dir(0, -1, w, cx)))
             .on_action(cx.listener(|ws, _: &FocusDown, w, cx| ws.focus_dir(0, 1, w, cx)))
             .on_action(cx.listener(|ws, _: &NewTerminal, w, cx| ws.new_terminal(w, cx)))
+            .on_action(cx.listener(|ws, _: &OpenClaude, w, cx| ws.open_agent(false, None, w, cx)))
+            .on_action(cx.listener(|ws, _: &NewClaude, w, cx| ws.open_agent(true, None, w, cx)))
+            .on_action(cx.listener(|ws, _: &MentionInClaude, w, cx| ws.mention_in_claude(w, cx)))
             .on_action(cx.listener(|ws, _: &ToggleTerminal, w, cx| ws.toggle_terminal(w, cx)))
             .on_action(cx.listener(|ws, _: &PaneBuffers, w, cx| ws.open_cmd(CmdMode::Buffers, "", w, cx)))
             .on_action(cx.listener(|ws, _: &Buffer1, w, cx| ws.show_buffer(0, w, cx)))
@@ -6487,6 +6583,8 @@ mod ui_tests {
         std::fs::create_dir_all(&project).unwrap();
         // Keep the test away from the real settings and shortcuts.
         unsafe { std::env::set_var("HOME", &home) };
+        // Real folders: the file watcher and git wake tasks from their own threads.
+        cx.executor().allow_parking();
         cx.update(|cx| {
             crate::editor::bind_keys();
             crate::workspace::bind_keys();
@@ -7030,7 +7128,7 @@ mod ui_tests {
         cx.simulate_click(at, gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(!d.read_with(cx, |d, _| d.show_blame), "the status bar switched it off");
-        d.update_in(cx, |d, window, _| d.focus(window));
+        d.update_in(cx, |d, window, cx| window.focus(&d.focus_target(cx), cx));
         cx.simulate_keystrokes("down down");
         cx.run_until_parked();
         assert!(cx.debug_bounds("blame-note-new").is_some() && cx.debug_bounds("blame-note-old").is_some(), "the selected line shows its author on both sides");
@@ -7419,7 +7517,7 @@ mod ui_tests {
             cx.run_until_parked();
         };
         click(cx, "change-row-a.txt");
-        ws.update_in(cx, |ws, window, cx| ws.git_panel.read(cx).focus_commit_input(window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.git_panel.update(cx, |p, cx| p.focus_commit_input(window, cx)));
         cx.run_until_parked();
         let letters = "abcdefghijklmnopqrstuvwxyz";
         for k in letters.chars() {
@@ -7455,7 +7553,7 @@ mod ui_tests {
                 t.select(root.clone())
             })
         });
-        ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
+        ws.update_in(cx, |ws, window, cx| window.focus(&ws.tree.read(cx).focus_target(cx), cx));
         cx.run_until_parked();
         cx.simulate_keystrokes("a");
         cx.simulate_input("home");
@@ -7914,7 +8012,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!((rel_before - rel_now).abs() < 0.05, "{rel_before:.2} → {rel_now:.2}");
         // Scrolls both ways, as far as the zoomed page goes.
         let (_, max) = preview.read_with(cx, |v, _| v.page_scroll());
-        assert!(max.width > gpui::px(100.) && max.height > gpui::px(100.), "{max:?}");
+        assert!(max.x > gpui::px(100.) && max.y > gpui::px(100.), "{max:?}");
 
         // Pinching back stops at 100%, the page exactly as it was.
         for _ in 0..40 {
@@ -8035,7 +8133,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         settle(cx);
         assert_eq!(decoded(cx), down, "back at the top: the same pictures, none freed or redrawn");
         // Scrolled to the end: those are drawn, the top ones freed.
-        let max = preview.read_with(cx, |v, _| v.page_scroll().1.height / gpui::px(1.));
+        let max = preview.read_with(cx, |v, _| v.page_scroll().1.y / gpui::px(1.));
         preview.update(cx, |v, cx| v.scroll_page_to(max, cx));
         settle(cx);
         let end = decoded(cx);
@@ -8200,7 +8298,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         let project = root.file_name().unwrap().to_string_lossy().to_string();
         assert_eq!(rows.first(), Some(&(0, project)), "the project folder is its own row");
         assert!(rows.contains(&(1, "src".to_string())), "files sit under it");
-        ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
+        ws.update_in(cx, |ws, window, cx| window.focus(&ws.tree.read(cx).focus_target(cx), cx));
         let select = |cx: &mut gpui::VisualTestContext, p: std::path::PathBuf| tree.update(cx, |t, _| t.select(p));
 
         // New file at the root (root row selected), typed into the name box.
@@ -8213,7 +8311,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert_eq!(ws.read_with(cx, |ws, cx| ws.active_editor().and_then(|e| e.read(cx).path.clone())), Some(root.join("new.ts")), "and opened");
 
         // Rename: the name box selects the name without the extension.
-        ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
+        ws.update_in(cx, |ws, window, cx| window.focus(&ws.tree.read(cx).focus_target(cx), cx));
         select(cx, root.join("new.ts"));
         cx.simulate_keystrokes("f2");
         cx.simulate_input("renamed");
@@ -8242,7 +8340,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert_eq!(ws.read_with(cx, |ws, cx| ws.active_editor().and_then(|e| e.read(cx).path.clone())), Some(root.join("src/renamed.ts")));
 
         // Delete asks first; Cancel leaves the file alone.
-        ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
+        ws.update_in(cx, |ws, window, cx| window.focus(&ws.tree.read(cx).focus_target(cx), cx));
         select(cx, root.join("b.ts"));
         cx.simulate_keystrokes("cmd-backspace");
         assert!(ws.read_with(cx, |ws, _| ws.ask.is_some()), "asks before moving to the Trash");
@@ -8639,7 +8737,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(chip.left() >= row.left() - gpui::px(1.) && chip.right() <= row.right() + gpui::px(1.), "the first is in view: {chip:?} in {row:?}");
         // The wheel moves the row sideways.
         let before = chip.left();
-        cx.simulate_event(gpui::ScrollWheelEvent { position: row.center(), delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-200.))), ..Default::default() });
+        cx.simulate_event(gpui::ScrollEvent { position: row.center(), delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-200.))), ..Default::default() });
         let (_, chip) = inside(cx);
         assert!(chip.left() < before, "scrolled: {before:?} → {:?}", chip.left());
     }

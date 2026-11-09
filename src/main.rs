@@ -1,6 +1,10 @@
 mod api;
 mod api_panel;
 mod api_view;
+mod agent;
+mod agent_view;
+mod claude_panel;
+
 mod assets;
 mod buffer;
 mod colors;
@@ -143,7 +147,7 @@ fn main() {
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
     let opened_from_os = std::rc::Rc::new(std::cell::Cell::new(false));
 
-    let app = Application::new().with_assets(assets::Assets);
+    let app = gpui_kit::application().with_assets(assets::Assets);
     app.on_open_urls(move |urls| {
         let _ = url_tx.unbounded_send(urls);
     });
@@ -155,7 +159,9 @@ fn main() {
     });
     let opened = opened_from_os.clone();
     app.run(move |cx: &mut App| {
+        keybindings::init_kit(cx);
         editor::bind_keys();
+        agent_view::bind_keys();
         workspace::bind_keys();
         file_tree::bind_keys();
         git_panel::bind_keys();
@@ -179,12 +185,11 @@ fn main() {
                             open_window(p.canonicalize().unwrap_or(p), cx);
                         }
                     })
-                    .ok();
                 }
             })
             .detach();
         });
-        cx.set_menus(vec![Menu { name: "OSKL Code".into(), items: vec![MenuItem::action("New Window", NewWindow), MenuItem::action("Open Folder…", OpenFolderApp), MenuItem::separator(), MenuItem::action("Quit OSKL Code", QuitApp)] }]);
+        cx.set_menus(vec![Menu { name: "OSKL Code".into(), items: vec![MenuItem::action("New Window", NewWindow), MenuItem::action("Open Folder…", OpenFolderApp), MenuItem::separator(), MenuItem::action("Quit OSKL Code", QuitApp)], disabled: false }]);
         cx.set_dock_menu(vec![MenuItem::action("New Window", NewWindow), MenuItem::action("Open Folder…", OpenFolderApp)]);
         // Remember which project windows were open, to reopen them next launch.
         cx.on_app_quit(|cx| {
@@ -202,8 +207,7 @@ fn main() {
                     if let Some(ws) = cx.active_window().and_then(|w| w.downcast::<Workspace>()) {
                         ws.update(cx, |ws, window, cx| ws.pinch(p, window, cx)).ok();
                     }
-                })
-                .ok();
+                });
             }
         })
         .detach();
@@ -225,8 +229,7 @@ fn main() {
                         }
                     }
                     cx.activate(true);
-                })
-                .ok();
+                });
             }
         })
         .detach();
@@ -239,7 +242,7 @@ fn main() {
                 cx.spawn(async move |cx| {
                     cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
                     if !opened.get() {
-                        cx.update(reopen_last_windows).ok();
+                        cx.update(reopen_last_windows);
                     }
                 })
                 .detach();

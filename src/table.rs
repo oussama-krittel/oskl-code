@@ -299,6 +299,7 @@ impl TableView {
     }
 
     /// The text of a cell, as shown (whole).
+    #[cfg(test)]
     pub fn cell_text(&self, r: usize, c: usize) -> String {
         let Some(s) = self.sheets.get(self.current) else { return String::new() };
         s.row(r).get(c).map(|t| t.trim_start_matches(crate::office::NUMBER).to_string()).unwrap_or_default()
@@ -308,7 +309,7 @@ impl TableView {
         // A merged range selects as its first cell.
         let (r, c) = self.sheets.get(self.current).and_then(|s| s.paper.as_ref()).and_then(|p| p.covered.get(&(r, c)).copied()).unwrap_or((r, c));
         self.sel = Some((r, c));
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -454,7 +455,7 @@ impl TableView {
 
     /// Scrolling: each gesture goes one way, the way it mostly goes when it starts, so
     /// scrolling down never drifts sideways (Shift + wheel scrolls sideways).
-    fn scroll(&mut self, ev: &gpui::ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn scroll(&mut self, ev: &gpui::ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         let d = ev.delta.pixel_delta(window.line_height());
         let (mut dx, dy) = (d.x / gpui::px(1.), d.y / gpui::px(1.));
         if ev.modifiers.shift && dx == 0. {
@@ -678,7 +679,7 @@ impl Render for TableView {
         let rows = s.rows().saturating_sub(s.header as usize);
         // A spreadsheet goes on past its last row, empty, like Excel's does.
         let shown_rows = if paper { (rows + 30).max(100) } else { rows };
-        let body = uniform_list("tbl-rows", shown_rows, cx.processor(|t: &mut TableView, range: Range<usize>, _, cx| range.map(|ix| t.render_row(ix, cx)).collect::<Vec<_>>())).track_scroll(self.list.clone()).flex_1();
+        let body = uniform_list("tbl-rows", shown_rows, cx.processor(|t: &mut TableView, range: Range<usize>, _, cx| range.map(|ix| t.render_row(ix, cx)).collect::<Vec<_>>())).track_scroll(&self.list).flex_1();
         let _ = &mut *cx;
         let tabs = (self.sheets.len() > 1).then(|| {
             div().flex().flex_none().gap(px(2.)).px(px(6.)).h(px(28.)).items_center().border_t_1().border_color(theme::border()).bg(theme::bg_side()).children(self.sheets.iter().enumerate().map(|(i, sh)| {
@@ -749,7 +750,7 @@ impl Render for TableView {
                             // goes only the way it's going: up and down, or sideways.
                             move |_, b, window, _| {
                                 let me = me.clone();
-                                window.on_mouse_event(move |ev: &gpui::ScrollWheelEvent, phase, window, cx| {
+                                window.on_mouse_event(move |ev: &gpui::ScrollEvent, phase, window, cx| {
                                     if phase == gpui::DispatchPhase::Capture && b.contains(&ev.position) {
                                         me.update(cx, |t, cx| t.scroll(ev, window, cx)).ok();
                                     }

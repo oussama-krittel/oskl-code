@@ -176,6 +176,8 @@ pub enum EditorEvent {
     OpenAt(crate::definition::Target),
     /// A short message for the status bar.
     Notice(String),
+    /// A picture pasted into a chat box.
+    Image(Image),
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -349,6 +351,12 @@ pub struct Editor {
     pub read_only: bool,
     /// A password box: every character drawn as a dot, and nothing copied out.
     pub secret: bool,
+    /// A chat box: Enter sends (⇧Enter for a new line), long lines wrap, pasted pictures are
+    /// handed out (`EditorEvent::Image`).
+    pub chat: bool,
+    /// Suggestions from outside (the chat's @files and /commands): given the line up to the
+    /// cursor, the text the choice replaces and the choices.
+    pub suggest: Option<Rc<dyn Fn(&str) -> Option<(String, Vec<complete::Item>)>>>,
     scroll_x: f32,
     scroll_y: f32,
     autoscroll: Option<bool>,
@@ -436,6 +444,8 @@ impl Editor {
             root: None,
             placeholder: SharedString::default(),
             secret: false,
+            chat: false,
+            suggest: None,
             read_only: false,
             scroll_x: 0.,
             scroll_y: 0.,
@@ -566,6 +576,7 @@ impl Editor {
     }
 
     /// How far the view is scrolled down, in pixels.
+    #[cfg(test)]
     pub fn scroll_top(&self) -> f32 {
         self.scroll_y
     }
@@ -574,8 +585,8 @@ impl Editor {
         self.focus.is_focused(window)
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus_target(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 
     pub fn text(&self) -> String {
@@ -938,7 +949,7 @@ impl Editor {
     }
 
     fn wrap_active(&self) -> bool {
-        word_wrap() && self.mode == EditorMode::Full && self.decor.is_none()
+        (word_wrap() && self.mode == EditorMode::Full && self.decor.is_none()) || self.chat
     }
 
     /// Recomputes wrap points when the text, the width (in columns) or the folds changed.
@@ -1039,11 +1050,6 @@ impl Editor {
         };
         let found = d.rows[disp..].iter().find_map(line).or_else(|| d.rows[..disp].iter().rev().find_map(line));
         found.unwrap_or(0).min(last)
-    }
-
-    pub fn blame_at_cursor(&self) -> Option<Arc<BlameCommit>> {
-        let (row, _) = self.cursor_rc();
-        self.blame.as_ref()?.get(row)?.clone()
     }
 
     /// Keeps highlight spans and diagnostics lined up with rows until they're recomputed.
@@ -1245,6 +1251,9 @@ impl Editor {
 
     /// After a character typed at a single cursor: close tags, then update the suggestions.
     fn after_type(&mut self, text: &str) {
+        if self.suggest.is_some() {
+            return self.refresh_completion(true);
+        }
         let Some(fl) = self.flavor() else { return };
         if !self.buf.extra.is_empty() || !self.buf.sel.is_empty() {
             return;
@@ -1279,6 +1288,15 @@ impl Editor {
     /// otherwise (backspace) the open one is refiltered or closed.
     fn refresh_completion(&mut self, typed: bool) {
         let old = self.completion.take();
+        if let Some(suggest) = self.suggest.clone() {
+            let (row, col) = self.cursor_rc();
+            let before: String = self.buf.line(row).chars().take(col).collect();
+            if let Some((prefix, items)) = suggest(&before).filter(|(_, items)| !items.is_empty()) {
+                let shown = (0..items.len()).collect();
+                self.completion = Some(Completion { ctx: complete::Ctx::Custom { prefix }, items, shown, sel: 0 });
+            }
+            return;
+        }
         let Some(fl) = self.flavor() else { return };
         if !self.buf.extra.is_empty() || !self.buf.sel.is_empty() {
             return;
@@ -1605,12 +1623,13 @@ impl Editor {
         self.edit(cx, |b| b.kill_line())
     }
 
-    fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
+    fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
         if self.completion.is_some() {
             return self.accept_completion(cx);
         }
         match self.mode {
             EditorMode::SingleLine => cx.emit(EditorEvent::Submit),
+            EditorMode::MultiLine if self.chat && !window.modifiers().shift => cx.emit(EditorEvent::Submit),
             _ => self.edit(cx, |b| b.newline()),
         }
     }
@@ -1693,7 +1712,14 @@ impl Editor {
         }
     }
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(mut text) = cx.read_from_clipboard().and_then(|c| c.text()) else { return };
+        let clip = cx.read_from_clipboard();
+        let image = clip.as_ref().and_then(|c| c.entries().iter().find_map(|e| if let ClipboardEntry::Image(i) = e { Some(i.clone()) } else { None }));
+        if self.chat
+            && let Some(image) = image
+        {
+            return cx.emit(EditorEvent::Image(image));
+        }
+        let Some(mut text) = clip.and_then(|c| c.text()) else { return };
         if self.mode == EditorMode::SingleLine {
             text = text.replace(['\n', '\r'], " ");
         }
@@ -1796,7 +1822,7 @@ impl Editor {
     }
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         self.completion = None;
         self.hover_info = None;
         self.hover_wait = None;
@@ -2013,7 +2039,7 @@ impl Editor {
         }
     }
 
-    fn scroll_wheel(&mut self, ev: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn scroll_wheel(&mut self, ev: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         let lh = self.line_height();
         let d = ev.delta.pixel_delta(px(lh));
         if self.mode != EditorMode::Full && self.buf.line_count() as f32 * lh <= self.layout.as_ref().map(|l| l.bounds.size.height / px(1.)).unwrap_or(0.) {
@@ -2121,7 +2147,11 @@ impl Editor {
 
         // Scrolling.
         let disp_count = self.disp_count();
-        let content_h = if full { (disp_count.saturating_sub(1)) as f32 * line_h + height } else { line_count as f32 * line_h };
+        let content_h = if full { (disp_count.saturating_sub(1)) as f32 * line_h + height } else { disp_count as f32 * line_h };
+        // The box was sized by the wrap of the last frame: drawn again when it wraps to another row count.
+        if self.chat && (disp_count.clamp(1, 10) as f32 * line_h - height).abs() > 0.5 {
+            window.refresh();
+        }
         let max_scroll = (content_h - height).max(0.);
         let (row, col) = self.buf.pos_to_rc(self.buf.sel.head);
         let cursor_disp = self.disp_of(row) + seg_index(self.seg_starts(row), col);
@@ -2714,7 +2744,7 @@ impl Editor {
                     };
                     let mut col = 0usize;
                     let mut run: Option<(usize, Hsla)> = None;
-                    let mut flush = |start: usize, end: usize, color: Hsla, p: &mut EditorPaint| {
+                    let flush = |start: usize, end: usize, color: Hsla, p: &mut EditorPaint| {
                         let x = mini_left + 4. + start as f32 * MINI_CHAR_W;
                         p.quads_over.push(fill(Bounds::new(point(px(x), px(y)), size(px((end - start) as f32 * MINI_CHAR_W), px(MINI_LINE_H - 0.5))), color.opacity(0.75)));
                     };
@@ -3669,7 +3699,8 @@ impl Element for EditorElement {
             EditorMode::Full => style.size.height = relative(1.).into(),
             EditorMode::SingleLine => style.size.height = px(lh + 6.).into(),
             EditorMode::MultiLine => {
-                let rows = ed.buf.line_count().clamp(1, 10) as f32;
+                // Wrapped rows count (the chat box): a long line grows the box instead of hiding.
+                let rows = ed.disp_count().clamp(1, 10) as f32;
                 style.size.height = px(rows * lh).into();
             }
         }
@@ -3692,11 +3723,11 @@ impl Element for EditorElement {
             }
             window.with_content_mask(Some(ContentMask { bounds: p.text_clip }), |window| {
                 for (origin, line) in &p.text {
-                    line.paint(*origin, p.line_h, window, cx).ok();
+                    line.paint(*origin, p.line_h, gpui::TextAlign::Left, None, window, cx).ok();
                 }
                 for (origin, line, clip) in &p.text_clipped {
                     window.with_content_mask(Some(ContentMask { bounds: *clip }), |window| {
-                        line.paint(*origin, p.line_h, window, cx).ok();
+                        line.paint(*origin, p.line_h, gpui::TextAlign::Left, None, window, cx).ok();
                     });
                 }
                 for (path, color) in p.paths.drain(..) {
@@ -3713,7 +3744,7 @@ impl Element for EditorElement {
                 window.paint_quad(q);
             }
             for (origin, line) in &p.overlay_text {
-                line.paint(*origin, p.line_h, window, cx).ok();
+                line.paint(*origin, p.line_h, gpui::TextAlign::Left, None, window, cx).ok();
             }
         });
     }
@@ -3799,7 +3830,7 @@ impl Render for Editor {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_move(cx.listener(Self::mouse_move))
-            .on_scroll_wheel(cx.listener(Self::scroll_wheel))
+            .on_scroll(cx.listener(Self::scroll_wheel))
             .child(EditorElement { editor: cx.entity() })
             .children(self.completion_popup(cx))
             .children(self.hover_popup(cx))
