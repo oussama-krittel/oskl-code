@@ -2127,10 +2127,12 @@ mod tests {
         assert_eq!(super::split_file_ref("src/a.rs:12:3"), ("src/a.rs", Some(12)));
         assert_eq!(super::split_file_ref("src/a.rs#L4-9"), ("src/a.rs", Some(4)));
         assert_eq!(super::split_file_ref("a.md#part"), ("a.md", None));
-        let blocks = super::parse_with("See `src/main.rs:3` and `not/here.rs` and `x` and `/etc/hosts` and `../oskl-code/Cargo.toml`.", Some(root));
+        // `../<this folder>/Cargo.toml` goes out and back in: inside the project, whatever the checkout is called.
+        let back_in = format!("../{}/Cargo.toml", root.file_name().unwrap().to_string_lossy());
+        let blocks = super::parse_with(&format!("See `src/main.rs:3` and `not/here.rs` and `x` and `/etc/hosts` and `{back_in}`."), Some(root));
         let Block::Para(inl) = &blocks[0] else { panic!("{blocks:?}") };
-        // `/etc/hosts` is outside the project; `../oskl-code/Cargo.toml` is inside it.
-        assert_eq!(inl.links.iter().map(|(_, u)| u.as_str()).collect::<Vec<_>>(), ["src/main.rs:3", "../oskl-code/Cargo.toml"]);
+        // `/etc/hosts` is outside the project.
+        assert_eq!(inl.links.iter().map(|(_, u)| u.as_str()).collect::<Vec<_>>(), ["src/main.rs:3", back_in.as_str()]);
     }
 
     #[test]
