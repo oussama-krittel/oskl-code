@@ -98,7 +98,7 @@ pub fn badge(text: impl Into<SharedString>, bg: Hsla) -> Div {
 /// the buttons or counts beside them doesn't); folded, clicking anywhere on it opens it.
 pub fn section_header(id: impl Into<ElementId>, title: &str, open: bool, toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Stateful<Div> {
     let id: ElementId = id.into();
-    let title_id = ElementId::NamedChild(Box::new(id.clone()), "title".into());
+    let title_id = ElementId::NamedChild(std::sync::Arc::new(id.clone()), "title".into());
     let (sel, title_sel) = (format!("section-{}", title.to_lowercase()), format!("section-{}-title", title.to_lowercase()));
     let label = div()
         .id(title_id)

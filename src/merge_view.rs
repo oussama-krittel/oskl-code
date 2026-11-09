@@ -83,8 +83,8 @@ impl MergeView {
         format!("Merging {}", ui::file_name(&self.rel))
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &App) {
-        self.result.read(cx).focus(window);
+    pub fn focus_target(&self, cx: &App) -> FocusHandle {
+        self.result.read(cx).focus_target(cx)
     }
 
     /// The snapshot with every ticked conflict replaced by its chosen side(s).

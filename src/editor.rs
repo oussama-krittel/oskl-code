@@ -585,8 +585,8 @@ impl Editor {
         self.focus.is_focused(window)
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus_target(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 
     pub fn text(&self) -> String {
@@ -1822,7 +1822,7 @@ impl Editor {
     }
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         self.completion = None;
         self.hover_info = None;
         self.hover_wait = None;
@@ -2039,7 +2039,7 @@ impl Editor {
         }
     }
 
-    fn scroll_wheel(&mut self, ev: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn scroll_wheel(&mut self, ev: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         let lh = self.line_height();
         let d = ev.delta.pixel_delta(px(lh));
         if self.mode != EditorMode::Full && self.buf.line_count() as f32 * lh <= self.layout.as_ref().map(|l| l.bounds.size.height / px(1.)).unwrap_or(0.) {
@@ -3718,11 +3718,11 @@ impl Element for EditorElement {
             }
             window.with_content_mask(Some(ContentMask { bounds: p.text_clip }), |window| {
                 for (origin, line) in &p.text {
-                    line.paint(*origin, p.line_h, window, cx).ok();
+                    line.paint(*origin, p.line_h, gpui::TextAlign::Left, None, window, cx).ok();
                 }
                 for (origin, line, clip) in &p.text_clipped {
                     window.with_content_mask(Some(ContentMask { bounds: *clip }), |window| {
-                        line.paint(*origin, p.line_h, window, cx).ok();
+                        line.paint(*origin, p.line_h, gpui::TextAlign::Left, None, window, cx).ok();
                     });
                 }
                 for (path, color) in p.paths.drain(..) {
@@ -3739,7 +3739,7 @@ impl Element for EditorElement {
                 window.paint_quad(q);
             }
             for (origin, line) in &p.overlay_text {
-                line.paint(*origin, p.line_h, window, cx).ok();
+                line.paint(*origin, p.line_h, gpui::TextAlign::Left, None, window, cx).ok();
             }
         });
     }
@@ -3825,7 +3825,7 @@ impl Render for Editor {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_move(cx.listener(Self::mouse_move))
-            .on_scroll_wheel(cx.listener(Self::scroll_wheel))
+            .on_scroll(cx.listener(Self::scroll_wheel))
             .child(EditorElement { editor: cx.entity() })
             .children(self.completion_popup(cx))
             .children(self.hover_popup(cx))

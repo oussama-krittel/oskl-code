@@ -1,0 +1,4 @@
+# packaging/build-app.sh builds with rustup, whose "stable" only moves when updated by hand; this pins
+# the version the app is developed and tested with (Homebrew's rustc). gpui-pre's dependencies need ≥ 1.92.
+[toolchain]
+channel = "1.99.1"

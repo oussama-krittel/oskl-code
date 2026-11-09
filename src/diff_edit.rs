@@ -93,8 +93,8 @@ impl DiffEditView {
         format!("{} (Index ↔ Working Tree)", ui::file_name(&self.spec.path))
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &App) {
-        self.right.read(cx).focus(window);
+    pub fn focus_target(&self, cx: &App) -> FocusHandle {
+        self.right.read(cx).focus_target(cx)
     }
 
     fn load_left_blame(&mut self, cx: &mut Context<Self>) {
@@ -106,7 +106,7 @@ impl DiffEditView {
         let left = self.left.clone();
         self._blame_task = Some(cx.spawn(async move |_, cx| {
             let lines = task.await;
-            left.update(cx, |l, cx| l.set_blame_lines(lines, cx)).ok();
+            left.update(cx, |l, cx| l.set_blame_lines(lines, cx));
         }));
     }
 
@@ -146,7 +146,7 @@ impl DiffEditView {
         };
         if let Some(&t) = target {
             self.right.update(cx, |r, cx| r.go_to(t, 0, cx));
-            self.right.read(cx).focus(window);
+            window.focus(&self.right.read(cx).focus_target(cx), cx);
         }
     }
 }

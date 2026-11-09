@@ -821,7 +821,7 @@ impl Workspace {
         // (or takes it back) at once, not on the next click.
         ws.extra_subs.push(cx.observe_window_bounds(window, |_, _, cx| cx.notify()));
         register_workspace(cx.entity().downgrade());
-        ws.tree.read(cx).focus(window);
+        window.focus(&ws.tree.read(cx).focus_target(cx), cx);
         ws
     }
 
@@ -1155,7 +1155,7 @@ impl Workspace {
     fn open_ask(&mut self, ask: crate::dialog::Ask, window: &mut Window, cx: &mut Context<Self>) {
         let focus = cx.focus_handle();
         let restore = window.focused(cx);
-        window.focus(&focus);
+        window.focus(&focus, cx);
         let sel = if ask.cancel_default { ask.buttons.len() } else { 0 };
         self.ask = Some(AskState { ask, sel, focus, restore });
         cx.notify();
@@ -1166,7 +1166,7 @@ impl Workspace {
     pub(crate) fn answer_ask(&mut self, choice: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(st) = self.ask.take() else { return };
         match &st.restore {
-            Some(f) => window.focus(f),
+            Some(f) => window.focus(f, cx),
             None => self.focus_active(window, cx),
         }
         cx.notify();
@@ -1473,7 +1473,7 @@ impl Workspace {
         self.sync_active();
         self.focus_active(window, cx);
         if self.active.is_none() {
-            window.focus(&self.focus);
+            window.focus(&self.focus, cx);
         }
         cx.notify();
     }
@@ -1875,7 +1875,7 @@ impl Workspace {
         if self.split_pane(vertical).is_none() {
             return self.split_limit_message(cx);
         }
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         // A new pane asks what to show, like a fresh terminal split.
         self.open_cmd(CmdMode::Files, "", window, cx);
         self.flash("New pane — pick a file (Esc for an empty pane, ⌘T for a terminal)".into(), false, cx);
@@ -2244,19 +2244,19 @@ impl Workspace {
     fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active.and_then(|a| self.tabs.get(a)) else {
             // Empty pane: keep keys working (⌘P, ⌘T, : …).
-            return window.focus(&self.focus);
+            return window.focus(&self.focus, cx);
         };
         match &tab.kind {
-            TabKind::Editor(e) => e.read(cx).focus(window),
-            TabKind::Diff(d) => d.read(cx).focus(window),
-            TabKind::DiffEdit(d) => d.read(cx).focus(window, cx),
-            TabKind::Commit(c) => c.read(cx).focus(window),
-            TabKind::Terminal(t) => t.read(cx).focus(window),
-            TabKind::Merge(m) => m.read(cx).focus(window, cx),
-            TabKind::Preview(v) => v.read(cx).focus(window),
-            TabKind::Db(v) => v.read(cx).focus(window, cx),
-            TabKind::Api(v) => v.read(cx).focus(window, cx),
-            TabKind::Agent(v) => v.read(cx).focus(window, cx),
+            TabKind::Editor(e) => window.focus(&e.read(cx).focus_target(cx), cx),
+            TabKind::Diff(d) => window.focus(&d.read(cx).focus_target(cx), cx),
+            TabKind::DiffEdit(d) => window.focus(&d.read(cx).focus_target(cx), cx),
+            TabKind::Commit(c) => window.focus(&c.read(cx).focus_target(cx), cx),
+            TabKind::Terminal(t) => window.focus(&t.read(cx).focus_target(cx), cx),
+            TabKind::Merge(m) => window.focus(&m.read(cx).focus_target(cx), cx),
+            TabKind::Preview(v) => window.focus(&v.read(cx).focus_target(cx), cx),
+            TabKind::Db(v) => window.focus(&v.read(cx).focus_target(cx), cx),
+            TabKind::Api(v) => window.focus(&v.read(cx).focus_target(cx), cx),
+            TabKind::Agent(v) => window.focus(&v.read(cx).focus_target(cx), cx),
         }
     }
 
@@ -2709,7 +2709,7 @@ impl Workspace {
         if self.active.is_some() {
             self.focus_active(window, cx);
         } else {
-            window.focus(&self.focus);
+            window.focus(&self.focus, cx);
         }
         cx.notify();
     }
@@ -2873,20 +2873,20 @@ impl Workspace {
     fn focus_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.side_visible = true;
         match self.side {
-            Side::Files => self.tree.read(cx).focus(window),
-            Side::Git => self.git_panel.read(cx).focus(window),
-            Side::Databases => self.db_panel.read(cx).focus(window),
-            Side::Api => self.api_panel.read(cx).focus(window),
+            Side::Files => window.focus(&self.tree.read(cx).focus_target(cx), cx),
+            Side::Git => window.focus(&self.git_panel.read(cx).focus_target(cx), cx),
+            Side::Databases => window.focus(&self.db_panel.read(cx).focus_target(cx), cx),
+            Side::Api => window.focus(&self.api_panel.read(cx).focus_target(cx), cx),
             Side::Search => {
                 let query = self.search.read(cx).query.clone();
                 query.update(cx, |q, cx| {
                     q.buf.select_all();
                     cx.notify();
                 });
-                query.read(cx).focus(window);
+                window.focus(&query.read(cx).focus_target(cx), cx);
             }
-            Side::Keys => self.keys.read(cx).focus(window, cx),
-            Side::Settings => window.focus(&self.focus),
+            Side::Keys => window.focus(&self.keys.read(cx).focus_target(cx), cx),
+            Side::Settings => window.focus(&self.focus, cx),
         }
         cx.notify();
     }
@@ -2913,7 +2913,7 @@ impl Workspace {
     fn toggle_output(&mut self, _: &ToggleOutput, window: &mut Window, cx: &mut Context<Self>) {
         self.output_visible = !self.output_visible;
         if self.output_visible {
-            window.focus(&self.output_focus);
+            window.focus(&self.output_focus, cx);
         } else if self.output_focus.is_focused(window) {
             self.focus_active(window, cx);
         }
@@ -2979,7 +2979,7 @@ impl Workspace {
     fn on_focus_commit(&mut self, _: &FocusCommit, window: &mut Window, cx: &mut Context<Self>) {
         self.side = Side::Git;
         self.side_visible = true;
-        self.git_panel.read(cx).focus_commit_input(window, cx);
+        self.git_panel.update(cx, |p, cx| p.focus_commit_input(window, cx));
         cx.notify();
     }
 
@@ -3749,12 +3749,12 @@ impl Workspace {
         match on {
             FindOn::Editor(ed) => {
                 if let Some(ed) = ed.upgrade() {
-                    ed.read(cx).focus(window);
+                    window.focus(&ed.read(cx).focus_target(cx), cx);
                 }
             }
             FindOn::Diff(d) => {
                 if let Some(d) = d.upgrade() {
-                    d.read(cx).focus(window);
+                    window.focus(&d.read(cx).focus_target(cx), cx);
                 }
             }
         }
@@ -3811,7 +3811,7 @@ impl Workspace {
                 CmdMode::CompareTo => format!("compare {} to which branch?", self.compare_from.clone().unwrap_or_default()).into(),
             };
             c.set_text(text, cx);
-            c.focus(window);
+            window.focus(&c.focus_target(cx), cx);
         });
         self.update_items(cx);
         cx.notify();
@@ -3821,7 +3821,7 @@ impl Workspace {
         self.cmd_mode = None;
         self.cmd_items.clear();
         if let Some(f) = self.return_focus.take() {
-            window.focus(&f);
+            window.focus(&f, cx);
         } else {
             self.focus_active(window, cx);
         }
@@ -4128,7 +4128,7 @@ impl Workspace {
         if let Ok(n) = line.parse::<usize>() {
             if let Some(ed) = self.active_editor() {
                 ed.update(cx, |ed, cx| ed.go_to(n.saturating_sub(1), 0, cx));
-                ed.read(cx).focus(window);
+                window.focus(&ed.read(cx).focus_target(cx), cx);
             }
             return;
         }
@@ -4739,7 +4739,7 @@ impl Workspace {
     fn toggle_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.overview = !self.overview;
         if self.overview {
-            window.focus(&self.overview_focus);
+            window.focus(&self.overview_focus, cx);
         } else {
             self.focus_active(window, cx);
         }
@@ -4844,7 +4844,7 @@ impl Workspace {
                     .rounded(px(8.))
                     .border_1()
                     .cursor_pointer()
-                    .when(on, |d| d.bg(color.opacity(0.14)).border_color(color).shadow(vec![gpui::BoxShadow { color: color.opacity(0.45), offset: gpui::point(px(0.), px(0.)), blur_radius: px(10.), spread_radius: px(0.) }]))
+                    .when(on, |d| d.bg(color.opacity(0.14)).border_color(color).shadow(vec![gpui::BoxShadow { inset: false, color: color.opacity(0.45), offset: gpui::point(px(0.), px(0.)), blur_radius: px(10.), spread_radius: px(0.) }]))
                     .when(!on, |d| d.bg(theme::bg_side()).border_color(theme::border()).hover(|s| s.bg(theme::hover()).border_color(color.opacity(0.6))))
                     .tooltip(ui::tooltip_text(tip))
                     .on_click(cx.listener(move |ws, ev: &gpui::ClickEvent, w, cx| {
@@ -4883,7 +4883,7 @@ impl Workspace {
                             }))
                             .into_any_element()
                     } else {
-                        div().size(px(7.)).rounded_full().bg(color).when(on, |d| d.shadow(vec![gpui::BoxShadow { color: color.opacity(0.7), offset: gpui::point(px(0.), px(0.)), blur_radius: px(6.), spread_radius: px(0.) }])).into_any_element()
+                        div().size(px(7.)).rounded_full().bg(color).when(on, |d| d.shadow(vec![gpui::BoxShadow { inset: false, color: color.opacity(0.7), offset: gpui::point(px(0.), px(0.)), blur_radius: px(6.), spread_radius: px(0.) }])).into_any_element()
                     })
                     .child(svg().path(crate::assets::vtext_path(&name)).w(px(tw)).h(px(th)).flex_none().text_color(if on { theme::fg_bright() } else { theme::fg_dim() }))
                     .when(i < 9, |d| d.child(div().text_size(px(9.)).text_color(if on { color } else { theme::fg_muted() }).child(format!("⌃{}", i + 1))))
@@ -5238,11 +5238,11 @@ impl Workspace {
                         .min_w_0()
                         .overflow_x_scroll()
                         .track_scroll(&handle)
-                        .on_scroll_wheel(move |ev, window, cx| {
+                        .on_scroll(move |ev, window, cx| {
                             // An up/down wheel moves the row sideways (a sideways swipe already does).
                             let d = ev.delta.pixel_delta(window.line_height());
                             if d.y.abs() > d.x.abs() {
-                                let max = wheel.max_offset().width;
+                                let max = wheel.max_offset().x;
                                 let off = wheel.offset();
                                 let x = (off.x + d.y).clamp(-max, gpui::px(0.));
                                 if x != off.x {
@@ -5662,7 +5662,7 @@ impl Workspace {
             .on_action(cx.listener(|ws, _: &OutputBottom, _, cx| ws.output_move(isize::MAX / 2, cx)))
             .on_action(cx.listener(|ws, _: &OutputOpen, w, cx| ws.output_open(w, cx)))
             .on_action(cx.listener(|ws, _: &OutputLeave, w, cx| ws.focus_active(w, cx)))
-            .on_mouse_down(MouseButton::Left, cx.listener(|ws, _, w, _| w.focus(&ws.output_focus)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|ws, _, w, cx| w.focus(&ws.output_focus, cx)))
             .flex()
             .flex_col()
             .flex_none()
@@ -5768,7 +5768,7 @@ impl Workspace {
                             .collect::<Vec<_>>()
                     }),
                 )
-                .track_scroll(self.output_scroll.clone())
+                .track_scroll(&self.output_scroll)
                 .flex_1(),
             )
     }
@@ -6297,7 +6297,7 @@ impl Render for Workspace {
                     return;
                 }
                 if std::env::var_os("KITE_DEBUG").is_some() {
-                    eprintln!("[kite] key {}", ev.keystroke.unparse());
+                    eprintln!("[kite] key {}", ev.keystroke.unparse(gpui::OperatingSystem::Mac));
                 }
                 // Direction letters with ⌃⌥ / ⌥ / ⌃⌥⌘ act as real arrow keys everywhere
                 // (editor, inputs, popups, terminal, lists). Not while recording a shortcut.
@@ -6563,6 +6563,8 @@ mod ui_tests {
         std::fs::create_dir_all(&project).unwrap();
         // Keep the test away from the real settings and shortcuts.
         unsafe { std::env::set_var("HOME", &home) };
+        // Real folders: the file watcher and git wake tasks from their own threads.
+        cx.executor().allow_parking();
         cx.update(|cx| {
             crate::editor::bind_keys();
             crate::workspace::bind_keys();
@@ -7106,7 +7108,7 @@ mod ui_tests {
         cx.simulate_click(at, gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(!d.read_with(cx, |d, _| d.show_blame), "the status bar switched it off");
-        d.update_in(cx, |d, window, _| d.focus(window));
+        d.update_in(cx, |d, window, cx| window.focus(&d.focus_target(cx), cx));
         cx.simulate_keystrokes("down down");
         cx.run_until_parked();
         assert!(cx.debug_bounds("blame-note-new").is_some() && cx.debug_bounds("blame-note-old").is_some(), "the selected line shows its author on both sides");
@@ -7495,7 +7497,7 @@ mod ui_tests {
             cx.run_until_parked();
         };
         click(cx, "change-row-a.txt");
-        ws.update_in(cx, |ws, window, cx| ws.git_panel.read(cx).focus_commit_input(window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.git_panel.update(cx, |p, cx| p.focus_commit_input(window, cx)));
         cx.run_until_parked();
         let letters = "abcdefghijklmnopqrstuvwxyz";
         for k in letters.chars() {
@@ -7531,7 +7533,7 @@ mod ui_tests {
                 t.select(root.clone())
             })
         });
-        ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
+        ws.update_in(cx, |ws, window, cx| window.focus(&ws.tree.read(cx).focus_target(cx), cx));
         cx.run_until_parked();
         cx.simulate_keystrokes("a");
         cx.simulate_input("home");
@@ -7990,7 +7992,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!((rel_before - rel_now).abs() < 0.05, "{rel_before:.2} → {rel_now:.2}");
         // Scrolls both ways, as far as the zoomed page goes.
         let (_, max) = preview.read_with(cx, |v, _| v.page_scroll());
-        assert!(max.width > gpui::px(100.) && max.height > gpui::px(100.), "{max:?}");
+        assert!(max.x > gpui::px(100.) && max.y > gpui::px(100.), "{max:?}");
 
         // Pinching back stops at 100%, the page exactly as it was.
         for _ in 0..40 {
@@ -8111,7 +8113,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         settle(cx);
         assert_eq!(decoded(cx), down, "back at the top: the same pictures, none freed or redrawn");
         // Scrolled to the end: those are drawn, the top ones freed.
-        let max = preview.read_with(cx, |v, _| v.page_scroll().1.height / gpui::px(1.));
+        let max = preview.read_with(cx, |v, _| v.page_scroll().1.y / gpui::px(1.));
         preview.update(cx, |v, cx| v.scroll_page_to(max, cx));
         settle(cx);
         let end = decoded(cx);
@@ -8276,7 +8278,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         let project = root.file_name().unwrap().to_string_lossy().to_string();
         assert_eq!(rows.first(), Some(&(0, project)), "the project folder is its own row");
         assert!(rows.contains(&(1, "src".to_string())), "files sit under it");
-        ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
+        ws.update_in(cx, |ws, window, cx| window.focus(&ws.tree.read(cx).focus_target(cx), cx));
         let select = |cx: &mut gpui::VisualTestContext, p: std::path::PathBuf| tree.update(cx, |t, _| t.select(p));
 
         // New file at the root (root row selected), typed into the name box.
@@ -8289,7 +8291,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert_eq!(ws.read_with(cx, |ws, cx| ws.active_editor().and_then(|e| e.read(cx).path.clone())), Some(root.join("new.ts")), "and opened");
 
         // Rename: the name box selects the name without the extension.
-        ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
+        ws.update_in(cx, |ws, window, cx| window.focus(&ws.tree.read(cx).focus_target(cx), cx));
         select(cx, root.join("new.ts"));
         cx.simulate_keystrokes("f2");
         cx.simulate_input("renamed");
@@ -8318,7 +8320,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert_eq!(ws.read_with(cx, |ws, cx| ws.active_editor().and_then(|e| e.read(cx).path.clone())), Some(root.join("src/renamed.ts")));
 
         // Delete asks first; Cancel leaves the file alone.
-        ws.update_in(cx, |ws, window, cx| ws.tree.read(cx).focus(window));
+        ws.update_in(cx, |ws, window, cx| window.focus(&ws.tree.read(cx).focus_target(cx), cx));
         select(cx, root.join("b.ts"));
         cx.simulate_keystrokes("cmd-backspace");
         assert!(ws.read_with(cx, |ws, _| ws.ask.is_some()), "asks before moving to the Trash");
@@ -8715,7 +8717,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(chip.left() >= row.left() - gpui::px(1.) && chip.right() <= row.right() + gpui::px(1.), "the first is in view: {chip:?} in {row:?}");
         // The wheel moves the row sideways.
         let before = chip.left();
-        cx.simulate_event(gpui::ScrollWheelEvent { position: row.center(), delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-200.))), ..Default::default() });
+        cx.simulate_event(gpui::ScrollEvent { position: row.center(), delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-200.))), ..Default::default() });
         let (_, chip) = inside(cx);
         assert!(chip.left() < before, "scrolled: {before:?} → {:?}", chip.left());
     }

@@ -261,7 +261,7 @@ impl GitPanel {
         let subs = vec![
             cx.subscribe_in(&commit_input, window, |panel, _, ev: &EditorEvent, window, cx| match ev {
                 EditorEvent::Submit => panel.commit(None, false, panel.amend, window, cx),
-                EditorEvent::Cancel => panel.focus(window),
+                EditorEvent::Cancel => window.focus(&panel.focus_target(cx), cx),
                 _ => {}
             }),
         ];
@@ -451,15 +451,15 @@ impl GitPanel {
 
     #[cfg(test)]
     pub fn changes_scroll_max(&self) -> f32 {
-        self.changes_scroll.max_offset().height / gpui::px(1.)
+        self.changes_scroll.max_offset().y / gpui::px(1.)
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus_target(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 
-    pub fn focus_commit_input(&self, window: &mut Window, cx: &App) {
-        self.commit_input.read(cx).focus(window);
+    pub fn focus_commit_input(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.commit_input.read(cx).focus_target(cx), cx);
     }
 
     // ------------------------------------------------------------ git actions
@@ -1459,7 +1459,7 @@ impl GitPanel {
                     })
                     .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
                     .on_click(cx.listener(move |panel, ev: &ClickEvent, window, cx| {
-                        window.focus(&panel.focus);
+                        window.focus(&panel.focus, cx);
                         panel.selected = Some(Item::File { staged, path: c1.path.clone() });
                         panel.open_change(staged, &c1, ev.click_count() < 2, cx);
                         cx.notify();
@@ -1755,7 +1755,7 @@ impl GitPanel {
             .when(selected && focused, |d| d.border_1().border_color(theme::focus_border()))
             .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
             .on_click(cx.listener(move |panel, ev: &ClickEvent, window, cx| {
-                window.focus(&panel.focus);
+                window.focus(&panel.focus, cx);
                 panel.selected = Some(Item::Commit(ix));
                 // One click lists the commit's files under it; the second click of a
                 // double-click puts that back and opens the commit page instead.
@@ -1897,7 +1897,7 @@ impl GitPanel {
             .on_click(cx.listener(move |panel, ev: &ClickEvent, window, cx| {
                 // Like the changes list: one click shows the diff and keeps the keyboard here,
                 // a double-click opens it for editing.
-                window.focus(&panel.focus);
+                window.focus(&panel.focus, cx);
                 panel.selected = Some(Item::CommitFile(ix, fi));
                 panel.open_commit_file(ix, fi, ev.click_count() < 2, cx);
                 cx.notify();
@@ -2171,7 +2171,7 @@ impl Render for GitPanel {
                                         .collect::<Vec<_>>()
                                 }),
                             )
-                            .track_scroll(self.graph_scroll.clone())
+                            .track_scroll(&self.graph_scroll)
                             .flex_1(),
                         )
                     }),

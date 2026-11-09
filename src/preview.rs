@@ -170,8 +170,8 @@ impl PreviewView {
         self.blocks.len()
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus_target(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 
     fn text(&self, cx: &App) -> String {
@@ -447,7 +447,7 @@ impl PreviewView {
 
     /// How far the page scrolls each way, and how far it can (tests).
     #[cfg(test)]
-    pub fn page_scroll(&self) -> (Point<Pixels>, Size<Pixels>) {
+    pub fn page_scroll(&self) -> (Point<Pixels>, Point<Pixels>) {
         (self.scroll.offset(), self.scroll.max_offset())
     }
 

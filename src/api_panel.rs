@@ -131,8 +131,8 @@ impl ApiPanel {
         p
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus_target(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 
     pub fn set_roots(&mut self, roots: Vec<PathBuf>, cx: &mut Context<Self>) {
@@ -285,12 +285,12 @@ impl ApiPanel {
         if let Some(ix) = self.rows.iter().position(|r| matches!(r.kind, RowKind::Naming) || self.renaming(&r.key)) {
             self.scroll.scroll_to_item(ix, gpui::ScrollStrategy::Center);
         }
-        input.read(cx).focus(window);
+        window.focus(&input.read(cx).focus_target(cx), cx);
         // Again once it's on screen: focus given to something not drawn yet can be lost.
         let again = input.clone();
         cx.on_next_frame(window, move |p, window, cx| {
             if p.naming.as_ref().is_some_and(|n| n.input == again) {
-                again.read(cx).focus(window);
+                window.focus(&again.read(cx).focus_target(cx), cx);
             }
         });
         cx.notify();
@@ -310,14 +310,14 @@ impl ApiPanel {
     fn cancel_naming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.naming = None;
         self.rebuild(cx);
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
     fn commit_naming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(n) = self.naming.take() else { return };
         let name = n.input.read(cx).text().trim().to_string();
-        window.focus(&self.focus);
+        window.focus(&self.focus, cx);
         if name.is_empty() {
             self.rebuild(cx);
             return cx.notify();
@@ -659,7 +659,7 @@ impl ApiPanel {
                 base.debug_selector(move || sel.clone())
                     .on_click(cx.listener(move |p, _, w, cx| {
                         p.selected = Some(rk.clone());
-                        w.focus(&p.focus);
+                        w.focus(&p.focus, cx);
                         if !p.open.remove(&f1) {
                             p.open.insert(f1.clone());
                         }
@@ -1041,7 +1041,7 @@ impl Render for ApiPanel {
                     .flex()
                     .flex_col()
                     .text_size(px(13.))
-                    .child(uniform_list("api-tree", self.rows.len(), cx.processor(move |p, range: Range<usize>, _, cx| range.map(|ix| p.render_row(ix, cx)).collect::<Vec<_>>())).track_scroll(self.scroll.clone()).flex_1()),
+                    .child(uniform_list("api-tree", self.rows.len(), cx.processor(move |p, range: Range<usize>, _, cx| range.map(|ix| p.render_row(ix, cx)).collect::<Vec<_>>())).track_scroll(&self.scroll).flex_1()),
             )
             .children(menu)
     }

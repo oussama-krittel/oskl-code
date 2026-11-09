@@ -187,8 +187,8 @@ impl CommitView {
         }
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus);
+    pub fn focus_target(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
     }
 
     fn open(&self, ix: usize, preview: bool, cx: &mut Context<Self>) {
@@ -424,7 +424,7 @@ impl Render for CommitView {
             .on_action(cx.listener(Self::prev))
             .on_action(cx.listener(Self::open_selected))
             .on_action(cx.listener(Self::copy_sha))
-            .on_mouse_down(MouseButton::Left, cx.listener(|v, _, w, _| w.focus(&v.focus)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|v, _, w, cx| w.focus(&v.focus, cx)))
             .size_full()
             .bg(theme::bg_editor());
 

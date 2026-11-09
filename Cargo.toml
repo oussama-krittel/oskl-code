@@ -34,7 +34,11 @@ futures-util = "0.3"
 anyhow = "1"
 block = "0.1.6"
 futures = "0.3"
-gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+# GPUI snapshots from Zed (the `gpui` crate on crates.io stopped at 0.2.2), named `gpui` so imports stay
+# `use gpui::*`. Pinned exactly: gpui-kit needs this same version, and snapshots break APIs.
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["runtime_shaders"] }
+gpui-kit = "=0.9.1"
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 # The one GPUI draws SVGs with: diagrams' text is turned into shapes with a font fallback that works.
@@ -92,4 +96,5 @@ opt-level = 3
 [dev-dependencies]
 resvg = "0.45.1"
 usvg = "0.45.1"
-gpui = { version = "0.2.2", features = ["runtime_shaders", "test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["test-support"] }

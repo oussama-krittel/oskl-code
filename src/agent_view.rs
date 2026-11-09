@@ -179,7 +179,7 @@ impl AgentView {
                 }
                 EditorEvent::Cancel => {
                     v.menu = None;
-                    v.input.read(cx).focus(window);
+                    window.focus(&v.input.read(cx).focus_target(cx), cx);
                     cx.notify();
                 }
                 _ => {}
@@ -343,8 +343,8 @@ impl AgentView {
         }));
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &App) {
-        self.input.read(cx).focus(window);
+    pub fn focus_target(&self, cx: &App) -> FocusHandle {
+        self.input.read(cx).focus_target(cx)
     }
 
     pub fn session(&self) -> Option<String> {
@@ -363,7 +363,7 @@ impl AgentView {
             let head = ed.buf.sel.head;
             ed.replace_range(head..head, text, cx);
         });
-        self.input.read(cx).focus(window);
+        window.focus(&self.input.read(cx).focus_target(cx), cx);
     }
 
     /// Sends what's in the box (`claude <message>` on the command line).
@@ -803,7 +803,7 @@ impl AgentView {
         }
         if menu == Menu::History {
             self.search.update(cx, |e, cx| e.set_text("", cx));
-            self.search.read(cx).focus(window);
+            window.focus(&self.search.read(cx).focus_target(cx), cx);
             self.refresh_history(cx);
         }
         cx.notify();
@@ -1246,7 +1246,7 @@ impl AgentView {
                     .child(ui::icon_button(("edit", ix), "new-file").tooltip(ui::tooltip("Edit: fork the conversation from here")).on_click(cx.listener(move |v, _, w, cx| {
                         if let Some(t) = v.rewind_chat(ix) {
                             v.input.update(cx, |e, cx| e.set_text(&t, cx));
-                            v.input.read(cx).focus(w);
+                            w.focus(&v.input.read(cx).focus_target(cx), cx);
                         }
                         cx.notify();
                     })))
@@ -1802,7 +1802,7 @@ impl AgentView {
             .shadow_lg()
             .on_mouse_down_out(cx.listener(|v, _, window, cx| {
                 v.just_closed = v.menu.take().map(|(m, _)| m);
-                v.input.read(cx).focus(window);
+                window.focus(&v.input.read(cx).focus_target(cx), cx);
                 cx.defer_in(window, |v, _, _| v.just_closed = None);
                 cx.notify();
             }));
@@ -1966,7 +1966,7 @@ impl AgentView {
                         .when(self.log.session.as_deref() == Some(&s.id), |d| d.bg(theme::selected()))
                         .on_click(cx.listener(move |v, _, w, cx| {
                             v.load(&id, Some(title.clone()), cx);
-                            v.input.read(cx).focus(w);
+                            w.focus(&v.input.read(cx).focus_target(cx), cx);
                         }))
                         .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_size(px(12.)).child(s.title.clone()))
                         .child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(crate::util::relative_time(s.updated)))
@@ -2081,7 +2081,7 @@ impl Render for AgentView {
             list(self.list.clone(), cx.processor(|v: &mut AgentView, ix: usize, w, cx| v.render_item(ix, w, cx))).flex_1().into_any_element()
         };
         let menu = self.menu.map(|(m, at)| {
-            let corner = if matches!(m, Menu::Mode | Menu::Model | Menu::Effort | Menu::Style) { Corner::BottomLeft } else { Corner::TopRight };
+            let corner = if matches!(m, Menu::Mode | Menu::Model | Menu::Effort | Menu::Style) { Anchor::BottomLeft } else { Anchor::TopRight };
             deferred(anchored().anchor(corner).position(at).snap_to_window().child(self.render_menu(m, cx))).with_priority(2)
         });
         let info = self.info.clone().map(|(t, rows)| self.render_info(&t, &rows, cx));

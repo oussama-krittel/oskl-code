@@ -136,13 +136,13 @@ impl SearchPanel {
                 EditorEvent::Submit if ix == 1 => panel.replace_all(cx),
                 EditorEvent::Submit => panel.run_search(cx),
                 EditorEvent::Down => {
-                    window.focus(&panel.results_focus);
+                    window.focus(&panel.results_focus, cx);
                     if panel.selected.is_none() {
                         panel.selected = panel.rows.first().copied();
                     }
                     cx.notify();
                 }
-                EditorEvent::Cancel => window.focus(&panel.results_focus),
+                EditorEvent::Cancel => window.focus(&panel.results_focus, cx),
                 _ => {}
             }));
         }
@@ -177,7 +177,7 @@ impl SearchPanel {
             q.buf.select_all();
             cx.notify();
         });
-        query.read(cx).focus(window);
+        window.focus(&query.read(cx).focus_target(cx), cx);
     }
 
     pub fn set_query(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -482,7 +482,7 @@ impl SearchPanel {
             })
             .when(!selected, |d| d.hover(|s| s.bg(theme::hover())))
             .on_click(cx.listener(move |p, _, window, cx| {
-                window.focus(&p.results_focus);
+                window.focus(&p.results_focus, cx);
                 p.selected = Some(row);
                 if let Row::File(fi) = row {
                     p.results[fi].collapsed = !p.results[fi].collapsed;
@@ -886,7 +886,7 @@ impl Render for SearchPanel {
                                 range.map(|ix| p.render_row(ix, results_focused, &replacement, cx)).collect::<Vec<_>>()
                             }),
                         )
-                        .track_scroll(self.scroll.clone())
+                        .track_scroll(&self.scroll)
                         .size_full(),
                     ),
             )
