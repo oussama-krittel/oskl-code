@@ -222,8 +222,11 @@ impl PreviewView {
                 }
                 self.diagrams = now;
             }
-            Kind::Svg if self.source.is_some() => {
-                let text = self.text(cx);
+            // Drawn from a snapshot while it's edited, or when it's a fragment without its <svg>.
+            Kind::Svg if self.source.is_some() || std::fs::read_to_string(&self.path).is_ok_and(|t| !has_svg_root(&t)) => {
+                let raw = self.text(cx);
+                let fragment = !has_svg_root(&raw);
+                let text = if fragment { wrap_svg_fragment(&raw) } else { raw.clone() };
                 let file = std::env::temp_dir().join(format!("kite-svg-{}-{:x}.svg", std::process::id(), hash(&text)));
                 if Some(&file) != self.snapshot.as_ref() && std::fs::write(&file, &text).is_ok() {
                     if let Some(old) = self.snapshot.replace(file.clone()) {
@@ -232,7 +235,7 @@ impl PreviewView {
                     }
                     self.shown = file;
                 }
-                self.info = format!("SVG · {}", human_size(text.len() as u64));
+                self.info = format!("SVG{} · {}", if fragment { " fragment (no <svg> element: drawn in one sized to it)" } else { "" }, human_size(raw.len() as u64));
             }
             Kind::Table => {
                 // Read (and split into rows) off the main thread: a big file takes a moment.
@@ -1384,7 +1387,12 @@ enum Block {
     /// Column alignment, then rows (the first is the header).
     Table(Vec<Alignment>, Vec<Vec<Inline>>),
     Image(String, String),
-    Html(String),
+    /// HTML's `<p align="center">` (or right): what's inside, aligned.
+    Align(Alignment, Vec<Block>),
+    /// HTML's `<img>`: where, its alt text, and the width and height it asks for.
+    Img { url: String, alt: String, w: Option<f32>, h: Option<f32> },
+    /// Pictures side by side (badges, a row of screenshots).
+    Row(Vec<Block>),
     /// A ```mermaid fence: the drawn diagram, or why it couldn't be (and its source).
     Mermaid(Result<Diagram, String>, String),
     /// A diagram still being drawn (in the background), by its text.
@@ -1583,10 +1591,10 @@ impl Builder {
                     }
                 }
                 TagEnd::HtmlBlock => {
-                    if let Some(h) = self.html.take()
-                        && !h.trim_start().starts_with("<!--")
-                    {
-                        self.push_block(Block::Html(h));
+                    if let Some(h) = self.html.take() {
+                        for b in html_blocks(&h) {
+                            self.push_block(b);
+                        }
                     }
                 }
                 TagEnd::List(_) => {
@@ -1653,6 +1661,9 @@ impl Builder {
                 let tag = t.trim().to_ascii_lowercase();
                 if tag.starts_with("<br") {
                     self.text("\n", false);
+                } else if tag.starts_with("<img") {
+                    // A picture in a line of text: shown after it, like Markdown's own.
+                    self.images.extend(html_blocks(&t));
                 }
             }
             Event::SoftBreak => self.text(" ", false),
@@ -1909,7 +1920,23 @@ impl Renderer {
                     )
                     .into_any_element()
             }
-            Block::Image(url, alt) => self.image(url, alt),
+            Block::Image(url, alt) => self.image(url, alt, None, None),
+            Block::Img { url, alt, w, h } => self.image(url, alt, *w, *h),
+            Block::Row(items) => {
+                let children: Vec<AnyElement> = items.iter().map(|b| self.block(b)).collect();
+                div().flex().flex_wrap().items_center().gap(px(6.)).children(children).into_any_element()
+            }
+            Block::Align(a, blocks) => {
+                let children: Vec<AnyElement> = blocks.iter().map(|b| self.block(b)).collect();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .when(matches!(a, Alignment::Center), |d| d.items_center().text_center())
+                    .when(matches!(a, Alignment::Right), |d| d.items_end().text_right())
+                    .children(children)
+                    .into_any_element()
+            }
             Block::Mermaid(Ok(d), _) => {
                 // Fitted to the page and zoomed with it. Only diagrams on or near the screen get
                 // a picture (drawn for that size, in steps); the rest are boxes of the same size,
@@ -2005,22 +2032,30 @@ impl Renderer {
                     .child(code_block(self.id(), src, None, self.wrap))
                     .into_any_element()
             }
-            Block::Html(text) => div().font_family(theme::MONO_FONT).text_size(px(12.)).text_color(theme::fg_muted()).child(text.trim().to_string()).into_any_element(),
         }
     }
 
-    fn image(&mut self, url: &str, alt: &str) -> AnyElement {
+    /// A picture: its own size (or the `width`/`height` HTML asked for), no wider than the page.
+    fn image(&mut self, url: &str, alt: &str, want_w: Option<f32>, want_h: Option<f32>) -> AnyElement {
         let local = !url.contains("://") && !url.starts_with("data:");
         let path = self.base.join(url.split(['?', '#']).next().unwrap_or(url));
         if local && path.is_file() {
             let alt = alt.to_string();
             let el = img(path.clone()).image_cache(&self.images).object_fit(ObjectFit::Contain).with_fallback(move || div().text_color(theme::fg_dim()).child(format!("[{alt}]")).into_any_element());
-            let el = match image_size(&path) {
-                Some((w, h)) if w > 0 && h > 0 => {
-                    let scale = (760. / w as f32).min(1.);
-                    el.w(px(w as f32 * scale)).h(px(h as f32 * scale))
+            let natural = image_size(&path).filter(|(w, h)| *w > 0 && *h > 0).map(|(w, h)| (w as f32, h as f32));
+            let size = match (natural, want_w, want_h) {
+                (Some((w, h)), Some(ww), None) => Some((ww, ww * h / w)),
+                (Some((w, h)), None, Some(hh)) => Some((hh * w / h, hh)),
+                (_, Some(ww), Some(hh)) => Some((ww, hh)),
+                (Some(n), None, None) => Some(n),
+                (None, _, _) => None,
+            };
+            let el = match size {
+                Some((w, h)) => {
+                    let scale = (760. / w).min(1.);
+                    el.w(px(w * scale)).h(px(h * scale))
                 }
-                _ => el.max_w(px(760.)),
+                None => el.max_w(px(760.)),
             };
             return div().child(el).into_any_element();
         }
@@ -2029,6 +2064,227 @@ impl Renderer {
         let inl = Inline { runs: vec![(label.len(), Style { link: true, ..Default::default() })], links: vec![(0..label.len(), url.to_string())], text: label };
         div().child(self.inline(&inl, false)).into_any_element()
     }
+}
+
+/// Whether an SVG file has its `<svg>` element (a fragment of one doesn't draw on its own).
+fn has_svg_root(text: &str) -> bool {
+    text.contains("<svg") || text.contains("<SVG")
+}
+
+/// An SVG fragment (shapes and defs, meant to go inside another drawing) in an `<svg>` of its
+/// own, the size of what it draws.
+fn wrap_svg_fragment(body: &str) -> String {
+    const NS: &str = r#"xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink""#;
+    let probe = format!(r#"<svg {NS} width="100000" height="100000">{body}</svg>"#);
+    let bounds = usvg::Tree::from_data(probe.as_bytes(), &usvg::Options::default()).ok().map(|t| t.root().abs_stroke_bounding_box()).filter(|b| b.width() > 0. && b.height() > 0.);
+    let (x, y, w, h) = match bounds {
+        Some(b) => {
+            let pad = b.width().max(b.height()) * 0.04;
+            (b.x() - pad, b.y() - pad, b.width() + 2. * pad, b.height() + 2. * pad)
+        }
+        None => (0., 0., 1024., 1024.),
+    };
+    format!(r#"<svg {NS} viewBox="{x} {y} {w} {h}" width="{w}" height="{h}">{body}</svg>"#)
+}
+
+/// What an HTML block in Markdown shows, for the HTML READMEs use: `<p align="center">` and
+/// `<div align>`, `<img src width height>`, `<br>`, `<a href>`, `<b>`/`<strong>`, `<i>`/`<em>`,
+/// `<code>`, `<h1>`…`<h6>`. Other tags are left out and their text kept; comments are dropped.
+fn html_blocks(html: &str) -> Vec<Block> {
+    #[derive(Default)]
+    struct P {
+        out: Vec<Block>,
+        group: Vec<Block>,
+        align: Option<Alignment>,
+        heading: Option<u8>,
+        inline: Inline,
+        style: Style,
+        link: Option<(usize, String)>,
+    }
+    impl P {
+        fn push(&mut self, t: &str) {
+            // HTML runs spaces and line breaks together; none at the start of a line.
+            let mut s = String::new();
+            for c in t.chars() {
+                let prev = s.chars().last().or_else(|| self.inline.text.chars().last());
+                if c.is_whitespace() {
+                    if prev.is_some_and(|p| !p.is_whitespace()) {
+                        s.push(' ');
+                    }
+                } else {
+                    s.push(c);
+                }
+            }
+            if !s.is_empty() {
+                self.inline.text.push_str(&s);
+                self.inline.runs.push((s.len(), self.style.clone()));
+            }
+        }
+        fn flush(&mut self) {
+            let mut inl = std::mem::take(&mut self.inline);
+            let trimmed = inl.text.trim_end().len();
+            if trimmed == 0 {
+                return;
+            }
+            // The trailing space goes, from the last runs.
+            let mut cut = inl.text.len() - trimmed;
+            while cut > 0 && let Some(last) = inl.runs.last_mut() {
+                let take = cut.min(last.0);
+                last.0 -= take;
+                cut -= take;
+                if last.0 == 0 {
+                    inl.runs.pop();
+                }
+            }
+            inl.text.truncate(trimmed);
+            self.group.push(match self.heading {
+                Some(n) => Block::Heading(n, inl),
+                None => Block::Para(inl),
+            });
+        }
+        fn end_group(&mut self) {
+            self.flush();
+            let mut items: Vec<Block> = Vec::new();
+            for b in std::mem::take(&mut self.group) {
+                match (items.last_mut(), b) {
+                    (Some(Block::Row(row)), img @ Block::Img { .. }) => row.push(img),
+                    (Some(prev @ Block::Img { .. }), img @ Block::Img { .. }) => {
+                        let first = std::mem::replace(prev, Block::Rule);
+                        *prev = Block::Row(vec![first, img]);
+                    }
+                    (_, b) => items.push(b),
+                }
+            }
+            match self.align.take() {
+                Some(a) if !items.is_empty() => self.out.push(Block::Align(a, items)),
+                _ => self.out.extend(items),
+            }
+        }
+    }
+    fn attrs(tag: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut rest = tag.split_once(|c: char| c.is_whitespace()).map(|(_, r)| r).unwrap_or("");
+        loop {
+            rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '/');
+            let n = rest.find(|c: char| c == '=' || c.is_whitespace() || c == '/').unwrap_or(rest.len());
+            if n == 0 {
+                return out;
+            }
+            let key = rest[..n].to_ascii_lowercase();
+            rest = rest[n..].trim_start();
+            let value = if let Some(r) = rest.strip_prefix('=') {
+                let r = r.trim_start();
+                let (v, after) = match r.chars().next() {
+                    Some(q @ ('"' | '\'')) => r[1..].split_once(q).unwrap_or((&r[1..], "")),
+                    _ => r.split_at(r.find(char::is_whitespace).unwrap_or(r.len())),
+                };
+                rest = after;
+                v.to_string()
+            } else {
+                String::new()
+            };
+            out.push((key, entities(&value)));
+        }
+    }
+    fn entities(s: &str) -> String {
+        if !s.contains('&') {
+            return s.to_string();
+        }
+        s.replace("&nbsp;", "\u{a0}").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'").replace("&copy;", "©").replace("&middot;", "·").replace("&mdash;", "—").replace("&ndash;", "–").replace("&amp;", "&")
+    }
+    fn size(v: Option<&String>) -> Option<f32> {
+        v.and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok()).filter(|n| *n > 0.)
+    }
+    let mut p = P::default();
+    let mut rest = html;
+    while let Some(lt) = rest.find('<') {
+        let text = entities(&rest[..lt]);
+        p.push(&text);
+        rest = &rest[lt..];
+        if let Some(after) = rest.strip_prefix("<!--") {
+            rest = after.split_once("-->").map(|(_, r)| r).unwrap_or("");
+            continue;
+        }
+        // The tag, to its '>' (not one inside quotes).
+        let mut end = None;
+        let mut quote = None;
+        for (i, c) in rest.char_indices().skip(1) {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), _) => {}
+                (None, '"' | '\'') => quote = Some(c),
+                (None, '>') => {
+                    end = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            p.push(&entities(rest));
+            rest = "";
+            break;
+        };
+        let tag = rest[1..end].trim();
+        rest = &rest[end + 1..];
+        let closing = tag.starts_with('/');
+        let name = tag.trim_start_matches('/').split(|c: char| c.is_whitespace() || c == '/').next().unwrap_or("").to_ascii_lowercase();
+        match (name.as_str(), closing) {
+            ("p" | "div" | "center" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "section" | "header" | "footer" | "blockquote", false) => {
+                p.end_group();
+                let a = attrs(tag);
+                let align = a.iter().find(|(k, _)| k == "align").map(|(_, v)| v.to_ascii_lowercase());
+                p.align = match align.as_deref() {
+                    _ if name == "center" => Some(Alignment::Center),
+                    Some("center") => Some(Alignment::Center),
+                    Some("right") => Some(Alignment::Right),
+                    _ => None,
+                };
+                p.heading = name.strip_prefix('h').and_then(|n| n.parse().ok());
+            }
+            ("p" | "div" | "center" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "section" | "header" | "footer" | "blockquote", true) => {
+                p.end_group();
+                p.heading = None;
+            }
+            ("br", _) => {
+                p.inline.text.push('\n');
+                p.inline.runs.push((1, p.style.clone()));
+            }
+            ("img", false) => {
+                let a = attrs(tag);
+                let get = |k: &str| a.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+                if let Some(url) = get("src") {
+                    p.flush();
+                    p.group.push(Block::Img { url, alt: get("alt").unwrap_or_default(), w: size(get("width").as_ref()), h: size(get("height").as_ref()) });
+                }
+            }
+            ("a", false) => {
+                let href = attrs(tag).into_iter().find(|(k, _)| k == "href").map(|(_, v)| v);
+                p.link = href.map(|h| (p.inline.text.len(), h));
+                p.style.link = p.link.is_some();
+            }
+            ("a", true) => {
+                if let Some((start, href)) = p.link.take()
+                    && start < p.inline.text.len()
+                {
+                    p.inline.links.push((start..p.inline.text.len(), href));
+                }
+                p.style.link = false;
+            }
+            ("b" | "strong", c) => p.style.bold = !c,
+            ("i" | "em", c) => p.style.italic = !c,
+            ("code" | "kbd", c) => p.style.code = !c,
+            ("s" | "del" | "strike", c) => p.style.strike = !c,
+            ("hr", _) => {
+                p.end_group();
+                p.out.push(Block::Rule);
+            }
+            _ => {}
+        }
+    }
+    p.push(&entities(rest));
+    p.end_group();
+    p.out
 }
 
 /// The narrowest a table column gets before the table scrolls sideways instead.
@@ -2120,6 +2376,35 @@ mod tests {
     }
 
     use super::{Block, Diagram, PENDING, PREVIOUS, TILE, crop_svg, emoji_in_emoji_font, image_size, mermaid_now, outline_text, parse, tiles};
+
+    #[test]
+    fn html_in_markdown_is_drawn_not_shown_as_code() {
+        let readme = "<p align=\"center\">\n  <img src=\"packaging/wordmark.png\" alt=\"OSKL Code\" width=\"420\">\n</p>\n\n<p align=\"center\">\n  A fast, <b>lightweight</b> editor.<br>\n  See <a href=\"https://x.dev\">the site</a> &amp; more.\n</p>\n\n<!-- hidden -->\n\n# After";
+        let b = parse(readme);
+        let Block::Align(_, first) = &b[0] else { panic!("{b:?}") };
+        assert!(matches!(&first[0], super::Block::Img { url, alt, w: Some(w), h: None } if url == "packaging/wordmark.png" && alt == "OSKL Code" && *w == 420.), "{first:?}");
+        let Block::Align(_, second) = &b[1] else { panic!("{b:?}") };
+        let Block::Para(inl) = &second[0] else { panic!("{second:?}") };
+        assert_eq!(inl.text, "A fast, lightweight editor.\nSee the site & more.");
+        assert_eq!(inl.links.len(), 1);
+        assert_eq!(&inl.text[inl.links[0].0.clone()], "the site");
+        assert!(inl.runs.iter().any(|(_, s)| s.bold), "bold kept");
+        assert_eq!(inl.runs.iter().map(|r| r.0).sum::<usize>(), inl.text.len(), "the runs cover the text");
+        assert!(matches!(&b[2], Block::Heading(1, h) if h.text == "After"), "the comment is dropped: {b:?}");
+        // Badges side by side.
+        let b = parse("<p><img src=\"a.png\"> <img src=\"b.png\"></p>");
+        assert!(matches!(&b[0], super::Block::Row(r) if r.len() == 2), "{b:?}");
+    }
+
+    #[test]
+    fn an_svg_fragment_is_drawn_in_an_svg_of_its_own() {
+        let art = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/packaging/logo-art.svg")).unwrap();
+        assert!(!super::has_svg_root(&art), "the logo's art is a fragment");
+        let whole = super::wrap_svg_fragment(&art);
+        let tree = usvg::Tree::from_data(whole.as_bytes(), &usvg::Options::default()).expect("draws");
+        let (w, h) = (tree.size().width(), tree.size().height());
+        assert!(w > 500. && w < 900. && h > 300. && h < 700., "sized to the letters: {w}×{h}");
+    }
 
     #[test]
     fn chat_code_spans_naming_files_become_links() {
