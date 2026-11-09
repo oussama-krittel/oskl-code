@@ -214,6 +214,8 @@ enum Side {
     Databases,
     /// API requests: collections, history, environments.
     Api,
+    /// Claude Code: sessions, usage, skills, MCP servers…
+    Claude,
     /// Settings, and its Shortcuts tab (the shortcuts list).
     Settings,
     Keys,
@@ -402,6 +404,7 @@ fn side_name(s: Side) -> &'static str {
         Side::Git => "git",
         Side::Databases => "databases",
         Side::Api => "api",
+        Side::Claude => "claude",
         Side::Settings => "settings",
         Side::Keys => "keys",
     }
@@ -413,6 +416,7 @@ fn side_of(name: &str) -> Side {
         "git" => Side::Git,
         "databases" => Side::Databases,
         "api" => Side::Api,
+        "claude" => Side::Claude,
         "keys" => Side::Keys,
         "settings" => Side::Settings,
         _ => Side::Files,
@@ -550,6 +554,7 @@ pub struct Workspace {
     git_panel: Entity<GitPanel>,
     db_panel: Entity<crate::db_panel::DbPanel>,
     api_panel: Entity<crate::api_panel::ApiPanel>,
+    claude_panel: Entity<crate::claude_panel::ClaudePanel>,
     search: Entity<SearchPanel>,
     keys: Entity<KeysPanel>,
     settings: Settings,
@@ -665,6 +670,7 @@ impl Workspace {
         let db_root = repo.read(cx).root.clone();
         let db_panel = cx.new(|cx| crate::db_panel::DbPanel::new(vec![db_root.clone()], cx));
         let api_panel = cx.new(|cx| crate::api_panel::ApiPanel::new(if root_is_project(&db_root) { vec![db_root] } else { Vec::new() }, cx));
+        let claude_panel = cx.new(|cx| crate::claude_panel::ClaudePanel::new(repo.read(cx).root.clone(), window, cx));
         let cmd = cx.new(|cx| Editor::new(EditorMode::SingleLine, cx));
         let search = cx.new(|cx| SearchPanel::new(repo.clone(), window, cx));
         let keys = cx.new(|cx| KeysPanel::new(window, cx));
@@ -691,6 +697,7 @@ impl Workspace {
             cx.subscribe_in(&git_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&db_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&api_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
+            cx.subscribe_in(&claude_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&cmd, window, |ws, _, ev: &EditorEvent, window, cx| ws.on_cmd_event(ev, window, cx)),
         ];
         let project = repo.read(cx).root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -706,6 +713,7 @@ impl Workspace {
             git_panel,
             db_panel,
             api_panel,
+            claude_panel,
             search,
             keys,
             tabs: Vec::new(),
@@ -1144,6 +1152,10 @@ impl Workspace {
                     v.update(cx, |v, _| v.fork_from(uuid.clone()));
                 }
             }
+            Request::OpenChat(session) => match session.as_ref().and_then(|id| self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Agent(v) if v.read(cx).session().as_ref() == Some(id)))) {
+                Some(ix) => self.activate(ix, window, cx),
+                None => self.open_agent(true, session.clone(), window, cx),
+            },
             Request::SelectRepo(root) => self.select_repo(root, window, cx),
             Request::AddFolder => self.add_folder_prompt(window, cx),
             Request::RemoveFolder(dir) => self.remove_folder(dir, window, cx),
@@ -2877,6 +2889,7 @@ impl Workspace {
             Side::Git => window.focus(&self.git_panel.read(cx).focus_target(cx), cx),
             Side::Databases => window.focus(&self.db_panel.read(cx).focus_target(cx), cx),
             Side::Api => window.focus(&self.api_panel.read(cx).focus_target(cx), cx),
+            Side::Claude => window.focus(&self.claude_panel.read(cx).focus_target(cx), cx),
             Side::Search => {
                 let query = self.search.read(cx).query.clone();
                 query.update(cx, |q, cx| {
@@ -3113,6 +3126,12 @@ impl Workspace {
         }
         self.side = side;
         self.focus_sidebar(window, cx);
+        // Claude: its panel read afresh, and the chat (the one open, else a new one) beside it.
+        if side == Side::Claude {
+            let root = self.root(cx);
+            self.claude_panel.update(cx, |p, cx| p.refresh(root, cx));
+            self.open_agent(false, None, window, cx);
+        }
     }
 
     fn search_all(&mut self, _: &SearchAll, window: &mut Window, cx: &mut Context<Self>) {
@@ -4705,14 +4724,7 @@ impl Workspace {
             }))
             .child(item("act-databases", "database", Side::Databases, "Databases", self, cx))
             .child(item("act-api", "api", Side::Api, "API: requests, collections, environments", self, cx))
-            .child({
-                let shown = self.active.is_some_and(|a| matches!(self.tabs[a].kind, TabKind::Agent(_)));
-                tool("act-claude", "sparkle", "Claude (⌘Esc; ⌘⇧Esc a new chat)", 19.)
-                    .h(px(40.))
-                    .when(shown && !right, |d| d.border_l_2().border_color(theme::fg_bright()))
-                    .when(shown && right, |d| d.border_r_2().border_color(theme::fg_bright()))
-                    .on_click(cx.listener(|ws, _, w, cx| ws.open_agent(false, None, w, cx)))
-            })
+            .child(item("act-claude", "sparkle", Side::Claude, "Claude: sessions, usage, skills, MCP (⌘Esc chat; ⌘⇧Esc a new one)", self, cx))
             .child(div().flex_1())
             .child(tool("tb-open", "folder", "Open Folder here (⌘O)", 16.).on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))))
             .child(tool("tb-add-folder", "new-folder", "Add Folder to Workspace…", 16.).on_click(cx.listener(|ws, _, w, cx| ws.add_folder_prompt(w, cx))))
@@ -6213,6 +6225,14 @@ impl Render for Workspace {
                 self.api_panel.clone().into_any_element()
             }
             Side::Search => self.search.clone().into_any_element(),
+            Side::Claude => {
+                // Shown without a click (a restored window or space): read it the first time.
+                if !self.claude_panel.read(cx).loaded() {
+                    let root = self.root(cx);
+                    self.claude_panel.update(cx, |p, cx| p.refresh(root, cx));
+                }
+                self.claude_panel.clone().into_any_element()
+            }
             Side::Keys => div().flex().flex_col().size_full().child(self.render_settings_tabs(cx)).child(div().flex_1().min_h_0().child(self.keys.clone())).into_any_element(),
             Side::Settings => self.render_settings(cx).into_any_element(),
         };

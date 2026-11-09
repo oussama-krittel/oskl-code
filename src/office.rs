@@ -67,10 +67,6 @@ impl Zip {
         Ok(Zip { file, entries })
     }
 
-    pub fn has(&self, name: &str) -> bool {
-        self.entries.contains_key(name)
-    }
-
     pub fn read(&mut self, name: &str) -> Option<Vec<u8>> {
         let e = self.entries.get(name)?;
         let (method, size, offset) = (e.method, e.size as usize, e.offset as u64);

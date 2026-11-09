@@ -686,6 +686,7 @@ impl PreviewView {
             near: around(self.area.get(), 1.5),
             keep: around(self.area.get(), 4.),
             paras: 0,
+            wrap: false,
         };
         let children: Vec<AnyElement> = blocks.iter().map(|b| r.block(b)).collect();
         let area = self.area.clone();
@@ -1339,6 +1340,7 @@ impl Markdown {
             near: Bounds::default(),
             keep: Bounds::default(),
             paras: 0,
+            wrap: true,
         };
         let children: Vec<AnyElement> = self.0.iter().map(|b| r.block(b)).collect();
         div().flex().flex_col().gap(px(8.)).font_family(PROSE_FONT).text_size(px(13.)).line_height(relative(1.5)).text_color(theme::fg()).children(children).into_any_element()
@@ -1695,6 +1697,8 @@ struct Renderer {
     keep: Bounds<Pixels>,
     /// Paragraphs drawn so far (for their test names).
     paras: usize,
+    /// Code blocks wrap their long lines (the chat) instead of scrolling sideways.
+    wrap: bool,
 }
 
 /// Opens a file link: the file and the line it names, if any.
@@ -1805,7 +1809,7 @@ impl Renderer {
                 self.paras += 1;
                 div().debug_selector(move || format!("md-para-{n}")).child(self.inline(inl, false)).into_any_element()
             }
-            Block::Code(text, spans) => code_block(self.id(), text, spans.as_deref()),
+            Block::Code(text, spans) => code_block(self.id(), text, spans.as_deref(), self.wrap),
             Block::Quote(blocks) => {
                 let color = std::mem::replace(&mut self.color, theme::fg_dim());
                 let children: Vec<AnyElement> = blocks.iter().map(|b| self.block(b)).collect();
@@ -1998,7 +2002,7 @@ impl Renderer {
                     .flex_col()
                     .gap(px(6.))
                     .child(div().debug_selector(move || format!("md-mermaid-error-{id}")).text_size(px(12.)).text_color(theme::git_deleted()).child(format!("Mermaid diagram not drawn: {e}")))
-                    .child(code_block(self.id(), src, None))
+                    .child(code_block(self.id(), src, None, self.wrap))
                     .into_any_element()
             }
             Block::Html(text) => div().font_family(theme::MONO_FONT).text_size(px(12.)).text_color(theme::fg_muted()).child(text.trim().to_string()).into_any_element(),
@@ -2045,14 +2049,14 @@ fn string_index() -> u8 {
     (0..u8::MAX).find(|i| highlight::name(*i) == "string").unwrap_or(0)
 }
 
-fn code_block(id: usize, text: &str, spans: Option<&LineSpans>) -> AnyElement {
+fn code_block(id: usize, text: &str, spans: Option<&LineSpans>, wrap: bool) -> AnyElement {
     let lines: Vec<AnyElement> = text
         .split('\n')
         .enumerate()
         .map(|(i, line)| {
             let shown = if line.is_empty() { " " } else { line };
             let runs = code_runs(shown, spans.and_then(|s| s.get(i)));
-            div().whitespace_nowrap().child(StyledText::new(shown.to_string()).with_runs(runs)).into_any_element()
+            div().when(!wrap, |d| d.whitespace_nowrap()).child(StyledText::new(shown.to_string()).with_runs(runs)).into_any_element()
         })
         .collect();
     div()
@@ -2063,7 +2067,7 @@ fn code_block(id: usize, text: &str, spans: Option<&LineSpans>) -> AnyElement {
         .border_color(theme::border())
         .px(px(14.))
         .py(px(10.))
-        .overflow_x_scroll()
+        .when(!wrap, |d| d.overflow_x_scroll())
         .font_family(theme::MONO_FONT)
         .text_size(px(12.5))
         .line_height(relative(1.45))

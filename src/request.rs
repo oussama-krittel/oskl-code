@@ -56,6 +56,8 @@ pub enum Request {
     RunInTerminal { dir: PathBuf, command: String },
     /// A Claude chat forked into a new tab: the session, continued from before the message `uuid`.
     ForkChat { session: String, uuid: String },
+    /// A Claude chat on this saved session (its tab if open), or a new chat.
+    OpenChat(Option<String>),
     /// Show this repository in the Source Control panel.
     SelectRepo(PathBuf),
     /// Pick a folder to add to the workspace.

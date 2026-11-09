@@ -156,13 +156,51 @@ pub fn usage(cwd: &Path) -> Result<String, String> {
     records.iter().find(|r| r["type"] == "result").and_then(|r| r["result"].as_str()).map(String::from).ok_or_else(|| "Claude Code /usage returned nothing".into())
 }
 
+/// The last `/usage` and when it was read (seconds): chat tabs and the Claude panel share it.
+static USAGE: std::sync::Mutex<Option<(i64, Result<String, String>)>> = std::sync::Mutex::new(None);
+
+/// `/usage`, read again only when the last read is older than `max_age` seconds.
+pub fn usage_cached(cwd: &Path, max_age: i64) -> Result<String, String> {
+    if let Some((at, r)) = USAGE.lock().unwrap().clone()
+        && crate::util::now() - at < max_age
+    {
+        return r;
+    }
+    let r = usage(cwd);
+    *USAGE.lock().unwrap() = Some((crate::util::now(), r.clone()));
+    r
+}
+
+/// A plan limit in `/usage` text: "Current week (all models): 7% used · resets Nov 15 at 1am (…)"
+/// → ("Current week (all models)", 7.0, "resets Nov 15 at 1am (…)").
+pub fn limit(line: &str) -> Option<(&str, f32, &str)> {
+    let (k, v) = line.trim().split_once(": ")?;
+    let (pct, rest) = v.split_once("% used")?;
+    Some((k, pct.trim().parse().ok()?, rest.trim_start_matches([' ', '·']).trim()))
+}
+
+/// A limit's name, short: "Current session" → "Session", "Current week (all models)" → "Week", "Current week (Fable)" → "Fable".
+pub fn limit_short(name: &str) -> String {
+    let n = name.trim_start_matches("Current ");
+    let n = match n.split_once(" (") {
+        Some((_, m)) if m != "all models)" => m.trim_end_matches(')'),
+        Some((w, _)) => w,
+        None => n,
+    };
+    let mut c = n.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
 pub fn control(id: &str, request: Value) -> Value {
     json!({ "type": "control_request", "request_id": id, "request": request })
 }
 
-/// A user message: pictures (media type, base64) first, then the context blocks, then the text.
-pub fn user_message(text: &str, context: &[String], images: &[(String, String)]) -> Value {
-    let mut content: Vec<Value> = images.iter().map(|(mt, data)| json!({ "type": "image", "source": { "type": "base64", "media_type": mt, "data": data } })).collect();
+/// A user message: pictures first, then the context blocks, then the text.
+pub fn user_message(text: &str, context: &[String], images: &[Picture]) -> Value {
+    let mut content: Vec<Value> = images
+        .iter()
+        .filter_map(|i| Some(json!({ "type": "image", "source": { "type": "base64", "media_type": media_type(i.format)?, "data": base64(&i.bytes) } })))
+        .collect();
     content.extend(context.iter().map(|c| json!({ "type": "text", "text": c })));
     if !text.is_empty() {
         content.push(json!({ "type": "text", "text": text }));
@@ -183,14 +221,32 @@ pub fn base64(bytes: &[u8]) -> String {
 }
 
 /// The picture types Claude reads, by file extension.
-pub fn image_type(ext: &str) -> Option<&'static str> {
-    match ext.to_ascii_lowercase().as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
+/// A picture in the chat: sent to Claude, and drawn in the message.
+pub type Picture = std::sync::Arc<gpui::Image>;
+
+/// The media type Claude knows a picture by (it reads PNG, JPEG, GIF and WebP).
+pub fn media_type(f: gpui::ImageFormat) -> Option<&'static str> {
+    use gpui::ImageFormat::*;
+    match f {
+        Png => Some("image/png"),
+        Jpeg => Some("image/jpeg"),
+        Gif => Some("image/gif"),
+        Webp => Some("image/webp"),
         _ => None,
     }
+}
+
+/// A picture of a file extension or media type ("png", "image/png") Claude reads.
+pub fn picture(kind: &str, bytes: Vec<u8>) -> Option<Picture> {
+    use gpui::ImageFormat::*;
+    let format = match kind.to_ascii_lowercase().trim_start_matches("image/") {
+        "png" => Png,
+        "jpg" | "jpeg" => Jpeg,
+        "gif" => Gif,
+        "webp" => Webp,
+        _ => return None,
+    };
+    Some(std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)))
 }
 
 // ---------------------------------------------------------------- chat log
@@ -256,7 +312,7 @@ pub struct Ask {
 pub enum Item {
     /// uuid: this message's record (file checkpoints are by it); before: the record just before
     /// it, where an edit or retry branches off.
-    User { text: String, images: usize, context: Vec<String>, uuid: Option<String>, before: Option<String> },
+    User { text: String, images: Vec<Picture>, context: Vec<String>, uuid: Option<String>, before: Option<String> },
     Text(String),
     Thinking(String),
     Tool(Tool),
@@ -512,7 +568,12 @@ impl Log {
                     && let Some(text) = prompt_text(content)
                 {
                     let blocks = content.as_array();
-                    let images = blocks.map_or(0, |b| b.iter().filter(|b| b["type"] == "image").count());
+                    let images = blocks
+                        .into_iter()
+                        .flatten()
+                        .filter(|b| b["type"] == "image")
+                        .filter_map(|b| picture(b["source"]["media_type"].as_str()?, crate::api::unbase64(b["source"]["data"].as_str()?)))
+                        .collect();
                     let context = blocks.into_iter().flatten().filter_map(|b| b["text"].as_str()).filter(|t| is_ide_block(t)).map(String::from).collect();
                     self.items.push(Item::User { text, images, context, uuid, before });
                 }
@@ -846,6 +907,25 @@ mod tests {
     }
 
     #[test]
+    fn replayed_messages_keep_their_pictures() {
+        let mut log = Log::default();
+        let data = base64(b"\x89PNG fake");
+        log.apply(&ev(&format!(r#"{{"type":"user","uuid":"u1","message":{{"content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{data}"}}}},{{"type":"text","text":"look"}}]}}}}"#)));
+        let Some(Item::User { images, .. }) = log.items.last() else { panic!("no message") };
+        assert_eq!((images.len(), images[0].format, images[0].bytes.as_slice()), (1, gpui::ImageFormat::Png, b"\x89PNG fake".as_slice()));
+        // Sent back as Claude reads it.
+        assert_eq!(user_message("", &[], images)["message"]["content"][0]["source"]["data"], data.as_str());
+        assert!(picture("bmp", vec![]).is_none());
+    }
+
+    #[test]
+    fn usage_limits() {
+        assert_eq!(limit("Current week (all models): 7% used · resets Nov 15 at 1am (Africa/Casablanca)"), Some(("Current week (all models)", 7., "resets Nov 15 at 1am (Africa/Casablanca)")));
+        assert_eq!(limit("Last 7d · 14582 requests · 42 sessions"), None);
+        assert_eq!(["Current session", "Current week (all models)", "Current week (Fable)"].map(limit_short), ["Session", "Week", "Fable"]);
+    }
+
+    #[test]
     fn base64_and_ids() {
         assert_eq!(base64(b""), "");
         assert_eq!(base64(b"f"), "Zg==");
@@ -860,7 +940,7 @@ mod tests {
     fn streamed_text_is_replaced_by_the_final_message_and_tools_get_results() {
         let mut log = Log::default();
         log.apply(&ev(r#"{"type":"system","subtype":"init","session_id":"s1","model":"m","permissionMode":"default"}"#));
-        log.items.push(Item::User { text: "hi".into(), images: 0, context: vec![], uuid: None, before: None });
+        log.items.push(Item::User { text: "hi".into(), images: vec![], context: vec![], uuid: None, before: None });
         log.apply(&ev(r#"{"type":"user","isReplay":true,"uuid":"u1","message":{"content":[{"type":"text","text":"hi"}]}}"#));
         assert!(matches!(&log.items[0], Item::User { uuid: Some(u), .. } if u == "u1"));
         log.apply(&ev(r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m1"}}}"#));
@@ -895,7 +975,7 @@ mod tests {
         p.send(&control("i", json!({ "subtype": "initialize" }))).unwrap();
         p.send(&user_message("Reply with just: pong", &[], &[])).unwrap();
         let mut log = Log::default();
-        log.items.push(Item::User { text: "Reply with just: pong".into(), images: 0, context: vec![], uuid: None, before: None });
+        log.items.push(Item::User { text: "Reply with just: pong".into(), images: vec![], context: vec![], uuid: None, before: None });
         log.busy = true;
         let mut rx = futures::executor::block_on_stream(rx);
         while log.busy {

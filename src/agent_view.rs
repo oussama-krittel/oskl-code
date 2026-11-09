@@ -65,7 +65,7 @@ enum Menu {
 
 struct Outgoing {
     text: String,
-    images: Vec<(String, String)>,
+    images: Vec<agent::Picture>,
     context: Vec<String>,
 }
 
@@ -110,7 +110,7 @@ pub struct AgentView {
     effort: String,
     mode: String,
     queue: Vec<Outgoing>,
-    images: Vec<(String, String)>,
+    images: Vec<agent::Picture>,
     /// The editor the user was in last (the workspace keeps it): its file and selection go along.
     editor: Rc<RefCell<Option<WeakEntity<Editor>>>>,
     share_editor: bool,
@@ -135,6 +135,9 @@ pub struct AgentView {
     _stop: Option<Task<()>>,
     _idle: Option<Task<()>>,
     _history: Option<Task<()>>,
+    /// Claude Code's `/usage` text, for the plan limits in the header.
+    limits: Option<String>,
+    _limits: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
 
@@ -229,6 +232,8 @@ impl AgentView {
             _stop: None,
             _idle: None,
             _history: None,
+            limits: None,
+            _limits: None,
             _subs: subs,
         };
         if let Some(offers) = OFFERS.with(|o| o.borrow().clone()) {
@@ -237,7 +242,21 @@ impl AgentView {
         if let Some(id) = session {
             v.load(&id, None, cx);
         }
+        v.fetch_limits(60, cx);
         v
+    }
+
+    /// The plan limits for the header (shared with other tabs; read again when older than `max_age` seconds).
+    fn fetch_limits(&mut self, max_age: i64, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        self._limits = Some(cx.spawn(async move |this, cx| {
+            let r = cx.background_spawn(async move { agent::usage_cached(&root, max_age) }).await;
+            this.update(cx, |v, cx| {
+                v.limits = r.ok().or(v.limits.take());
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Lists the project's files (for @) when the box is used, at most once a minute for all its tabs.
@@ -466,6 +485,7 @@ impl AgentView {
         if matches!(ev["type"].as_str(), Some("result" | "exit")) {
             self._stop = None;
             self.drain(cx);
+            self.fetch_limits(60, cx);
         }
         if self.proc.is_some() && self.idle() {
             self.stop_when_idle(cx);
@@ -545,7 +565,7 @@ impl AgentView {
         }
         let old = self.log.items.len();
         let shown = m.context.iter().filter(|c| !c.starts_with("<ide_opened_file>")).cloned().collect();
-        self.log.items.push(Item::User { text: m.text.clone(), images: m.images.len(), context: shown, uuid: None, before: self.log.last_uuid.clone() });
+        self.log.items.push(Item::User { text: m.text.clone(), images: m.images.clone(), context: shown, uuid: None, before: self.log.last_uuid.clone() });
         self.list.splice(old..old, 1);
         self.list.reset(self.log.items.len()); // follow the bottom again
         self.log.busy = true;
@@ -582,17 +602,13 @@ impl AgentView {
     }
 
     fn add_image(&mut self, img: &Image, cx: &mut Context<Self>) {
-        let mt = match img.format {
-            ImageFormat::Png => "image/png",
-            ImageFormat::Jpeg => "image/jpeg",
-            ImageFormat::Gif => "image/gif",
-            ImageFormat::Webp => "image/webp",
-            _ => return cx.emit(Request::Error("Claude reads PNG, JPEG, GIF and WebP pictures".into())),
-        };
+        if agent::media_type(img.format).is_none() {
+            return cx.emit(Request::Error("Claude reads PNG, JPEG, GIF and WebP pictures".into()));
+        }
         if img.bytes.len() > MAX_IMAGE {
             return cx.emit(Request::Error("Pictures can be at most 5 MB".into()));
         }
-        self.images.push((mt.into(), agent::base64(&img.bytes)));
+        self.images.push(std::sync::Arc::new(img.clone()));
         cx.notify();
     }
 
@@ -600,11 +616,11 @@ impl AgentView {
     fn add_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let mut mentions = String::new();
         for p in paths {
-            let mt = p.extension().and_then(|e| agent::image_type(&e.to_string_lossy()));
+            let ext = p.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
             let small = std::fs::metadata(&p).is_ok_and(|m| m.len() as usize <= MAX_IMAGE);
-            match (mt.filter(|_| small), std::fs::read(&p)) {
-                (Some(mt), Ok(bytes)) => self.images.push((mt.into(), agent::base64(&bytes))),
-                _ => mentions.push_str(&format!("@{} ", p.strip_prefix(&self.root).unwrap_or(&p).display())),
+            match small.then(|| std::fs::read(&p).ok()).flatten().and_then(|bytes| agent::picture(&ext, bytes)) {
+                Some(pic) => self.images.push(pic),
+                None => mentions.push_str(&format!("@{} ", p.strip_prefix(&self.root).unwrap_or(&p).display())),
             }
         }
         if !mentions.is_empty() {
@@ -975,6 +991,68 @@ impl AgentView {
         out
     }
 
+    /// The subagent map: the trees in `jobs` (preorder, as `jobs()` gives them) starting at its top level.
+    fn job_subtrees(&self, jobs: &[(usize, agent::Job)], offset: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < jobs.len() {
+            let (depth, j) = &jobs[i];
+            let end = jobs[i + 1..].iter().position(|(d, _)| d <= depth).map_or(jobs.len(), |n| i + 1 + n);
+            let children = self.job_subtrees(&jobs[i + 1..end], offset + i + 1, cx);
+            out.push(tree_node(self.job_card(offset + i, j, cx).into_any_element(), children).into_any_element());
+            i = end;
+        }
+        out
+    }
+
+    fn job_card(&self, i: usize, j: &agent::Job, cx: &mut Context<Self>) -> Stateful<Div> {
+        let color = match j.status.as_str() {
+            "running" => theme::accent(),
+            "completed" => theme::git_added(),
+            "failed" => theme::git_deleted(),
+            _ => theme::fg_muted(),
+        };
+        let kind = if j.is_agent() { if j.agent.is_empty() { "subagent".to_string() } else { j.agent.clone() } } else { "Command".to_string() };
+        let item = j.tool_use.as_ref().and_then(|t| self.log.items.iter().position(|it| matches!(it, Item::Tool(x) if x.id == *t)));
+        div()
+            .id(("job", i))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .w(px(200.))
+            .px(px(8.))
+            .py(px(6.))
+            .rounded(px(5.))
+            .border_1()
+            .border_color(color)
+            .bg(theme::bg_editor())
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::selected_focused()))
+            .when_some(item, |d, ix| {
+                d.on_click(cx.listener(move |v, _, _, cx| {
+                    v.menu = None;
+                    v.toggled.insert(ix);
+                    v.list.splice(ix..ix + 1, 1);
+                    v.list.scroll_to_reveal_item(ix);
+                    cx.notify();
+                }))
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .text_size(px(11.))
+                    .child(div().size(px(7.)).rounded_full().bg(color))
+                    .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().font_weight(FontWeight::SEMIBOLD).child(kind))
+                    .child(div().text_color(color).child(j.status.clone())),
+            )
+            .when(!j.what.is_empty(), |d| d.child(div().text_size(px(12.)).line_clamp(2).child(j.what.clone())))
+            .when(!j.last.is_empty(), |d| d.child(div().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.)).text_color(theme::fg_muted()).child(j.last.clone())))
+            .children(self.job_button(("job-btn", i), j, cx).map(|b| div().flex().justify_end().child(b)))
+    }
+
     /// Stops a subagent or background command.
     fn stop_job(&mut self, id: String, cx: &mut Context<Self>) {
         self.request(json!({ "subtype": "stop_task", "task_id": id }), |v, r, cx| {
@@ -1012,8 +1090,11 @@ impl AgentView {
         self.info = Some(("Usage".into(), vec![("Asking Claude Code…".into(), String::new())]));
         let root = self.root.clone();
         cx.spawn(async move |this, cx| {
-            let r = cx.background_spawn(async move { agent::usage(&root) }).await;
+            let r = cx.background_spawn(async move { agent::usage_cached(&root, 10) }).await;
             this.update(cx, |v, cx| {
+                if let Ok(text) = &r {
+                    v.limits = Some(text.clone());
+                }
                 let rows = match r {
                     Ok(text) => text
                         .lines()
@@ -1054,6 +1135,29 @@ impl AgentView {
             cx.notify();
         }, cx);
     }
+}
+
+/// A node of the subagent map: its card, and under it its children side by side, joined by lines.
+fn tree_node(card: AnyElement, children: Vec<AnyElement>) -> Div {
+    const GAP: f32 = 14.;
+    let line = theme::border_input();
+    let n = children.len();
+    div().flex_none().flex().flex_col().items_center().child(card).when(n > 0, |d| {
+        d.child(div().w(px(1.)).h(px(GAP)).bg(line)).child(div().flex().items_start().children(children.into_iter().enumerate().map(|(k, child)| {
+            // Each child draws its share of the bar across the siblings, and its stub down.
+            div()
+                .relative()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(GAP))
+                .px(px(6.))
+                .when(k > 0, |d| d.child(div().absolute().top_0().left_0().w(relative(0.5)).h(px(1.)).bg(line)))
+                .when(k + 1 < n, |d| d.child(div().absolute().top_0().right_0().w(relative(0.5)).h(px(1.)).bg(line)))
+                .child(div().absolute().top_0().left(relative(0.5)).w(px(1.)).h(px(GAP)).bg(line))
+                .child(child)
+        })))
+    })
 }
 
 /// The box's suggestions: /commands at the start, @files after a space.
@@ -1153,6 +1257,25 @@ fn mono_box(text: String) -> Div {
         .child(shown)
 }
 
+/// A picture in the chat, `h` tall in its own proportions.
+fn thumb(pic: &agent::Picture, h: f32) -> Div {
+    div().flex_none().rounded(px(4.)).overflow_hidden().border_1().border_color(theme::border()).child(img(pic.clone()).h(px(h)).max_w(px(h * 3.)).object_fit(ObjectFit::Contain))
+}
+
+/// The sign before a tool, as OpenCode marks them: reads →, edits ←, commands $, searches ✱, the web %, subagents #.
+fn tool_glyph(name: &str) -> &'static str {
+    match name {
+        "Read" | "NotebookRead" => "→",
+        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => "←",
+        "Bash" | "BashOutput" | "KillShell" => "$",
+        "Glob" | "Grep" | "LS" | "ToolSearch" => "✱",
+        "WebFetch" | "WebSearch" => "%",
+        "Task" | "Agent" => "#",
+        "TodoWrite" => "☐",
+        _ => "⚙",
+    }
+}
+
 /// An edit's changed lines (at most 400), worked out once per edit.
 fn diff_lines(old: &str, new: &str) -> Vec<(similar::ChangeTag, String)> {
     similar::TextDiff::from_lines(old, new).iter_all_changes().take(400).map(|ch| (ch.tag(), ch.value().trim_end_matches('\n').to_string())).collect()
@@ -1167,7 +1290,7 @@ fn diff_box(lines: &[(similar::ChangeTag, String)]) -> Div {
             similar::ChangeTag::Insert => ("+", theme::diff_ins_line()),
             similar::ChangeTag::Equal => (" ", gpui::transparent_black()),
         };
-        rows.push(div().bg(bg).px(px(6.)).whitespace_nowrap().child(format!("{sign} {text}")));
+        rows.push(div().bg(bg).px(px(6.)).whitespace_normal().child(format!("{sign} {text}")));
     }
     div()
         .rounded(px(4.))
@@ -1231,11 +1354,9 @@ impl AgentView {
         let root = &self.root;
         let body: AnyElement = match item {
             Item::User { text, images, context, uuid, .. } => {
-                let images = *images;
                 let chips = context
                     .iter()
                     .filter_map(|c| between_tags(c))
-                    .chain((images > 0).then(|| format!("{images} picture{}", if images == 1 { "" } else { "s" })))
                     .map(|c| div().px(px(6.)).rounded(px(3.)).bg(theme::badge()).text_size(px(11.)).text_color(theme::fg_dim()).child(c));
                 let text2 = text.clone();
                 let actions = div()
@@ -1272,17 +1393,19 @@ impl AgentView {
                     .flex_col()
                     .gap(px(4.))
                     .child(
+                        // OpenCode's look: a bar down the left in the accent colour, no bubble.
                         div()
-                            .px(px(10.))
+                            .pl(px(12.))
+                            .pr(px(10.))
                             .py(px(8.))
-                            .rounded(px(6.))
-                            .bg(theme::bg_input())
-                            .border_1()
-                            .border_color(theme::border_input())
+                            .border_l_2()
+                            .border_color(theme::accent())
+                            .bg(theme::fg().opacity(0.04))
                             .flex()
                             .flex_col()
                             .gap(px(6.))
-                            .child(div().font_family(".SystemUIFont").text_size(px(13.)).line_height(relative(1.5)).text_color(theme::fg_bright()).whitespace_normal().child(text.clone()))
+                            .when(!text.is_empty(), |d| d.child(div().font_family(".SystemUIFont").text_size(px(13.)).line_height(relative(1.5)).text_color(theme::fg_bright()).whitespace_normal().child(text.clone())))
+                            .when(!images.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(6.)).children(images.iter().map(|p| thumb(p, 120.)))))
                             .child(div().flex().flex_wrap().gap(px(4.)).children(chips)),
                     )
                     .child(div().flex().justify_end().child(actions))
@@ -1366,11 +1489,10 @@ impl AgentView {
     fn render_tool(&self, ix: usize, t: &agent::Tool, cx: &mut Context<Self>) -> AnyElement {
         let edit = matches!(t.name.as_str(), "Edit" | "MultiEdit" | "Write");
         let open = self.toggled.contains(&ix) != edit; // edits show their diff unless closed
-        let (dot, color) = match &t.result {
-            None if self.log.busy => ("◌", theme::accent()),
-            None => ("○", theme::fg_muted()),
-            Some((true, _)) => ("✕", theme::git_deleted()),
-            Some((false, _)) => ("●", theme::git_added()),
+        let color = match &t.result {
+            None if self.log.busy => theme::accent(),
+            Some((true, _)) => theme::git_deleted(),
+            _ => theme::fg_muted(),
         };
         let target = agent::tool_target(&t.input, &self.root);
         let file = t.input["file_path"].as_str().or(t.input["notebook_path"].as_str()).map(PathBuf::from);
@@ -1387,14 +1509,15 @@ impl AgentView {
             .cursor_pointer()
             .text_size(px(12.))
             .on_click(cx.listener(move |v, _, _, cx| v.toggle(ix, cx)))
-            .child(div().text_color(color).child(dot))
-            .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(t.name.clone()))
+            .child(div().w(px(12.)).flex_none().font_family(theme::MONO_FONT).text_color(color).child(tool_glyph(&t.name)))
+            .child(div().flex_none().text_color(theme::fg_dim()).child(t.name.clone()))
             .child(
                 div()
                     .id(("tool-target", ix))
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
+                    .text_ellipsis()
                     .whitespace_nowrap()
                     .font_family(theme::MONO_FONT)
                     .text_size(px(11.5))
@@ -1421,7 +1544,7 @@ impl AgentView {
                 .text_size(px(11.))
                 .text_color(theme::fg_muted())
                 .child(format!("{n} step{}", if n == 1 { "" } else { "s" }))
-                .children(shown.into_iter().map(|(tool, target)| div().pl(px(8.)).overflow_hidden().whitespace_nowrap().child(format!("↳ {tool} {target}"))))
+                .children(shown.into_iter().map(|(tool, target)| div().pl(px(8.)).overflow_hidden().text_ellipsis().whitespace_nowrap().child(format!("{} {tool} {target}", tool_glyph(tool)))))
         });
         div()
             .flex()
@@ -1429,7 +1552,7 @@ impl AgentView {
             .gap(px(4.))
             .child(header)
             .children(steps)
-            .when(open, |d| d.child(div().pl(px(18.)).flex().flex_col().gap(px(4.)).children(tool_body(t, &self.differ(ix)))))
+            .when(open, |d| d.child(div().ml(px(5.)).pl(px(12.)).border_l_1().border_color(theme::border()).flex().flex_col().gap(px(4.)).children(tool_body(t, &self.differ(ix)))))
             .into_any_element()
     }
 
@@ -1570,6 +1693,8 @@ impl AgentView {
         let cost = (self.log.cost > 0.).then(|| format!("${:.2}", self.log.cost));
         let jobs = self.jobs();
         let running = jobs.iter().filter(|(_, j)| j.running()).count();
+        let ctx = self.log.context.map(|(used, window)| (used as f64 / window.max(1) as f64 * 100.).round() as u32);
+        let limits: Vec<(String, f32, String)> = self.limits.iter().flat_map(|t| t.lines()).filter_map(agent::limit).map(|(k, p, r)| (k.to_string(), p, r.to_string())).collect();
         div()
             .flex()
             .flex_none()
@@ -1581,6 +1706,45 @@ impl AgentView {
             .border_color(theme::border())
             .child(ui::small_icon("sparkle", theme::accent()))
             .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(12.)).text_color(theme::fg_bright()).child(self.title()))
+            .children(ctx.map(|p| {
+                div()
+                    .id("agent-context")
+                    .px(px(4.))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(if p >= 80 { theme::git_modified() } else { theme::fg_muted() })
+                    .tooltip(ui::tooltip("Context used (click for details; /compact frees it)"))
+                    .on_click(cx.listener(|v, _, _, cx| v.show_context(cx)))
+                    .child(format!("{p}% context"))
+            }))
+            .when(!limits.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id("agent-limits")
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(5.))
+                        .h(px(22.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .tooltip(ui::tooltip_text(limits.iter().map(|(k, p, resets)| format!("{k}: {p}% used · {resets}")).collect::<Vec<_>>().join("\n")))
+                        .on_click(cx.listener(|v, _, _, cx| v.show_usage(cx)))
+                        .children(limits.iter().take(2).map(|(k, p, _)| {
+                            let color = if *p >= 80. { theme::git_deleted() } else { theme::accent() };
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .text_size(px(11.))
+                                .text_color(theme::fg_muted())
+                                .child(agent::limit_short(k))
+                                .child(div().w(px(28.)).h(px(4.)).rounded(px(2.)).bg(theme::border()).child(div().h_full().rounded(px(2.)).w(relative(p.clamp(0., 100.) / 100.)).bg(color)))
+                                .child(format!("{p}%"))
+                        })),
+                )
+            })
             .children(cost.map(|c| div().text_size(px(11.)).text_color(theme::fg_muted()).child(c)))
             .when(!jobs.is_empty(), |d| {
                 d.child(
@@ -1653,7 +1817,7 @@ impl AgentView {
                 .px(px(10.))
                 .text_size(px(11.5))
                 .text_color(theme::fg_dim())
-                .child(div().flex_1().overflow_hidden().whitespace_nowrap().child(format!("Queued: {}", m.text)))
+                .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(format!("Queued: {}", m.text)))
                 .child(ui::icon_button(("unqueue", i), "close").on_click(cx.listener(move |v, _, _, cx| {
                     if i < v.queue.len() {
                         v.queue.remove(i);
@@ -1695,28 +1859,31 @@ impl AgentView {
                     .child(ui::small_icon("eye", theme::fg_dim()).size(px(11.)))
                     .child(label)
             }))
-            .children(self.images.iter().enumerate().map(|(i, (mt, _))| {
+            .children(self.images.iter().enumerate().map(|(i, pic)| {
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .pl(px(6.))
-                    .h(px(20.))
-                    .rounded(px(3.))
-                    .bg(theme::badge())
-                    .text_size(px(11.))
-                    .child(format!("Picture {} ({})", i + 1, mt.trim_start_matches("image/")))
-                    .child(ui::icon_button(("unimage", i), "close").size(px(18.)).on_click(cx.listener(move |v, _, _, cx| {
-                        if i < v.images.len() {
-                            v.images.remove(i);
-                        }
-                        cx.notify();
-                    })))
+                    .group("pending-pic")
+                    .relative()
+                    .child(thumb(pic, 56.))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(2.))
+                            .right(px(2.))
+                            .rounded(px(3.))
+                            .bg(theme::bg_popup())
+                            .invisible()
+                            .group_hover("pending-pic", |s| s.visible())
+                            .child(ui::icon_button(("unimage", i), "close").size(px(18.)).tooltip(ui::tooltip("Remove")).on_click(cx.listener(move |v, _, _, cx| {
+                                if i < v.images.len() {
+                                    v.images.remove(i);
+                                }
+                                cx.notify();
+                            }))),
+                    )
             }));
         let mode_label = MODES.iter().find(|(m, _)| *m == self.mode).map_or(self.mode.clone(), |(_, l)| l.to_string());
         let model_label = self.model_info().and_then(|m| m["displayName"].as_str()).map(String::from).unwrap_or_else(|| if self.model.is_empty() { "Default model".into() } else { self.model.clone() });
         let effort_label = if self.effort.is_empty() { "Effort".to_string() } else { format!("Effort: {}", self.effort) };
-        let ctx = self.log.context.map(|(used, window)| (used as f64 / window.max(1) as f64 * 100.).round() as u32);
         let busy = self.log.busy;
         let footer = div()
             .flex()
@@ -1731,17 +1898,6 @@ impl AgentView {
             })
             .child(pill("agent-effort", effort_label).on_mouse_down(MouseButton::Left, cx.listener(|v, e: &MouseDownEvent, w, cx| v.open_menu(Menu::Effort, e.position, w, cx))))
             .child(div().flex_1())
-            .children(ctx.map(|p| {
-                div()
-                    .id("agent-context")
-                    .px(px(4.))
-                    .cursor_pointer()
-                    .text_size(px(11.))
-                    .text_color(if p >= 80 { theme::git_modified() } else { theme::fg_muted() })
-                    .tooltip(ui::tooltip("Context used (click for details; /compact frees it)"))
-                    .on_click(cx.listener(|v, _, _, cx| v.show_context(cx)))
-                    .child(format!("{p}% context"))
-            }))
             .child(ui::icon_button("agent-attach", "paperclip").tooltip(ui::tooltip("Attach files or pictures")).on_click(cx.listener(|_, _, window, cx| {
                 let pick = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: None });
                 cx.spawn_in(window, async move |this, cx| {
@@ -1771,14 +1927,19 @@ impl AgentView {
                     .p(px(10.))
                     .child(chips)
                     .child(
+                        // OpenCode's prompt: a bar down the left in the mode's colour (plan: yellow).
                         div()
                             .id("agent-input")
-                            .px(px(8.))
-                            .py(px(6.))
-                            .rounded(px(6.))
+                            .relative()
+                            .pl(px(12.))
+                            .pr(px(8.))
+                            .py(px(8.))
+                            .rounded(px(4.))
+                            .overflow_hidden()
                             .border_1()
-                            .border_color(if self.mode == "plan" { theme::git_modified() } else { theme::border_input() })
+                            .border_color(theme::border_input())
                             .bg(theme::bg_input())
+                            .child(div().absolute().left_0().top_0().bottom_0().w(px(3.)).bg(if self.mode == "plan" { theme::git_modified() } else { theme::accent() }))
                             .child(self.input.clone()),
                     )
                     .child(footer)
@@ -1848,63 +2009,24 @@ impl AgentView {
                 }))
                 .into_any_element(),
             Menu::Agents => {
-                let rows: Vec<_> = self
-                    .jobs()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (depth, j))| {
-                        let color = match j.status.as_str() {
-                            "running" => theme::accent(),
-                            "completed" => theme::git_added(),
-                            "failed" => theme::git_deleted(),
-                            _ => theme::fg_muted(),
-                        };
-                        let kind = if j.is_agent() { format!("Agent · {}", if j.agent.is_empty() { "subagent" } else { &j.agent }) } else { "Command".to_string() };
-                        let item = j.tool_use.as_ref().and_then(|t| self.log.items.iter().position(|it| matches!(it, Item::Tool(x) if x.id == *t)));
-                        div()
-                            .id(("job", i))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .pl(px(10. + 14. * depth as f32))
-                            .pr(px(6.))
-                            .py(px(4.))
-                            .mx(px(4.))
-                            .rounded(px(3.))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme::selected_focused()))
-                            .when_some(item, |d, ix| {
-                                d.on_click(cx.listener(move |v, _, _, cx| {
-                                    v.menu = None;
-                                    v.toggled.insert(ix);
-                                    v.list.splice(ix..ix + 1, 1);
-                                    v.list.scroll_to_reveal_item(ix);
-                                    cx.notify();
-                                }))
-                            })
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .gap(px(6.))
-                                            .text_size(px(12.))
-                                            .child(div().text_color(color).child(j.status.clone()))
-                                            .child(div().font_weight(FontWeight::SEMIBOLD).child(kind))
-                                            .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(j.what.clone())),
-                                    )
-                                    .when(!j.last.is_empty(), |d| d.child(div().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.)).text_color(theme::fg_muted()).child(j.last.clone()))),
-                            )
-                            .children(self.job_button(("job-btn", i), &j, cx))
-                    })
-                    .collect();
-                base.w(px(460.))
+                let jobs = self.jobs();
+                let root = div()
+                    .flex_none()
+                    .w(px(200.))
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(theme::accent())
+                    .bg(theme::bg_editor())
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.title());
+                base.max_w(px(900.))
+                    .max_h(px(560.))
+                    .overflow_scroll()
                     .child(div().px(px(10.)).pb(px(4.)).text_size(px(11.)).text_color(theme::fg_muted()).child("Subagents and background jobs (Stop ends one; a stopped subagent can resume)"))
-                    .children(rows)
+                    .child(div().flex().p(px(10.)).child(tree_node(root.into_any_element(), self.job_subtrees(&jobs, 0, cx))))
                     .into_any_element()
             }
             Menu::Effort => {

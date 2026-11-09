@@ -3,6 +3,7 @@ mod api_panel;
 mod api_view;
 mod agent;
 mod agent_view;
+mod claude_panel;
 
 mod assets;
 mod buffer;

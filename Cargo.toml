@@ -32,7 +32,8 @@ md-5 = "0.11"
 fastrand = "2"
 futures-util = "0.3"
 anyhow = "1"
-block = "0.1.6"
+# Objective-C blocks (the successor of `block`, already built for GPUI).
+block2 = "0.6"
 futures = "0.3"
 # GPUI snapshots from Zed (the `gpui` crate on crates.io stopped at 0.2.2), named `gpui` so imports stay
 # `use gpui::*`. Pinned exactly: gpui-kit needs this same version, and snapshots break APIs.

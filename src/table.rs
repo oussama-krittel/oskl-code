@@ -299,6 +299,7 @@ impl TableView {
     }
 
     /// The text of a cell, as shown (whole).
+    #[cfg(test)]
     pub fn cell_text(&self, r: usize, c: usize) -> String {
         let Some(s) = self.sheets.get(self.current) else { return String::new() };
         s.row(r).get(c).map(|t| t.trim_start_matches(crate::office::NUMBER).to_string()).unwrap_or_default()

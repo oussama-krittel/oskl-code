@@ -2147,7 +2147,11 @@ impl Editor {
 
         // Scrolling.
         let disp_count = self.disp_count();
-        let content_h = if full { (disp_count.saturating_sub(1)) as f32 * line_h + height } else { line_count as f32 * line_h };
+        let content_h = if full { (disp_count.saturating_sub(1)) as f32 * line_h + height } else { disp_count as f32 * line_h };
+        // The box was sized by the wrap of the last frame: drawn again when it wraps to another row count.
+        if self.chat && (disp_count.clamp(1, 10) as f32 * line_h - height).abs() > 0.5 {
+            window.refresh();
+        }
         let max_scroll = (content_h - height).max(0.);
         let (row, col) = self.buf.pos_to_rc(self.buf.sel.head);
         let cursor_disp = self.disp_of(row) + seg_index(self.seg_starts(row), col);
@@ -3695,7 +3699,8 @@ impl Element for EditorElement {
             EditorMode::Full => style.size.height = relative(1.).into(),
             EditorMode::SingleLine => style.size.height = px(lh + 6.).into(),
             EditorMode::MultiLine => {
-                let rows = ed.buf.line_count().clamp(1, 10) as f32;
+                // Wrapped rows count (the chat box): a long line grows the box instead of hiding.
+                let rows = ed.disp_count().clamp(1, 10) as f32;
                 style.size.height = px(rows * lh).into();
             }
         }
