@@ -677,6 +677,24 @@ impl DbView {
         d.grid.as_ref()?.grid.trees.as_ref()?.get(row).map(|t| t.text(style))
     }
 
+    /// The first document on screen in the Data View.
+    #[cfg(test)]
+    pub fn docs_scroll_top(&self) -> usize {
+        match &self.body {
+            Body::Data(d) => d.grid.as_ref().map(|g| g.list.logical_scroll_top().item_ix).unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn scroll_docs_to_top(&mut self) {
+        if let Body::Data(d) = &mut self.body
+            && let Some(g) = &d.grid
+        {
+            g.list.scroll_to(gpui::ListOffset::default());
+        }
+    }
+
     pub fn set_query(&mut self, text: &str, cx: &mut Context<Self>) {
         if let Body::Data(d) = &self.body {
             let q = d.query.clone();
@@ -1792,7 +1810,13 @@ fn one_line(id: impl Into<gpui::ElementId>, child: gpui::Div) -> gpui::Stateful<
         .min_w_0()
         .overflow_x_scroll()
         .whitespace_nowrap()
-        .on_scroll(|_, _, cx| cx.stop_propagation())
+        // A sideways swipe stays in the value; an up/down one goes on to the list around it.
+        .on_scroll(|ev, window, cx| {
+            let d = ev.delta.pixel_delta(window.line_height());
+            if d.x.abs() > d.y.abs() {
+                cx.stop_propagation();
+            }
+        })
         .child(child)
 }
 

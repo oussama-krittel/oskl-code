@@ -8743,6 +8743,24 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     /// The open database tab.
+    /// The test MongoDB, connected: a collection of `n` documents in kite_test. Its connection id.
+    fn live_mongo_docs(coll: &str, n: usize, _cx: &mut VisualTestContext) -> String {
+        let mut c = crate::db::Conn::new(crate::db::Kind::MongoDb);
+        c.name = "Mongo".into();
+        c.port = 57017;
+        c.user = "root".into();
+        crate::db::save(&c, Some("mongopw")).unwrap();
+        crate::db::engine::open(&c.id);
+        let docs: Vec<String> = (0..n).map(|i| format!("{{n: {i}, name: 'person {i}', tags: ['a', 'b'], addr: {{city: 'Oslo', zip: '{:04}'}}, note: 'a fairly long note that runs on past the edge of the card for document {i}'}}", i * 7)).collect();
+        let seed = crate::db::engine::run(crate::db::engine::query(
+            c.clone(),
+            crate::db::Scope { database: Some("kite_test".into()), collection: None },
+            format!("db.{coll}.drop()\ndb.{coll}.insertMany([{}])", docs.join(", ")),
+        ));
+        futures::executor::block_on(seed).unwrap();
+        c.id
+    }
+
     fn db_tab(ws: &gpui::Entity<Workspace>, cx: &mut VisualTestContext) -> Option<gpui::Entity<crate::db_view::DbView>> {
         ws.read_with(cx, |ws, _| ws.active.and_then(|a| match &ws.tabs[a].kind {
             TabKind::Db(v) => Some(v.clone()),
@@ -9263,6 +9281,32 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(shell.starts_with("{\n  _id: ObjectId('"), "{shell}");
         click_on(cx, "db-mode-table");
         assert!(cx.debug_bounds("db-col-0").is_some(), "a table, with its columns");
+    }
+
+    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    #[gpui::test]
+    fn mongodb_documents_scroll_with_the_pointer_on_their_values(cx: &mut TestAppContext) {
+        if std::env::var_os("KITE_DB_LIVE").is_none() {
+            return;
+        }
+        let (ws, cx) = setup(cx);
+        let id = live_mongo_docs("scroll_docs", 40, cx);
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["kite_test".into(), "scroll_docs".into()] }, window, cx));
+        let tab = db_tab(&ws, cx).expect("a data tab");
+        wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
+        for mode in ["db-mode-json", "db-mode-list"] {
+            click_on(cx, mode);
+            tab.update(cx, |t, _| t.scroll_docs_to_top());
+            cx.run_until_parked();
+            // The wheel over a value (not between the cards) scrolls the documents.
+            let card = cx.debug_bounds("db-card-0").expect("the first card");
+            let at = gpui::point(card.left() + gpui::px(120.), card.top() + gpui::px(40.));
+            for _ in 0..5 {
+                cx.simulate_event(gpui::ScrollEvent { position: at, delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-200.))), ..Default::default() });
+                cx.run_until_parked();
+            }
+            assert!(tab.read_with(cx, |t, _| t.docs_scroll_top()) > 0, "{mode}: scrolled down");
+        }
     }
 
     /// With the test PostgreSQL server running (KITE_DB_LIVE=1, port 55432).
