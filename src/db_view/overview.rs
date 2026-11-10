@@ -189,6 +189,9 @@ impl DbView {
                 .flex()
                 .items_center()
                 .gap(px(4.))
+                // A long name stays in its column (cut short rather than over the next one).
+                .overflow_hidden()
+                .whitespace_nowrap()
                 .cursor_pointer()
                 .hover(|s| s.bg(theme::hover()))
                 .on_click(cx.listener(move |v, _, _, cx| {
@@ -198,8 +201,8 @@ impl DbView {
                     }
                     cx.notify();
                 }))
-                .child(text)
-                .child(div().text_color(theme::fg_muted()).child(arrow))
+                .child(div().min_w_0().overflow_hidden().text_ellipsis().child(text))
+                .child(div().flex_none().text_color(theme::fg_muted()).child(arrow))
         };
         let cell = |text: String, w: f32| div().w(px(w)).flex_none().px(px(10.)).overflow_hidden().text_ellipsis().whitespace_nowrap().child(text);
         let opt = |v: Option<u64>, f: fn(u64) -> String| v.map(f).unwrap_or_else(|| "–".into());
@@ -232,12 +235,12 @@ impl DbView {
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(Request::Db(DbRequest::Open(Open::Data { conn: conn.clone(), path: vec![db.clone(), name.clone()] })))))
                         .child(div().flex_1().min_w_0().px(px(10.)).text_color(theme::fg_bright()).child(SharedString::from(c.name.clone())))
                         .child(div().w(px(150.)).flex_none().px(px(10.)).flex().flex_wrap().gap(px(4.)).when(c.props.is_empty(), |d| d.child("-")).children(c.props.iter().map(|p| ui::badge(p.to_uppercase(), theme::bg_input()))))
-                        .child(cell(opt(c.storage, size_text), 110.))
-                        .child(cell(opt(c.data, size_text), 110.))
-                        .child(cell(opt(c.docs, db::short_count), 100.))
-                        .child(cell(opt(c.avg, size_text), 110.))
-                        .child(cell(opt(c.indexes, |n| n.to_string()), 80.))
-                        .child(cell(opt(c.index_size, size_text), 120.))
+                        .child(cell(opt(c.storage, size_text), 130.))
+                        .child(cell(opt(c.data, size_text), 115.))
+                        .child(cell(opt(c.docs, db::short_count), 115.))
+                        .child(cell(opt(c.avg, size_text), 130.))
+                        .child(cell(opt(c.indexes, |n| n.to_string()), 95.))
+                        .child(cell(opt(c.index_size, size_text), 115.))
                         .child(
                             div().w(px(40.)).flex_none().flex().justify_center().child(
                                 div()
@@ -349,12 +352,12 @@ impl DbView {
                             .text_color(theme::fg_bright())
                             .child(head("db-sort-name", "Collection name", Col::Name, None, cx))
                             .child(div().w(px(150.)).flex_none().px(px(10.)).child("Properties"))
-                            .child(head("db-sort-storage", "Storage size", Col::Storage, Some(110.), cx))
-                            .child(head("db-sort-data", "Data size", Col::Data, Some(110.), cx))
-                            .child(head("db-sort-docs", "Documents", Col::Docs, Some(100.), cx))
-                            .child(head("db-sort-avg", "Avg. document size", Col::Avg, Some(110.), cx))
-                            .child(head("db-sort-indexes", "Indexes", Col::Indexes, Some(80.), cx))
-                            .child(head("db-sort-index-size", "Total index size", Col::IndexSize, Some(120.), cx))
+                            .child(head("db-sort-storage", "Storage size", Col::Storage, Some(130.), cx))
+                            .child(head("db-sort-data", "Data size", Col::Data, Some(115.), cx))
+                            .child(head("db-sort-docs", "Documents", Col::Docs, Some(115.), cx))
+                            .child(head("db-sort-avg", "Avg. doc size", Col::Avg, Some(130.), cx))
+                            .child(head("db-sort-indexes", "Indexes", Col::Indexes, Some(95.), cx))
+                            .child(head("db-sort-index-size", "Index size", Col::IndexSize, Some(115.), cx))
                             .child(div().w(px(40.)).flex_none()),
                     )
                     .child(body),
