@@ -8874,6 +8874,57 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         wait_for(cx, "saved", |cx| tab.read_with(cx, |t, _| t.json_editor(0)).is_none());
         assert!(first(&conn).contains("name: 'Zed'"), "{}", first(&conn));
 
+        // Typed as JSON, then the view switched: the change stays, in every view, until saved.
+        wait_for(cx, "the card", |cx| cx.debug_bounds("db-card-0").is_some());
+        let card = cx.debug_bounds("db-card-0").unwrap();
+        cx.simulate_mouse_move(card.center(), None, gpui::Modifiers::none());
+        click_on(cx, "db-doc-edit-0");
+        let (json, _) = tab.read_with(cx, |t, _| t.json_editor(0)).unwrap();
+        let text = json.read_with(cx, |e, _| e.text());
+        json.update(cx, |e, cx| e.set_text(&text.replace("\"Zed\"", "\"Kept\""), cx));
+        cx.run_until_parked();
+        click_on(cx, "db-mode-list");
+        assert!(tab.read_with(cx, |t, _| t.json_editor(0)).is_none(), "now a change of the document");
+        assert!(cx.debug_bounds("db-doc-bar-0").is_some(), "Cancel and Update in List");
+        click_on(cx, "db-mode-table");
+        assert!(cx.debug_bounds("db-doc-bar-0").is_some(), "and in Table");
+        click_on(cx, "db-doc-update-0");
+        wait_for(cx, "saved", |cx| cx.debug_bounds("db-doc-bar-0").is_none());
+        assert!(first(&conn).contains("name: 'Kept'"), "{}", first(&conn));
+
+        // A key being typed: Cancel and Update show at once.
+        click_on(cx, "db-mode-list");
+        wait_for(cx, "the card", |cx| cx.debug_bounds("db-key-0-3").is_some());
+        let key = cx.debug_bounds("db-key-0-3").unwrap().center();
+        for n in [1, 2] {
+            cx.simulate_event(gpui::MouseDownEvent { position: key, button: gpui::MouseButton::Left, click_count: n, ..Default::default() });
+            cx.simulate_event(gpui::MouseUpEvent { position: key, button: gpui::MouseButton::Left, click_count: n, ..Default::default() });
+        }
+        cx.run_until_parked();
+        assert_eq!(tab.read_with(cx, |t, _| t.editor_in_card()).unwrap().read_with(cx, |e, _| e.text()), "name", "the whole name, as it is");
+        assert!(cx.debug_bounds("db-doc-bar-0").is_some(), "the bar while typing");
+        click_on(cx, "db-doc-cancel-0");
+
+        // Table: sorting keeps the columns in view; the wheel up and down doesn't move them.
+        click_on(cx, "db-mode-table");
+        cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(700.)));
+        cx.run_until_parked();
+        tab.update(cx, |t, _| t.set_table_scroll_x(60.));
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+        let x = tab.read_with(cx, |t, _| t.table_scroll_x());
+        assert!(x > 0., "the table scrolls sideways in a narrow window");
+        click_on(cx, "db-col-1");
+        wait_for(cx, "sorted", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
+        assert_eq!(tab.read_with(cx, |t, _| t.table_scroll_x()), x, "still where it was");
+        let grid = cx.debug_bounds("db-grid").unwrap();
+        cx.simulate_event(gpui::ScrollEvent { position: grid.center(), delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-120.))), ..Default::default() });
+        cx.run_until_parked();
+        assert_eq!(tab.read_with(cx, |t, _| t.table_scroll_x()), x, "not sideways");
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(900.)));
+        cx.run_until_parked();
+        click_on(cx, "db-mode-json");
+
         // Clone, then delete (asked first).
         wait_for(cx, "the card again", |cx| cx.debug_bounds("db-card-0").is_some());
         let card = cx.debug_bounds("db-card-0").unwrap();

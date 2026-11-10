@@ -544,6 +544,8 @@ pub enum Op {
     Remove(Vec<Seg>),
     /// A field (with its name) or an array item, at this place in the object or array at the path.
     Insert(Vec<Seg>, usize, Option<String>, Bson),
+    /// The whole document, typed as JSON (its _id kept).
+    Replace(Document),
 }
 
 /// A value typed in a card. It keeps its type where it can: a string stays a string, a Double a
@@ -605,10 +607,32 @@ pub fn apply(doc: &mut Document, op: &Op) -> Result<()> {
     r
 }
 
+/// A document typed whole keeps the _id it had.
+fn replaced(old_id: Option<Bson>, new: &Document) -> Result<Document> {
+    match (old_id, new.get("_id")) {
+        (Some(id), Some(n)) if *n != id => bail!("The _id can't be changed"),
+        (Some(id), None) => {
+            let mut d = doc! { "_id": id };
+            d.extend(new.clone());
+            Ok(d)
+        }
+        _ => Ok(new.clone()),
+    }
+}
+
 fn apply_bson(root: &mut Bson, op: &Op) -> Result<()> {
+    if let Op::Replace(new) = op {
+        let id = match root {
+            Bson::Document(d) => d.get("_id").cloned(),
+            _ => None,
+        };
+        *root = Bson::Document(replaced(id, new)?);
+        return Ok(());
+    }
     let (parent, last): (&[Seg], Option<&Seg>) = match op {
         Op::Set(p, _) | Op::Rename(p, _) | Op::Remove(p) => (&p[..p.len().saturating_sub(1)], p.last()),
         Op::Insert(p, _, _, _) => (p, None),
+        Op::Replace(_) => return Ok(()),
     };
     let target = bson_at(root, parent)?;
     match (op, target, last) {
@@ -659,9 +683,15 @@ fn tree_at<'a>(t: &'a mut Tree, path: &[Seg]) -> Option<&'a mut Tree> {
 
 /// The same change on the card's copy of the document (to show it before it's saved).
 pub fn apply_tree(t: &mut Tree, op: &Op) -> Result<(), String> {
+    if let Op::Replace(new) = op {
+        let id = id_of(t).ok();
+        *t = tree(&Bson::Document(replaced(id, new).map_err(|e| e.to_string())?));
+        return Ok(());
+    }
     let (parent, last): (&[Seg], Option<&Seg>) = match op {
         Op::Set(p, _) | Op::Rename(p, _) | Op::Remove(p) => (&p[..p.len().saturating_sub(1)], p.last()),
         Op::Insert(p, _, _, _) => (p, None),
+        Op::Replace(_) => return Ok(()),
     };
     let target = tree_at(t, parent).ok_or("that field isn't there any more")?;
     match (op, target, last) {

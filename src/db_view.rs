@@ -492,6 +492,8 @@ impl DbView {
                             && let Some(old) = &d.grid
                         {
                             g.widths = old.widths.clone();
+                            // And the same columns in view: sorting or paging doesn't scroll back to the first.
+                            g.hscroll = old.hscroll.clone();
                         }
                         g
                     });
@@ -785,6 +787,27 @@ impl DbView {
 
     /// MongoDB: List, JSON or Table (every grid's rows are measured again).
     fn set_doc_mode(&mut self, mode: DocMode, cx: &mut Context<Self>) {
+        // A key or value being typed is kept; a document typed as JSON becomes its change, so
+        // every view shows it (with Cancel and Update) until it's saved or dropped.
+        if self.editing.is_some() {
+            self.commit_edit_quietly(cx);
+        }
+        let mut carried: Vec<(Option<usize>, usize, mongodb::bson::Document)> = Vec::new();
+        if let Body::Data(d) = &self.body
+            && let Some(g) = &d.grid
+        {
+            for (r, j) in &g.json_edits {
+                if let Ok(doc) = compass::parse_document(&j.editor.read(cx).text()) {
+                    carried.push((None, *r, doc));
+                }
+            }
+        }
+        for (which, r, doc) in carried {
+            if let Some(g) = self.grid_of_mut(which) {
+                g.json_edits.remove(&r);
+            }
+            self.edit_op(which, r, compass::Op::Replace(doc), None, cx);
+        }
         let Body::Data(d) = &mut self.body else { return };
         d.doc_mode = mode;
         self.sel.reset();
@@ -1438,6 +1461,8 @@ impl DbView {
             .flex_1()
             .min_h_0()
             .overflow_x_scroll()
+            // Up and down scroll the rows, never the columns sideways.
+            .restrict_scroll_to_axis()
             .track_scroll(&gv.hscroll)
             .on_mouse_down(MouseButton::Left, { let sel = self.sel.clone(); move |ev, window, _| sel.press(ev, window) })
             // At least as wide as the pane: few columns share its width.
@@ -1809,7 +1834,8 @@ impl DbView {
     fn doc_bar(&self, which: Option<usize>, r: usize, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let gv = self.grid_of(which)?;
         let e = gv.edits.get(&r)?;
-        let (modified, saving, error) = (!e.ops.is_empty(), e.saving, e.error.clone());
+        let typing = self.editing.as_ref().is_some_and(|ed| ed.which == which && ed.row == r);
+        let (modified, saving, error) = (!e.ops.is_empty() || typing, e.saving, e.error.clone());
         (modified || error.is_some()).then(|| {
             div()
                 .debug_selector(move || format!("db-doc-bar-{r}"))
@@ -1837,7 +1863,8 @@ impl DbView {
 
     /// The pencil in JSON: the card becomes its document as text, checked as it's typed.
     fn start_json_edit(&mut self, which: Option<usize>, r: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(t) = self.doc_tree(which, r) else { return };
+        let edited = self.grid_of(which).and_then(|g| g.edits.get(&r)).map(|e| e.working.clone());
+        let Some(t) = edited.or_else(|| self.doc_tree(which, r)) else { return };
         let editor = cx.new(|cx| {
             let mut ed = Editor::new(EditorMode::Full, cx);
             ed.set_text(&t.text(TextStyle::Json), cx);
@@ -1906,7 +1933,9 @@ impl DbView {
     }
 
     fn save_json_edit(&mut self, which: Option<usize>, r: usize, cx: &mut Context<Self>) {
-        let Some(original) = self.doc_tree(which, r) else { return };
+        // Checked against the document as it was loaded (changes made in other views included in the text).
+        let loaded = self.grid_of(which).and_then(|g| g.edits.get(&r)).map(|e| e.original.clone());
+        let Some(original) = loaded.or_else(|| self.doc_tree(which, r)) else { return };
         let Some(j) = self.grid_of_mut(which).and_then(|g| g.json_edits.get_mut(&r)) else { return };
         if j.saving || j.invalid.is_some() {
             return;
@@ -1945,6 +1974,30 @@ impl DbView {
     #[cfg(test)]
     pub fn json_editor(&self, row: usize) -> Option<(Entity<Editor>, Option<String>)> {
         self.grid_of(None)?.json_edits.get(&row).map(|j| (j.editor.clone(), j.invalid.clone().or(j.error.clone())))
+    }
+
+    /// What's typed in an edit box goes into the document (switching views).
+    fn commit_edit_quietly(&mut self, cx: &mut Context<Self>) {
+        let Some(ed) = self.editing.take() else { return };
+        let text = ed.editor.read(cx).text();
+        let (which, row) = (ed.which, ed.row);
+        let op = if ed.key {
+            let new = text.trim().to_string();
+            match ed.path.last() {
+                Some(Seg::Key(old)) if !new.is_empty() && new != *old => {
+                    let mut renamed = ed.path.clone();
+                    *renamed.last_mut().unwrap() = Seg::Key(new.clone());
+                    Some((compass::Op::Rename(ed.path.clone(), new), renamed))
+                }
+                _ => None,
+            }
+        } else {
+            let value = if ed.fresh && !ed.ty_chosen { compass::edit_value(&text, None) } else { compass::typed_value(&text, ed.ty) };
+            value.ok().map(|v| (compass::Op::Set(ed.path.clone(), v), ed.path.clone()))
+        };
+        if let Some((op, mark)) = op {
+            self.edit_op(which, row, op, Some(mark), cx);
+        }
     }
 
     /// Esc: the key or value as it was.
@@ -2006,11 +2059,12 @@ impl DbView {
         let Body::Data(d) = &self.body else { return };
         let [db, coll] = d.path.as_slice() else { return };
         let (conn, db, coll) = (d.conn.clone(), db.clone(), coll.clone());
+        // What's still in an edit box is part of it.
         if self.editing.as_ref().is_some_and(|e| e.which == which && e.row == row) {
-            self.editing = None;
+            self.commit_edit_quietly(cx);
         }
         let Some(e) = self.doc_edit(which, row) else { return };
-        if e.saving {
+        if e.saving || e.ops.is_empty() {
             return;
         }
         e.saving = true;
@@ -2040,6 +2094,19 @@ impl DbView {
         })
         .detach();
         self.remeasure(which, row, cx);
+    }
+
+    /// How far the table is scrolled sideways (tests).
+    #[cfg(test)]
+    pub fn table_scroll_x(&self) -> f32 {
+        self.grid_of(None).map(|g| -g.hscroll.offset().x / gpui::px(1.)).unwrap_or(0.)
+    }
+
+    #[cfg(test)]
+    pub fn set_table_scroll_x(&self, x: f32) {
+        if let Some(g) = self.grid_of(None) {
+            g.hscroll.set_offset(gpui::point(gpui::px(-x), gpui::px(0.)));
+        }
     }
 
     #[cfg(test)]
@@ -2254,7 +2321,7 @@ impl DbView {
             .invisible()
             .group_hover("db-card", |s| s.visible())
             .when(editable && json, |d| d.child(tool("db-doc-edit", "pencil", "Edit as JSON").on_click(cx.listener(move |v, _, window, cx| v.start_json_edit(which, r, window, cx)))))
-            .child(copy_button(("db-card-copy", r), copy))
+            .child(tool("db-card-copy", "copy", "Copy").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))))
             .when(editable, |d| {
                 d.child(tool("db-doc-clone", "files", "Clone: insert a copy").on_click(cx.listener(move |v, _, _, cx| v.clone_doc(which, r, cx))))
                     .child(tool("db-doc-delete", "trash", "Delete").on_click(cx.listener(move |v, _, _, cx| v.ask_delete_doc(which, r, cx))))
@@ -2337,9 +2404,14 @@ impl DbView {
                 let top_id = depth == 0 && key == "_id";
                 let edit_key = w.editing.as_ref().filter(|(ep, k, _)| *ep == here && *k).map(|(_, _, e)| e.clone());
                 let edit_value = w.editing.as_ref().filter(|(ep, k, _)| *ep == here && !*k).map(|(_, _, e)| e.clone());
-                let field_box = |e: Entity<Editor>, wide: bool| div().when(wide, |d| d.flex_1()).when(!wide, |d| d.w(px(160.)).flex_none()).h(px(19.)).px(px(4.)).flex().items_center().rounded(px(3.)).bg(theme::bg_input()).border_1().border_color(theme::focus_border()).child(e);
+                // The box as wide as the name in it (the whole name shows), as tall as the text needs.
+                let field_box = |e: Entity<Editor>, wide: bool, cx: &mut Context<DbView>| {
+                    let chars = e.read(cx).text().chars().count().max(8) as f32;
+                    div().when(wide, |d| d.flex_1()).when(!wide, |d| d.w(px(chars * 7.8 + 24.)).flex_none()).h(px(24.)).px(px(5.)).flex().items_center().rounded(px(3.)).bg(theme::bg_input()).border_1().border_color(theme::focus_border()).child(e)
+                };
+                let editing_here = w.editing.as_ref().is_some_and(|(ep, _, _)| *ep == here);
                 let key_el = match (edit_key, key_text.is_empty()) {
-                    (Some(e), _) => Some(div().flex().items_center().gap(px(4.)).child(field_box(e, false)).child(":").into_any_element()),
+                    (Some(e), _) => Some(div().flex().items_center().gap(px(4.)).mr(px(6.)).child(field_box(e, false, cx)).child(":").into_any_element()),
                     (None, false) => {
                         let piece = v.sel.text_piece(((row * 100_000 + id) as u64, 0), format!("{key_text}: "), theme::fg_bright(), true);
                         let renamable = w.editable && matches!(seg, Seg::Key(_)) && !top_id;
@@ -2365,7 +2437,7 @@ impl DbView {
                     (None, true) => None,
                 };
                 let value_el = match edit_value {
-                    Some(e) => div().flex_1().flex().items_center().gap(px(6.)).child(field_box(e, true)).child(v.type_picker(cx)).into_any_element(),
+                    Some(e) => div().flex_1().flex().items_center().gap(px(6.)).child(field_box(e, true, cx)).child(v.type_picker(cx)).into_any_element(),
                     None => {
                         let path_v = here.clone();
                         let editable_value = w.editable && !container && !top_id;
@@ -2435,9 +2507,10 @@ impl DbView {
                         .group("db-line")
                         .flex()
                         .items_center()
-                        .h(px(21.))
+                        .h(px(if editing_here { 28. } else { 21. }))
                         .whitespace_nowrap()
-                        .when(w.changed.contains(&here), |d| d.bg(theme::git_modified().opacity(0.18)))
+                        // Changed, or being changed: highlighted.
+                        .when(w.changed.contains(&here) || editing_here, |d| d.bg(theme::git_modified().opacity(0.18)))
                         .children(gutter)
                         .child(div().w(px(depth as f32 * 18.)).flex_none())
                         .when(container, |d| d.cursor_pointer().on_click(cx.listener(move |v, _, _, cx| v.toggle_fold(which, row, fold.clone(), cx))))
