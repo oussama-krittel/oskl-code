@@ -6586,6 +6586,8 @@ mod ui_tests {
         // Real folders: the file watcher and git wake tasks from their own threads.
         cx.executor().allow_parking();
         cx.update(|cx| {
+            // As the app starts: the kit's widgets and text selection.
+            crate::keybindings::init_kit(cx);
             crate::editor::bind_keys();
             crate::workspace::bind_keys();
             crate::file_tree::bind_keys();
@@ -8743,6 +8745,43 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     /// The open database tab.
+    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    #[gpui::test]
+    fn document_text_is_selected_by_dragging_and_copied(cx: &mut TestAppContext) {
+        if std::env::var_os("KITE_DB_LIVE").is_none() {
+            return;
+        }
+        let (ws, cx) = setup(cx);
+        let id = live_mongo_docs("select_docs", 3, cx);
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["kite_test".into(), "select_docs".into()] }, window, cx));
+        let tab = db_tab(&ws, cx).expect("a data tab");
+        wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
+        for (mode, want) in [("db-mode-table", ""), ("db-mode-list", "name: 'person 0'"), ("db-mode-json", "\"name\": \"person 0\"")] {
+            click_on(cx, mode);
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+            let (from, to) = if mode == "db-mode-table" {
+                let a = cx.debug_bounds("db-col-0").unwrap();
+                (gpui::point(a.left() + gpui::px(12.), a.bottom() + gpui::px(13.)), gpui::point(a.left() + gpui::px(400.), a.bottom() + gpui::px(13.)))
+            } else {
+                let card = cx.debug_bounds("db-card-0").unwrap();
+                (gpui::point(card.left() + gpui::px(32.), card.top() + gpui::px(20.)), gpui::point(card.left() + gpui::px(300.), card.top() + gpui::px(20. + 21. * 3.)))
+            };
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.simulate_mouse_move(from, None, gpui::Modifiers::none());
+            cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_move(to, Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+            cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+            cx.run_until_parked();
+            tab.update_in(cx, |t, window, cx| window.focus(&gpui::Focusable::focus_handle(t, cx), cx));
+            cx.simulate_keystrokes("cmd-c");
+            let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default();
+            assert_ne!(copied, "before", "{mode}: dragging selected something");
+            assert!(copied.lines().count() > 1 || mode == "db-mode-table", "{mode}: over several lines: {copied:?}");
+            assert!(want.is_empty() || copied.contains(want), "{mode}: {copied:?}");
+        }
+    }
+
     /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
     #[gpui::test]
     fn a_mongodb_collection_has_compass_tabs(cx: &mut TestAppContext) {

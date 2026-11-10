@@ -19,6 +19,7 @@ use std::time::Instant;
 mod assist;
 mod compass_ui;
 mod overview;
+mod sel;
 use compass_ui::{AGG, Compass};
 pub use compass_ui::CTab;
 
@@ -70,6 +71,8 @@ pub struct DbView {
     pub open: Open,
     body: Body,
     _subs: Vec<Subscription>,
+    /// Text dragged over in the documents and tables (⌘C copies it).
+    sel: sel::Selection,
 }
 
 enum Body {
@@ -314,7 +317,7 @@ impl DbView {
                 None => Body::Missing("This connection was deleted.".into()),
             },
         };
-        let mut v = DbView { focus: cx.focus_handle(), open, body, _subs: subs };
+        let mut v = DbView { focus: cx.focus_handle(), open, body, _subs: subs, sel: sel::Selection::default() };
         v.load(cx);
         v.learn_names(cx);
         v.load_overview(cx);
@@ -447,6 +450,7 @@ impl DbView {
                     if let Ok(p) = &r {
                         learn_fields(&d.names, &p.grid);
                     }
+                    v.sel.reset();
                     d.page = Some(r);
                 }
                 cx.notify();
@@ -731,6 +735,7 @@ impl DbView {
     fn set_doc_mode(&mut self, mode: DocMode, cx: &mut Context<Self>) {
         let Body::Data(d) = &mut self.body else { return };
         d.doc_mode = mode;
+        self.sel.reset();
         let agg = d.compass.as_deref_mut().and_then(|c| c.agg.as_mut());
         for gv in d.grid.iter_mut().chain(d.results.iter_mut()).chain(agg) {
             gv.list.reset(gv.grid.rows.len());
@@ -738,7 +743,12 @@ impl DbView {
         cx.notify();
     }
 
+    /// ⌘C: the text dragged over, else the selected cell.
     fn copy_cell(&mut self, _: &CopyCell, _: &mut Window, cx: &mut Context<Self>) {
+        let dragged = self.sel.text();
+        if !dragged.is_empty() {
+            return cx.write_to_clipboard(ClipboardItem::new_string(dragged));
+        }
         let Body::Data(d) = &self.body else { return };
         let gv = if d.inner == Inner::Query { d.results.get(d.result_ix) } else { d.grid.as_ref() };
         if let Some((_, v)) = gv.and_then(|g| g.selected_text()) {
@@ -1316,7 +1326,18 @@ impl DbView {
         let mode = self.doc_mode(gv);
         let body = list(gv.list.clone(), cx.processor(move |v: &mut DbView, ix: usize, _w, cx| v.render_item(which, ix, cx))).with_sizing_behavior(gpui::ListSizingBehavior::Auto).flex_1();
         if mode != DocMode::Table {
-            return div().id(SharedString::from(format!("db-docs-{}", which.map(|i| i.to_string()).unwrap_or_default()))).debug_selector(|| "db-grid".into()).flex().flex_col().flex_1().min_h_0().child(body).into_any_element();
+            let sel = self.sel.clone();
+            return div()
+                .id(SharedString::from(format!("db-docs-{}", which.map(|i| i.to_string()).unwrap_or_default())))
+                .debug_selector(|| "db-grid".into())
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                // A press beside the text (an empty part of a line) starts a selection there too.
+                .on_mouse_down(MouseButton::Left, move |ev, window, _| sel.press(ev, window))
+                .child(body)
+                .into_any_element();
         }
         let g = gv.grid.clone();
         let total_w: f32 = gv.widths.iter().sum::<f32>() + 44.;
@@ -1366,6 +1387,7 @@ impl DbView {
             .min_h_0()
             .overflow_x_scroll()
             .track_scroll(&gv.hscroll)
+            .on_mouse_down(MouseButton::Left, { let sel = self.sel.clone(); move |ev, window, _| sel.press(ev, window) })
             // At least as wide as the pane: few columns share its width.
             .child(div().min_w(px(total_w)).w_full().h_full().flex().flex_col().text_size(px(12.5)).child(header).child(body))
             .into_any_element()
@@ -1502,9 +1524,12 @@ impl DbView {
                     .when(italic, |d| d.italic())
                     .on_click(cx.listener(move |v, _: &ClickEvent, window, cx| {
                         window.focus(&v.focus, cx);
-                        v.toggle_row(which, r, Some(c), cx);
+                        // A drag selected text: not a click on the row.
+                        if !v.sel.has_selection() {
+                            v.toggle_row(which, r, Some(c), cx);
+                        }
                     }))
-                    .child(div().min_w_0().overflow_hidden().text_ellipsis().child(text))
+                    .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(self.sel.text_piece(((r * 100_000) as u64, c as u32), text, color, false).join("\t")))
             }));
         if open != Some(r) {
             return line.into_any_element();
@@ -1528,7 +1553,7 @@ impl DbView {
                         .h(px(24.))
                         .child(div().w(px(200.)).flex_none().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_dim()).child(col.clone()))
                         .child(one_line(("db-field-value", i), match val {
-                            Some(v) => div().text_color(theme::fg_bright()).child(v.replace(['\n', '\r'], " ⏎ ")),
+                            Some(v) => div().child(self.sel.text_piece(((r * 100_000 + 1 + i) as u64, 1), v.replace(['\n', '\r'], " ⏎ "), theme::fg_bright(), false).join("\t")),
                             None => div().italic().text_color(theme::fg_muted()).child("NULL"),
                         }))
                         .child(copy_button(("db-field-copy", i), copy))
@@ -1629,8 +1654,8 @@ impl DbView {
                         .whitespace_nowrap()
                         .when(container, |d| d.cursor_pointer().on_click(cx.listener(move |v, _, _, cx| v.toggle_fold(which, row, fold.clone(), cx))))
                         .child(div().w(px(14.)).flex_none().text_color(theme::fg_muted()).child(if container { if open { "▾" } else { "▸" } } else { "" }))
-                        .when(!key_text.is_empty(), |d| d.child(div().flex_none().font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(format!("{key_text}: "))))
-                        .child(one_line(("db-tree-value", id), div().text_color(color).child(summary)))
+                        .when(!key_text.is_empty(), |d| d.child(div().flex_none().child(v.sel.text_piece(((row * 100_000 + id) as u64, 0), format!("{key_text}: "), theme::fg_bright(), true))))
+                        .child(one_line(("db-tree-value", id), div().child(v.sel.text_piece(((row * 100_000 + id) as u64, 1), summary, color, false))))
                         .into_any_element(),
                 );
                 if open {
@@ -1643,7 +1668,8 @@ impl DbView {
                     walk(v, which, row, children, &p, depth + 1, json, style, unfolded, out, n, cx);
                     if json {
                         *n += 1;
-                        out.push(div().h(px(21.)).pl(px(depth as f32 * 18. + 14.)).text_color(theme::fg_dim()).child(format!("{}{comma}", if matches!(val, Tree::Array(_)) { "]" } else { "}" })).into_any_element());
+                        let close = format!("{}{comma}", if matches!(val, Tree::Array(_)) { "]" } else { "}" });
+                        out.push(div().h(px(21.)).flex().items_center().pl(px(depth as f32 * 18. + 14.)).child(v.sel.text_piece(((row * 100_000 + *n) as u64, 0), close, theme::fg_dim(), false)).into_any_element());
                     }
                 }
             }
@@ -1651,11 +1677,11 @@ impl DbView {
         let Tree::Object(fields) = t else { return out };
         let unfolded = gv.unfolded.clone();
         if json {
-            out.push(div().h(px(21.)).text_color(theme::fg_dim()).child("{").into_any_element());
+            out.push(div().h(px(21.)).flex().items_center().child(self.sel.text_piece(((row * 100_000) as u64, 0), "{", theme::fg_dim(), false)).into_any_element());
         }
         walk(self, which, row, fields.iter().map(|(k, v)| (k.clone(), v)).collect(), "", if json { 1 } else { 0 }, json, style, &unfolded, &mut out, &mut n, cx);
         if json {
-            out.push(div().h(px(21.)).text_color(theme::fg_dim()).child("}").into_any_element());
+            out.push(div().h(px(21.)).flex().items_center().child(self.sel.text_piece(((row * 100_000 + 99_999) as u64, 0), "}", theme::fg_dim(), false)).into_any_element());
         }
         out
     }
@@ -2157,6 +2183,13 @@ impl Render for DbView {
             .on_action(cx.listener(Self::row_up))
             .on_action(cx.listener(Self::row_down))
             .on_action(cx.listener(Self::close_detail))
+            // A press anywhere starts afresh: the old selection goes (a drag makes a new one).
+            .capture_any_mouse_down(cx.listener(|v, _, _, cx| {
+                if v.sel.has_selection() {
+                    v.sel.clear();
+                    cx.notify();
+                }
+            }))
             .on_mouse_down(MouseButton::Left, cx.listener(|v, _, _, cx| {
                 if let Body::Data(d) = &mut v.body {
                     let history = d.compass.as_deref_mut().map(|c| std::mem::take(&mut c.history)).unwrap_or(false);
@@ -2180,3 +2213,4 @@ mod tests {
         assert_eq!(super::group_digits(999), "999");
     }
 }
+
