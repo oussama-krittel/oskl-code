@@ -8747,6 +8747,75 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     /// The open database tab.
     /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
     #[gpui::test]
+    fn a_mongodb_document_is_edited_in_place(cx: &mut TestAppContext) {
+        if std::env::var_os("KITE_DB_LIVE").is_none() {
+            return;
+        }
+        let (ws, cx) = setup(cx);
+        let id = live_mongo_docs("edit_docs", 1, cx);
+        let conn = crate::db::load().into_iter().find(|c| c.id == id).unwrap();
+        let read_back = |conn: &crate::db::Conn| {
+            let q = crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("kite_test".into()), collection: None }, "db.edit_docs.findOne({})".into()));
+            futures::executor::block_on(q).unwrap()[0].trees.clone().unwrap()[0].text(crate::db::TextStyle::Shell)
+        };
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["kite_test".into(), "edit_docs".into()] }, window, cx));
+        let tab = db_tab(&ws, cx).expect("a data tab");
+        wait_for(cx, "the document", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
+        let dbl = |cx: &mut VisualTestContext, sel: &str| {
+            let at = cx.debug_bounds(Box::leak(sel.to_string().into_boxed_str())).unwrap_or_else(|| panic!("{sel}")).center();
+            cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+            for n in [1, 2] {
+                cx.simulate_event(gpui::MouseDownEvent { position: at, button: gpui::MouseButton::Left, click_count: n, ..Default::default() });
+                cx.simulate_event(gpui::MouseUpEvent { position: at, button: gpui::MouseButton::Left, click_count: n, ..Default::default() });
+            }
+            cx.run_until_parked();
+        };
+        let type_in = |cx: &mut VisualTestContext, text: &str| {
+            let ed = tab.read_with(cx, |t, _| t.editor_in_card()).expect("typing in the card");
+            ed.update(cx, |e, cx| e.set_text(text, cx));
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+        };
+        // Lines: _id 1, n 2, name 3, tags 4, addr 5, note 6.
+        dbl(cx, "db-value-0-3");
+        type_in(cx, "Ann");
+        assert!(cx.debug_bounds("db-doc-bar-0").is_some(), "Document modified, with Cancel and Update");
+        // A field added after n: its name, then its value.
+        let line = cx.debug_bounds("db-value-0-2").unwrap();
+        cx.simulate_mouse_move(line.center(), None, gpui::Modifiers::none());
+        click_on(cx, "db-add-0-2");
+        type_in(cx, "extra");
+        type_in(cx, "42");
+        // The note removed.
+        let line = cx.debug_bounds("db-value-0-7").unwrap();
+        cx.simulate_mouse_move(line.center(), None, gpui::Modifiers::none());
+        click_on(cx, "db-remove-0-7");
+        click_on(cx, "db-doc-update-0");
+        wait_for(cx, "saved", |cx| cx.debug_bounds("db-doc-bar-0").is_none());
+        let saved = read_back(&conn);
+        assert!(saved.contains("n: 0,\n  extra: 42,\n  name: 'Ann'"), "{saved}");
+        assert!(!saved.contains("note:"), "{saved}");
+
+        // Cancel drops the changes.
+        wait_for(cx, "the saved document shown", |cx| cx.debug_bounds("db-value-0-3").is_some());
+        dbl(cx, "db-value-0-4");
+        type_in(cx, "Bob");
+        click_on(cx, "db-doc-cancel-0");
+        assert!(cx.debug_bounds("db-doc-bar-0").is_none());
+        assert_eq!(read_back(&conn), saved, "nothing saved");
+
+        // Changed on the server meanwhile: Update says so and saves nothing.
+        dbl(cx, "db-value-0-4");
+        type_in(cx, "Cy");
+        futures::executor::block_on(crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("kite_test".into()), collection: None }, "db.edit_docs.updateOne({}, {$set: {n: 99}})".into()))).unwrap();
+        click_on(cx, "db-doc-update-0");
+        wait_for(cx, "the refusal", |cx| tab.read_with(cx, |t, _| t.card_error(0)).is_some());
+        assert!(tab.read_with(cx, |t, _| t.card_error(0)).unwrap().contains("changed since"));
+        assert!(read_back(&conn).contains("name: 'Ann'"), "not overwritten");
+    }
+
+    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    #[gpui::test]
     fn document_text_is_selected_by_dragging_and_copied(cx: &mut TestAppContext) {
         if std::env::var_os("KITE_DB_LIVE").is_none() {
             return;

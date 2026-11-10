@@ -738,6 +738,16 @@ impl<'a> Parser<'a> {
                         let full = if t.len() == 10 { format!("{t}T00:00:00Z") } else if t.ends_with('Z') || t[10..].contains(['+', '-']) { t.clone() } else { format!("{t}Z") };
                         Ok(Bson::DateTime(mongodb::bson::DateTime::parse_rfc3339_str(&full).map_err(|_| anyhow!("not a date: {t}"))?))
                     }
+                    // How mongosh prints them, read back the same way.
+                    "Int32" => Ok(Bson::Int32(text.and_then(|t| t.parse().ok()).map(Ok).unwrap_or_else(|| num_arg(&args).map(|n| n as i32))?)),
+                    "Long" => Ok(Bson::Int64(text.and_then(|t| t.parse().ok()).map(Ok).unwrap_or_else(|| num_arg(&args))?)),
+                    "Double" => Ok(Bson::Double(text.and_then(|t| t.parse().ok()).or_else(|| match args.first() {
+                        Some(Bson::Double(f)) => Some(*f),
+                        Some(Bson::Int32(n)) => Some(*n as f64),
+                        Some(Bson::Int64(n)) => Some(*n as f64),
+                        _ => None,
+                    }).ok_or_else(|| anyhow!("not a number"))?)),
+                    "Decimal128" => Ok(Bson::Decimal128(text.unwrap_or_default().parse().map_err(|_| anyhow!("not a decimal"))?)),
                     "NumberInt" => Ok(Bson::Int32(text.and_then(|t| t.parse().ok()).map(Ok).unwrap_or_else(|| num_arg(&args).map(|n| n as i32))?)),
                     "NumberLong" => Ok(Bson::Int64(text.and_then(|t| t.parse().ok()).map(Ok).unwrap_or_else(|| num_arg(&args))?)),
                     "NumberDecimal" => Ok(Bson::Decimal128(text.unwrap_or_default().parse().map_err(|_| anyhow!("not a decimal"))?)),

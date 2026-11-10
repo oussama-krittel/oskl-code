@@ -1,7 +1,8 @@
 //! Database tabs: the connect form, a table's (collection's, key's, queue's) Data View and
 //! Query, and query tabs. Results show in a grid that draws only the rows on screen.
 
-use crate::db::{self, Conn, Grid, Kind, Page, PageSpec, Scope, TextStyle, Tree, engine};
+use crate::db::{self, Conn, Grid, Kind, Page, PageSpec, Scope, TextStyle, Tree, compass, compass::Seg, engine};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use crate::editor::{Editor, EditorEvent, EditorMode};
 use crate::request::Request;
@@ -73,6 +74,7 @@ pub struct DbView {
     _subs: Vec<Subscription>,
     /// Text dragged over in the documents and tables (⌘C copies it).
     sel: sel::Selection,
+    editing: Option<Editing>,
 }
 
 enum Body {
@@ -211,6 +213,31 @@ struct GridView {
     open: Option<usize>,
     /// "<row>/<field>/…" of nested values shown open.
     unfolded: HashSet<String>,
+    /// Documents being edited in place, by row.
+    edits: HashMap<usize, DocEdit>,
+}
+
+/// A document's changes, not saved yet (Update saves them, Cancel drops them).
+struct DocEdit {
+    original: Tree,
+    working: Tree,
+    ops: Vec<compass::Op>,
+    /// Fields changed or added, highlighted.
+    changed: HashSet<Vec<Seg>>,
+    saving: bool,
+    error: Option<String>,
+}
+
+/// The key or value being typed into, in a document's card.
+struct Editing {
+    which: Option<usize>,
+    row: usize,
+    path: Vec<Seg>,
+    key: bool,
+    /// A field just added: its value is asked for next.
+    fresh: bool,
+    editor: Entity<Editor>,
+    _sub: Subscription,
 }
 
 impl GridView {
@@ -230,7 +257,7 @@ impl GridView {
             w.max((head as f32 * 7.6 + 26.).min(420.))
         }).collect();
         let list = ListState::new(grid.rows.len(), ListAlignment::Top, gpui::px(600.));
-        GridView { grid: Arc::new(grid), widths, types, list, hscroll: ScrollHandle::new(), sel: None, open: None, unfolded: HashSet::new() }
+        GridView { grid: Arc::new(grid), widths, types, list, hscroll: ScrollHandle::new(), sel: None, open: None, unfolded: HashSet::new(), edits: HashMap::new() }
     }
 
     fn selected_text(&self) -> Option<(String, Option<String>)> {
@@ -317,7 +344,7 @@ impl DbView {
                 None => Body::Missing("This connection was deleted.".into()),
             },
         };
-        let mut v = DbView { focus: cx.focus_handle(), open, body, _subs: subs, sel: sel::Selection::default() };
+        let mut v = DbView { focus: cx.focus_handle(), open, body, _subs: subs, sel: sel::Selection::default(), editing: None };
         v.load(cx);
         v.learn_names(cx);
         v.load_overview(cx);
@@ -451,6 +478,10 @@ impl DbView {
                         learn_fields(&d.names, &p.grid);
                     }
                     v.sel.reset();
+                    // The rows were read again: an edit box open in one of them goes.
+                    if v.editing.as_ref().is_some_and(|e| e.which.is_none()) {
+                        v.editing = None;
+                    }
                     d.page = Some(r);
                 }
                 cx.notify();
@@ -1458,6 +1489,251 @@ impl DbView {
         cx.notify();
     }
 
+    // ------------------------------------------------------------ editing documents in place
+
+    /// The row's changes (begun with its document as shown).
+    fn doc_edit(&mut self, which: Option<usize>, row: usize) -> Option<&mut DocEdit> {
+        let gv = self.grid_of_mut(which)?;
+        let t = gv.grid.trees.as_ref()?.get(row)?.clone();
+        Some(gv.edits.entry(row).or_insert_with(|| DocEdit { original: t.clone(), working: t, ops: Vec::new(), changed: HashSet::new(), saving: false, error: None }))
+    }
+
+    /// Redraws a card (its height may change).
+    fn remeasure(&mut self, which: Option<usize>, row: usize, cx: &mut Context<Self>) {
+        if let Some(gv) = self.grid_of_mut(which) {
+            gv.list.splice(row..row + 1, 1);
+        }
+        cx.notify();
+    }
+
+    /// Applies a change to a card's document; `mark` is the field to highlight.
+    fn edit_op(&mut self, which: Option<usize>, row: usize, op: compass::Op, mark: Option<Vec<Seg>>, cx: &mut Context<Self>) -> bool {
+        let Some(e) = self.doc_edit(which, row) else { return false };
+        let ok = match compass::apply_tree(&mut e.working, &op) {
+            Ok(()) => {
+                // Inserting or removing in an array moves the highlights after it; keep it simple: forget those.
+                if matches!(op, compass::Op::Remove(_) | compass::Op::Insert(..)) {
+                    let parent: Vec<Seg> = match &op {
+                        compass::Op::Remove(p) => p[..p.len().saturating_sub(1)].to_vec(),
+                        compass::Op::Insert(p, ..) => p.clone(),
+                        _ => Vec::new(),
+                    };
+                    e.changed.retain(|c| !(c.len() > parent.len() && c.starts_with(&parent) && matches!(c[parent.len()], Seg::Idx(_))));
+                }
+                if let Some(m) = mark {
+                    e.changed.insert(m);
+                }
+                e.ops.push(op);
+                e.error = None;
+                true
+            }
+            Err(err) => {
+                e.error = Some(err);
+                false
+            }
+        };
+        self.remeasure(which, row, cx);
+        ok
+    }
+
+    /// Double-click: types into a key (or value) in place.
+    fn start_edit(&mut self, which: Option<usize>, row: usize, path: Vec<Seg>, key: bool, fresh: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_edit(window, cx);
+        let Some(e) = self.doc_edit(which, row) else { return };
+        let text = match (key, path.last()) {
+            (true, Some(Seg::Key(k))) => k.clone(),
+            (true, _) => return,
+            (false, _) => {
+                let mut t = Some(&e.working);
+                for s in &path {
+                    t = match (t, s) {
+                        (Some(Tree::Object(f)), Seg::Key(k)) => f.iter().find(|(n, _)| n == k).map(|(_, v)| v),
+                        (Some(Tree::Array(a)), Seg::Idx(i)) => a.get(*i),
+                        _ => None,
+                    };
+                }
+                t.map(compass::edit_text).unwrap_or_default()
+            }
+        };
+        let editor = input("", &text, cx);
+        editor.update(cx, |ed, cx| {
+            ed.pairs = true;
+            ed.buf.select_all();
+            cx.notify();
+        });
+        window.focus(&editor.read(cx).focus_target(cx), cx);
+        let sub = cx.subscribe_in(&editor, window, |v: &mut DbView, _, ev: &EditorEvent, window, cx| match ev {
+            EditorEvent::Submit => v.commit_edit(window, cx),
+            EditorEvent::Cancel => v.cancel_edit(cx),
+            _ => {}
+        });
+        self.editing = Some(Editing { which, row, path, key, fresh, editor, _sub: sub });
+        self.remeasure(which, row, cx);
+    }
+
+    /// Enter: the typed key or value goes into the document.
+    fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ed) = self.editing.take() else { return };
+        let text = ed.editor.read(cx).text();
+        let (which, row) = (ed.which, ed.row);
+        if ed.key {
+            let new = text.trim().to_string();
+            let Some(Seg::Key(old)) = ed.path.last().cloned() else { return };
+            if new.is_empty() {
+                if let Some(e) = self.doc_edit(which, row) {
+                    e.error = Some("A field needs a name".into());
+                }
+                // Asked again.
+                self.editing = Some(ed);
+                return self.remeasure(which, row, cx);
+            }
+            let mut renamed = ed.path.clone();
+            *renamed.last_mut().unwrap() = Seg::Key(new.clone());
+            if new != old && !self.edit_op(which, row, compass::Op::Rename(ed.path.clone(), new), Some(renamed.clone()), cx) {
+                self.editing = Some(ed);
+                return;
+            }
+            // A new field: its value next.
+            if ed.fresh {
+                self.start_edit(which, row, renamed, false, true, window, cx);
+            }
+            return self.remeasure(which, row, cx);
+        }
+        let was = self.doc_edit(which, row).and_then(|e| {
+            let mut t = Some(&e.working);
+            for s in &ed.path {
+                t = match (t, s) {
+                    (Some(Tree::Object(f)), Seg::Key(k)) => f.iter().find(|(n, _)| n == k).map(|(_, v)| v),
+                    (Some(Tree::Array(a)), Seg::Idx(i)) => a.get(*i),
+                    _ => None,
+                };
+            }
+            t.cloned()
+        });
+        // A field just added (empty) takes whatever is typed, read as a value if it is one.
+        let prev = was.filter(|_| !ed.fresh);
+        match compass::edit_value(&text, prev.as_ref()) {
+            Ok(v) => {
+                let unchanged = prev.as_ref().is_some_and(|p| *p == crate::db::compass_tree(&v));
+                if !unchanged {
+                    self.edit_op(which, row, compass::Op::Set(ed.path.clone(), v), Some(ed.path.clone()), cx);
+                }
+            }
+            Err(e) => {
+                if let Some(d) = self.doc_edit(which, row) {
+                    d.error = Some(e);
+                }
+                self.editing = Some(ed);
+            }
+        }
+        self.remeasure(which, row, cx);
+    }
+
+    /// Esc: the key or value as it was.
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(ed) = self.editing.take() {
+            self.remeasure(ed.which, ed.row, cx);
+        }
+    }
+
+    /// The plus on a line: a new field (or array item) right after it, its name asked for.
+    fn add_after(&mut self, which: Option<usize>, row: usize, path: Vec<Seg>, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_edit(window, cx);
+        let Some((last, parent)) = path.split_last() else { return };
+        let parent = parent.to_vec();
+        match last {
+            Seg::Idx(i) => {
+                let mut at = parent.clone();
+                at.push(Seg::Idx(i + 1));
+                if self.edit_op(which, row, compass::Op::Insert(parent, i + 1, None, mongodb::bson::Bson::String(String::new())), Some(at.clone()), cx) {
+                    self.start_edit(which, row, at, false, true, window, cx);
+                }
+            }
+            Seg::Key(k) => {
+                let Some(e) = self.doc_edit(which, row) else { return };
+                let mut t = Some(&e.working);
+                for s in &parent {
+                    t = match (t, s) {
+                        (Some(Tree::Object(f)), Seg::Key(k)) => f.iter().find(|(n, _)| n == k).map(|(_, v)| v),
+                        (Some(Tree::Array(a)), Seg::Idx(i)) => a.get(*i),
+                        _ => None,
+                    };
+                }
+                let Some(Tree::Object(fields)) = t else { return };
+                if fields.iter().any(|(n, _)| n.is_empty()) {
+                    return; // one unnamed field at a time
+                }
+                let ix = fields.iter().position(|(n, _)| n == k).map_or(fields.len(), |i| i + 1);
+                let mut at = parent.clone();
+                at.push(Seg::Key(String::new()));
+                if self.edit_op(which, row, compass::Op::Insert(parent, ix, Some(String::new()), mongodb::bson::Bson::String(String::new())), Some(at.clone()), cx) {
+                    self.start_edit(which, row, at, true, true, window, cx);
+                }
+            }
+        }
+    }
+
+    fn cancel_doc(&mut self, which: Option<usize>, row: usize, cx: &mut Context<Self>) {
+        if self.editing.as_ref().is_some_and(|e| e.which == which && e.row == row) {
+            self.editing = None;
+        }
+        if let Some(gv) = self.grid_of_mut(which) {
+            gv.edits.remove(&row);
+        }
+        self.remeasure(which, row, cx);
+    }
+
+    /// Update: saves the card's changes (the document is checked unchanged meanwhile), then shows it as saved.
+    fn update_doc(&mut self, which: Option<usize>, row: usize, cx: &mut Context<Self>) {
+        let Body::Data(d) = &self.body else { return };
+        let [db, coll] = d.path.as_slice() else { return };
+        let (conn, db, coll) = (d.conn.clone(), db.clone(), coll.clone());
+        if self.editing.as_ref().is_some_and(|e| e.which == which && e.row == row) {
+            self.editing = None;
+        }
+        let Some(e) = self.doc_edit(which, row) else { return };
+        if e.saving {
+            return;
+        }
+        e.saving = true;
+        let (original, ops) = (e.original.clone(), e.ops.clone());
+        let work = engine::run(engine::mongo(conn, move |cl| async move { compass::update_doc(&cl, &db, &coll, &original, &ops).await }));
+        cx.spawn(async move |this, cx| {
+            let r = work.await;
+            this.update(cx, |v, cx| {
+                match r {
+                    Ok(()) => {
+                        if let Some(gv) = v.grid_of_mut(which) {
+                            gv.edits.remove(&row);
+                        }
+                        cx.emit(Request::Message("Document updated".into()));
+                        v.load(cx);
+                    }
+                    Err(err) => {
+                        if let Some(e) = v.doc_edit(which, row) {
+                            e.saving = false;
+                            e.error = Some(err);
+                        }
+                    }
+                }
+                v.remeasure(which, row, cx);
+            })
+            .ok();
+        })
+        .detach();
+        self.remeasure(which, row, cx);
+    }
+
+    #[cfg(test)]
+    pub fn card_error(&self, row: usize) -> Option<String> {
+        self.grid_of(None)?.edits.get(&row)?.error.clone()
+    }
+
+    #[cfg(test)]
+    pub fn editor_in_card(&self) -> Option<Entity<Editor>> {
+        self.editing.as_ref().map(|e| e.editor.clone())
+    }
+
     /// Folds or unfolds a nested value of a document.
     fn toggle_fold(&mut self, which: Option<usize>, row: usize, path: String, cx: &mut Context<Self>) {
         let Some(gv) = self.grid_of_mut(which) else { return };
@@ -1586,9 +1862,33 @@ impl DbView {
     /// A MongoDB document as a card: its fields one per line (List), or as JSON.
     fn render_card(&mut self, which: Option<usize>, r: usize, json: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(gv) = self.grid_of(which) else { return div().into_any_element() };
-        let Some(t) = gv.grid.trees.as_ref().and_then(|t| t.get(r)).cloned() else { return div().into_any_element() };
+        let edit = gv.edits.get(&r).map(|e| (e.working.clone(), !e.ops.is_empty(), e.saving, e.error.clone()));
+        let Some(t) = edit.as_ref().map(|e| e.0.clone()).or_else(|| gv.grid.trees.as_ref().and_then(|t| t.get(r)).cloned()) else { return div().into_any_element() };
         let copy = t.text(if json { TextStyle::Json } else { TextStyle::Shell });
         let lines = self.tree_lines(which, r, &t, json, cx);
+        // Changed: say so, with Cancel and Update (and why it couldn't be saved).
+        let bar = edit.filter(|e| e.1 || e.3.is_some()).map(|(_, modified, saving, error)| {
+            div()
+                .debug_selector(move || format!("db-doc-bar-{r}"))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .mt(px(8.))
+                .mx(px(-14.))
+                .mb(px(-10.))
+                .px(px(14.))
+                .py(px(6.))
+                .rounded_b(px(6.))
+                .bg(if error.is_some() { theme::git_deleted().opacity(0.25) } else { theme::git_modified().opacity(0.25) })
+                .font_family(theme::UI_FONT)
+                .child(div().flex_1().min_w_0().text_color(theme::fg_bright()).child(match &error {
+                    Some(e) => e.clone(),
+                    None if modified => "Document modified.".to_string(),
+                    None => String::new(),
+                }))
+                .child(button(SharedString::from(format!("db-doc-cancel-{r}")), "Cancel", None, false).on_click(cx.listener(move |v, _, _, cx| v.cancel_doc(which, r, cx))))
+                .when(modified, |d| d.child(button(SharedString::from(format!("db-doc-update-{r}")), if saving { "Updating…" } else { "Update" }, None, true).on_click(cx.listener(move |v, _, _, cx| v.update_doc(which, r, cx)))))
+        });
         div()
             .pb(px(8.))
             .pr(px(4.))
@@ -1609,24 +1909,44 @@ impl DbView {
                     .font_family(theme::MONO_FONT)
                     .text_size(px(12.5))
                     .children(lines)
+                    .children(bar)
                     .child(div().absolute().top(px(6.)).right(px(8.)).invisible().group_hover("db-card", |s| s.visible()).child(copy_button(("db-card-copy", r), copy))),
             )
             .into_any_element()
     }
 
     /// A document's fields as lines: `key: value`, nested objects and arrays folded until
-    /// clicked (List), or as JSON with its brackets.
+    /// clicked (List), or as JSON with its brackets. A collection's List can be edited in place:
+    /// double-click a key or value, the trash and plus on a line remove it or add one after it.
     fn tree_lines(&self, which: Option<usize>, row: usize, t: &Tree, json: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let Some(gv) = self.grid_of(which) else { return Vec::new() };
-        let style = if json { TextStyle::Json } else { TextStyle::Shell };
+        let editable = !json && which.is_none() && matches!(&self.body, Body::Data(d) if d.compass.is_some());
+        let changed = gv.edits.get(&row).map(|e| e.changed.clone()).unwrap_or_default();
+        let editing = self.editing.as_ref().filter(|e| e.which == which && e.row == row).map(|e| (e.path.clone(), e.key, e.editor.clone()));
         let mut out = Vec::new();
         let mut n = 0usize;
-        fn walk(v: &DbView, which: Option<usize>, row: usize, entries: Vec<(String, &Tree)>, path: &str, depth: usize, json: bool, style: TextStyle, unfolded: &HashSet<String>, out: &mut Vec<gpui::AnyElement>, n: &mut usize, cx: &mut Context<DbView>) {
+        struct W<'a> {
+            which: Option<usize>,
+            row: usize,
+            json: bool,
+            style: TextStyle,
+            unfolded: &'a HashSet<String>,
+            editable: bool,
+            changed: &'a HashSet<Vec<Seg>>,
+            editing: Option<(Vec<Seg>, bool, Entity<Editor>)>,
+        }
+        fn walk(v: &DbView, w: &W, entries: Vec<(String, &Tree)>, path: &str, segs: &[Seg], depth: usize, out: &mut Vec<gpui::AnyElement>, n: &mut usize, cx: &mut Context<DbView>) {
+            let (which, row, json, style) = (w.which, w.row, w.json, w.style);
             let count = entries.len();
             for (i, (key, val)) in entries.into_iter().enumerate() {
                 let p = format!("{path}/{key}");
+                let seg = match key.strip_prefix(['\u{0}', '\u{1}']) {
+                    Some(ix) => Seg::Idx(ix.parse().unwrap_or(0)),
+                    None => Seg::Key(key.clone()),
+                };
+                let here: Vec<Seg> = segs.iter().cloned().chain(std::iter::once(seg.clone())).collect();
                 let container = matches!(val, Tree::Array(a) if !a.is_empty()) || matches!(val, Tree::Object(f) if !f.is_empty());
-                let open = container && unfolded.contains(&format!("{row}{p}"));
+                let open = container && w.unfolded.contains(&format!("{row}{p}"));
                 let comma = if json && i + 1 < count { "," } else { "" };
                 let key_text = match key.strip_prefix('\u{1}') {
                     // An array item's index (List): as is.
@@ -1644,18 +1964,113 @@ impl DbView {
                 let fold = format!("{row}{p}");
                 *n += 1;
                 let id = *n;
+                let top_id = depth == 0 && key == "_id";
+                let edit_key = w.editing.as_ref().filter(|(ep, k, _)| *ep == here && *k).map(|(_, _, e)| e.clone());
+                let edit_value = w.editing.as_ref().filter(|(ep, k, _)| *ep == here && !*k).map(|(_, _, e)| e.clone());
+                let field_box = |e: Entity<Editor>, wide: bool| div().when(wide, |d| d.flex_1()).when(!wide, |d| d.w(px(160.)).flex_none()).h(px(19.)).px(px(4.)).flex().items_center().rounded(px(3.)).bg(theme::bg_input()).border_1().border_color(theme::focus_border()).child(e);
+                let key_el = match (edit_key, key_text.is_empty()) {
+                    (Some(e), _) => Some(div().flex().items_center().gap(px(4.)).child(field_box(e, false)).child(":").into_any_element()),
+                    (None, false) => {
+                        let piece = v.sel.text_piece(((row * 100_000 + id) as u64, 0), format!("{key_text}: "), theme::fg_bright(), true);
+                        let renamable = w.editable && matches!(seg, Seg::Key(_)) && !top_id;
+                        let path_k = here.clone();
+                        Some(
+                            div()
+                                .id(("db-key", id))
+                                .debug_selector(move || format!("db-key-{row}-{id}"))
+                                .flex_none()
+                                .when(renamable, |d| {
+                                    d.on_click(cx.listener(move |v, ev: &ClickEvent, window, cx| {
+                                        if ev.click_count() == 2 {
+                                            cx.stop_propagation();
+                                            v.start_edit(which, row, path_k.clone(), true, false, window, cx);
+                                        }
+                                    }))
+                                })
+                                .child(piece)
+                                .into_any_element(),
+                        )
+                    }
+                    (None, true) => None,
+                };
+                let value_el = match edit_value {
+                    Some(e) => field_box(e, true).into_any_element(),
+                    None => {
+                        let path_v = here.clone();
+                        let editable_value = w.editable && !container && !top_id;
+                        one_line(("db-tree-value", id), div().child(v.sel.text_piece(((row * 100_000 + id) as u64, 1), summary, color, false)))
+                            .debug_selector(move || format!("db-value-{row}-{id}"))
+                            .when(editable_value, |d| {
+                                d.on_click(cx.listener(move |v, ev: &ClickEvent, window, cx| {
+                                    if ev.click_count() == 2 {
+                                        cx.stop_propagation();
+                                        v.start_edit(which, row, path_v.clone(), false, false, window, cx);
+                                    }
+                                }))
+                            })
+                            .into_any_element()
+                    }
+                };
+                let gutter = w.editable.then(|| {
+                    let (path_del, path_add) = (here.clone(), here.clone());
+                    div()
+                        .w(px(36.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(2.))
+                        .invisible()
+                        .group_hover("db-line", |s| s.visible())
+                        .when(!top_id, |d| {
+                            d.child(
+                                div()
+                                    .id(("db-line-remove", id))
+                                    .debug_selector(move || format!("db-remove-{row}-{id}"))
+                                    .p(px(1.))
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::hover()))
+                                    .tooltip(ui::tooltip("Remove"))
+                                    .on_click(cx.listener(move |v, _, _, cx| {
+                                        cx.stop_propagation();
+                                        v.edit_op(which, row, compass::Op::Remove(path_del.clone()), None, cx);
+                                    }))
+                                    .child(ui::small_icon("trash", theme::fg_dim())),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id(("db-line-add", id))
+                                .debug_selector(move || format!("db-add-{row}-{id}"))
+                                .p(px(1.))
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(theme::border_input())
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::hover()))
+                                .tooltip(ui::tooltip("Add a field after this one"))
+                                .on_click(cx.listener(move |v, _, window, cx| {
+                                    cx.stop_propagation();
+                                    v.add_after(which, row, path_add.clone(), window, cx);
+                                }))
+                                .child(ui::small_icon("plus", theme::fg_dim())),
+                        )
+                });
                 out.push(
                     div()
                         .id(("db-tree-line", id))
+                        .group("db-line")
                         .flex()
                         .items_center()
                         .h(px(21.))
-                        .pl(px(depth as f32 * 18.))
                         .whitespace_nowrap()
+                        .when(w.changed.contains(&here), |d| d.bg(theme::git_modified().opacity(0.18)))
+                        .children(gutter)
+                        .child(div().w(px(depth as f32 * 18.)).flex_none())
                         .when(container, |d| d.cursor_pointer().on_click(cx.listener(move |v, _, _, cx| v.toggle_fold(which, row, fold.clone(), cx))))
                         .child(div().w(px(14.)).flex_none().text_color(theme::fg_muted()).child(if container { if open { "▾" } else { "▸" } } else { "" }))
-                        .when(!key_text.is_empty(), |d| d.child(div().flex_none().child(v.sel.text_piece(((row * 100_000 + id) as u64, 0), format!("{key_text}: "), theme::fg_bright(), true))))
-                        .child(one_line(("db-tree-value", id), div().child(v.sel.text_piece(((row * 100_000 + id) as u64, 1), summary, color, false))))
+                        .children(key_el)
+                        .child(value_el)
                         .into_any_element(),
                 );
                 if open {
@@ -1665,7 +2080,7 @@ impl DbView {
                         Tree::Object(f) => f.iter().map(|(k, x)| (k.clone(), x)).collect(),
                         _ => Vec::new(),
                     };
-                    walk(v, which, row, children, &p, depth + 1, json, style, unfolded, out, n, cx);
+                    walk(v, w, children, &p, &here, depth + 1, out, n, cx);
                     if json {
                         *n += 1;
                         let close = format!("{}{comma}", if matches!(val, Tree::Array(_)) { "]" } else { "}" });
@@ -1676,10 +2091,11 @@ impl DbView {
         }
         let Tree::Object(fields) = t else { return out };
         let unfolded = gv.unfolded.clone();
+        let w = W { which, row, json, style: if json { TextStyle::Json } else { TextStyle::Shell }, unfolded: &unfolded, editable, changed: &changed, editing };
         if json {
             out.push(div().h(px(21.)).flex().items_center().child(self.sel.text_piece(((row * 100_000) as u64, 0), "{", theme::fg_dim(), false)).into_any_element());
         }
-        walk(self, which, row, fields.iter().map(|(k, v)| (k.clone(), v)).collect(), "", if json { 1 } else { 0 }, json, style, &unfolded, &mut out, &mut n, cx);
+        walk(self, &w, fields.iter().map(|(k, v)| (k.clone(), v)).collect(), "", &[], if json { 1 } else { 0 }, &mut out, &mut n, cx);
         if json {
             out.push(div().h(px(21.)).flex().items_center().child(self.sel.text_piece(((row * 100_000 + 99_999) as u64, 0), "}", theme::fg_dim(), false)).into_any_element());
         }

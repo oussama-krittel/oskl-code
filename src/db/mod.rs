@@ -5,6 +5,11 @@
 //! capped (`MAX_ROWS`, `MAX_CELL`) so a big table never fills memory.
 
 pub mod compass;
+
+/// A MongoDB value as the views show it.
+pub fn compass_tree(v: &mongodb::bson::Bson) -> Tree {
+    mongo::tree(v)
+}
 pub mod engine;
 mod mongo;
 mod mssql;

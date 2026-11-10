@@ -525,6 +525,209 @@ pub async fn drop_collection(c: &Client, db: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- editing a document
+
+/// A step on the way to a field: its name, or its place in an array.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Seg {
+    Key(String),
+    Idx(usize),
+}
+
+/// One change to a document, as made in its card.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Op {
+    /// A new value.
+    Set(Vec<Seg>, Bson),
+    /// A field renamed (it keeps its place).
+    Rename(Vec<Seg>, String),
+    Remove(Vec<Seg>),
+    /// A field (with its name) or an array item, at this place in the object or array at the path.
+    Insert(Vec<Seg>, usize, Option<String>, Bson),
+}
+
+/// A value typed in a card. It keeps its type where it can: a string stays a string, a Double a
+/// Double; otherwise it's read in the shell's syntax (a new field's text that isn't a value is a string).
+pub fn edit_value(text: &str, was: Option<&Tree>) -> Result<Bson, String> {
+    let t = text.trim();
+    match was {
+        Some(Tree::Str(_)) => return Ok(Bson::String(text.to_string())),
+        Some(Tree::Typed("Double", _)) if t.parse::<f64>().is_ok() => return Ok(Bson::Double(t.parse().unwrap_or_default())),
+        Some(Tree::Typed("Long", _)) if t.parse::<i64>().is_ok() => return Ok(Bson::Int64(t.parse().unwrap_or_default())),
+        Some(Tree::Num(_)) if t.parse::<i32>().is_ok() => return Ok(Bson::Int32(t.parse().unwrap_or_default())),
+        _ => {}
+    }
+    match parse_value(t) {
+        Ok(v) => Ok(v),
+        Err(_) if was.is_none() => Ok(Bson::String(text.to_string())),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The text a value is edited as: a string as it is, others in the shell's syntax.
+pub fn edit_text(t: &Tree) -> String {
+    match t {
+        Tree::Str(s) => s.clone(),
+        other => other.short(TextStyle::Shell),
+    }
+}
+
+fn rebuild(d: &Document, f: impl FnOnce(&mut Vec<(String, Bson)>) -> Result<()>) -> Result<Document> {
+    let mut pairs: Vec<(String, Bson)> = d.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    f(&mut pairs)?;
+    let mut out = Document::new();
+    for (k, v) in pairs {
+        if out.contains_key(&k) {
+            bail!("“{k}” is there twice");
+        }
+        out.insert(k, v);
+    }
+    Ok(out)
+}
+
+fn bson_at<'a>(b: &'a mut Bson, path: &[Seg]) -> Result<&'a mut Bson> {
+    let Some((first, rest)) = path.split_first() else { return Ok(b) };
+    let next = match (b, first) {
+        (Bson::Document(d), Seg::Key(k)) => d.get_mut(k),
+        (Bson::Array(a), Seg::Idx(i)) => a.get_mut(*i),
+        _ => None,
+    };
+    bson_at(next.ok_or_else(|| anyhow!("that field isn't there any more"))?, rest)
+}
+
+/// Applies a change to a document (read from the server).
+pub fn apply(doc: &mut Document, op: &Op) -> Result<()> {
+    let mut root = Bson::Document(std::mem::take(doc));
+    let r = apply_bson(&mut root, op);
+    if let Bson::Document(d) = root {
+        *doc = d;
+    }
+    r
+}
+
+fn apply_bson(root: &mut Bson, op: &Op) -> Result<()> {
+    let (parent, last): (&[Seg], Option<&Seg>) = match op {
+        Op::Set(p, _) | Op::Rename(p, _) | Op::Remove(p) => (&p[..p.len().saturating_sub(1)], p.last()),
+        Op::Insert(p, _, _, _) => (p, None),
+    };
+    let target = bson_at(root, parent)?;
+    match (op, target, last) {
+        (Op::Set(_, v), Bson::Document(d), Some(Seg::Key(k))) if d.contains_key(k) => {
+            d.insert(k.clone(), v.clone());
+        }
+        (Op::Set(_, v), Bson::Array(a), Some(Seg::Idx(i))) if *i < a.len() => a[*i] = v.clone(),
+        (Op::Rename(_, new), Bson::Document(d), Some(Seg::Key(k))) => {
+            let (k, new) = (k.clone(), new.clone());
+            *d = rebuild(d, |pairs| {
+                let slot = pairs.iter_mut().find(|(n, _)| *n == k).ok_or_else(|| anyhow!("no field {k}"))?;
+                slot.0 = new;
+                Ok(())
+            })?;
+        }
+        (Op::Remove(_), Bson::Document(d), Some(Seg::Key(k))) => {
+            let k = k.clone();
+            *d = rebuild(d, |pairs| {
+                pairs.retain(|(n, _)| *n != k);
+                Ok(())
+            })?;
+        }
+        (Op::Remove(_), Bson::Array(a), Some(Seg::Idx(i))) if *i < a.len() => {
+            a.remove(*i);
+        }
+        (Op::Insert(_, at, Some(key), v), Bson::Document(d), _) => {
+            let (key, v, at) = (key.clone(), v.clone(), *at);
+            *d = rebuild(d, |pairs| {
+                pairs.insert(at.min(pairs.len()), (key, v));
+                Ok(())
+            })?;
+        }
+        (Op::Insert(_, at, None, v), Bson::Array(a), _) => a.insert((*at).min(a.len()), v.clone()),
+        _ => bail!("that change doesn't fit the document any more"),
+    }
+    Ok(())
+}
+
+fn tree_at<'a>(t: &'a mut Tree, path: &[Seg]) -> Option<&'a mut Tree> {
+    let Some((first, rest)) = path.split_first() else { return Some(t) };
+    let next = match (t, first) {
+        (Tree::Object(f), Seg::Key(k)) => f.iter_mut().find(|(n, _)| n == k).map(|(_, v)| v),
+        (Tree::Array(a), Seg::Idx(i)) => a.get_mut(*i),
+        _ => None,
+    };
+    tree_at(next?, rest)
+}
+
+/// The same change on the card's copy of the document (to show it before it's saved).
+pub fn apply_tree(t: &mut Tree, op: &Op) -> Result<(), String> {
+    let (parent, last): (&[Seg], Option<&Seg>) = match op {
+        Op::Set(p, _) | Op::Rename(p, _) | Op::Remove(p) => (&p[..p.len().saturating_sub(1)], p.last()),
+        Op::Insert(p, _, _, _) => (p, None),
+    };
+    let target = tree_at(t, parent).ok_or("that field isn't there any more")?;
+    match (op, target, last) {
+        (Op::Set(_, v), Tree::Object(f), Some(Seg::Key(k))) => f.iter_mut().find(|(n, _)| n == k).ok_or("no such field")?.1 = tree(v),
+        (Op::Set(_, v), Tree::Array(a), Some(Seg::Idx(i))) => *a.get_mut(*i).ok_or("no such item")? = tree(v),
+        (Op::Rename(_, new), Tree::Object(f), Some(Seg::Key(k))) => {
+            if f.iter().any(|(n, _)| n == new) && new != k {
+                return Err(format!("There's already a field “{new}”"));
+            }
+            f.iter_mut().find(|(n, _)| n == k).ok_or("no such field")?.0 = new.clone();
+        }
+        (Op::Remove(_), Tree::Object(f), Some(Seg::Key(k))) => f.retain(|(n, _)| n != k),
+        (Op::Remove(_), Tree::Array(a), Some(Seg::Idx(i))) if *i < a.len() => {
+            a.remove(*i);
+        }
+        (Op::Insert(_, at, Some(key), v), Tree::Object(f), _) => {
+            let at = (*at).min(f.len());
+            f.insert(at, (key.clone(), tree(v)));
+        }
+        (Op::Insert(_, at, None, v), Tree::Array(a), _) => {
+            let at = (*at).min(a.len());
+            a.insert(at, tree(v));
+        }
+        _ => return Err("that change doesn't fit the document".into()),
+    }
+    Ok(())
+}
+
+/// A document's _id, from how it was shown, to find it again.
+fn id_of(t: &Tree) -> Result<Bson> {
+    let Tree::Object(f) = t else { bail!("not a document") };
+    let id = f.iter().find(|(k, _)| k == "_id").map(|(_, v)| v).ok_or_else(|| anyhow!("The document has no _id"))?;
+    Ok(match id {
+        Tree::Str(s) => Bson::String(s.clone()),
+        Tree::Num(n) => Bson::Int32(n.parse()?),
+        Tree::Typed("Long", n) => Bson::Int64(n.parse()?),
+        Tree::Typed("Double", n) => Bson::Double(n.parse()?),
+        Tree::Typed("ObjectId", h) => Bson::ObjectId(mongodb::bson::oid::ObjectId::parse_str(h)?),
+        Tree::Typed("UUID", u) => Bson::Binary(mongodb::bson::Binary::from_uuid(mongodb::bson::Uuid::parse_str(u)?)),
+        Tree::Typed("Date", d) => Bson::DateTime(mongodb::bson::DateTime::parse_rfc3339_str(d)?),
+        other => bail!("Documents with an _id like {} can't be edited here", other.short(TextStyle::Shell)),
+    })
+}
+
+/// Saves a card's changes: the document is read again, checked unchanged since it was shown,
+/// changed the same way, and replaced.
+pub async fn update_doc(c: &Client, db: &str, coll: &str, original: &Tree, ops: &[Op]) -> Result<()> {
+    if ops.iter().any(|op| matches!(op, Op::Set(p, _) | Op::Rename(p, _) | Op::Remove(p) if p.first() == Some(&Seg::Key("_id".into())) && p.len() == 1)) {
+        bail!("The _id can't be changed");
+    }
+    let id = id_of(original)?;
+    let coll = c.database(db).collection::<Document>(coll);
+    let mut doc = coll.find_one(doc! { "_id": id.clone() }).await?.ok_or_else(|| anyhow!("The document was deleted meanwhile"))?;
+    if &tree(&Bson::Document(doc.clone())) != original {
+        bail!("The document changed since it was shown: refresh, then edit it again");
+    }
+    for op in ops {
+        apply(&mut doc, op)?;
+    }
+    if doc.keys().any(|k| k.is_empty()) {
+        bail!("A field needs a name");
+    }
+    coll.replace_one(doc! { "_id": id }, doc).await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- validation
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -572,6 +775,35 @@ mod tests {
         assert_eq!(check(&FindQuery { filter: "{age: }".into(), ..Default::default() }).unwrap_err().split(':').next(), Some("Filter"));
         assert_eq!(check(&FindQuery { limit: "ten".into(), ..Default::default() }).unwrap_err(), "Limit: expected a whole number, not “ten”");
         assert!(parse(&FindQuery::default()).unwrap().filter.is_empty(), "an empty bar finds everything");
+    }
+
+    #[test]
+    fn edits_apply_to_the_document_and_its_card_alike() {
+        let original = doc! { "_id": 1, "status": "OPEN", "n": 2.5, "history": [{ "s": "A" }, { "s": "B" }] };
+        let ops = vec![
+            Op::Set(vec![Seg::Key("status".into())], edit_value("DONE", Some(&Tree::Str("OPEN".into()))).unwrap()),
+            Op::Set(vec![Seg::Key("n".into())], edit_value("3", Some(&Tree::Typed("Double", "2.5".into()))).unwrap()),
+            Op::Rename(vec![Seg::Key("status".into())], "state".into()),
+            Op::Insert(vec![Seg::Key("history".into()), Seg::Idx(0)], 1, Some("reason".into()), edit_value("'why'", None).unwrap()),
+            Op::Insert(vec![Seg::Key("history".into())], 1, None, edit_value("{s: 'A2'}", None).unwrap()),
+            Op::Remove(vec![Seg::Key("history".into()), Seg::Idx(2)]),
+            Op::Insert(vec![], 1, Some("added".into()), edit_value("42", None).unwrap()),
+        ];
+        let mut d = original.clone();
+        let mut t = tree(&Bson::Document(original));
+        for op in &ops {
+            apply(&mut d, op).unwrap();
+            apply_tree(&mut t, op).unwrap();
+        }
+        assert_eq!(d, doc! { "_id": 1, "added": 42, "state": "DONE", "n": 3.0, "history": [{ "s": "A", "reason": "why" }, { "s": "A2" }] });
+        assert_eq!(t, tree(&Bson::Document(d)), "the card shows what will be saved");
+        assert_eq!(edit_value("12", Some(&Tree::Str("x".into()))).unwrap(), Bson::String("12".into()), "a string stays a string");
+        assert_eq!(edit_value("Long('7')", Some(&Tree::Typed("ObjectId", String::new()))).unwrap(), Bson::Int64(7));
+        assert!(edit_value("{a: ", Some(&Tree::Num("1".into()))).is_err());
+        assert_eq!(edit_value("hello there", None).unwrap(), Bson::String("hello there".into()), "a new field's plain text");
+        assert_eq!(edit_text(&Tree::Typed("Date", "2024-01-02T00:00:00Z".into())), "ISODate('2024-01-02T00:00:00Z')");
+        let mut t2 = tree(&Bson::Document(doc! { "a": 1, "b": 2 }));
+        assert!(apply_tree(&mut t2, &Op::Rename(vec![Seg::Key("a".into())], "b".into())).is_err(), "no two fields with one name");
     }
 
     #[test]
