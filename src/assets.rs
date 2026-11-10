@@ -38,6 +38,7 @@ fn icon_body(name: &str) -> Option<&'static str> {
         "check" => r#"<path d="M3 8.5l3.2 3.2L13 4.8"/>"#,
         "refresh" => r#"<path d="M13 8a5 5 0 1 1-1.6-3.7"/><path d="M13 2.3v3h-3"/>"#,
         "plus" => r#"<path d="M8 3v10M3 8h10"/>"#,
+        "pencil" => r#"<path d="M10.8 2.6l2.6 2.6-7.6 7.6H3.2v-2.6z"/><path d="M9.2 4.2l2.6 2.6"/>"#,
         "sparkle" => r#"<path d="M8 1.5l1.6 4.9 4.9 1.6-4.9 1.6L8 14.5l-1.6-4.9L1.5 8l4.9-1.6z"/>"#,
         "history" => r#"<path d="M2.6 8a5.4 5.4 0 1 0 1.6-3.8"/><path d="M2.3 2.5v2.3h2.3"/><path d="M8 5v3.2l2.2 1.4"/>"#,
         "paperclip" => r#"<path d="M13 7.5l-5.2 5.2a3 3 0 0 1-4.3-4.3l5.6-5.6a2 2 0 0 1 2.9 2.9L6.4 11.3a1 1 0 0 1-1.4-1.4l4.8-4.8"/>"#,

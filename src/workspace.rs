@@ -8816,6 +8816,80 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
 
     /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
     #[gpui::test]
+    fn mongodb_table_cells_and_json_cards_are_edited(cx: &mut TestAppContext) {
+        if std::env::var_os("KITE_DB_LIVE").is_none() {
+            return;
+        }
+        let (ws, cx) = setup(cx);
+        let id = live_mongo_docs("edit_more", 1, cx);
+        let conn = crate::db::load().into_iter().find(|c| c.id == id).unwrap();
+        let shell = |conn: &crate::db::Conn, q: &str| {
+            let q = crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("kite_test".into()), collection: None }, q.into()));
+            futures::executor::block_on(q).unwrap()
+        };
+        let first = |conn: &crate::db::Conn| shell(conn, "db.edit_more.findOne({})")[0].trees.clone().unwrap()[0].text(crate::db::TextStyle::Shell);
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["kite_test".into(), "edit_more".into()] }, window, cx));
+        let tab = db_tab(&ws, cx).expect("a data tab");
+        wait_for(cx, "the document", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
+
+        // Table: a cell double-clicked, given a number of type Int32.
+        click_on(cx, "db-mode-table");
+        let head = cx.debug_bounds("db-col-2").unwrap();
+        let at = gpui::point(head.left() + gpui::px(20.), head.bottom() + gpui::px(13.));
+        for n in [1, 2] {
+            cx.simulate_event(gpui::MouseDownEvent { position: at, button: gpui::MouseButton::Left, click_count: n, ..Default::default() });
+            cx.simulate_event(gpui::MouseUpEvent { position: at, button: gpui::MouseButton::Left, click_count: n, ..Default::default() });
+        }
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("db-cell-editor").is_some(), "an edit box over the cell");
+        click_on(cx, "db-type-button");
+        assert!(cx.debug_bounds("db-type-LegacyPythonUUID").is_some() || cx.debug_bounds("db-type-Array").is_some(), "the types listed");
+        click_on(cx, "db-type-Int32");
+        let ed = tab.read_with(cx, |t, _| t.editor_in_card()).unwrap();
+        ed.update(cx, |e, cx| e.set_text("77", cx));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        click_on(cx, "db-doc-update-0");
+        wait_for(cx, "saved", |cx| cx.debug_bounds("db-doc-bar-0").is_none());
+        assert!(first(&conn).contains("name: 77,"), "{}", first(&conn));
+
+        // JSON: the pencil makes the card text; not a document yet: said, not saved.
+        click_on(cx, "db-mode-json");
+        wait_for(cx, "the card", |cx| cx.debug_bounds("db-card-0").is_some());
+        let card = cx.debug_bounds("db-card-0").unwrap();
+        cx.simulate_mouse_move(card.center(), None, gpui::Modifiers::none());
+        click_on(cx, "db-doc-edit-0");
+        let (json, _) = tab.read_with(cx, |t, _| t.json_editor(0)).expect("the JSON editor");
+        let text = json.read_with(cx, |e, _| e.text());
+        assert!(text.contains("\"$oid\""), "{text}");
+        json.update(cx, |e, cx| e.set_text("{\"name\": ", cx));
+        cx.run_until_parked();
+        assert!(tab.read_with(cx, |t, _| t.json_editor(0)).unwrap().1.is_some(), "invalid, said why");
+        click_on(cx, "db-json-update-0");
+        assert!(first(&conn).contains("name: 77"), "nothing saved while invalid");
+        json.update(cx, |e, cx| e.set_text(&text.replace("\"name\": 77", "\"name\": \"Zed\""), cx));
+        cx.run_until_parked();
+        assert!(tab.read_with(cx, |t, _| t.json_editor(0)).unwrap().1.is_none());
+        click_on(cx, "db-json-update-0");
+        wait_for(cx, "saved", |cx| tab.read_with(cx, |t, _| t.json_editor(0)).is_none());
+        assert!(first(&conn).contains("name: 'Zed'"), "{}", first(&conn));
+
+        // Clone, then delete (asked first).
+        wait_for(cx, "the card again", |cx| cx.debug_bounds("db-card-0").is_some());
+        let card = cx.debug_bounds("db-card-0").unwrap();
+        cx.simulate_mouse_move(card.center(), None, gpui::Modifiers::none());
+        click_on(cx, "db-doc-clone-0");
+        wait_for(cx, "two documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 2));
+        let card = cx.debug_bounds("db-card-0").unwrap();
+        cx.simulate_mouse_move(card.center(), None, gpui::Modifiers::none());
+        click_on(cx, "db-doc-delete-0");
+        assert!(ws.read_with(cx, |ws, _| ws.ask.is_some()), "asked first");
+        click_on(cx, "dialog-button-Delete");
+        wait_for(cx, "one left", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 1));
+    }
+
+    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    #[gpui::test]
     fn document_text_is_selected_by_dragging_and_copied(cx: &mut TestAppContext) {
         if std::env::var_os("KITE_DB_LIVE").is_none() {
             return;

@@ -75,6 +75,8 @@ pub struct DbView {
     /// Text dragged over in the documents and tables (⌘C copies it).
     sel: sel::Selection,
     editing: Option<Editing>,
+    /// Table: the cell the next edit box opens over.
+    edit_anchor: Option<usize>,
 }
 
 enum Body {
@@ -215,6 +217,8 @@ struct GridView {
     unfolded: HashSet<String>,
     /// Documents being edited in place, by row.
     edits: HashMap<usize, DocEdit>,
+    /// Documents being edited as JSON text, by row.
+    json_edits: HashMap<usize, JsonEdit>,
 }
 
 /// A document's changes, not saved yet (Update saves them, Cancel drops them).
@@ -238,6 +242,23 @@ struct Editing {
     fresh: bool,
     editor: Entity<Editor>,
     _sub: Subscription,
+    /// The value's type (Compass's list); picked from the menu when `ty_chosen`.
+    ty: &'static str,
+    ty_chosen: bool,
+    /// The type menu is open.
+    menu: bool,
+    /// Table: the cell it's typed over.
+    anchor_col: Option<usize>,
+}
+
+/// A document typed whole, as JSON, in its card.
+struct JsonEdit {
+    editor: Entity<Editor>,
+    /// Why the text isn't a document (Update waits until it is).
+    invalid: Option<String>,
+    error: Option<String>,
+    saving: bool,
+    _sub: Subscription,
 }
 
 impl GridView {
@@ -257,7 +278,7 @@ impl GridView {
             w.max((head as f32 * 7.6 + 26.).min(420.))
         }).collect();
         let list = ListState::new(grid.rows.len(), ListAlignment::Top, gpui::px(600.));
-        GridView { grid: Arc::new(grid), widths, types, list, hscroll: ScrollHandle::new(), sel: None, open: None, unfolded: HashSet::new(), edits: HashMap::new() }
+        GridView { grid: Arc::new(grid), widths, types, list, hscroll: ScrollHandle::new(), sel: None, open: None, unfolded: HashSet::new(), edits: HashMap::new(), json_edits: HashMap::new() }
     }
 
     fn selected_text(&self) -> Option<(String, Option<String>)> {
@@ -344,7 +365,7 @@ impl DbView {
                 None => Body::Missing("This connection was deleted.".into()),
             },
         };
-        let mut v = DbView { focus: cx.focus_handle(), open, body, _subs: subs, sel: sel::Selection::default(), editing: None };
+        let mut v = DbView { focus: cx.focus_handle(), open, body, _subs: subs, sel: sel::Selection::default(), editing: None, edit_anchor: None };
         v.load(cx);
         v.learn_names(cx);
         v.load_overview(cx);
@@ -1540,6 +1561,7 @@ impl DbView {
     fn start_edit(&mut self, which: Option<usize>, row: usize, path: Vec<Seg>, key: bool, fresh: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_edit(window, cx);
         let Some(e) = self.doc_edit(which, row) else { return };
+        let mut ty = "String";
         let text = match (key, path.last()) {
             (true, Some(Seg::Key(k))) => k.clone(),
             (true, _) => return,
@@ -1551,6 +1573,9 @@ impl DbView {
                         (Some(Tree::Array(a)), Seg::Idx(i)) => a.get(*i),
                         _ => None,
                     };
+                }
+                if let Some(t) = t {
+                    ty = compass::type_of(t);
                 }
                 t.map(compass::edit_text).unwrap_or_default()
             }
@@ -1567,7 +1592,7 @@ impl DbView {
             EditorEvent::Cancel => v.cancel_edit(cx),
             _ => {}
         });
-        self.editing = Some(Editing { which, row, path, key, fresh, editor, _sub: sub });
+        self.editing = Some(Editing { which, row, path, key, fresh, editor, _sub: sub, ty, ty_chosen: false, menu: false, anchor_col: self.edit_anchor });
         self.remeasure(which, row, cx);
     }
 
@@ -1612,7 +1637,9 @@ impl DbView {
         });
         // A field just added (empty) takes whatever is typed, read as a value if it is one.
         let prev = was.filter(|_| !ed.fresh);
-        match compass::edit_value(&text, prev.as_ref()) {
+        // The type picked (or the field's own); a new field's text is read as whatever value it is.
+        let value = if ed.fresh && !ed.ty_chosen { compass::edit_value(&text, prev.as_ref()) } else { compass::typed_value(&text, ed.ty) };
+        match value {
             Ok(v) => {
                 let unchanged = prev.as_ref().is_some_and(|p| *p == crate::db::compass_tree(&v));
                 if !unchanged {
@@ -1627,6 +1654,297 @@ impl DbView {
             }
         }
         self.remeasure(which, row, cx);
+    }
+
+    /// The value's type, a menu of them (Compass's) when clicked.
+    fn type_picker(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(ed) = &self.editing else { return div().into_any_element() };
+        if ed.key {
+            return div().into_any_element();
+        }
+        let (ty, open) = (ed.ty, ed.menu);
+        let menu = open.then(|| {
+            deferred(
+                div()
+                    .id("db-type-menu")
+                    .debug_selector(|| "db-type-menu".into())
+                    .absolute()
+                    .top(px(22.))
+                    .right(px(0.))
+                    .w(px(190.))
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .py(px(4.))
+                    .rounded(px(5.))
+                    .bg(theme::bg_popup())
+                    .border_1()
+                    .border_color(theme::border_input())
+                    .shadow_lg()
+                    .font_family(theme::UI_FONT)
+                    .children(compass::TYPES.iter().map(|t| {
+                        let t: &'static str = t;
+                        div()
+                            .id(SharedString::from(format!("db-type-{t}")))
+                            .debug_selector(move || format!("db-type-{t}"))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .px(px(10.))
+                            .py(px(3.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |v, _, window, cx| {
+                                if let Some(ed) = v.editing.as_mut() {
+                                    ed.ty = t;
+                                    ed.ty_chosen = true;
+                                    ed.menu = false;
+                                    window.focus(&ed.editor.read(cx).focus_target(cx), cx);
+                                }
+                                cx.notify();
+                            }))
+                            .child(div().w(px(12.)).text_color(theme::accent()).child(if t == ty { "✓" } else { "" }))
+                            .child(div().when(t == ty, |d| d.font_weight(FontWeight::SEMIBOLD)).child(t))
+                    })),
+            )
+            .with_priority(2)
+        });
+        div()
+            .relative()
+            .flex_none()
+            .child(
+                div()
+                    .id("db-type-button")
+                    .debug_selector(|| "db-type-button".into())
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .h(px(19.))
+                    .px(px(6.))
+                    .rounded(px(3.))
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(theme::border_input())
+                    .cursor_pointer()
+                    .font_family(theme::UI_FONT)
+                    .text_size(px(11.5))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|v, _, _, cx| {
+                        if let Some(ed) = v.editing.as_mut() {
+                            ed.menu = !ed.menu;
+                        }
+                        cx.notify();
+                    }))
+                    .child(ty)
+                    .child(ui::small_icon("chevron-down", theme::fg_dim())),
+            )
+            .children(menu)
+            .into_any_element()
+    }
+
+    /// Table: the edit box over a cell, with its type, add a field after it, remove it.
+    fn cell_editor(&self, which: Option<usize>, r: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(ed) = &self.editing else { return div().into_any_element() };
+        let path = ed.path.clone();
+        let (p_add, p_del) = (path.clone(), path.clone());
+        deferred(
+            div()
+                .debug_selector(|| "db-cell-editor".into())
+                .absolute()
+                .top(px(-4.))
+                .left(px(0.))
+                .w(px(440.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .p(px(4.))
+                .rounded(px(5.))
+                .bg(theme::bg_popup())
+                .border_1()
+                .border_color(theme::border_input())
+                .shadow_lg()
+                .id("db-cell-editor")
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                // Clicks in it aren't clicks on the cell under it.
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(div().flex_1().min_w_0().h(px(22.)).px(px(6.)).flex().items_center().rounded(px(3.)).bg(theme::bg_input()).border_1().border_color(theme::focus_border()).font_family(theme::MONO_FONT).child(ed.editor.clone()))
+                .child(self.type_picker(cx))
+                .child(
+                    div()
+                        .id("db-cell-add")
+                        .debug_selector(|| "db-cell-add".into())
+                        .p(px(3.))
+                        .rounded(px(3.))
+                        .border_1()
+                        .border_color(theme::border_input())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .tooltip(ui::tooltip("Add a field after this one"))
+                        .on_click(cx.listener(move |v, _, window, cx| v.add_after(which, r, p_add.clone(), window, cx)))
+                        .child(ui::small_icon("plus", theme::fg())),
+                )
+                .child(
+                    div()
+                        .id("db-cell-remove")
+                        .debug_selector(|| "db-cell-remove".into())
+                        .p(px(3.))
+                        .rounded(px(3.))
+                        .border_1()
+                        .border_color(theme::border_input())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .tooltip(ui::tooltip("Remove this field"))
+                        .on_click(cx.listener(move |v, _, _, cx| {
+                            v.editing = None;
+                            v.edit_op(which, r, compass::Op::Remove(p_del.clone()), None, cx);
+                        }))
+                        .child(ui::small_icon("trash", theme::fg())),
+                ),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
+
+    /// Cancel and Update under a document (a card or a table row), when it has changes.
+    fn doc_bar(&self, which: Option<usize>, r: usize, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let gv = self.grid_of(which)?;
+        let e = gv.edits.get(&r)?;
+        let (modified, saving, error) = (!e.ops.is_empty(), e.saving, e.error.clone());
+        (modified || error.is_some()).then(|| {
+            div()
+                .debug_selector(move || format!("db-doc-bar-{r}"))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(14.))
+                .py(px(6.))
+                .bg(if error.is_some() { theme::git_deleted().opacity(0.25) } else { theme::git_modified().opacity(0.25) })
+                .font_family(theme::UI_FONT)
+                .child(div().flex_1().min_w_0().text_color(theme::fg_bright()).child(match &error {
+                    Some(e) => e.clone(),
+                    None => "Document modified.".to_string(),
+                }))
+                .child(button(SharedString::from(format!("db-doc-cancel-{r}")), "Cancel", None, false).on_click(cx.listener(move |v, _, _, cx| v.cancel_doc(which, r, cx))))
+                .when(modified, |d| d.child(button(SharedString::from(format!("db-doc-update-{r}")), if saving { "Updating…" } else { "Update" }, None, true).on_click(cx.listener(move |v, _, _, cx| v.update_doc(which, r, cx)))))
+        })
+    }
+
+    // ------------------------------------------------------------ a document as JSON text, cloned, deleted
+
+    fn doc_tree(&self, which: Option<usize>, r: usize) -> Option<Tree> {
+        self.grid_of(which)?.grid.trees.as_ref()?.get(r).cloned()
+    }
+
+    /// The pencil in JSON: the card becomes its document as text, checked as it's typed.
+    fn start_json_edit(&mut self, which: Option<usize>, r: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(t) = self.doc_tree(which, r) else { return };
+        let editor = cx.new(|cx| {
+            let mut ed = Editor::new(EditorMode::Full, cx);
+            ed.set_text(&t.text(TextStyle::Json), cx);
+            ed.set_language("json", cx);
+            ed
+        });
+        window.focus(&editor.read(cx).focus_target(cx), cx);
+        let sub = cx.subscribe(&editor, move |v: &mut DbView, ed, ev: &EditorEvent, cx| {
+            if matches!(ev, EditorEvent::Changed) {
+                let invalid = compass::parse_document(&ed.read(cx).text()).err();
+                if let Some(e) = v.grid_of_mut(which).and_then(|g| g.json_edits.get_mut(&r)) {
+                    e.invalid = invalid;
+                }
+                cx.notify();
+            }
+        });
+        if let Some(gv) = self.grid_of_mut(which) {
+            gv.json_edits.insert(r, JsonEdit { editor, invalid: None, error: None, saving: false, _sub: sub });
+        }
+        self.remeasure(which, r, cx);
+    }
+
+    fn cancel_json_edit(&mut self, which: Option<usize>, r: usize, cx: &mut Context<Self>) {
+        if let Some(gv) = self.grid_of_mut(which) {
+            gv.json_edits.remove(&r);
+        }
+        self.remeasure(which, r, cx);
+    }
+
+    /// Runs a call on the tab's collection, then reloads the documents (or shows why it failed).
+    fn doc_call<F, Fut>(&mut self, which: Option<usize>, r: usize, done: &'static str, f: F, cx: &mut Context<Self>)
+    where
+        F: FnOnce(mongodb::Client, String, String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let Body::Data(d) = &self.body else { return };
+        let [db, coll] = d.path.as_slice() else { return };
+        let (conn, db, coll) = (d.conn.clone(), db.clone(), coll.clone());
+        let work = engine::run(engine::mongo(conn, move |cl| f(cl, db, coll)));
+        cx.spawn(async move |this, cx| {
+            let r2 = work.await;
+            this.update(cx, |v, cx| {
+                match r2 {
+                    Ok(()) => {
+                        if let Some(gv) = v.grid_of_mut(which) {
+                            gv.json_edits.remove(&r);
+                        }
+                        cx.emit(Request::Message(done.into()));
+                        v.load(cx);
+                    }
+                    Err(e) => {
+                        match v.grid_of_mut(which).and_then(|g| g.json_edits.get_mut(&r)) {
+                            Some(j) => {
+                                j.saving = false;
+                                j.error = Some(e);
+                            }
+                            None => cx.emit(Request::Error(e)),
+                        }
+                        v.remeasure(which, r, cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn save_json_edit(&mut self, which: Option<usize>, r: usize, cx: &mut Context<Self>) {
+        let Some(original) = self.doc_tree(which, r) else { return };
+        let Some(j) = self.grid_of_mut(which).and_then(|g| g.json_edits.get_mut(&r)) else { return };
+        if j.saving || j.invalid.is_some() {
+            return;
+        }
+        j.saving = true;
+        let text = j.editor.read(cx).text();
+        self.doc_call(which, r, "Document updated", move |cl, db, coll| async move { compass::replace_doc(&cl, &db, &coll, &original, &text).await }, cx);
+        cx.notify();
+    }
+
+    fn clone_doc(&mut self, which: Option<usize>, r: usize, cx: &mut Context<Self>) {
+        let Some(original) = self.doc_tree(which, r) else { return };
+        self.doc_call(which, r, "Document cloned", move |cl, db, coll| async move { compass::clone_doc(&cl, &db, &coll, &original).await }, cx);
+    }
+
+    fn ask_delete_doc(&mut self, which: Option<usize>, r: usize, cx: &mut Context<Self>) {
+        let weak = cx.entity().downgrade();
+        cx.emit(Request::Ask(crate::dialog::Ask {
+            title: "Delete this document?".into(),
+            detail: "It's removed from the collection. This can't be undone.".into(),
+            buttons: vec!["Delete".into()],
+            danger: true,
+            cancel_default: true,
+            cancel_label: None,
+            on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
+                if let Some(v) = weak.upgrade() {
+                    v.update(cx, |v, cx| {
+                        let Some(original) = v.doc_tree(which, r) else { return };
+                        v.doc_call(which, r, "Document deleted", move |cl, db, coll| async move { compass::delete_doc(&cl, &db, &coll, &original).await }, cx);
+                    });
+                }
+            }),
+        }));
+    }
+
+    #[cfg(test)]
+    pub fn json_editor(&self, row: usize) -> Option<(Entity<Editor>, Option<String>)> {
+        self.grid_of(None)?.json_edits.get(&row).map(|j| (j.editor.clone(), j.invalid.clone().or(j.error.clone())))
     }
 
     /// Esc: the key or value as it was.
@@ -1760,7 +2078,11 @@ impl DbView {
         };
         let (grid, widths, sel, open) = (gv.grid.clone(), gv.widths.clone(), gv.sel, gv.open);
         let Some(row) = grid.rows.get(r) else { return div().into_any_element() };
-        let tree = grid.trees.as_ref().and_then(|t| t.get(r));
+        // Edited and not saved yet: shown as edited.
+        let working = gv.edits.get(&r).map(|e| e.working.clone());
+        let tree = working.as_ref().or_else(|| grid.trees.as_ref().and_then(|t| t.get(r)));
+        let editable = which.is_none() && matches!(&self.body, Body::Data(d) if d.compass.is_some());
+        let edit_col = self.editing.as_ref().filter(|e| e.which == which && e.row == r).and_then(|e| e.anchor_col);
         let fields: Option<&Vec<(String, Tree)>> = match tree {
             Some(Tree::Object(f)) => Some(f),
             _ => None,
@@ -1798,17 +2120,30 @@ impl DbView {
                     .when(on, |d| d.border_1().border_color(theme::focus_border()))
                     .text_color(color)
                     .when(italic, |d| d.italic())
-                    .on_click(cx.listener(move |v, _: &ClickEvent, window, cx| {
+                    .on_click(cx.listener(move |v, ev: &ClickEvent, window, cx| {
+                        // A collection's cell double-clicked: typed into, like Compass.
+                        if editable && ev.click_count() == 2 {
+                            let col = v.grid_of(which).and_then(|g| g.grid.columns.get(c).cloned());
+                            if let Some(col) = col.filter(|c| c != "_id") {
+                                v.edit_anchor = Some(c);
+                                return v.start_edit(which, r, vec![Seg::Key(col)], false, false, window, cx);
+                            }
+                        }
                         window.focus(&v.focus, cx);
                         // A drag selected text: not a click on the row.
                         if !v.sel.has_selection() {
                             v.toggle_row(which, r, Some(c), cx);
                         }
                     }))
+                    .when(edit_col == Some(c), |d| d.relative().overflow_hidden().child(self.cell_editor(which, r, cx)))
                     .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(self.sel.text_piece(((r * 100_000) as u64, c as u32), text, color, false).join("\t")))
             }));
+        let bar = self.doc_bar(which, r, cx);
         if open != Some(r) {
-            return line.into_any_element();
+            return match bar {
+                Some(b) => div().flex().flex_col().w_full().child(line).child(b.justify_end()).into_any_element(),
+                None => line.into_any_element(),
+            };
         }
         // Open: every field one under another; long values stay on one line and scroll.
         let detail: Vec<gpui::AnyElement> = match tree {
@@ -1856,6 +2191,7 @@ impl DbView {
                     .text_size(px(12.5))
                     .children(detail),
             )
+            .children(bar)
             .into_any_element()
     }
 
@@ -1866,29 +2202,63 @@ impl DbView {
         let Some(t) = edit.as_ref().map(|e| e.0.clone()).or_else(|| gv.grid.trees.as_ref().and_then(|t| t.get(r)).cloned()) else { return div().into_any_element() };
         let copy = t.text(if json { TextStyle::Json } else { TextStyle::Shell });
         let lines = self.tree_lines(which, r, &t, json, cx);
-        // Changed: say so, with Cancel and Update (and why it couldn't be saved).
-        let bar = edit.filter(|e| e.1 || e.3.is_some()).map(|(_, modified, saving, error)| {
-            div()
-                .debug_selector(move || format!("db-doc-bar-{r}"))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .mt(px(8.))
-                .mx(px(-14.))
-                .mb(px(-10.))
-                .px(px(14.))
-                .py(px(6.))
-                .rounded_b(px(6.))
-                .bg(if error.is_some() { theme::git_deleted().opacity(0.25) } else { theme::git_modified().opacity(0.25) })
-                .font_family(theme::UI_FONT)
-                .child(div().flex_1().min_w_0().text_color(theme::fg_bright()).child(match &error {
-                    Some(e) => e.clone(),
-                    None if modified => "Document modified.".to_string(),
-                    None => String::new(),
-                }))
-                .child(button(SharedString::from(format!("db-doc-cancel-{r}")), "Cancel", None, false).on_click(cx.listener(move |v, _, _, cx| v.cancel_doc(which, r, cx))))
-                .when(modified, |d| d.child(button(SharedString::from(format!("db-doc-update-{r}")), if saving { "Updating…" } else { "Update" }, None, true).on_click(cx.listener(move |v, _, _, cx| v.update_doc(which, r, cx)))))
-        });
+        let bar = self.doc_bar(which, r, cx).map(|b| b.mt(px(8.)).mx(px(-14.)).mb(px(-10.)).rounded_b(px(6.)));
+        let editable = which.is_none() && matches!(&self.body, Body::Data(d) if d.compass.is_some());
+        // JSON typed whole: the text, why it isn't a document yet, Cancel and Update.
+        let json_edit = gv.json_edits.get(&r).map(|j| (j.editor.clone(), j.invalid.clone(), j.error.clone(), j.saving));
+        if let Some((editor, invalid, error, saving)) = json_edit {
+            let lines = editor.read(cx).text().lines().count().max(3);
+            let problem = invalid.clone().or(error);
+            return div()
+                .pb(px(8.))
+                .pr(px(4.))
+                .child(
+                    div()
+                        .debug_selector(move || format!("db-json-edit-{r}"))
+                        .flex()
+                        .flex_col()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(if invalid.is_some() { theme::git_deleted() } else { theme::focus_border() })
+                        .bg(theme::bg_side())
+                        .overflow_hidden()
+                        .child(div().h(px((lines as f32 * 19. + 16.).min(560.))).child(editor))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .px(px(14.))
+                                .py(px(6.))
+                                .bg(if problem.is_some() { theme::git_deleted().opacity(0.25) } else { theme::git_modified().opacity(0.25) })
+                                .child(div().debug_selector(move || format!("db-json-status-{r}")).flex_1().min_w_0().text_color(theme::fg_bright()).child(problem.unwrap_or_else(|| "Document modified.".into())))
+                                .child(button(SharedString::from(format!("db-json-cancel-{r}")), "Cancel", None, false).on_click(cx.listener(move |v, _, _, cx| v.cancel_json_edit(which, r, cx))))
+                                .child(
+                                    button(SharedString::from(format!("db-json-update-{r}")), if saving { "Updating…" } else { "Update" }, None, true)
+                                        .when(invalid.is_some(), |b| b.opacity(0.4))
+                                        .on_click(cx.listener(move |v, _, _, cx| v.save_json_edit(which, r, cx))),
+                                ),
+                        ),
+                )
+                .into_any_element();
+        }
+        let tool = |id: &'static str, icon: &'static str, tip: &'static str| {
+            div().id((id, r)).debug_selector(move || format!("{id}-{r}")).p(px(4.)).rounded(px(4.)).border_1().border_color(theme::border_input()).bg(theme::bg_editor()).cursor_pointer().hover(|s| s.bg(theme::hover())).tooltip(ui::tooltip(tip)).child(ui::small_icon(icon, theme::fg()))
+        };
+        let tools = div()
+            .absolute()
+            .top(px(6.))
+            .right(px(8.))
+            .flex()
+            .gap(px(6.))
+            .invisible()
+            .group_hover("db-card", |s| s.visible())
+            .when(editable && json, |d| d.child(tool("db-doc-edit", "pencil", "Edit as JSON").on_click(cx.listener(move |v, _, window, cx| v.start_json_edit(which, r, window, cx)))))
+            .child(copy_button(("db-card-copy", r), copy))
+            .when(editable, |d| {
+                d.child(tool("db-doc-clone", "files", "Clone: insert a copy").on_click(cx.listener(move |v, _, _, cx| v.clone_doc(which, r, cx))))
+                    .child(tool("db-doc-delete", "trash", "Delete").on_click(cx.listener(move |v, _, _, cx| v.ask_delete_doc(which, r, cx))))
+            });
         div()
             .pb(px(8.))
             .pr(px(4.))
@@ -1910,7 +2280,7 @@ impl DbView {
                     .text_size(px(12.5))
                     .children(lines)
                     .children(bar)
-                    .child(div().absolute().top(px(6.)).right(px(8.)).invisible().group_hover("db-card", |s| s.visible()).child(copy_button(("db-card-copy", r), copy))),
+                    .child(tools),
             )
             .into_any_element()
     }
@@ -1983,6 +2353,7 @@ impl DbView {
                                     d.on_click(cx.listener(move |v, ev: &ClickEvent, window, cx| {
                                         if ev.click_count() == 2 {
                                             cx.stop_propagation();
+                                            v.edit_anchor = None;
                                             v.start_edit(which, row, path_k.clone(), true, false, window, cx);
                                         }
                                     }))
@@ -1994,7 +2365,7 @@ impl DbView {
                     (None, true) => None,
                 };
                 let value_el = match edit_value {
-                    Some(e) => field_box(e, true).into_any_element(),
+                    Some(e) => div().flex_1().flex().items_center().gap(px(6.)).child(field_box(e, true)).child(v.type_picker(cx)).into_any_element(),
                     None => {
                         let path_v = here.clone();
                         let editable_value = w.editable && !container && !top_id;
@@ -2004,6 +2375,7 @@ impl DbView {
                                 d.on_click(cx.listener(move |v, ev: &ClickEvent, window, cx| {
                                     if ev.click_count() == 2 {
                                         cx.stop_propagation();
+                                        v.edit_anchor = None;
                                         v.start_edit(which, row, path_v.clone(), false, false, window, cx);
                                     }
                                 }))
@@ -2051,6 +2423,7 @@ impl DbView {
                                 .tooltip(ui::tooltip("Add a field after this one"))
                                 .on_click(cx.listener(move |v, _, window, cx| {
                                     cx.stop_propagation();
+                                    v.edit_anchor = None;
                                     v.add_after(which, row, path_add.clone(), window, cx);
                                 }))
                                 .child(ui::small_icon("plus", theme::fg_dim())),

@@ -728,6 +728,174 @@ pub async fn update_doc(c: &Client, db: &str, coll: &str, original: &Tree, ops: 
     Ok(())
 }
 
+// ---------------------------------------------------------------- types, whole documents
+
+/// The types a value can be given, as Compass lists them.
+pub const TYPES: &[&str] = &[
+    "Array", "Binary", "Boolean", "Code", "Date", "Decimal128", "Double", "Int32", "Int64", "MaxKey", "MinKey", "Null", "Object", "ObjectId", "BSONRegExp", "String",
+    "BSONSymbol", "Timestamp", "Undefined", "UUID", "LegacyJavaUUID", "LegacyCSharpUUID", "LegacyPythonUUID",
+];
+
+/// A value's type, by the names in TYPES.
+pub fn type_of(t: &Tree) -> &'static str {
+    match t.type_name() {
+        "Regex" => "BSONRegExp",
+        "Binary" => "Binary",
+        n => TYPES.iter().find(|x| **x == n).copied().unwrap_or("String"),
+    }
+}
+
+/// `Name('x')` or `'x'` → x (what's typed may be written either way).
+fn inner(text: &str) -> &str {
+    let t = text.trim();
+    let t = match (t.find('('), t.ends_with(')')) {
+        (Some(i), true) if t[..i].chars().all(|c| c.is_ascii_alphanumeric()) => &t[i + 1..t.len() - 1],
+        _ => t,
+    };
+    t.trim().trim_matches(['\'', '"'])
+}
+
+/// A value of a chosen type from what's typed.
+pub fn typed_value(text: &str, ty: &str) -> Result<Bson, String> {
+    use mongodb::bson::{Binary, DateTime, Decimal128, Regex, Timestamp, Uuid, oid::ObjectId, spec::BinarySubtype};
+    let t = inner(text);
+    let bad = |what: &str| format!("Not {what}: “{}”", text.trim());
+    Ok(match ty {
+        "String" => Bson::String(text.to_string()),
+        "Int32" => Bson::Int32(t.parse().map_err(|_| bad("an Int32"))?),
+        "Int64" => Bson::Int64(t.parse().map_err(|_| bad("an Int64"))?),
+        "Double" => Bson::Double(t.parse().map_err(|_| bad("a number"))?),
+        "Decimal128" => Bson::Decimal128(t.parse::<Decimal128>().map_err(|_| bad("a decimal"))?),
+        "Boolean" => Bson::Boolean(match t.to_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" | "" => false,
+            _ => return Err(bad("true or false")),
+        }),
+        "Null" => Bson::Null,
+        "Undefined" => Bson::Undefined,
+        "MinKey" => Bson::MinKey,
+        "MaxKey" => Bson::MaxKey,
+        "Date" => match t.parse::<i64>() {
+            Ok(ms) => Bson::DateTime(DateTime::from_millis(ms)),
+            Err(_) => {
+                let full = if t.len() == 10 { format!("{t}T00:00:00Z") } else if t.len() > 10 && !t.ends_with('Z') && !t[10..].contains(['+', '-']) { format!("{t}Z") } else { t.to_string() };
+                Bson::DateTime(DateTime::parse_rfc3339_str(&full).map_err(|_| bad("a date (2024-01-31T12:00:00Z)"))?)
+            }
+        },
+        "ObjectId" => Bson::ObjectId(ObjectId::parse_str(t).map_err(|_| bad("an ObjectId (24 hex digits)"))?),
+        "UUID" => Bson::Binary(Binary::from_uuid(Uuid::parse_str(t).map_err(|_| bad("a UUID"))?)),
+        "LegacyJavaUUID" | "LegacyCSharpUUID" | "LegacyPythonUUID" => {
+            let u = Uuid::parse_str(t).map_err(|_| bad("a UUID"))?;
+            let mut b = u.bytes().to_vec();
+            match ty {
+                "LegacyJavaUUID" => {
+                    b[..8].reverse();
+                    b[8..].reverse();
+                }
+                "LegacyCSharpUUID" => {
+                    b[..4].reverse();
+                    b[4..6].reverse();
+                    b[6..8].reverse();
+                }
+                _ => {}
+            }
+            Bson::Binary(Binary { subtype: BinarySubtype::UuidOld, bytes: b })
+        }
+        "Binary" => Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: base64_decode(t).ok_or_else(|| bad("base64"))? }),
+        "Code" => Bson::JavaScriptCode(text.to_string()),
+        "BSONSymbol" => Bson::Symbol(text.to_string()),
+        "BSONRegExp" => {
+            let r = text.trim();
+            let (pattern, options) = match r.strip_prefix('/').and_then(|x| x.rsplit_once('/')) {
+                Some((p, o)) => (p.to_string(), o.to_string()),
+                None => (r.to_string(), String::new()),
+            };
+            Bson::RegularExpression(Regex { pattern, options })
+        }
+        "Timestamp" => {
+            let (a, b) = t.split_once([':', ',']).unwrap_or((t, "1"));
+            Bson::Timestamp(Timestamp { time: a.trim().parse().map_err(|_| bad("a timestamp (seconds:increment)"))?, increment: b.trim().parse().map_err(|_| bad("a timestamp"))? })
+        }
+        "Array" | "Object" if text.trim().is_empty() => if ty == "Array" { Bson::Array(Vec::new()) } else { Bson::Document(Document::new()) },
+        "Array" | "Object" => match parse_value(text.trim()).map_err(|e| e.to_string())? {
+            v @ Bson::Array(_) if ty == "Array" => v,
+            v @ Bson::Document(_) if ty == "Object" => v,
+            _ => return Err(bad(if ty == "Array" { "an array [ … ]" } else { "an object { … }" })),
+        },
+        other => return Err(format!("Unknown type {other}")),
+    })
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut buf, mut bits) = (0u32, 0);
+    for c in s.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=') {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32;
+        buf = buf << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// A whole document typed as text: Extended JSON (as the JSON view shows it) or the shell's syntax.
+pub fn parse_document(text: &str) -> Result<Document, String> {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+        return match Bson::try_from(json) {
+            Ok(Bson::Document(d)) => Ok(d),
+            Ok(_) => Err("A document is an object { … }".into()),
+            Err(e) => Err(e.to_string()),
+        };
+    }
+    match parse_value(text.trim()) {
+        Ok(Bson::Document(d)) => Ok(d),
+        Ok(_) => Err("A document is an object { … }".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Replaces a document with one typed whole (its _id kept; checked unchanged since shown).
+pub async fn replace_doc(c: &Client, db: &str, coll: &str, original: &Tree, text: &str) -> Result<()> {
+    let new = parse_document(text).map_err(|e| anyhow!(e))?;
+    let id = id_of(original)?;
+    if new.get("_id").is_some_and(|n| *n != id) {
+        bail!("The _id can't be changed");
+    }
+    let coll = c.database(db).collection::<Document>(coll);
+    let doc = coll.find_one(doc! { "_id": id.clone() }).await?.ok_or_else(|| anyhow!("The document was deleted meanwhile"))?;
+    if &tree(&Bson::Document(doc)) != original {
+        bail!("The document changed since it was shown: refresh, then edit it again");
+    }
+    coll.replace_one(doc! { "_id": id }, new).await?;
+    Ok(())
+}
+
+/// A copy of a document, with a new _id.
+pub async fn clone_doc(c: &Client, db: &str, coll: &str, original: &Tree) -> Result<()> {
+    let id = id_of(original)?;
+    let coll = c.database(db).collection::<Document>(coll);
+    let mut doc = coll.find_one(doc! { "_id": id }).await?.ok_or_else(|| anyhow!("The document was deleted meanwhile"))?;
+    doc.remove("_id");
+    coll.insert_one(doc).await?;
+    Ok(())
+}
+
+pub async fn delete_doc(c: &Client, db: &str, coll: &str, original: &Tree) -> Result<()> {
+    let id = id_of(original)?;
+    c.database(db).collection::<Document>(coll).delete_one(doc! { "_id": id }).await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- validation
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -804,6 +972,23 @@ mod tests {
         assert_eq!(edit_text(&Tree::Typed("Date", "2024-01-02T00:00:00Z".into())), "ISODate('2024-01-02T00:00:00Z')");
         let mut t2 = tree(&Bson::Document(doc! { "a": 1, "b": 2 }));
         assert!(apply_tree(&mut t2, &Op::Rename(vec![Seg::Key("a".into())], "b".into())).is_err(), "no two fields with one name");
+    }
+
+    #[test]
+    fn values_take_the_type_chosen() {
+        assert_eq!(typed_value("42", "Int32").unwrap(), Bson::Int32(42));
+        assert_eq!(typed_value("Long('5')", "Int64").unwrap(), Bson::Int64(5));
+        assert!(matches!(typed_value("ISODate('2024-01-02')", "Date").unwrap(), Bson::DateTime(_)));
+        assert!(matches!(typed_value("64b7f0c2a1b2c3d4e5f60718", "ObjectId").unwrap(), Bson::ObjectId(_)));
+        assert_eq!(typed_value("x", "Int32").unwrap_err(), "Not an Int32: “x”");
+        assert_eq!(typed_value("/^a/i", "BSONRegExp").unwrap(), Bson::RegularExpression(mongodb::bson::Regex { pattern: "^a".into(), options: "i".into() }));
+        assert_eq!(typed_value("aGk=", "Binary").unwrap(), Bson::Binary(mongodb::bson::Binary { subtype: mongodb::bson::spec::BinarySubtype::Generic, bytes: b"hi".to_vec() }));
+        assert_eq!(typed_value("", "Array").unwrap(), Bson::Array(vec![]));
+        assert_eq!(type_of(&Tree::Typed("Long", "1".into())), "Int64");
+        let d = parse_document(r#"{"_id": {"$oid": "64b7f0c2a1b2c3d4e5f60718"}, "at": {"$date": "2024-01-02T00:00:00Z"}, "n": 3}"#).unwrap();
+        assert!(matches!(d.get("_id"), Some(Bson::ObjectId(_))) && matches!(d.get("at"), Some(Bson::DateTime(_))), "Extended JSON read back as types");
+        assert!(parse_document("{a: ").is_err());
+        assert!(parse_document("{a: ObjectId('64b7f0c2a1b2c3d4e5f60718')}").is_ok(), "the shell's syntax too");
     }
 
     #[test]
