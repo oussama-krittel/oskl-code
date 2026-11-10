@@ -148,7 +148,8 @@ fn build(lang: Lang) -> Option<HighlightConfiguration> {
 }
 
 fn config(lang: Lang) -> Option<&'static HighlightConfiguration> {
-    static CONFIGS: [OnceLock<Option<HighlightConfiguration>>; 16] = [const { OnceLock::new() }; 16];
+    // One per language (room for a few more).
+    static CONFIGS: [OnceLock<Option<HighlightConfiguration>>; 24] = [const { OnceLock::new() }; 24];
     CONFIGS[lang as usize].get_or_init(|| build(lang)).as_ref()
 }
 
