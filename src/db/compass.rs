@@ -449,6 +449,82 @@ pub(super) fn analyze(docs: &[Document]) -> Schema {
     Schema { sampled: docs.len() as u64, fields }
 }
 
+// ---------------------------------------------------------------- a database's collections
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CollStat {
+    pub name: String,
+    /// view, time-series, capped, clustered, validation…
+    pub props: Vec<String>,
+    pub storage: Option<u64>,
+    pub data: Option<u64>,
+    pub docs: Option<u64>,
+    pub avg: Option<u64>,
+    pub indexes: Option<u64>,
+    pub index_size: Option<u64>,
+}
+
+/// The collections of a database with their sizes, like Compass's database page.
+pub async fn collections(c: &Client, db: &str) -> Result<Vec<CollStat>> {
+    let database = c.database(db);
+    let specs: Vec<mongodb::results::CollectionSpecification> = database.list_collections().await?.try_collect().await?;
+    let stats = specs.iter().map(|s| {
+        let database = database.clone();
+        let (name, view) = (s.name.clone(), matches!(s.collection_type, mongodb::results::CollectionType::View));
+        async move {
+            if view {
+                return Document::new();
+            }
+            async {
+                let mut cur = database.collection::<Document>(&name).aggregate([doc! { "$collStats": { "storageStats": {} } }]).await?;
+                Ok::<_, anyhow::Error>(cur.try_next().await?.and_then(|d| d.get_document("storageStats").ok().cloned()).unwrap_or_default())
+            }
+            .await
+            .unwrap_or_default()
+        }
+    });
+    let stats = futures::future::join_all(stats).await;
+    let mut out: Vec<CollStat> = specs
+        .into_iter()
+        .zip(stats)
+        .map(|(s, st)| {
+            let mut props = Vec::new();
+            match s.collection_type {
+                mongodb::results::CollectionType::View => props.push("view".to_string()),
+                mongodb::results::CollectionType::Timeseries => props.push("time-series".into()),
+                _ => {}
+            }
+            if s.options.capped.unwrap_or(false) {
+                props.push("capped".into());
+            }
+            if s.options.clustered_index.is_some() {
+                props.push("clustered".into());
+            }
+            if s.options.validator.as_ref().is_some_and(|v| !v.is_empty()) {
+                props.push("validation".into());
+            }
+            let n = |k: &str| st.get(k).map(|_| int(&st, k).max(0) as u64);
+            CollStat { name: s.name, props, storage: n("storageSize"), data: n("size"), docs: n("count"), avg: n("avgObjSize").or(st.get("count").map(|_| 0)), indexes: n("nindexes"), index_size: n("totalIndexSize") }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+pub async fn create_collection(c: &Client, db: &str, name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() || name.starts_with("system.") || name.contains('$') || name.contains('\0') {
+        bail!("Not a collection name: “{name}”");
+    }
+    c.database(db).create_collection(name).await?;
+    Ok(())
+}
+
+pub async fn drop_collection(c: &Client, db: &str, name: &str) -> Result<()> {
+    c.database(db).collection::<Document>(name).drop().await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- validation
 
 #[derive(Clone, Debug, Default, PartialEq)]

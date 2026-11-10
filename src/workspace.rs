@@ -8829,6 +8829,50 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         wait_for(cx, "the rules saved", |cx| cx.debug_bounds("db-val-status").is_some() && tab.read_with(cx, |t, _| t.compass_tab()) == Some(CTab::Validation));
     }
 
+    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    #[gpui::test]
+    fn a_mongodb_database_lists_its_collections(cx: &mut TestAppContext) {
+        if std::env::var_os("KITE_DB_LIVE").is_none() {
+            return;
+        }
+        let (ws, cx) = setup(cx);
+        let id = live_mongo_docs("overview_big", 30, cx);
+        live_mongo_docs("overview_small", 2, cx);
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Database { conn: id.clone(), db: "kite_test".into() }, window, cx));
+        let tab = db_tab(&ws, cx).expect("a database tab");
+        assert_eq!(ws.read_with(cx, |ws, cx| ws.tab_title(&ws.tabs[ws.active.unwrap()], cx).0), "kite_test");
+        wait_for(cx, "the collections", |cx| tab.read_with(cx, |t, _| t.overview_names()).is_some());
+        let names = tab.read_with(cx, |t, _| t.overview_names()).unwrap().unwrap();
+        assert!(names.contains(&"overview_big".to_string()) && names.contains(&"overview_small".to_string()), "{names:?}");
+        // Sorted by documents, most first.
+        click_on(cx, "db-sort-docs");
+        let names = tab.read_with(cx, |t, _| t.overview_names()).unwrap().unwrap();
+        let (big, small) = (names.iter().position(|n| n == "overview_big").unwrap(), names.iter().position(|n| n == "overview_small").unwrap());
+        assert!(big < small, "{names:?}");
+        // Create one.
+        click_on(cx, "db-coll-new");
+        tab.update(cx, |t, cx| t.type_collection_name("overview_new", cx));
+        click_on(cx, "db-coll-create");
+        wait_for(cx, "the new collection", |cx| tab.read_with(cx, |t, _| t.overview_names()).is_some_and(|r| r.is_ok_and(|l| l.contains(&"overview_new".to_string()))));
+        // Drop it (asked first).
+        let row = tab.read_with(cx, |t, _| t.overview_names()).unwrap().unwrap().iter().position(|n| n == "overview_new").unwrap();
+        let sel: &'static str = Box::leak(format!("db-coll-{row}").into_boxed_str());
+        let drop: &'static str = Box::leak(format!("db-coll-drop-{row}").into_boxed_str());
+        let at = cx.debug_bounds(sel).unwrap().center();
+        cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+        click_on(cx, drop);
+        assert!(ws.read_with(cx, |ws, _| ws.ask.is_some()), "asks first");
+        click_on(cx, "dialog-button-Drop Collection");
+        wait_for(cx, "it gone", |cx| tab.read_with(cx, |t, _| t.overview_names()).is_some_and(|r| r.is_ok_and(|l| !l.contains(&"overview_new".to_string()))));
+        // A collection clicked opens it.
+        let row = tab.read_with(cx, |t, _| t.overview_names()).unwrap().unwrap().iter().position(|n| n == "overview_small").unwrap();
+        let sel: &'static str = Box::leak(format!("db-coll-{row}").into_boxed_str());
+        click_on(cx, sel);
+        let data = db_tab(&ws, cx).expect("the collection's tab");
+        assert_eq!(ws.read_with(cx, |ws, cx| ws.tab_title(&ws.tabs[ws.active.unwrap()], cx).0), "MongoDB: overview_small");
+        wait_for(cx, "its documents", |cx| data.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 2));
+    }
+
     /// The test MongoDB, connected: a collection of `n` documents in kite_test. Its connection id.
     fn live_mongo_docs(coll: &str, n: usize, _cx: &mut VisualTestContext) -> String {
         let mut c = crate::db::Conn::new(crate::db::Kind::MongoDb);

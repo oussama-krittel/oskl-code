@@ -533,6 +533,7 @@ impl DbPanel {
                 let (id2, path2) = (id.clone(), path.clone());
                 let (id3, path3) = (id.clone(), path.clone());
                 let queryable = matches!(n.kind, db::NodeKind::Database) || leaf;
+                let mongo_db = c.kind == db::Kind::MongoDb && matches!(n.kind, db::NodeKind::Database) && path.len() == 1;
                 base.debug_selector(move || format!("db-node-{label}"))
                     .on_click(cx.listener(move |p, _, w, cx| {
                         p.selected = Some(rk.clone());
@@ -541,6 +542,10 @@ impl DbPanel {
                             cx.emit(Request::Db(DbRequest::Open(Open::Data { conn: id.clone(), path: path.clone() })));
                         } else {
                             p.toggle(&id, path.clone(), cx);
+                            // A MongoDB database also opens its page of collections, like Compass.
+                            if mongo_db {
+                                cx.emit(Request::Db(DbRequest::Open(Open::Database { conn: id.clone(), db: path[0].clone() })));
+                            }
                         }
                     }))
                     .child(if leaf { ui::small_icon("dot", transparent_black()) } else { chevron(open) })

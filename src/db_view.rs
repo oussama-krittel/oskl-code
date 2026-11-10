@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod compass_ui;
+mod overview;
 use compass_ui::{AGG, Compass};
 pub use compass_ui::CTab;
 
@@ -45,6 +46,8 @@ pub enum Open {
     Data { conn: String, path: Vec<String> },
     /// A query on a connection or one of its databases.
     Query { conn: String, path: Vec<String> },
+    /// A MongoDB database: its collections with their sizes.
+    Database { conn: String, db: String },
 }
 
 /// What a database tab asks of the workspace and the panel.
@@ -71,6 +74,7 @@ pub struct DbView {
 enum Body {
     Form(Box<Form>),
     Data(Box<Data>),
+    Overview(Box<overview::Overview>),
     Missing(String),
 }
 
@@ -204,6 +208,10 @@ impl DbView {
                 Some(c) => Body::Form(Box::new(Form::new(c, true, project, &mut subs, window, cx))),
                 None => Body::Missing("This connection was deleted.".into()),
             },
+            Open::Database { conn, db } => match find(conn) {
+                Some(c) => Body::Overview(Box::new(overview::Overview::new(c, db.clone()))),
+                None => Body::Missing("This connection was deleted.".into()),
+            },
             Open::Data { conn, path } | Open::Query { conn, path } => match find(conn) {
                 Some(c) => {
                     let has_data = matches!(open, Open::Data { .. });
@@ -252,6 +260,7 @@ impl DbView {
         };
         let mut v = DbView { focus: cx.focus_handle(), open, body, _subs: subs };
         v.load(cx);
+        v.load_overview(cx);
         // The Indexes tab shows how many there are, like Compass.
         if matches!(&v.body, Body::Data(d) if d.compass.is_some()) {
             v.load_indexes(cx);
@@ -301,6 +310,7 @@ impl DbView {
                 let what = d.path.last().cloned().unwrap_or_else(|| d.conn.title());
                 if d.has_data { (format!("{}: {what}", d.conn.kind.label()), d.path.join(" / ")) } else { (format!("Query: {what}"), d.conn.title()) }
             }
+            Body::Overview(o) => (o.db.clone(), o.conn.title()),
             Body::Missing(_) => ("Database".into(), String::new()),
         }
     }
@@ -311,6 +321,7 @@ impl DbView {
         match &self.body {
             Body::Form(f) => Some(f.conn.kind),
             Body::Data(d) => Some(d.conn.kind),
+            Body::Overview(o) => Some(o.conn.kind),
             Body::Missing(_) => None,
         }
     }
@@ -319,6 +330,7 @@ impl DbView {
     pub fn conn_id(&self) -> Option<String> {
         match &self.body {
             Body::Data(d) => Some(d.conn.id.clone()),
+            Body::Overview(o) => Some(o.conn.id.clone()),
             _ => None,
         }
     }
@@ -329,11 +341,14 @@ impl DbView {
         if waiting {
             self.load(cx);
         }
+        if matches!(&self.body, Body::Overview(o) if o.list.as_ref().is_none_or(|l| l.is_err())) {
+            self.load_overview(cx);
+        }
     }
 
     /// Whether this tab shows `open` (to switch to it instead of opening another).
     pub fn shows(&self, open: &Open) -> bool {
-        matches!(open, Open::Edit(_) | Open::Data { .. }) && &self.open == open
+        matches!(open, Open::Edit(_) | Open::Data { .. } | Open::Database { .. }) && &self.open == open
     }
 
     /// A saved connection changed: data tabs use its new settings.
@@ -1972,6 +1987,7 @@ impl Render for DbView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body: gpui::AnyElement = match &self.body {
             Body::Form(f) => self.render_form(f, cx),
+            Body::Overview(o) => self.render_overview(o, cx),
             Body::Missing(m) => div().p(px(24.)).text_color(theme::fg_dim()).child(m.clone()).into_any_element(),
             Body::Data(d) => {
                 let tab = |id: &'static str, text: &'static str, icon: &'static str, which: Inner, cx: &mut Context<Self>| {
