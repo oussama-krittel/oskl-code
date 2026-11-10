@@ -2223,6 +2223,7 @@ impl DbView {
                     (None, None) => ("NULL".into(), theme::fg_muted(), true),
                 };
                 let text = if fields.is_some() && typed.is_none() { String::new() } else { text };
+                let container_cell = matches!(typed, Some(Tree::Array(_) | Tree::Object(_)));
                 div()
                     .id(("db-cell", r * 1000 + c))
                     .flex_basis(px(widths.get(c).copied().unwrap_or(100.)))
@@ -2239,12 +2240,17 @@ impl DbView {
                     .when(italic, |d| d.italic())
                     .on_click(cx.listener(move |v, ev: &ClickEvent, window, cx| {
                         // A collection's cell double-clicked: typed into, like Compass.
-                        if editable && ev.click_count() == 2 {
+                        // (Not an array or object: those open with the row, to look at.)
+                        if editable && ev.click_count() == 2 && !container_cell {
                             let col = v.grid_of(which).and_then(|g| g.grid.columns.get(c).cloned());
                             if let Some(col) = col.filter(|c| c != "_id") {
                                 v.edit_anchor = Some(c);
                                 return v.start_edit(which, r, vec![Seg::Key(col)], false, false, window, cx);
                             }
+                        }
+                        // More clicks select a word or the line (the first opened the row).
+                        if ev.click_count() > 1 {
+                            return;
                         }
                         window.focus(&v.focus, cx);
                         // A drag selected text: not a click on the row.
@@ -2407,7 +2413,8 @@ impl DbView {
     /// double-click a key or value, the trash and plus on a line remove it or add one after it.
     fn tree_lines(&self, which: Option<usize>, row: usize, t: &Tree, json: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let Some(gv) = self.grid_of(which) else { return Vec::new() };
-        let editable = !json && which.is_none() && matches!(&self.body, Body::Data(d) if d.compass.is_some());
+        // Edited in the List view only: JSON and a table's opened row are to look at (and select).
+        let editable = !json && which.is_none() && self.doc_mode(gv) == DocMode::List && matches!(&self.body, Body::Data(d) if d.compass.is_some());
         let changed = gv.edits.get(&row).map(|e| e.changed.clone()).unwrap_or_default();
         let editing = self.editing.as_ref().filter(|e| e.which == which && e.row == row).map(|e| (e.path.clone(), e.key, e.editor.clone()));
         let mut out = Vec::new();
@@ -2568,7 +2575,14 @@ impl DbView {
                         .when(w.changed.contains(&here) || editing_here, |d| d.bg(theme::git_modified().opacity(0.18)))
                         .children(gutter)
                         .child(div().w(px(depth as f32 * 18.)).flex_none())
-                        .when(container, |d| d.cursor_pointer().on_click(cx.listener(move |v, _, _, cx| v.toggle_fold(which, row, fold.clone(), cx))))
+                        // One click opens or closes; a second and third select a word, the line.
+                        .when(container, |d| {
+                            d.cursor_pointer().on_click(cx.listener(move |v, ev: &ClickEvent, _, cx| {
+                                if ev.click_count() == 1 {
+                                    v.toggle_fold(which, row, fold.clone(), cx)
+                                }
+                            }))
+                        })
                         .child(div().w(px(14.)).flex_none().text_color(theme::fg_muted()).child(if container { if open { "▾" } else { "▸" } } else { "" }))
                         .children(key_el)
                         .child(value_el)

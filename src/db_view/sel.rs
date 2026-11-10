@@ -81,17 +81,36 @@ impl Selection {
     }
 
     /// A press: a selection starts at the text there (or the nearest on that line).
+    /// Twice selects the word there, three times the whole line, as in a text file.
     pub fn press(&self, ev: &MouseDownEvent, window: &mut Window) {
-        if ev.click_count != 1 {
-            return;
-        }
         let mut s = self.0.borrow_mut();
-        if let Some(at) = Self::locate(&s, ev.position) {
-            s.anchor = Some(at);
-            s.head = Some(at);
-            s.dragging = true;
-            window.refresh();
+        let Some(at) = Self::locate(&s, ev.position) else { return };
+        match ev.click_count {
+            1 => {
+                s.anchor = Some(at);
+                s.head = Some(at);
+                s.dragging = true;
+            }
+            2 => {
+                let Some(p) = s.pieces.get(&at.0) else { return };
+                let (a, b) = word_at(&p.text, at.1);
+                s.anchor = Some((at.0, a));
+                s.head = Some((at.0, b));
+                s.dragging = false;
+            }
+            _ => {
+                let line = at.0.0;
+                let mut on_line = s.pieces.range((line, 0)..=(line, u32::MAX));
+                let first = on_line.next().map(|(o, _)| *o);
+                let last = s.pieces.range((line, 0)..=(line, u32::MAX)).next_back().map(|(o, p)| (*o, p.text.len()));
+                if let (Some(f), Some((l, len))) = (first, last) {
+                    s.anchor = Some((f, 0));
+                    s.head = Some((l, len));
+                }
+                s.dragging = false;
+            }
         }
+        window.refresh();
     }
 
     /// The selected text, as it reads.
@@ -143,6 +162,28 @@ impl IntoElement for SelText {
     fn into_element(self) -> Self {
         self
     }
+}
+
+/// The word around a byte index: letters, digits and _ (or just the character there).
+fn word_at(text: &str, at: usize) -> (usize, usize) {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let at = at.min(text.len());
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let Some(i) = chars.iter().position(|(b, _)| *b >= at).or(chars.len().checked_sub(1)) else { return (at, at) };
+    let i = if i > 0 && (i == chars.len() || !is_word(chars[i].1)) && is_word(chars[i - 1].1) { i - 1 } else { i };
+    if !is_word(chars[i].1) {
+        let end = chars.get(i + 1).map_or(text.len(), |c| c.0);
+        return (chars[i].0, end);
+    }
+    let mut a = i;
+    while a > 0 && is_word(chars[a - 1].1) {
+        a -= 1;
+    }
+    let mut b = i;
+    while b + 1 < chars.len() && is_word(chars[b + 1].1) {
+        b += 1;
+    }
+    (chars[a].0, chars.get(b + 1).map_or(text.len(), |c| c.0))
 }
 
 /// The text index under `pos` (its end when past it).
@@ -258,6 +299,38 @@ mod tests {
                 .child(div().flex().child(self.0.text_piece((1, 0), "a", red, false)).child(self.0.text_piece((1, 1), "b", red, false).join("\t")))
                 .child(div().h(px(20.)).w(px(100.)))
         }
+    }
+
+    #[test]
+    fn words_are_found() {
+        let t = "status: 'COMPLETE_2', x";
+        let w = |i: usize| {
+            let (a, b) = word_at(t, i);
+            &t[a..b]
+        };
+        assert_eq!(w(2), "status");
+        assert_eq!(w(12), "COMPLETE_2");
+        assert_eq!(w(6), "status", "just after a word: that word");
+        assert_eq!(w(8), "'", "not in a word: the character there");
+    }
+
+    #[gpui::test]
+    fn double_and_triple_clicks_select_a_word_and_a_line(cx: &mut TestAppContext) {
+        let sel = Selection::default();
+        let s2 = sel.clone();
+        let (_, cx) = cx.add_window_view(|_, _| V(s2));
+        cx.update(|w, cx| {
+            let _ = w.draw(cx);
+        });
+        let at = gpui::point(px(60.), px(6.));
+        for n in 1..=2 {
+            cx.simulate_event(MouseDownEvent { position: at, button: MouseButton::Left, click_count: n, ..Default::default() });
+            cx.simulate_event(MouseUpEvent { position: at, button: MouseButton::Left, click_count: n, ..Default::default() });
+        }
+        assert_eq!(sel.text(), "alpha");
+        cx.simulate_event(MouseDownEvent { position: at, button: MouseButton::Left, click_count: 3, ..Default::default() });
+        cx.simulate_event(MouseUpEvent { position: at, button: MouseButton::Left, click_count: 3, ..Default::default() });
+        assert_eq!(sel.text(), "key: alpha");
     }
 
     #[gpui::test]

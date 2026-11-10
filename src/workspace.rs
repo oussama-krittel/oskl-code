@@ -8831,6 +8831,26 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert_eq!(read_back(&conn), before, "nothing saved");
         click_on(cx, "db-doc-cancel-0");
 
+        // JSON and a table's opened row are to look at: a double-click selects, it doesn't edit.
+        click_on(cx, "db-mode-json");
+        wait_for(cx, "json", |cx| cx.debug_bounds("db-value-0-4").is_some());
+        dbl(cx, "db-value-0-4");
+        assert!(tab.read_with(cx, |t, _| t.editor_in_card()).is_none(), "no edit box in JSON");
+        assert!(cx.debug_bounds("db-doc-bar-0").is_none());
+        click_on(cx, "db-mode-table");
+        let head = cx.debug_bounds("db-col-4").unwrap(); // tags: an array
+        let at = gpui::point(head.left() + gpui::px(20.), head.bottom() + gpui::px(13.));
+        for n in [1, 2] {
+            cx.simulate_event(gpui::MouseDownEvent { position: at, button: gpui::MouseButton::Left, click_count: n, ..Default::default() });
+            cx.simulate_event(gpui::MouseUpEvent { position: at, button: gpui::MouseButton::Left, click_count: n, ..Default::default() });
+        }
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("db-cell-editor").is_none(), "an array cell isn't typed into");
+        assert!(cx.debug_bounds("db-fields").is_some(), "the row opened to look at");
+        dbl(cx, "db-value-0-4");
+        assert!(tab.read_with(cx, |t, _| t.editor_in_card()).is_none(), "the opened row isn't edited");
+        click_on(cx, "db-mode-list");
+
         // Changed on the server meanwhile: Update says so and saves nothing.
         dbl(cx, "db-value-0-4");
         type_in(cx, "Cy");
