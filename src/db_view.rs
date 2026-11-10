@@ -1596,6 +1596,11 @@ impl DbView {
                 }
                 e.ops.push(op);
                 e.error = None;
+                // Back to the document as loaded: nothing to save, nothing highlighted.
+                if e.working == e.original {
+                    e.ops.clear();
+                    e.changed.clear();
+                }
                 true
             }
             Err(err) => {
@@ -1860,8 +1865,10 @@ impl DbView {
         let gv = self.grid_of(which)?;
         let e = gv.edits.get(&r)?;
         let typing = self.editing.as_ref().is_some_and(|ed| ed.which == which && ed.row == r);
-        let (modified, saving, error) = (!e.ops.is_empty() || typing, e.saving, e.error.clone());
-        (modified || error.is_some()).then(|| {
+        // Modified only when it differs from the document as loaded (a value put back isn't a change).
+        let modified = e.working != e.original;
+        let (saving, error) = (e.saving, e.error.clone());
+        (modified || typing || error.is_some()).then(|| {
             div()
                 .debug_selector(move || format!("db-doc-bar-{r}"))
                 .flex()
@@ -1871,12 +1878,19 @@ impl DbView {
                 .py(px(6.))
                 .bg(if error.is_some() { theme::git_deleted().opacity(0.25) } else { theme::git_modified().opacity(0.25) })
                 .font_family(theme::UI_FONT)
+                .when(!modified && error.is_none(), |d| d.bg(theme::bg_side()))
                 .child(div().flex_1().min_w_0().text_color(theme::fg_bright()).child(match &error {
                     Some(e) => e.clone(),
-                    None => "Document modified.".to_string(),
+                    None if modified => "Document modified.".to_string(),
+                    None => String::new(),
                 }))
                 .child(button(SharedString::from(format!("db-doc-cancel-{r}")), "Cancel", None, false).on_click(cx.listener(move |v, _, _, cx| v.cancel_doc(which, r, cx))))
-                .when(modified, |d| d.child(button(SharedString::from(format!("db-doc-update-{r}")), if saving { "Updating…" } else { "Update" }, None, true).on_click(cx.listener(move |v, _, _, cx| v.update_doc(which, r, cx)))))
+                // Nothing changed yet: Update waits (dimmed).
+                .child(
+                    button(SharedString::from(format!("db-doc-update-{r}")), if saving { "Updating…" } else { "Update" }, None, true)
+                        .when(!modified, |b| b.opacity(0.4).cursor_default())
+                        .on_click(cx.listener(move |v, _, _, cx| v.update_doc(which, r, cx))),
+                )
         })
     }
 
@@ -2101,7 +2115,7 @@ impl DbView {
             return; // what's typed isn't a value of its type: said in the bar
         }
         let Some(e) = self.doc_edit(which, row) else { return };
-        if e.saving || e.ops.is_empty() {
+        if e.saving || e.ops.is_empty() || e.working == e.original {
             return;
         }
         e.saving = true;
@@ -2157,6 +2171,11 @@ impl DbView {
             ed.ty = ty;
             ed.ty_chosen = true;
         }
+    }
+
+    #[cfg(test)]
+    pub fn card_modified(&self, row: usize) -> bool {
+        self.grid_of(None).and_then(|g| g.edits.get(&row)).is_some_and(|e| e.working != e.original)
     }
 
     #[cfg(test)]
@@ -2316,7 +2335,43 @@ impl DbView {
                     .border_color(theme::border())
                     .bg(theme::bg_side())
                     .text_size(px(12.5))
-                    .children(detail),
+                    .relative()
+                    .children(detail)
+                    // Closes it again (like clicking the row).
+                    .child(
+                        div()
+                            .id(("db-fields-close", r))
+                            .debug_selector(move || format!("db-fields-close-{r}"))
+                            .absolute()
+                            .top(px(6.))
+                            .right(px(10.))
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .px(px(6.))
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(theme::border_input())
+                            .bg(theme::bg_editor())
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            .tooltip(ui::tooltip("Collapse (Esc)"))
+                            .text_size(px(11.5))
+                            .text_color(theme::fg_dim())
+                            .on_click(cx.listener(move |v, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(gv) = v.grid_of_mut(which)
+                                    && gv.open == Some(r)
+                                {
+                                    gv.open = None;
+                                    gv.list.splice(r..r + 1, 1);
+                                }
+                                cx.notify();
+                            }))
+                            .child(ui::small_icon("collapse-all", theme::fg_dim()))
+                            .child("Collapse"),
+                    ),
             )
             .children(bar)
             .into_any_element()

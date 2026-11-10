@@ -8777,6 +8777,19 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
             cx.run_until_parked();
         };
         // Lines: _id 1, n 2, name 3, tags 4, addr 5, note 6.
+        // A double-click alone (or a value put back as it was) isn't a change: not "modified", Update waits.
+        dbl(cx, "db-value-0-3");
+        assert!(!tab.read_with(cx, |t, _| t.card_modified(0)), "just selected");
+        type_in(cx, "Other");
+        assert!(tab.read_with(cx, |t, _| t.card_modified(0)));
+        dbl(cx, "db-value-0-3");
+        type_in(cx, "person 0");
+        assert!(!tab.read_with(cx, |t, _| t.card_modified(0)), "put back as it was");
+        let before = read_back(&conn);
+        if cx.debug_bounds("db-doc-update-0").is_some() {
+            click_on(cx, "db-doc-update-0");
+        }
+        assert_eq!(read_back(&conn), before, "nothing to save");
         dbl(cx, "db-value-0-3");
         type_in(cx, "Ann");
         assert!(cx.debug_bounds("db-doc-bar-0").is_some(), "Document modified, with Cancel and Update");
@@ -8993,7 +9006,8 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         cx.run_until_parked();
         let fields = cx.debug_bounds("db-fields").expect("the row opened");
         assert!((fields.left() - grid.left()).abs() < gpui::px(2.), "fields at the visible left edge: {fields:?} in {grid:?}");
-        cx.simulate_click(first_row, gpui::Modifiers::none());
+        click_on(cx, "db-fields-close-0");
+        assert!(cx.debug_bounds("db-fields").is_none(), "Collapse closed it");
         cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(900.)));
         cx.run_until_parked();
         click_on(cx, "db-mode-json");
@@ -9173,6 +9187,14 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         wait_for(cx, "the collections", |cx| tab.read_with(cx, |t, _| t.overview_names()).is_some());
         let names = tab.read_with(cx, |t, _| t.overview_names()).unwrap().unwrap();
         assert!(names.contains(&"overview_big".to_string()) && names.contains(&"overview_small".to_string()), "{names:?}");
+        // A narrow window: names stay on one line (rows keep their height), the table scrolls sideways.
+        cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(700.)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("db-overview-x").is_some());
+        let h = cx.debug_bounds("db-coll-0").unwrap().size.height;
+        assert!(h < gpui::px(42.), "one line: {h:?}");
+        cx.simulate_resize(gpui::size(gpui::px(1800.), gpui::px(900.)));
+        cx.run_until_parked();
         // Sorted by documents, most first.
         click_on(cx, "db-sort-docs");
         let names = tab.read_with(cx, |t, _| t.overview_names()).unwrap().unwrap();

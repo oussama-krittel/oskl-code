@@ -62,6 +62,11 @@ impl Overview {
     }
 }
 
+/// The narrowest the name column gets (names longer than that end in “…”).
+const NAME_MIN: f32 = 240.;
+/// The table's narrowest: the name, then the fixed columns.
+const TABLE_MIN: f32 = NAME_MIN + 150. + 130. + 115. + 115. + 130. + 95. + 115. + 40.;
+
 pub(super) fn size_text(b: u64) -> String {
     match b {
         0..1000 => format!("{b} B"),
@@ -183,7 +188,7 @@ impl DbView {
                 .id(id)
                 .debug_selector(move || id.to_string())
                 .when_some(w, |d, w| d.w(px(w)).flex_none())
-                .when(w.is_none(), |d| d.flex_1().min_w_0())
+                .when(w.is_none(), |d| d.flex_1().min_w(px(NAME_MIN)))
                 .px(px(10.))
                 .h_full()
                 .flex()
@@ -233,7 +238,7 @@ impl DbView {
                         .cursor_pointer()
                         .hover(|s| s.bg(theme::hover()))
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(Request::Db(DbRequest::Open(Open::Data { conn: conn.clone(), path: vec![db.clone(), name.clone()] })))))
-                        .child(div().flex_1().min_w_0().px(px(10.)).text_color(theme::fg_bright()).child(SharedString::from(c.name.clone())))
+                        .child(div().flex_1().min_w(px(NAME_MIN)).px(px(10.)).overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_bright()).child(SharedString::from(c.name.clone())))
                         .child(div().w(px(150.)).flex_none().px(px(10.)).flex().flex_wrap().gap(px(4.)).when(c.props.is_empty(), |d| d.child("-")).children(c.props.iter().map(|p| ui::badge(p.to_uppercase(), theme::bg_input()))))
                         .child(cell(opt(c.storage, size_text), 130.))
                         .child(cell(opt(c.data, size_text), 115.))
@@ -339,6 +344,23 @@ impl DbView {
                     .border_1()
                     .border_color(theme::border_input())
                     .text_size(px(12.5))
+                    .overflow_hidden()
+                    // Narrower than the columns need: the whole table scrolls sideways.
+                    .child(
+                        div()
+                            .id("db-overview-x")
+                            .debug_selector(|| "db-overview-x".into())
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_x_scroll()
+                            .restrict_scroll_to_axis()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .h_full()
+                                    .w_full()
+                                    .min_w(px(TABLE_MIN))
                     .child(
                         div()
                             .flex()
@@ -361,6 +383,8 @@ impl DbView {
                             .child(div().w(px(40.)).flex_none()),
                     )
                     .child(body),
+                            ),
+                    ),
             )
             .into_any_element()
     }
