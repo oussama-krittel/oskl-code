@@ -67,7 +67,7 @@ pub(super) struct Compass {
 }
 
 impl Compass {
-    pub(super) fn new(subs: &mut Vec<Subscription>, window: &mut Window, cx: &mut Context<DbView>) -> Compass {
+    pub(super) fn new(names: &super::assist::Shared, subs: &mut Vec<Subscription>, window: &mut Window, cx: &mut Context<DbView>) -> Compass {
         let filter = input("Type a query: { field: 'value' }", "", cx);
         let project = input("{ field: 0 }", "", cx);
         let sort = input("{ field: -1 } or [['field', -1]]", "", cx);
@@ -90,6 +90,17 @@ impl Compass {
             ed
         });
         let validator = cx.new(|cx| Editor::new(EditorMode::Full, cx));
+        // Colored as the shell's JavaScript, with suggestions; brackets and quotes close themselves.
+        let suggest = super::assist::mongo(names.clone());
+        let idx_keys = input("{ email: 1 }", "", cx);
+        let idx_options = input("{ unique: true, expireAfterSeconds: 3600, partialFilterExpression: {…} }", "", cx);
+        for e in [&filter, &project, &sort, &collation, &hint, &pipeline, &validator, &idx_keys, &idx_options] {
+            e.update(cx, |e, cx| {
+                e.set_language("js", cx);
+                e.suggest = Some(suggest.clone());
+                e.pairs = true;
+            });
+        }
         Compass {
             tab: CTab::Documents,
             filter,
@@ -117,8 +128,8 @@ impl Compass {
             indexes: None,
             idx_task: None,
             new_index: false,
-            idx_keys: input("{ email: 1 }", "", cx),
-            idx_options: input("{ unique: true, expireAfterSeconds: 3600, partialFilterExpression: {…} }", "", cx),
+            idx_keys,
+            idx_options,
             idx_status: None,
             validator,
             level: "strict".into(),
@@ -492,6 +503,13 @@ impl DbView {
     }
 
     // ------------------------------------------------------------ test hooks
+
+    /// The query bar's filter box, and the Shell tab's editor (tests).
+    #[cfg(test)]
+    pub fn editors(&self) -> (Entity<Editor>, Entity<Editor>) {
+        let Body::Data(d) = &self.body else { panic!("not a data tab") };
+        (d.compass.as_ref().expect("a collection").filter.clone(), d.query.clone())
+    }
 
     #[cfg(test)]
     pub fn compass_tab(&self) -> Option<CTab> {

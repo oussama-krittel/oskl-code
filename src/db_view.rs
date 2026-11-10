@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod assist;
 mod compass_ui;
 mod overview;
 use compass_ui::{AGG, Compass};
@@ -131,6 +132,54 @@ struct Data {
     doc_mode: DocMode,
     /// A MongoDB collection: Compass's tabs (query bar, aggregations, schema, indexes, validation).
     compass: Option<Box<Compass>>,
+    /// What the query editors suggest from.
+    names: assist::Shared,
+}
+
+/// Remembers the fields (columns) of results, for suggestions; MongoDB's nested ones as `a.b`.
+fn learn_fields(names: &assist::Shared, g: &Grid) {
+    let mut n = names.borrow_mut();
+    let mut add = |f: String| {
+        if n.fields.len() < 2000 && !n.fields.contains(&f) {
+            n.fields.push(f);
+        }
+    };
+    for c in &g.columns {
+        add(c.clone());
+    }
+    fn walk(t: &Tree, prefix: &str, depth: usize, add: &mut dyn FnMut(String)) {
+        if let Tree::Object(fields) = t {
+            for (k, v) in fields {
+                let p = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                if depth > 0 {
+                    add(p.clone());
+                }
+                if depth < 2 {
+                    walk(v, &p, depth + 1, add);
+                }
+            }
+        }
+    }
+    for t in g.trees.iter().flatten().take(50) {
+        walk(t, "", 0, &mut add);
+    }
+}
+
+/// The query editors' coloring: MongoDB's shell is JavaScript; SQL its own.
+fn query_lang(kind: Kind) -> &'static str {
+    match kind {
+        Kind::MongoDb => "js",
+        Kind::Postgres | Kind::SqlServer => "sql",
+        Kind::Redis | Kind::RabbitMq => "",
+    }
+}
+
+fn suggestions(kind: Kind, names: &assist::Shared) -> Option<assist::Suggest> {
+    match kind {
+        Kind::MongoDb => Some(assist::mongo(names.clone())),
+        Kind::Postgres | Kind::SqlServer => Some(assist::sql(names.clone())),
+        Kind::Redis | Kind::RabbitMq => None,
+    }
 }
 
 /// MongoDB documents as cards of fields (like Compass's List), as JSON, or as a table.
@@ -217,9 +266,15 @@ impl DbView {
                     let has_data = matches!(open, Open::Data { .. });
                     let starter = db::starter_query(c.kind, path);
                     let search = input("Search…", "", cx);
+                    // Names the suggestions use: collections or tables, fields or columns.
+                    let names: assist::Shared = Default::default();
+                    let lang = query_lang(c.kind);
+                    let suggest = suggestions(c.kind, &names);
                     let query = cx.new(|cx| {
                         let mut ed = Editor::new(EditorMode::Full, cx);
                         ed.set_text(&starter, cx);
+                        ed.set_language(lang, cx);
+                        ed.suggest = suggest.clone();
                         ed
                     });
                     subs.push(cx.subscribe_in(&search, window, |v: &mut DbView, _, ev: &EditorEvent, _, cx| match ev {
@@ -227,7 +282,7 @@ impl DbView {
                         EditorEvent::Changed => v.search_soon(cx),
                         _ => {}
                     }));
-                    let compass = (has_data && c.kind == Kind::MongoDb && path.len() == 2).then(|| Box::new(Compass::new(&mut subs, window, cx)));
+                    let compass = (has_data && c.kind == Kind::MongoDb && path.len() == 2).then(|| Box::new(Compass::new(&names, &mut subs, window, cx)));
                     let data = Data {
                         conn: c,
                         path: path.clone(),
@@ -252,6 +307,7 @@ impl DbView {
                         exporting: false,
                         doc_mode: DocMode::List,
                         compass,
+                        names,
                     };
                     Body::Data(Box::new(data))
                 }
@@ -260,6 +316,7 @@ impl DbView {
         };
         let mut v = DbView { focus: cx.focus_handle(), open, body, _subs: subs };
         v.load(cx);
+        v.learn_names(cx);
         v.load_overview(cx);
         // The Indexes tab shows how many there are, like Compass.
         if matches!(&v.body, Body::Data(d) if d.compass.is_some()) {
@@ -387,6 +444,9 @@ impl DbView {
                         }
                         g
                     });
+                    if let Ok(p) = &r {
+                        learn_fields(&d.names, &p.grid);
+                    }
                     d.page = Some(r);
                 }
                 cx.notify();
@@ -394,6 +454,48 @@ impl DbView {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// The collections (or tables and views) the suggestions offer, read once in the background.
+    fn learn_names(&mut self, cx: &mut Context<Self>) {
+        let Body::Data(d) = &self.body else { return };
+        if suggestions(d.conn.kind, &d.names).is_none() {
+            return;
+        }
+        let (conn, names) = (d.conn.clone(), d.names.clone());
+        // Where its tables are: the tab's database (MongoDB), or the database it's on.
+        let start: Vec<String> = d.path.iter().take(1).cloned().collect();
+        let work = engine::run(async move {
+            let mut found = Vec::new();
+            let mut queue = vec![(start, 0)];
+            let mut calls = 0;
+            while let Some((path, depth)) = queue.pop() {
+                calls += 1;
+                if calls > 30 {
+                    break;
+                }
+                let Ok(nodes) = engine::children(conn.clone(), path).await else { continue };
+                for n in nodes {
+                    match n.kind {
+                        db::NodeKind::Table | db::NodeKind::View | db::NodeKind::Collection => found.push(n.label),
+                        db::NodeKind::Database | db::NodeKind::Schema | db::NodeKind::Folder if depth < 3 && !matches!(n.label.as_str(), "admin" | "config" | "local" | "information_schema" | "pg_catalog") => queue.push((n.path, depth + 1)),
+                        _ => {}
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(found)
+        });
+        cx.spawn(async move |_, _| {
+            if let Ok(found) = work.await {
+                let mut n = names.borrow_mut();
+                for t in found {
+                    if !n.tables.contains(&t) {
+                        n.tables.push(t);
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     fn search_now(&mut self, cx: &mut Context<Self>) {
@@ -563,6 +665,9 @@ impl DbView {
                     d.took = d.running.take().map(|t| t.elapsed());
                     match r {
                         Ok(grids) => {
+                            for g in &grids {
+                                learn_fields(&d.names, g);
+                            }
                             d.results = grids.into_iter().map(GridView::new).collect();
                             // The last result with rows is the interesting one.
                             d.result_ix = d.results.iter().rposition(|g| !g.grid.columns.is_empty()).unwrap_or(d.results.len().saturating_sub(1));

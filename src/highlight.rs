@@ -82,6 +82,8 @@ pub enum Lang {
     /// Comma (or semicolon…) and tab separated values: each column in its own color.
     Csv,
     Tsv,
+    /// SQL (keywords, strings, numbers, comments, functions): colored by a small lexer.
+    Sql,
 }
 
 pub fn detect(path: &Path) -> Option<Lang> {
@@ -102,6 +104,7 @@ pub fn detect(path: &Path) -> Option<Lang> {
         "toml" => Lang::Toml,
         "csv" => Lang::Csv,
         "tsv" | "tab" => Lang::Tsv,
+        "sql" | "psql" | "pgsql" => Lang::Sql,
         "tf" | "tfvars" | "hcl" | "tftest" => Lang::Terraform,
         _ if name == ".zshrc" || name == ".bashrc" || name.ends_with(".env") || name == ".envrc" => Lang::Bash,
         _ if name == "cargo.lock" => Lang::Toml,
@@ -134,7 +137,7 @@ fn build(lang: Lang) -> Option<HighlightConfiguration> {
         Lang::Toml => (tree_sitter_toml_ng::LANGUAGE.into(), tree_sitter_toml_ng::HIGHLIGHTS_QUERY.into(), ""),
         Lang::Terraform => (tree_sitter_hcl::LANGUAGE.into(), include_str!("hcl_highlights.scm").into(), ""),
         // Colored by `columns`, not tree-sitter.
-        Lang::Csv | Lang::Tsv => return None,
+        Lang::Csv | Lang::Tsv | Lang::Sql => return None,
     };
     let mut config = HighlightConfiguration::new(language, format!("{lang:?}"), &highlights, injections, "").ok()?;
     config.configure(NAMES);
@@ -153,6 +156,7 @@ pub fn highlight(lang: Lang, text: &str) -> Option<LineSpans> {
     match lang {
         Lang::Csv => return Some(columns(text, crate::table::separator(std::path::Path::new("x.csv"), text.lines().next().unwrap_or("")))),
         Lang::Tsv => return Some(columns(text, b'\t')),
+        Lang::Sql => return Some(sql(text)),
         _ => {}
     }
     let config = config(lang)?;
@@ -191,6 +195,103 @@ pub fn highlight(lang: Lang, text: &str) -> Option<LineSpans> {
         }
     }
     Some(out)
+}
+
+/// SQL's reserved words (and common types), upper case.
+pub const SQL_KEYWORDS: &[&str] = &[
+    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "IS", "NULL", "LIKE", "ILIKE", "BETWEEN", "EXISTS", "AS", "ON", "JOIN", "INNER", "LEFT", "RIGHT", "FULL",
+    "OUTER", "CROSS", "NATURAL", "USING", "GROUP", "BY", "ORDER", "ASC", "DESC", "NULLS", "FIRST", "LAST", "HAVING", "LIMIT", "OFFSET", "FETCH", "NEXT", "ROWS",
+    "ONLY", "TOP", "DISTINCT", "ALL", "ANY", "SOME", "UNION", "INTERSECT", "EXCEPT", "INSERT", "INTO", "VALUES", "DEFAULT", "UPDATE", "SET", "DELETE", "RETURNING",
+    "OUTPUT", "MERGE", "MATCHED", "THEN", "WHEN", "CASE", "ELSE", "END", "WITH", "RECURSIVE", "CREATE", "ALTER", "DROP", "TRUNCATE", "TABLE", "VIEW", "INDEX",
+    "UNIQUE", "PRIMARY", "KEY", "FOREIGN", "REFERENCES", "CONSTRAINT", "CHECK", "COLUMN", "ADD", "RENAME", "TO", "SCHEMA", "DATABASE", "SEQUENCE", "IF",
+    "CASCADE", "RESTRICT", "BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION", "GRANT", "REVOKE", "EXPLAIN", "ANALYZE", "VACUUM", "OVER", "PARTITION", "WINDOW",
+    "TRUE", "FALSE", "INTEGER", "INT", "BIGINT", "SMALLINT", "SERIAL", "BIGSERIAL", "TEXT", "VARCHAR", "NVARCHAR", "CHAR", "BOOLEAN", "BOOL", "DATE", "TIME",
+    "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL", "NUMERIC", "DECIMAL", "REAL", "FLOAT", "DOUBLE", "PRECISION", "JSON", "JSONB", "UUID", "BYTEA", "ARRAY", "GO", "DECLARE",
+    "EXEC", "PROCEDURE", "FUNCTION", "RETURNS", "LANGUAGE", "TRIGGER", "FOR", "EACH", "ROW", "LATERAL", "ILIKE", "SIMILAR", "COLLATE", "CAST",
+];
+
+/// Colors SQL: keywords, 'strings', numbers, -- and /* */ comments, "quoted names", and names
+/// called like functions.
+fn sql(text: &str) -> LineSpans {
+    let idx = |n: &str| NAMES.iter().position(|x| *x == n).unwrap_or(0) as u8;
+    let (kw, string, number, comment, func, prop, op) = (idx("keyword"), idx("string"), idx("number"), idx("comment"), idx("function"), idx("property"), idx("operator"));
+    let mut out: LineSpans = Vec::new();
+    let mut in_block = false;
+    for line in text.split('\n') {
+        let c: Vec<char> = line.chars().collect();
+        let mut row = Vec::new();
+        let mut i = 0;
+        if in_block {
+            match line.find("*/") {
+                Some(b) => {
+                    let end = line[..b + 2].chars().count();
+                    row.push((0..end, comment));
+                    i = end;
+                    in_block = false;
+                }
+                None => {
+                    row.push((0..c.len(), comment));
+                    out.push(row);
+                    continue;
+                }
+            }
+        }
+        while i < c.len() {
+            let ch = c[i];
+            let start = i;
+            if ch == '-' && c.get(i + 1) == Some(&'-') {
+                row.push((i..c.len(), comment));
+                break;
+            } else if ch == '/' && c.get(i + 1) == Some(&'*') {
+                let mut j = i + 2;
+                while j + 1 < c.len() && !(c[j] == '*' && c[j + 1] == '/') {
+                    j += 1;
+                }
+                if j + 1 < c.len() {
+                    row.push((i..j + 2, comment));
+                    i = j + 2;
+                } else {
+                    row.push((i..c.len(), comment));
+                    in_block = true;
+                    break;
+                }
+            } else if ch == '\'' || ch == '"' || ch == '`' || ch == '[' {
+                let close = if ch == '[' { ']' } else { ch };
+                let mut j = i + 1;
+                while j < c.len() && c[j] != close {
+                    j += 1;
+                }
+                i = (j + 1).min(c.len());
+                row.push((start..i, if ch == '\'' { string } else { prop }));
+            } else if ch.is_ascii_digit() || (ch == '.' && c.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
+                while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '.') {
+                    i += 1;
+                }
+                row.push((start..i, number));
+            } else if ch.is_alphabetic() || ch == '_' || ch == '@' || ch == '$' {
+                while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_' || c[i] == '$' || c[i] == '@') {
+                    i += 1;
+                }
+                let word: String = c[start..i].iter().collect::<String>().to_uppercase();
+                let mut k = i;
+                while k < c.len() && c[k] == ' ' {
+                    k += 1;
+                }
+                if SQL_KEYWORDS.contains(&word.as_str()) {
+                    row.push((start..i, kw));
+                } else if c.get(k) == Some(&'(') {
+                    row.push((start..i, func));
+                }
+            } else {
+                if "=<>!+-*/%|&".contains(ch) {
+                    row.push((i..i + 1, op));
+                }
+                i += 1;
+            }
+        }
+        out.push(row);
+    }
+    out
 }
 
 /// Colors a delimited file's columns (quoted fields, even over several lines, stay one
@@ -232,6 +333,27 @@ fn columns(text: &str, sep: u8) -> LineSpans {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sql_is_colored() {
+        let names = |l: &Vec<(std::ops::Range<usize>, u8)>, text: &str| -> Vec<(String, &'static str)> {
+            let c: Vec<char> = text.chars().collect();
+            l.iter().map(|(r, h)| (c[r.clone()].iter().collect(), super::NAMES[*h as usize])).collect()
+        };
+        let text = "SELECT count(*) FROM \"users\" WHERE name = 'a''b' AND n > 2 -- note\n/* one\ntwo */ select 1";
+        let s = super::sql(text);
+        let lines: Vec<&str> = text.split('\n').collect();
+        let first = names(&s[0], lines[0]);
+        assert_eq!(first[0], ("SELECT".to_string(), "keyword"));
+        assert!(first.contains(&("count".to_string(), "function")));
+        assert!(first.contains(&("\"users\"".to_string(), "property")));
+        assert!(first.contains(&("2".to_string(), "number")));
+        assert!(first.contains(&("-- note".to_string(), "comment")));
+        assert_eq!(names(&s[1], lines[1]), [("/* one".to_string(), "comment")]);
+        let third = names(&s[2], lines[2]);
+        assert_eq!(third[0], ("two */".to_string(), "comment"));
+        assert_eq!(third[1], ("select".to_string(), "keyword"), "lower case too");
+    }
+
     #[test]
     fn csv_columns_take_turns_in_colors() {
         let s = super::columns("a,b,\"c,d\"\nx;y", b',');

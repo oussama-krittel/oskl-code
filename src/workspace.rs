@@ -8795,6 +8795,29 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         click_on(cx, "db-reset");
         wait_for(cx, "all of them", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.2 == Some(40)));
 
+        // The bar colors, closes brackets and suggests field names (Enter takes one).
+        let (filter, shell) = tab.read_with(cx, |t, _| t.editors());
+        filter.update(cx, |e, cx| e.set_text("", cx));
+        tab.update_in(cx, |_, window, cx| window.focus(&filter.read(cx).focus_target(cx), cx));
+        cx.simulate_input("{");
+        assert_eq!(filter.read_with(cx, |e, _| e.text()), "{}", "closed");
+        cx.simulate_input(" na");
+        assert_eq!(filter.read_with(cx, |e, _| e.completion_labels()).first().map(String::as_str), Some("name"));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(filter.read_with(cx, |e, _| e.text()), "{ name}");
+        filter.update(cx, |e, cx| e.set_text("", cx));
+        // The shell suggests the database's collections after db.
+        click_on(cx, "db-tab-query");
+        shell.update(cx, |e, cx| e.set_text("", cx));
+        tab.update_in(cx, |_, window, cx| window.focus(&shell.read(cx).focus_target(cx), cx));
+        cx.simulate_input("db.compass_u");
+        assert_eq!(shell.read_with(cx, |e, _| e.completion_labels()).first().map(String::as_str), Some("compass_ui"));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input(".fin");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(shell.read_with(cx, |e, _| e.text()), "db.compass_ui.find({})");
+        click_on(cx, "db-tab-data");
+
         // Aggregations.
         click_on(cx, "db-tab-aggregations");
         assert_eq!(tab.read_with(cx, |t, _| t.compass_tab()), Some(CTab::Aggregations));

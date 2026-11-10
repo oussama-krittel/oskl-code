@@ -354,6 +354,8 @@ pub struct Editor {
     /// A chat box: Enter sends (⇧Enter for a new line), long lines wrap, pasted pictures are
     /// handed out (`EditorEvent::Image`).
     pub chat: bool,
+    /// One line, but brackets and quotes close themselves as in code (a query box).
+    pub pairs: bool,
     /// Suggestions from outside (the chat's @files and /commands): given the line up to the
     /// cursor, the text the choice replaces and the choices.
     pub suggest: Option<Rc<dyn Fn(&str) -> Option<(String, Vec<complete::Item>)>>>,
@@ -445,6 +447,7 @@ impl Editor {
             placeholder: SharedString::default(),
             secret: false,
             chat: false,
+            pairs: false,
             suggest: None,
             read_only: false,
             scroll_x: 0.,
@@ -1311,6 +1314,12 @@ impl Editor {
         if !shown.is_empty() {
             self.completion = Some(Completion { ctx, items, shown, sel: 0 });
         }
+    }
+
+    /// The suggestions on show (tests).
+    #[cfg(test)]
+    pub fn completion_labels(&self) -> Vec<String> {
+        self.completion.as_ref().map(|c| c.shown.iter().map(|i| c.items[*i].label.clone()).collect()).unwrap_or_default()
     }
 
     pub fn accept_completion(&mut self, cx: &mut Context<Self>) {
@@ -3171,7 +3180,7 @@ impl EntityInputHandler for Editor {
             .unwrap_or(self.buf.sel.range());
         self.marked = None;
         let text = if self.mode == EditorMode::SingleLine { text.replace('\n', " ") } else { text.to_string() };
-        let code = self.mode == EditorMode::Full && range_utf16_none;
+        let code = (self.mode == EditorMode::Full || self.pairs) && range_utf16_none;
         if typed_at_cursors {
             return self.edit(cx, |b| if code { b.type_char(&text) } else { b.insert(&text) });
         }
