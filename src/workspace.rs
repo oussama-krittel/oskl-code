@@ -8981,6 +8981,19 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         shell(&conn, "db.edit_more.deleteOne({zzz: 1})");
         tab.update(cx, |t, cx| t.reload(cx));
         wait_for(cx, "one again", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 1));
+        // A row opened while scrolled sideways: its fields are where the table is in view, not off to the left.
+        tab.update(cx, |t, _| t.set_table_scroll_x(80.));
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+        let grid = cx.debug_bounds("db-grid").unwrap();
+        let col = (1..8).find_map(|i| cx.debug_bounds(Box::leak(format!("db-col-{i}").into_boxed_str())).filter(|b| b.left() > grid.left() + gpui::px(50.))).unwrap();
+        let first_row = gpui::point(col.left() + gpui::px(10.), col.bottom() + gpui::px(13.));
+        cx.simulate_click(first_row, gpui::Modifiers::none());
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+        let fields = cx.debug_bounds("db-fields").expect("the row opened");
+        assert!((fields.left() - grid.left()).abs() < gpui::px(2.), "fields at the visible left edge: {fields:?} in {grid:?}");
+        cx.simulate_click(first_row, gpui::Modifiers::none());
         cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(900.)));
         cx.run_until_parked();
         click_on(cx, "db-mode-json");

@@ -2194,6 +2194,8 @@ impl DbView {
             _ => 0,
         };
         let (grid, widths, sel, open) = (gv.grid.clone(), gv.widths.clone(), gv.sel, gv.open);
+        // The part of the table in view (it scrolls sideways): an opened row's fields stay in it.
+        let (shift, view_w) = (-gv.hscroll.offset().x, gv.hscroll.bounds().size.width);
         let Some(row) = grid.rows.get(r) else { return div().into_any_element() };
         // Edited and not saved yet: shown as edited.
         let working = gv.edits.get(&r).map(|e| e.working.clone());
@@ -2261,7 +2263,7 @@ impl DbView {
                     .when(edit_col == Some(c), |d| d.relative().overflow_hidden().child(self.cell_editor(which, r, cx)))
                     .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(self.sel.text_piece(((r * 100_000) as u64, c as u32), text, color, false).join("\t")))
             }));
-        let bar = self.doc_bar(which, r, cx);
+        let bar = self.doc_bar(which, r, cx).map(|b| if view_w > px(0.) { b.ml(shift).w(view_w) } else { b });
         if open != Some(r) {
             return match bar {
                 Some(b) => div().flex().flex_col().w_full().child(line).child(b.justify_end()).into_any_element(),
@@ -2305,7 +2307,9 @@ impl DbView {
                     .debug_selector(|| "db-fields".into())
                     .flex()
                     .flex_col()
-                    .w_full()
+                    .ml(shift)
+                    .when(view_w > px(0.), |d| d.w(view_w))
+                    .when(view_w <= px(0.), |d| d.w_full())
                     .px(px(52.))
                     .py(px(8.))
                     .border_b_1()
