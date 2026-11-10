@@ -2,7 +2,7 @@
 //!
 //! Modules declare their default bindings with `kb(..)` / `collect(..)`. At startup (and
 //! whenever the user edits a shortcut) `apply` merges those defaults with the overrides in
-//! `~/.config/kite/keys` and rebinds everything. Bindings that use direction letters are
+//! `~/.config/oskl/keys` and rebinds everything. Bindings that use direction letters are
 //! written with `{left}` `{down}` `{up}` `{right}` and follow the configured letters.
 
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, Keystroke};
@@ -189,7 +189,7 @@ impl Default for Config {
 }
 
 fn config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/kite/keys"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/oskl/keys"))
 }
 
 impl Config {
@@ -336,8 +336,8 @@ pub fn apply(cx: &mut App) {
             }
         }
     }
-    if std::env::var_os("KITE_DEBUG").is_some() {
-        eprintln!("[kite] key bindings applied: {}", bindings.len());
+    if std::env::var_os("OSKL_DEBUG").is_some() {
+        eprintln!("[oskl] key bindings applied: {}", bindings.len());
     }
     cx.bind_keys(bindings);
 }

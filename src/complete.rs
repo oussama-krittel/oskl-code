@@ -1126,7 +1126,7 @@ mod tests {
 
     #[test]
     fn lists_import_paths() {
-        let dir = std::env::temp_dir().join(format!("kite-complete-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oskl-complete-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("src/components")).unwrap();
         std::fs::write(dir.join("src/components/Card.tsx"), "").unwrap();
         std::fs::write(dir.join("src/app.tsx"), "").unwrap();

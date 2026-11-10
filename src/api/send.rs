@@ -461,7 +461,7 @@ async fn once(client: &reqwest::Client, ready: &Ready, digest_header: Option<Str
         match &mut file {
             Some((_, f)) => f.write_all(&chunk).await?,
             None if mem.len() + chunk.len() > MAX_IN_MEMORY => {
-                let path = std::env::temp_dir().join(format!("kite-response-{}-{}", std::process::id(), super::new_id()));
+                let path = std::env::temp_dir().join(format!("oskl-response-{}-{}", std::process::id(), super::new_id()));
                 let mut f = tokio::fs::File::create(&path).await?;
                 f.write_all(&mem).await?;
                 f.write_all(&chunk).await?;
@@ -948,7 +948,7 @@ pub(crate) mod tests {
     #[test]
     fn folders_give_headers_and_auth_and_variables_fill_in() {
         let mut coll = Folder { auth: Auth::Bearer { token: "{{token}}".into(), prefix: "Bearer".into() }, ..Default::default() };
-        coll.headers.push(Row::new("X-App", "kite"));
+        coll.headers.push(Row::new("X-App", "oskl"));
         let mut folder = Folder { auth: Auth::Inherit, ..Default::default() };
         folder.headers.push(Row::new("X-App", "orders"));
         let req = Request { url: "{{base}}/orders/:id".into(), path_params: vec![Row::new("id", "a b")], headers: vec![Row::new("Accept", "application/json")], ..Default::default() };
@@ -1030,7 +1030,7 @@ pub(crate) mod tests {
                     let headers: serde_json::Map<String, serde_json::Value> = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_lowercase(), serde_json::json!(v.trim()))).collect();
                     let auth = headers.get("authorization").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let (status, extra, body): (&str, String, Vec<u8>) = match path.split('?').next().unwrap() {
-                        "/digest" if !auth.starts_with("Digest ") => ("401 Unauthorized", "WWW-Authenticate: Digest realm=\"kite\", nonce=\"abc\", qop=\"auth\"\r\n".into(), b"no".to_vec()),
+                        "/digest" if !auth.starts_with("Digest ") => ("401 Unauthorized", "WWW-Authenticate: Digest realm=\"oskl\", nonce=\"abc\", qop=\"auth\"\r\n".into(), b"no".to_vec()),
                         "/digest" => {
                             let ok = auth.contains("username=\"ada\"") && auth.contains("uri=\"/digest\"");
                             (if ok { "200 OK" } else { "403 Forbidden" }, String::new(), b"in".to_vec())
@@ -1058,16 +1058,16 @@ pub(crate) mod tests {
         let port = server();
         let base = format!("http://127.0.0.1:{port}");
         // A JSON body, headers, a query, auth.
-        let req = Request { method: "POST".into(), url: format!("{base}/echo?q=1"), headers: vec![Row::new("X-Kite", "yes")], body: Body::Json { text: "{\"a\":1}".into() }, auth: Auth::Apikey { key: "k".into(), value: "v w".into(), query: true }, ..Default::default() };
+        let req = Request { method: "POST".into(), url: format!("{base}/echo?q=1"), headers: vec![Row::new("X-Oskl", "yes")], body: Body::Json { text: "{\"a\":1}".into() }, auth: Auth::Apikey { key: "k".into(), value: "v w".into(), query: true }, ..Default::default() };
         let r = go(prepare(&req, &[], &Vars::default()));
         assert_eq!(r.status, 200);
         let j = r.json().unwrap();
         assert_eq!(j["method"], "POST");
         assert_eq!(j["path"], "/echo?q=1&k=v+w");
-        assert_eq!(j["headers"]["x-kite"], "yes");
+        assert_eq!(j["headers"]["x-oskl"], "yes");
         assert_eq!(j["headers"]["content-type"], "application/json");
         assert_eq!(j["body"], "{\"a\":1}");
-        assert_eq!(r.sent.headers.iter().find(|(k, _)| k == "X-Kite").unwrap().1, "yes");
+        assert_eq!(r.sent.headers.iter().find(|(k, _)| k == "X-Oskl").unwrap().1, "yes");
         // Form fields.
         let req = Request { method: "PUT".into(), url: format!("{base}/echo"), body: Body::Form { rows: vec![Row::new("a b", "c&d")] }, ..Default::default() };
         let j = go(prepare(&req, &[], &Vars::default())).json().unwrap();

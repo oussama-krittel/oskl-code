@@ -1,4 +1,4 @@
-//! Persistent user settings in ~/.config/kite/settings (simple `key = value` lines).
+//! Persistent user settings in ~/.config/oskl/settings (simple `key = value` lines).
 
 use std::path::PathBuf;
 
@@ -29,7 +29,7 @@ pub const UI_ZOOM_MAX: f32 = 1.6;
 pub const UI_ZOOM_STEP: f32 = 0.1;
 
 fn path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/kite/settings"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/oskl/settings"))
 }
 
 impl Settings {

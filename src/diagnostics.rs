@@ -81,7 +81,7 @@ pub fn typecheck(root: &Path, file: &Path) -> Option<Result<FileDiags, String>> 
     };
     let tsc = tools::find_named("tsc", &project, root)?;
     // Incremental info lives in the temp dir so repeated checks are fast.
-    let info = std::env::temp_dir().join(format!("kite-{:x}.tsbuildinfo", hash(&project.to_string_lossy())));
+    let info = std::env::temp_dir().join(format!("oskl-{:x}.tsbuildinfo", hash(&project.to_string_lossy())));
     let (ok, out, err) = tools::run_tool(
         &tsc,
         &["--noEmit", "--pretty", "false", "--incremental", "--tsBuildInfoFile", &info.to_string_lossy(), "-p", &project.to_string_lossy()],
@@ -245,10 +245,10 @@ mod tests {
 
 #[cfg(test)]
 mod live {
-    /// Runs real tsc/biome against a project given in KITE_TS_PROJECT (skipped otherwise).
+    /// Runs real tsc/biome against a project given in OSKL_TS_PROJECT (skipped otherwise).
     #[test]
     fn real_tools() {
-        let Ok(dir) = std::env::var("KITE_TS_PROJECT") else { return };
+        let Ok(dir) = std::env::var("OSKL_TS_PROJECT") else { return };
         let root = std::path::PathBuf::from(dir).canonicalize().unwrap();
         let file = root.join("src/app.ts");
         let ts = super::typecheck(&root, &file).expect("tsc ran").expect("tsc succeeded");

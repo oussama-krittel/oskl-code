@@ -148,7 +148,7 @@ Type commands; Tab completes paths and branches:
 
 ### Settings
 
-Settings are stored in `~/.config/kite/settings` as plain `key = value` lines (`sidebar`, `font_size`, `autosave`, `formatonsave`, `blame`, `wrap`). Most of them can also be changed from the status bar or the command line. Each project's layout (splits, open files, terminals, added folders) is saved and restored when you reopen it.
+Settings are stored in `~/.config/oskl/settings` as plain `key = value` lines (`sidebar`, `font_size`, `autosave`, `formatonsave`, `blame`, `wrap`). Most of them can also be changed from the status bar or the command line. Each project's layout (splits, open files, terminals, added folders) is saved and restored when you reopen it.
 
 ## Development
 

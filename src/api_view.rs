@@ -617,7 +617,7 @@ impl ApiView {
             let ct = r.content_type();
             let image = if ct.starts_with("image/") && !det.truncated {
                 let ext = ct.trim_start_matches("image/").split([';', '+']).next().unwrap_or("png").to_string();
-                let p = std::env::temp_dir().join(format!("kite-image-{}.{ext}", api::new_id()));
+                let p = std::env::temp_dir().join(format!("oskl-image-{}.{ext}", api::new_id()));
                 std::fs::write(&p, &r.body).ok().map(|_| p)
             } else {
                 None
@@ -1187,7 +1187,7 @@ impl ApiView {
                 let ct = r.content_type();
                 let image = if ct.starts_with("image/") && r.body_file.is_none() {
                     let ext = ct.trim_start_matches("image/").split([';', '+']).next().unwrap_or("png").to_string();
-                    let p = std::env::temp_dir().join(format!("kite-image-{}.{ext}", api::new_id()));
+                    let p = std::env::temp_dir().join(format!("oskl-image-{}.{ext}", api::new_id()));
                     std::fs::write(&p, &r.body).ok().map(|_| p)
                 } else {
                     None

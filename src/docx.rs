@@ -388,7 +388,7 @@ fn read_docx(path: &Path) -> Result<Document, String> {
         if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "tif" | "tiff" | "webp" | "svg") {
             return None;
         }
-        let dir = media.get_or_insert_with(|| std::env::temp_dir().join(format!("kite-docx-{}-{}", std::process::id(), crate::api::new_id()))).clone();
+        let dir = media.get_or_insert_with(|| std::env::temp_dir().join(format!("oskl-docx-{}-{}", std::process::id(), crate::api::new_id()))).clone();
         std::fs::create_dir_all(&dir).ok()?;
         let bytes = z.read(target)?;
         // A big photo is kept 1,400 pixels wide at most: sharp on the page, a fraction of the memory.
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn documents_keep_their_styles_lists_tables_and_pictures() {
-        let p = std::env::temp_dir().join(format!("kite-doc-{}.docx", std::process::id()));
+        let p = std::env::temp_dir().join(format!("oskl-doc-{}.docx", std::process::id()));
         let doc = r#"<w:document><w:body>
             <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Plan</w:t></w:r></w:p>
             <w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t xml:space="preserve">Ship it </w:t></w:r><w:r><w:rPr><w:b/><w:color w:val="FF0000"/><w:highlight w:val="yellow"/></w:rPr><w:t>today</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve"> </w:t></w:r></w:p>

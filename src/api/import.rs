@@ -1077,7 +1077,7 @@ mod formats {
         assert!(matches!(&r.body, Body::Json { text } if text.contains("\"qty\": 2")));
         assert!(!r.settings.verify_tls);
         assert_eq!(r.params, [Row::new("limit", "5")]);
-        let f = curl("curl https://x.io/up -F name=kite -F file=@/tmp/a.png -u ada:pw").unwrap();
+        let f = curl("curl https://x.io/up -F name=oskl -F file=@/tmp/a.png -u ada:pw").unwrap();
         assert_eq!(f.method, "POST");
         assert!(matches!(&f.body, Body::Multipart { rows } if rows.len() == 2 && rows[1].flag && rows[1].value == "/tmp/a.png"));
         assert_eq!(f.auth, Auth::Basic { user: "ada".into(), pass: "pw".into() });

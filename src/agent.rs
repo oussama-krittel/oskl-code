@@ -1053,7 +1053,7 @@ mod tests {
 
     #[test]
     fn sessions_list_load_rename_and_trash() {
-        let dir = std::env::temp_dir().join(format!("kite-agent-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oskl-agent-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let text = [
             r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"<ide_opened_file>x</ide_opened_file>"},{"type":"text","text":"Fix the   login\nbug"}]}}"#,

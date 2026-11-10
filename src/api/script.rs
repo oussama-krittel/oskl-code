@@ -202,13 +202,13 @@ mod scripts {
         assert_eq!(pre.vars, [("environment".to_string(), "seen".to_string(), "http://x".to_string())]);
         assert_eq!(pre.logs[0], "hi {\n  \"a\": 1\n}");
 
-        let resp = serde_json::json!({ "status": 200, "headers": [["Content-Type", "application/json"]], "body": "{\"items\":[1,2,3],\"name\":\"kite\"}", "time": 12 });
+        let resp = serde_json::json!({ "status": 200, "headers": [["Content-Type", "application/json"]], "body": "{\"items\":[1,2,3],\"name\":\"oskl\"}", "time": 12 });
         let post = run(
             r#"
             pm.test("status ok", () => pm.response.to.have.status(200));
             tc.test("three items", () => expect(tc.response.json().items).to.have.lengthOf(3));
-            tc.test("name", () => expect(tc.response.json().name).to.not.equal("kite"));
-            tc.test("type", () => expect(tc.response.json()).to.be.an("object").and.have.property("name", "kite"));
+            tc.test("name", () => expect(tc.response.json().name).to.not.equal("oskl"));
+            tc.test("type", () => expect(tc.response.json()).to.be.an("object").and.have.property("name", "oskl"));
             tc.setVar("n", tc.response.json().items.length);
             "#,
             &vars,

@@ -999,7 +999,7 @@ mod tests {
 
     #[test]
     fn copies_get_finder_names() {
-        let d = std::env::temp_dir().join(format!("kite-tree-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("oskl-tree-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("src")).unwrap();
         std::fs::write(d.join("a.ts"), "x").unwrap();

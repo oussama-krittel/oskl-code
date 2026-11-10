@@ -862,7 +862,7 @@ pub fn list_files(root: &Path) -> Vec<String> {
 mod tests {
     #[test]
     fn filter_reads_local_and_remote_branches_of_a_repo() {
-        let base = std::env::temp_dir().join(format!("kite-branches-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("oskl-branches-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let sh = |cmd: &str| {
@@ -931,7 +931,7 @@ mod tests {
 mod live {
     #[test]
     fn reads_real_repo() {
-        let Ok(dir) = std::env::var("KITE_REPO") else { return };
+        let Ok(dir) = std::env::var("OSKL_REPO") else { return };
         let root = super::repo_root(std::path::Path::new(&dir)).expect("repo root");
         let st = super::status(&root).expect("status");
         println!("branch={:?} staged={} unstaged={}", st.branch, st.staged.len(), st.unstaged.len());
@@ -948,7 +948,7 @@ mod live {
 
     /// A repo where `main` and `feature` both changed line 1 of a.txt.
     fn conflicting_repo(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kite-git-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oskl-git-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sh = |cmd: &str| {

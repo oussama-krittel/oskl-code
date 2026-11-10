@@ -227,7 +227,7 @@ impl PreviewView {
                 let raw = self.text(cx);
                 let fragment = !has_svg_root(&raw);
                 let text = if fragment { wrap_svg_fragment(&raw) } else { raw.clone() };
-                let file = std::env::temp_dir().join(format!("kite-svg-{}-{:x}.svg", std::process::id(), hash(&text)));
+                let file = std::env::temp_dir().join(format!("oskl-svg-{}-{:x}.svg", std::process::id(), hash(&text)));
                 if Some(&file) != self.snapshot.as_ref() && std::fs::write(&file, &text).is_ok() {
                     if let Some(old) = self.snapshot.replace(file.clone()) {
                         release(&old, window, cx);
@@ -846,7 +846,7 @@ pub fn clean_old_temp_files() {
     let Ok(dir) = std::fs::read_dir(std::env::temp_dir()) else { return };
     for e in dir.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        let Some(rest) = name.strip_prefix("kite-mermaid-").or_else(|| name.strip_prefix("kite-svg-")) else { continue };
+        let Some(rest) = name.strip_prefix("oskl-mermaid-").or_else(|| name.strip_prefix("oskl-svg-")) else { continue };
         let pid = rest.split('-').next().unwrap_or("");
         if pid != ours && !pid.is_empty() && name.ends_with(".svg") {
             std::fs::remove_file(e.path()).ok();
@@ -887,7 +887,7 @@ impl DiagramJob {
         let result = svg.and_then(|svg| {
             let svg = outline_text(&emoji_in_emoji_font(&svg)).unwrap_or(svg);
             let (w, h) = svg_size(&svg).ok_or("the drawing has no size")?;
-            let path = std::env::temp_dir().join(format!("kite-mermaid-{}-{key:x}.svg", std::process::id()));
+            let path = std::env::temp_dir().join(format!("oskl-mermaid-{}-{key:x}.svg", std::process::id()));
             std::fs::write(&path, &svg).map_err(|e| e.to_string())?;
             Ok(Diagram { path, w, h, stand_in: None })
         });
@@ -2358,10 +2358,10 @@ fn code_runs(line: &str, spans: Option<&Vec<(Range<usize>, u8)>>) -> Vec<TextRun
 
 #[cfg(test)]
 mod tests {
-    /// Real files from KITE_OFFICE_FILES (one path a line): read without panicking.
+    /// Real files from OSKL_OFFICE_FILES (one path a line): read without panicking.
     #[test]
     fn real_office_files_read() {
-        let Ok(list) = std::env::var("KITE_OFFICE_FILES") else { return };
+        let Ok(list) = std::env::var("OSKL_OFFICE_FILES") else { return };
         for p in list.lines().filter(|l| !l.trim().is_empty()) {
             let path = std::path::Path::new(p.trim());
             eprintln!("-- {p}");
@@ -2412,8 +2412,8 @@ mod tests {
         assert_eq!(super::split_file_ref("src/a.rs:12:3"), ("src/a.rs", Some(12)));
         assert_eq!(super::split_file_ref("src/a.rs#L4-9"), ("src/a.rs", Some(4)));
         assert_eq!(super::split_file_ref("a.md#part"), ("a.md", None));
-        // `../<this folder>/Cargo.toml` goes out and back in: inside the project, whatever the checkout is called.
-        let back_in = format!("../{}/Cargo.toml", root.file_name().unwrap().to_string_lossy());
+        // `src/../Cargo.toml` goes out of a folder and back: still inside the project (whatever it's called).
+        let back_in = "src/../Cargo.toml".to_string();
         let blocks = super::parse_with(&format!("See `src/main.rs:3` and `not/here.rs` and `x` and `/etc/hosts` and `{back_in}`."), Some(root));
         let Block::Para(inl) = &blocks[0] else { panic!("{blocks:?}") };
         // `/etc/hosts` is outside the project.
@@ -2422,7 +2422,7 @@ mod tests {
 
     #[test]
     fn big_diagrams_are_drawn_in_tiles_that_cover_them_exactly() {
-        let dir = std::env::temp_dir().join(format!("kite-tiles-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oskl-tiles-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("d.svg");
         std::fs::write(&path, r#"<svg xmlns="http://www.w3.org/2000/svg" width="800" height="2600" viewBox="0 0 400 1300"><rect width="400" height="1300"/></svg>"#).unwrap();
@@ -2546,7 +2546,7 @@ mod tests {
 
     #[test]
     fn reads_picture_sizes_from_headers() {
-        let dir = std::env::temp_dir().join(format!("kite-img-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oskl-img-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let png = dir.join("a.png");
         let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();

@@ -60,7 +60,7 @@ use futures::StreamExt;
 use std::path::PathBuf;
 use workspace::Workspace;
 
-actions!(kite, [QuitApp, NewWindow, OpenFolderApp]);
+actions!(oskl, [QuitApp, NewWindow, OpenFolderApp]);
 
 /// mimalloc instead of the system allocator: it hands freed memory back to macOS, where the
 /// system one keeps big freed blocks (decoded pictures…) counted against the app.
@@ -83,7 +83,7 @@ pub fn open_window(root: PathBuf, cx: &mut App) {
     open_window_with(root, None, cx);
 }
 
-/// Opens a project window, optionally showing a file right away (`kite <folder> <file>` / `kite <file>`).
+/// Opens a project window, optionally showing a file right away (`oskl <folder> <file>` / `oskl <file>`).
 pub fn open_window_with(root: PathBuf, file: Option<PathBuf>, cx: &mut App) {
     // Where this project's window was last time: same display, size, maximized or full screen.
     let place = (root != workspace::no_project_dir()).then(|| session::load(&root)).flatten().and_then(|s| s.window);
@@ -121,10 +121,21 @@ pub fn open_window_with(root: PathBuf, file: Option<PathBuf>, cx: &mut App) {
         .expect("failed to open window");
 }
 
+/// Settings, connections, sessions… were kept in ~/.config/kite before the app's name became
+/// oskl everywhere: moved over once, so nothing is lost.
+fn move_old_settings() {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+    let (old, new) = (home.join(".config/kite"), home.join(".config/oskl"));
+    if old.is_dir() && !new.exists() {
+        std::fs::rename(&old, &new).ok();
+    }
+}
+
 fn main() {
+    move_old_settings();
     tune_allocator();
     let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
-    // `kite <file>` opens the file's repo (or folder); `kite <folder> [file]` opens the folder.
+    // `oskl <file>` opens the file's repo (or folder); `oskl <folder> [file]` opens the folder.
     // With no arguments: from a terminal, the current folder; from the Dock/Finder, the
     // project windows that were open last time (or the start screen).
     let launch: Option<(PathBuf, Option<PathBuf>)> = match args.as_slice() {

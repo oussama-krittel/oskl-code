@@ -98,7 +98,7 @@ pub fn start(cwd: &std::path::Path) -> anyhow::Result<Started> {
         shell: None,
         working_directory: Some(cwd.to_path_buf()),
         drain_on_exit: false,
-        env: [("TERM_PROGRAM".to_string(), "kite".to_string())].into_iter().collect(),
+        env: [("TERM_PROGRAM".to_string(), "oskl".to_string())].into_iter().collect(),
     };
     let window_size = WindowSize { num_lines: size.rows as u16, num_cols: size.cols as u16, cell_width: 8, cell_height: 16 };
     let pty = tty::new(&options, window_size, 0)?;
@@ -873,7 +873,7 @@ mod tests {
         use alacritty_terminal::index::{Column, Line};
         let dir = std::env::temp_dir();
         let started = super::start(&dir).expect("pty starts");
-        Notifier(started.sender.clone()).notify(&b"echo kite-$((40+2))\r"[..]);
+        Notifier(started.sender.clone()).notify(&b"echo oskl-$((40+2))\r"[..]);
         let mut found = false;
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -882,7 +882,7 @@ mod tests {
                 .flat_map(|l| (0..term.grid().columns()).map(move |c| (l, c)))
                 .map(|(l, c)| term.grid()[Line(l as i32)][Column(c)].c)
                 .collect();
-            if text.contains("kite-42") {
+            if text.contains("oskl-42") {
                 found = true;
                 break;
             }
@@ -926,8 +926,8 @@ mod tests {
 
     #[test]
     fn render_qr_preview() {
-        // Writes a PNG of the QR drawn with the terminal's block shapes (KITE_QR_PNG=path).
-        let Ok(out) = std::env::var("KITE_QR_PNG") else { return };
+        // Writes a PNG of the QR drawn with the terminal's block shapes (OSKL_QR_PNG=path).
+        let Ok(out) = std::env::var("OSKL_QR_PNG") else { return };
         use resvg::tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
         let qr = include_str!("../tests/expo_qr.txt");
         let (cw, lh) = (8.0f32, 16.0f32);

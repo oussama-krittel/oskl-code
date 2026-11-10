@@ -24,14 +24,14 @@ fn shell_path() -> Option<&'static String> {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
             // Markers around PATH so shell startup chatter can't corrupt it.
             let out = Command::new(shell)
-                .args(["-lic", "printf '__KITE_PATH__%s__KITE_END__' \"$PATH\""])
+                .args(["-lic", "printf '__OSKL_PATH__%s__OSKL_END__' \"$PATH\""])
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
                 .ok()?;
             let text = String::from_utf8_lossy(&out.stdout).to_string();
-            let start = text.find("__KITE_PATH__")? + "__KITE_PATH__".len();
-            let end = text[start..].find("__KITE_END__")? + start;
+            let start = text.find("__OSKL_PATH__")? + "__OSKL_PATH__".len();
+            let end = text[start..].find("__OSKL_END__")? + start;
             let path = text[start..end].trim().to_string();
             (!path.is_empty()).then_some(path)
         })
@@ -331,10 +331,10 @@ mod tests {
 
 #[cfg(test)]
 mod live_format {
-    /// Formats a messy TS snippet with the project's formatter (KITE_TS_PROJECT, skipped otherwise).
+    /// Formats a messy TS snippet with the project's formatter (OSKL_TS_PROJECT, skipped otherwise).
     #[test]
     fn formats_with_project_tool() {
-        let Ok(dir) = std::env::var("KITE_TS_PROJECT") else { return };
+        let Ok(dir) = std::env::var("OSKL_TS_PROJECT") else { return };
         let root = std::path::PathBuf::from(dir);
         let file = root.join("src/app.ts");
         let (out, tool) = super::format(&root, &file, "const   x={a:1,b:2}\nexport   function f( ){return x}\n").expect("formats");
@@ -348,7 +348,7 @@ mod terraform_tests {
     /// Runs only where terraform (or tofu) is installed.
     #[test]
     fn formats_java_when_a_formatter_is_installed() {
-        let dir = std::env::temp_dir().join(format!("kite-fmt-java-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oskl-fmt-java-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("A.java");
         match super::format(&dir, &file, "class A{void f(){int x=1;}}\n") {
@@ -360,7 +360,7 @@ mod terraform_tests {
 
     #[test]
     fn formats_terraform() {
-        let dir = std::env::temp_dir().join(format!("kite-tf-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oskl-tf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("main.tf");
         match super::format(&dir, &file, "resource \"a\" \"b\" {\nx=1\n  longer_name=\"y\"\n}\n") {

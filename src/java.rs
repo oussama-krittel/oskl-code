@@ -104,7 +104,7 @@ pub fn javac_check(root: &Path, file: &Path) -> Result<(String, Vec<Diag>), Stri
     let mut sourcepath = vec![src.clone()];
     sourcepath.extend(source_roots(root).into_iter().filter(|r| *r != src));
     let classpath = classpath(root, file);
-    let out_dir = std::env::temp_dir().join(format!("kite-javac-{}", std::process::id()));
+    let out_dir = std::env::temp_dir().join(format!("oskl-javac-{}", std::process::id()));
     let join = |v: &[PathBuf]| v.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>().join(":");
     let mut c = Command::new(&javac);
     // A small, quick JVM: this runs on every save.
@@ -818,7 +818,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("kite-java-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("oskl-java-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

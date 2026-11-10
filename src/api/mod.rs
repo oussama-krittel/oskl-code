@@ -516,13 +516,13 @@ pub fn new_id() -> String {
 
 // ---------------------------------------------------------------- where things are kept
 
-/// Where API data is kept: `~/.config/kite/api`, and under it `projects/<name>-<id>` for each
+/// Where API data is kept: `~/.config/oskl/api`, and under it `projects/<name>-<id>` for each
 /// project's own (nothing is written into the projects themselves).
 pub fn base(project: Option<&Path>) -> Option<PathBuf> {
     #[cfg(test)]
-    let global = TEST_BASE.with(|b| b.borrow().clone()).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/kite/api")))?;
+    let global = TEST_BASE.with(|b| b.borrow().clone()).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/oskl/api")))?;
     #[cfg(not(test))]
-    let global = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/kite/api"))?;
+    let global = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/oskl/api"))?;
     match project {
         None => Some(global),
         Some(p) => {
@@ -1017,7 +1017,7 @@ mod store_tests {
     use super::*;
 
     fn temp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("kite-api-{}", new_id()));
+        let d = std::env::temp_dir().join(format!("oskl-api-{}", new_id()));
         TEST_BASE.with(|b| *b.borrow_mut() = Some(d.join("global")));
         d
     }

@@ -387,7 +387,7 @@ mod tests {
     fn pages_are_drawn_at_the_width_asked() {
         // A one-page PDF, written by hand.
         let pdf = "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 4 0 R>>endobj\n4 0 obj<</Length 26>>stream\n0 0 1 rg 0 0 100 100 re f\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n";
-        let p = std::env::temp_dir().join(format!("kite-{}.pdf", std::process::id()));
+        let p = std::env::temp_dir().join(format!("oskl-{}.pdf", std::process::id()));
         std::fs::write(&p, pdf).unwrap();
         let (doc, sizes) = super::Doc::open(&p).unwrap();
         assert_eq!(sizes, [(200., 100.)]);

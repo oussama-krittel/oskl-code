@@ -49,8 +49,8 @@ pub struct Repo {
 impl Repo {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let git_root = git::repo_root(&root);
-        if std::env::var_os("KITE_DEBUG").is_some() {
-            eprintln!("[kite] open {} -> git root {:?}", root.display(), git_root);
+        if std::env::var_os("OSKL_DEBUG").is_some() {
+            eprintln!("[oskl] open {} -> git root {:?}", root.display(), git_root);
         }
         let is_git = git_root.is_some();
         Self::build(git_root.unwrap_or(root), is_git, cx)
@@ -115,8 +115,8 @@ impl Repo {
         let task = cx.background_executor().spawn(async move { git::status(&root) });
         self.status_task = Some(cx.spawn(async move |this, cx| {
             let status = task.await;
-            if std::env::var_os("KITE_DEBUG").is_some() {
-                eprintln!("[kite] status: {:?}", status.as_ref().map(|s| (s.branch.clone(), s.staged.len(), s.unstaged.len())));
+            if std::env::var_os("OSKL_DEBUG").is_some() {
+                eprintln!("[oskl] status: {:?}", status.as_ref().map(|s| (s.branch.clone(), s.staged.len(), s.unstaged.len())));
             }
             this.update(cx, |repo, cx| {
                 repo.status_running = false;
@@ -173,8 +173,8 @@ impl Repo {
         });
         self.log_task = Some(cx.spawn(async move |this, cx| {
             let (commits, rows) = task.await;
-            if std::env::var_os("KITE_DEBUG").is_some() {
-                eprintln!("[kite] log: {:?}", commits.as_ref().map(|c| c.len()));
+            if std::env::var_os("OSKL_DEBUG").is_some() {
+                eprintln!("[oskl] log: {:?}", commits.as_ref().map(|c| c.len()));
             }
             this.update(cx, |repo, cx| {
                 repo.log_running = false;
@@ -394,7 +394,7 @@ pub fn find_repos(root: &Path, max_depth: usize) -> Vec<PathBuf> {
 mod tests {
     #[test]
     fn finds_env_files_but_not_in_dependencies() {
-        let d = std::env::temp_dir().join(format!("kite-env-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("oskl-env-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         for f in [".env", ".env.example", "apps/api/.env.local", "node_modules/x/.env", ".git/.env", "src/a.ts"] {
             let p = d.join(f);

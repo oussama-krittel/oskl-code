@@ -170,7 +170,7 @@ fn new_id() -> String {
 
 #[cfg(not(test))]
 fn store_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/kite/connections.json"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/oskl/connections.json"))
 }
 
 // Per test (thread): parallel tests don't see each other's connections.
@@ -358,10 +358,10 @@ pub(crate) mod keychain {
             assert_eq!(super::decode("plain"), None);
         }
 
-        /// The real Keychain (KITE_DB_LIVE=1): written, read back without asking, deleted.
+        /// The real Keychain (OSKL_DB_LIVE=1): written, read back without asking, deleted.
         #[test]
         fn the_keychain_round_trip() {
-            if std::env::var_os("KITE_DB_LIVE").is_none() {
+            if std::env::var_os("OSKL_DB_LIVE").is_none() {
                 return;
             }
             let (svc, id) = ("OSKL Code test", "round-trip");
@@ -747,13 +747,13 @@ mod tests {
     }
 }
 
-/// Against real servers (run with KITE_DB_LIVE=1; see the ports below).
+/// Against real servers (run with OSKL_DB_LIVE=1; see the ports below).
 #[cfg(test)]
 mod live {
     use super::*;
 
     fn live() -> bool {
-        std::env::var_os("KITE_DB_LIVE").is_some()
+        std::env::var_os("OSKL_DB_LIVE").is_some()
     }
 
     fn conn(kind: Kind, port: u16, user: &str, pw: &str, db: &str) -> Conn {
@@ -861,7 +861,7 @@ mod live {
         }
         let c = conn(Kind::MongoDb, 57017, "root", "mongopw", "admin");
         assert!(wait(engine::test(c.clone(), "mongopw".into())).unwrap().starts_with("MongoDB 7"));
-        let scope = Scope { database: Some("kite_test".into()), collection: None };
+        let scope = Scope { database: Some("oskl_test".into()), collection: None };
         let r = wait(engine::query(
             c.clone(),
             scope.clone(),
@@ -878,16 +878,16 @@ mod live {
         assert_eq!(r[4].rows, vec![vec![Some("3".into())]]);
         let dbs = wait(engine::children(c.clone(), vec![])).unwrap();
         let at = |n: &str| dbs.iter().position(|d| d.label == n);
-        assert!(at("kite_test").unwrap() < at("admin").unwrap(), "your databases before admin/config/local");
-        let colls = wait(engine::children(c.clone(), vec!["kite_test".into()])).unwrap();
+        assert!(at("oskl_test").unwrap() < at("admin").unwrap(), "your databases before admin/config/local");
+        let colls = wait(engine::children(c.clone(), vec!["oskl_test".into()])).unwrap();
         assert!(labels(&colls).contains(&"users".to_string()), "{colls:?}");
-        let path: Vec<String> = vec!["kite_test".into(), "users".into()];
+        let path: Vec<String> = vec!["oskl_test".into(), "users".into()];
         let p = wait(engine::page(c.clone(), path.clone(), PageSpec { limit: 2, sort: Some(("age".into(), false)), ..Default::default() })).unwrap();
         assert_eq!((p.total, p.grid.rows.len()), (Some(3), 2));
         assert_eq!(p.grid.columns[0], "_id");
         let p = wait(engine::page(c.clone(), path.clone(), PageSpec { limit: 25, search: "bo".into(), ..Default::default() })).unwrap();
         assert_eq!(p.total, Some(1), "searched in any field");
-        let in_coll = Scope { database: Some("kite_test".into()), collection: Some("users".into()) };
+        let in_coll = Scope { database: Some("oskl_test".into()), collection: Some("users".into()) };
         let r = wait(engine::query(c.clone(), in_coll.clone(), "{name: 'Ann'}".into())).unwrap();
         assert_eq!(r[0].rows.len(), 1, "a bare filter in a collection's tab finds");
         let r = wait(engine::query(c.clone(), in_coll, "[{$group: {_id: null, avg: {$avg: '$age'}}}]".into())).unwrap();
@@ -907,10 +907,10 @@ mod live {
         wait(engine::query(
             c.clone(),
             Scope::default(),
-            "IF DB_ID('kite_test') IS NULL CREATE DATABASE kite_test;".into(),
+            "IF DB_ID('oskl_test') IS NULL CREATE DATABASE oskl_test;".into(),
         ))
         .unwrap();
-        let scope = Scope { database: Some("kite_test".into()), collection: None };
+        let scope = Scope { database: Some("oskl_test".into()), collection: None };
         let r = wait(engine::query(
             c.clone(),
             scope.clone(),
@@ -926,12 +926,12 @@ mod live {
         assert_eq!(g.rows[1][2], None, "NULL");
         let dbs = wait(engine::children(c.clone(), vec![])).unwrap();
         let at = |n: &str| dbs.iter().position(|d| d.label == n);
-        assert!(at("kite_test").unwrap() < at("master").unwrap(), "your databases before the system ones");
-        let schemas = wait(engine::children(c.clone(), vec!["kite_test".into()])).unwrap();
+        assert!(at("oskl_test").unwrap() < at("master").unwrap(), "your databases before the system ones");
+        let schemas = wait(engine::children(c.clone(), vec!["oskl_test".into()])).unwrap();
         assert_eq!(labels(&schemas), ["dbo"]);
-        let tables = wait(engine::children(c.clone(), vec!["kite_test".into(), "dbo".into()])).unwrap();
+        let tables = wait(engine::children(c.clone(), vec!["oskl_test".into(), "dbo".into()])).unwrap();
         assert_eq!(labels(&tables), ["fruit"]);
-        let path: Vec<String> = vec!["kite_test".into(), "dbo".into(), "fruit".into()];
+        let path: Vec<String> = vec!["oskl_test".into(), "dbo".into(), "fruit".into()];
         let p = wait(engine::page(c.clone(), path.clone(), PageSpec { limit: 2, offset: 1, sort: Some(("qty".into(), true)), ..Default::default() })).unwrap();
         assert_eq!(p.total, Some(3));
         assert_eq!(p.grid.rows.iter().map(|r| r[1].clone().unwrap()).collect::<Vec<_>>(), ["Mango", "Apple"], "page 2 of qty descending");
@@ -950,17 +950,17 @@ mod live {
         let r = wait(engine::query(
             c.clone(),
             Scope::default(),
-            "PUT /api/queues/%2F/kite-test-orders\n{\"durable\": true}\nPOST /api/exchanges/%2F/amq.default/publish\n{\"properties\": {}, \"routing_key\": \"kite-test-orders\", \"payload\": \"hello\", \"payload_encoding\": \"string\"}".into(),
+            "PUT /api/queues/%2F/oskl-test-orders\n{\"durable\": true}\nPOST /api/exchanges/%2F/amq.default/publish\n{\"properties\": {}, \"routing_key\": \"oskl-test-orders\", \"payload\": \"hello\", \"payload_encoding\": \"string\"}".into(),
         ))
         .unwrap();
         assert_eq!(r[1].rows, vec![vec![Some("routed".into()), Some("true".into())]]);
         let top = wait(engine::children(c.clone(), vec![])).unwrap();
         assert_eq!(labels(&top), ["Queues", "Exchanges"]);
         let qs = wait(engine::children(c.clone(), vec!["Queues".into()])).unwrap();
-        assert!(labels(&qs).contains(&"kite-test-orders".into()), "{qs:?}");
+        assert!(labels(&qs).contains(&"oskl-test-orders".into()), "{qs:?}");
         let ex = wait(engine::children(c.clone(), vec!["Exchanges".into()])).unwrap();
         assert!(labels(&ex).contains(&"(AMQP default)".into()));
-        let q = wait(engine::page(c.clone(), vec!["Queues".into(), "/".into(), "kite-test-orders".into()], spec(25))).unwrap();
+        let q = wait(engine::page(c.clone(), vec!["Queues".into(), "/".into(), "oskl-test-orders".into()], spec(25))).unwrap();
         assert_eq!(q.grid.rows[0][0].as_deref(), Some("state"));
         let bad = conn(Kind::RabbitMq, 15673, "guest", "nope", "/");
         assert!(wait(engine::test(bad, "nope".into())).unwrap_err().contains("wrong user name or password"));
@@ -969,7 +969,7 @@ mod live {
     }
 }
 
-/// What connections cost (KITE_DB_LIVE=1, all five servers): printed, and kept small.
+/// What connections cost (OSKL_DB_LIVE=1, all five servers): printed, and kept small.
 #[cfg(test)]
 mod live_memory {
     use super::*;
@@ -985,7 +985,7 @@ mod live_memory {
 
     #[test]
     fn connections_cost_little() {
-        if std::env::var_os("KITE_DB_LIVE").is_none() {
+        if std::env::var_os("OSKL_DB_LIVE").is_none() {
             return;
         }
         fn wait<T>(f: impl std::future::Future<Output = T>) -> T {

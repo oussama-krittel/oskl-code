@@ -107,7 +107,7 @@ impl WindowPlace {
 }
 
 fn config_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/kite"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/oskl"))
 }
 
 /// One file per project, named after its path.

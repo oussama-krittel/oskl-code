@@ -33,7 +33,7 @@ cp "$BUILD/icon/icon_1024.png" "$ICONSET/icon_512x512@2x.png"
 echo "→ assembling $APP_NAME.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/kite "$APP/Contents/MacOS/$BIN_NAME"
+cp target/release/oskl "$APP/Contents/MacOS/$BIN_NAME"
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

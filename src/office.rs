@@ -817,7 +817,7 @@ pub(crate) mod tests {
 
     #[test]
     fn workbooks_read_as_sheets() {
-        let p = std::env::temp_dir().join(format!("kite-{}.xlsx", std::process::id()));
+        let p = std::env::temp_dir().join(format!("oskl-{}.xlsx", std::process::id()));
         zip(&p, &[
             ("xl/workbook.xml", r#"<workbook><sheets><sheet name="Orders" sheetId="1" r:id="rId1"/><sheet name="Empty" sheetId="2" r:id="rId2"/></sheets></workbook>"#),
             ("xl/_rels/workbook.xml.rels", r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="/xl/worksheets/sheet2.xml"/></Relationships>"#),

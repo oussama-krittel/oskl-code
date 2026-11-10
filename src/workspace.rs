@@ -3548,8 +3548,8 @@ impl Workspace {
 
     /// Lints a saved/opened file, and type-checks its TypeScript project.
     fn check_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if std::env::var_os("KITE_DEBUG").is_some() {
-            eprintln!("[kite] check_file {} (checks on: {})", path.display(), self.settings.checks);
+        if std::env::var_os("OSKL_DEBUG").is_some() {
+            eprintln!("[oskl] check_file {} (checks on: {})", path.display(), self.settings.checks);
         }
         if !self.settings.checks || crate::diagnostics::is_dependency(&path) {
             return;
@@ -3562,8 +3562,8 @@ impl Workspace {
             key.clone(),
             cx.spawn(async move |this, cx| {
                 let result = task.await;
-                if std::env::var_os("KITE_DEBUG").is_some() {
-                    eprintln!("[kite] lint {}: {:?}", key.display(), result.as_ref().map(|r| r.as_ref().map(|(t, d)| (t.clone(), d.len()))));
+                if std::env::var_os("OSKL_DEBUG").is_some() {
+                    eprintln!("[oskl] lint {}: {:?}", key.display(), result.as_ref().map(|r| r.as_ref().map(|(t, d)| (t.clone(), d.len()))));
                 }
                 this.update(cx, |ws, cx| {
                     ws.lint_tasks.remove(&key);
@@ -3619,8 +3619,8 @@ impl Workspace {
         let task = cx.background_executor().spawn(async move { crate::diagnostics::typecheck(&root, &path) });
         self.tsc_task = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
-            if std::env::var_os("KITE_DEBUG").is_some() {
-                eprintln!("[kite] tsc: {:?}", result.as_ref().map(|r| r.as_ref().map(|m| m.iter().map(|(p, d)| (p.display().to_string(), d.len())).collect::<Vec<_>>())));
+            if std::env::var_os("OSKL_DEBUG").is_some() {
+                eprintln!("[oskl] tsc: {:?}", result.as_ref().map(|r| r.as_ref().map(|m| m.iter().map(|(p, d)| (p.display().to_string(), d.len())).collect::<Vec<_>>())));
             }
             this.update(cx, |ws, cx| {
                 ws.tsc_running = false;
@@ -6316,8 +6316,8 @@ impl Render for Workspace {
                     cx.stop_propagation();
                     return;
                 }
-                if std::env::var_os("KITE_DEBUG").is_some() {
-                    eprintln!("[kite] key {}", ev.keystroke.unparse(gpui::OperatingSystem::Mac));
+                if std::env::var_os("OSKL_DEBUG").is_some() {
+                    eprintln!("[oskl] key {}", ev.keystroke.unparse(gpui::OperatingSystem::Mac));
                 }
                 // Direction letters with ⌃⌥ / ⌥ / ⌃⌥⌘ act as real arrow keys everywhere
                 // (editor, inputs, popups, terminal, lists). Not while recording a shortcut.
@@ -6556,7 +6556,7 @@ mod tests {
 
 /// An empty placeholder folder used when the app starts without a project.
 pub fn no_project_dir() -> PathBuf {
-    let dir = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(".config/kite/no-project");
+    let dir = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(".config/oskl/no-project");
     std::fs::create_dir_all(&dir).ok();
     dir.canonicalize().unwrap_or(dir)
 }
@@ -6576,7 +6576,7 @@ mod ui_tests {
 
     /// Like `setup`, letting the test fill the project folder before the window opens.
     fn setup_with(cx: &mut TestAppContext, prepare: impl FnOnce(&std::path::Path)) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
-        let home = std::env::temp_dir().join(format!("kite-ui-test-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("oskl-ui-test-{}", std::process::id()));
         // Each test gets its own project so saved sessions don't clash between parallel tests.
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let project = home.join(format!("project-{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
@@ -7222,7 +7222,7 @@ mod ui_tests {
         assert!(ws.read_with(cx, |ws, _| ws.side == super::Side::Keys), "the shortcuts list is a tab of Settings");
 
         // Saved for next time.
-        let saved = std::fs::read_to_string(std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".config/kite/settings")).unwrap();
+        let saved = std::fs::read_to_string(std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".config/oskl/settings")).unwrap();
         assert!(saved.contains("theme = default") && saved.contains("ui_zoom = 1.00"), "{saved}");
     }
 
@@ -7360,7 +7360,7 @@ mod ui_tests {
         cx.simulate_click(at, gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(view(cx).is_none(), "no minimap when it's off");
-        let saved = std::fs::read_to_string(std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".config/kite/settings")).unwrap();
+        let saved = std::fs::read_to_string(std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".config/oskl/settings")).unwrap();
         assert!(saved.contains("minimap = off"), "{saved}");
         cx.simulate_click(at, gpui::Modifiers::none());
         cx.run_until_parked();
@@ -7799,7 +7799,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         cx.run_until_parked();
         let shown = cx.debug_bounds("md-mermaid-1").expect("the diagram is drawn");
         assert!(shown.size.width > gpui::px(100.) && shown.size.height > gpui::px(20.), "{shown:?}");
-        let files = || std::fs::read_dir(std::env::temp_dir()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&format!("kite-mermaid-{}-", std::process::id()))).count();
+        let files = || std::fs::read_dir(std::env::temp_dir()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&format!("oskl-mermaid-{}-", std::process::id()))).count();
         let before = files();
 
         // Broken while typing: the error and the source show, and the old picture is freed.
@@ -8393,7 +8393,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert_eq!(panel_repo, "web");
 
         // Add a folder from elsewhere: a second root in the explorer, its repo in the picker.
-        let other = std::env::temp_dir().join(format!("kite-added-{}", std::process::id()));
+        let other = std::env::temp_dir().join(format!("oskl-added-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&other);
         init(&other, "lib.rs");
         ws.update_in(cx, |ws, window, cx| ws.add_folder(other.clone(), window, cx));
@@ -8745,20 +8745,20 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     /// The open database tab.
-    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    /// With the test MongoDB server running (OSKL_DB_LIVE=1, port 57017).
     #[gpui::test]
     fn a_mongodb_document_is_edited_in_place(cx: &mut TestAppContext) {
-        if std::env::var_os("KITE_DB_LIVE").is_none() {
+        if std::env::var_os("OSKL_DB_LIVE").is_none() {
             return;
         }
         let (ws, cx) = setup(cx);
         let id = live_mongo_docs("edit_docs", 1, cx);
         let conn = crate::db::load().into_iter().find(|c| c.id == id).unwrap();
         let read_back = |conn: &crate::db::Conn| {
-            let q = crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("kite_test".into()), collection: None }, "db.edit_docs.findOne({})".into()));
+            let q = crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("oskl_test".into()), collection: None }, "db.edit_docs.findOne({})".into()));
             futures::executor::block_on(q).unwrap()[0].trees.clone().unwrap()[0].text(crate::db::TextStyle::Shell)
         };
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["kite_test".into(), "edit_docs".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "edit_docs".into()] }, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the document", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         let dbl = |cx: &mut VisualTestContext, sel: &str| {
@@ -8854,28 +8854,28 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         // Changed on the server meanwhile: Update says so and saves nothing.
         dbl(cx, "db-value-0-4");
         type_in(cx, "Cy");
-        futures::executor::block_on(crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("kite_test".into()), collection: None }, "db.edit_docs.updateOne({}, {$set: {n: 99}})".into()))).unwrap();
+        futures::executor::block_on(crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("oskl_test".into()), collection: None }, "db.edit_docs.updateOne({}, {$set: {n: 99}})".into()))).unwrap();
         click_on(cx, "db-doc-update-0");
         wait_for(cx, "the refusal", |cx| tab.read_with(cx, |t, _| t.card_error(0)).is_some());
         assert!(tab.read_with(cx, |t, _| t.card_error(0)).unwrap().contains("changed since"));
         assert!(read_back(&conn).contains("name: 'Ann'"), "not overwritten");
     }
 
-    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    /// With the test MongoDB server running (OSKL_DB_LIVE=1, port 57017).
     #[gpui::test]
     fn mongodb_table_cells_and_json_cards_are_edited(cx: &mut TestAppContext) {
-        if std::env::var_os("KITE_DB_LIVE").is_none() {
+        if std::env::var_os("OSKL_DB_LIVE").is_none() {
             return;
         }
         let (ws, cx) = setup(cx);
         let id = live_mongo_docs("edit_more", 1, cx);
         let conn = crate::db::load().into_iter().find(|c| c.id == id).unwrap();
         let shell = |conn: &crate::db::Conn, q: &str| {
-            let q = crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("kite_test".into()), collection: None }, q.into()));
+            let q = crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("oskl_test".into()), collection: None }, q.into()));
             futures::executor::block_on(q).unwrap()
         };
         let first = |conn: &crate::db::Conn| shell(conn, "db.edit_more.findOne({})")[0].trees.clone().unwrap()[0].text(crate::db::TextStyle::Shell);
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["kite_test".into(), "edit_more".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "edit_more".into()] }, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the document", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
 
@@ -9012,15 +9012,15 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         wait_for(cx, "one left", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 1));
     }
 
-    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    /// With the test MongoDB server running (OSKL_DB_LIVE=1, port 57017).
     #[gpui::test]
     fn document_text_is_selected_by_dragging_and_copied(cx: &mut TestAppContext) {
-        if std::env::var_os("KITE_DB_LIVE").is_none() {
+        if std::env::var_os("OSKL_DB_LIVE").is_none() {
             return;
         }
         let (ws, cx) = setup(cx);
         let id = live_mongo_docs("select_docs", 3, cx);
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["kite_test".into(), "select_docs".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "select_docs".into()] }, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         for (mode, want) in [("db-mode-table", ""), ("db-mode-list", "name: 'person 0'"), ("db-mode-json", "\"name\": \"person 0\"")] {
@@ -9049,16 +9049,16 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         }
     }
 
-    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    /// With the test MongoDB server running (OSKL_DB_LIVE=1, port 57017).
     #[gpui::test]
     fn a_mongodb_collection_has_compass_tabs(cx: &mut TestAppContext) {
-        if std::env::var_os("KITE_DB_LIVE").is_none() {
+        if std::env::var_os("OSKL_DB_LIVE").is_none() {
             return;
         }
         use crate::db_view::CTab;
         let (ws, cx) = setup(cx);
         let id = live_mongo_docs("compass_ui", 40, cx);
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["kite_test".into(), "compass_ui".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "compass_ui".into()] }, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         for t in ["db-tab-data", "db-tab-aggregations", "db-tab-schema", "db-tab-indexes", "db-tab-validation", "db-tab-query", "db-filter", "db-find", "db-explain", "db-reset", "db-options", "db-history-button", "db-range"] {
@@ -9158,18 +9158,18 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         wait_for(cx, "the rules saved", |cx| cx.debug_bounds("db-val-status").is_some() && tab.read_with(cx, |t, _| t.compass_tab()) == Some(CTab::Validation));
     }
 
-    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    /// With the test MongoDB server running (OSKL_DB_LIVE=1, port 57017).
     #[gpui::test]
     fn a_mongodb_database_lists_its_collections(cx: &mut TestAppContext) {
-        if std::env::var_os("KITE_DB_LIVE").is_none() {
+        if std::env::var_os("OSKL_DB_LIVE").is_none() {
             return;
         }
         let (ws, cx) = setup(cx);
         let id = live_mongo_docs("overview_big", 30, cx);
         live_mongo_docs("overview_small", 2, cx);
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Database { conn: id.clone(), db: "kite_test".into() }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Database { conn: id.clone(), db: "oskl_test".into() }, window, cx));
         let tab = db_tab(&ws, cx).expect("a database tab");
-        assert_eq!(ws.read_with(cx, |ws, cx| ws.tab_title(&ws.tabs[ws.active.unwrap()], cx).0), "kite_test");
+        assert_eq!(ws.read_with(cx, |ws, cx| ws.tab_title(&ws.tabs[ws.active.unwrap()], cx).0), "oskl_test");
         wait_for(cx, "the collections", |cx| tab.read_with(cx, |t, _| t.overview_names()).is_some());
         let names = tab.read_with(cx, |t, _| t.overview_names()).unwrap().unwrap();
         assert!(names.contains(&"overview_big".to_string()) && names.contains(&"overview_small".to_string()), "{names:?}");
@@ -9202,7 +9202,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         wait_for(cx, "its documents", |cx| data.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 2));
     }
 
-    /// The test MongoDB, connected: a collection of `n` documents in kite_test. Its connection id.
+    /// The test MongoDB, connected: a collection of `n` documents in oskl_test. Its connection id.
     fn live_mongo_docs(coll: &str, n: usize, _cx: &mut VisualTestContext) -> String {
         let mut c = crate::db::Conn::new(crate::db::Kind::MongoDb);
         c.name = "Mongo".into();
@@ -9213,7 +9213,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         let docs: Vec<String> = (0..n).map(|i| format!("{{n: {i}, name: 'person {i}', tags: ['a', 'b'], addr: {{city: 'Oslo', zip: '{:04}'}}, note: 'a fairly long note that runs on past the edge of the card for document {i}'}}", i * 7)).collect();
         let seed = crate::db::engine::run(crate::db::engine::query(
             c.clone(),
-            crate::db::Scope { database: Some("kite_test".into()), collection: None },
+            crate::db::Scope { database: Some("oskl_test".into()), collection: None },
             format!("db.{coll}.drop()\ndb.{coll}.insertMany([{}])", docs.join(", ")),
         ));
         futures::executor::block_on(seed).unwrap();
@@ -9462,7 +9462,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     fn files_dropped_from_finder_open_where_dropped(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         // A file outside the workspace.
-        let outside = std::env::temp_dir().join(format!("kite-drop-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("oskl-drop-{}", std::process::id()));
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("notes.txt"), "hello").unwrap();
         std::fs::write(outside.join("todo.txt"), "later").unwrap();
@@ -9705,10 +9705,10 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(ws.read_with(cx, |ws, _| ws.ask.is_none()), "no failure popup for a cancel");
     }
 
-    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    /// With the test MongoDB server running (OSKL_DB_LIVE=1, port 57017).
     #[gpui::test]
     fn a_mongodb_document_shows_as_json(cx: &mut TestAppContext) {
-        if std::env::var_os("KITE_DB_LIVE").is_none() {
+        if std::env::var_os("OSKL_DB_LIVE").is_none() {
             return;
         }
         let (ws, cx) = setup(cx);
@@ -9722,11 +9722,11 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         // Its own documents, in its own database.
         let seed = crate::db::engine::run(crate::db::engine::query(
             c.clone(),
-            crate::db::Scope { database: Some("kite_test".into()), collection: None },
+            crate::db::Scope { database: Some("oskl_test".into()), collection: None },
             "db.ui_users.drop()\ndb.ui_users.insertMany([{name: 'Ann', age: 34, tags: ['a'], addr: {city: 'Oslo'}}, {name: 'Bob', age: 25}])".into(),
         ));
         futures::executor::block_on(seed).unwrap();
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["kite_test".into(), "ui_users".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "ui_users".into()] }, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         // Like Compass: cards of fields at first; JSON and Table a click away.
@@ -9742,15 +9742,15 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(cx.debug_bounds("db-col-0").is_some(), "a table, with its columns");
     }
 
-    /// With the test MongoDB server running (KITE_DB_LIVE=1, port 57017).
+    /// With the test MongoDB server running (OSKL_DB_LIVE=1, port 57017).
     #[gpui::test]
     fn mongodb_documents_scroll_with_the_pointer_on_their_values(cx: &mut TestAppContext) {
-        if std::env::var_os("KITE_DB_LIVE").is_none() {
+        if std::env::var_os("OSKL_DB_LIVE").is_none() {
             return;
         }
         let (ws, cx) = setup(cx);
         let id = live_mongo_docs("scroll_docs", 40, cx);
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["kite_test".into(), "scroll_docs".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "scroll_docs".into()] }, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         for mode in ["db-mode-json", "db-mode-list"] {
@@ -9768,10 +9768,10 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         }
     }
 
-    /// With the test PostgreSQL server running (KITE_DB_LIVE=1, port 55432).
+    /// With the test PostgreSQL server running (OSKL_DB_LIVE=1, port 55432).
     #[gpui::test]
     fn a_postgres_table_is_browsed_searched_and_queried(cx: &mut TestAppContext) {
-        if std::env::var_os("KITE_DB_LIVE").is_none() {
+        if std::env::var_os("OSKL_DB_LIVE").is_none() {
             return;
         }
         let (ws, cx) = setup(cx);

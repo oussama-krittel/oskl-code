@@ -1,5 +1,5 @@
 [package]
-name = "kite"
+name = "oskl"
 version = "0.1.0"
 edition = "2024"
 description = "A lightweight, git-first code editor for macOS"

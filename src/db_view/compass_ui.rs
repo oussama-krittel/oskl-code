@@ -181,7 +181,7 @@ struct Recent {
 }
 
 fn history_file() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/kite/mongo-queries.json"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/oskl/mongo-queries.json"))
 }
 
 fn read_history() -> Vec<Recent> {

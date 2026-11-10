@@ -17,10 +17,10 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) fn runtime() -> &'static tokio::runtime::Handle {
     static RT: OnceLock<tokio::runtime::Handle> = OnceLock::new();
     RT.get_or_init(|| {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().thread_name("kite-db").build().expect("database runtime");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().thread_name("oskl-db").build().expect("database runtime");
         let handle = rt.handle().clone();
         std::thread::Builder::new()
-            .name("kite-db".into())
+            .name("oskl-db".into())
             .stack_size(1 << 20)
             .spawn(move || rt.block_on(close_idle()))
             .expect("database thread");

@@ -438,7 +438,7 @@ impl AgentView {
             return then(self, Err(e), cx);
         }
         self.n += 1;
-        let id = format!("kite-{}", self.n);
+        let id = format!("oskl-{}", self.n);
         match self.proc.as_mut().map(|p| p.send(&agent::control(&id, req))) {
             Some(Ok(())) => {
                 self.waiting.insert(id, Box::new(then));

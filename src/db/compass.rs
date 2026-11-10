@@ -1042,7 +1042,7 @@ mod tests {
     }
 }
 
-/// Against the test MongoDB (KITE_DB_LIVE=1, port 57017).
+/// Against the test MongoDB (OSKL_DB_LIVE=1, port 57017).
 #[cfg(test)]
 mod live {
     use super::super::{Conn, Kind, Scope, engine};
@@ -1054,7 +1054,7 @@ mod live {
 
     #[test]
     fn compass_tabs_work_on_a_real_server() {
-        if std::env::var_os("KITE_DB_LIVE").is_none() {
+        if std::env::var_os("OSKL_DB_LIVE").is_none() {
             return;
         }
         let mut c = Conn::new(Kind::MongoDb);
@@ -1063,8 +1063,8 @@ mod live {
         crate::db::save(&c, Some("mongopw")).unwrap();
         engine::open(&c.id);
         let docs: Vec<String> = (0..30).map(|i| format!("{{n: {i}, name: 'p{i}', group: {}}}", i % 3)).collect();
-        wait(engine::query(c.clone(), Scope { database: Some("kite_test".into()), collection: None }, format!("db.compass.drop()\ndb.compass.insertMany([{}])", docs.join(", ")))).unwrap();
-        let on = |c: &Conn| (c.clone(), "kite_test".to_string(), "compass".to_string());
+        wait(engine::query(c.clone(), Scope { database: Some("oskl_test".into()), collection: None }, format!("db.compass.drop()\ndb.compass.insertMany([{}])", docs.join(", ")))).unwrap();
+        let on = |c: &Conn| (c.clone(), "oskl_test".to_string(), "compass".to_string());
         let (cc, db, coll) = on(&c);
         wait(engine::mongo(cc, move |cl| async move { create_index(&cl, &db, &coll, "{n: 1}", "").await })).unwrap();
 

@@ -154,7 +154,7 @@ const LAST: &[&str] = &["Lee", "Martin", "Nakamura", "Okafor", "Petrov", "Quinn"
 const CITIES: &[&str] = &["Paris", "Berlin", "Tokyo", "Lisbon", "Casablanca", "Montreal", "Madrid", "Oslo", "Seoul", "Lima"];
 const COUNTRIES: &[&str] = &["France", "Germany", "Japan", "Portugal", "Morocco", "Canada", "Spain", "Norway", "Korea", "Peru"];
 const COLORS: &[&str] = &["red", "green", "blue", "orange", "purple", "teal", "yellow", "black", "white", "gray"];
-const WORDS: &[&str] = &["alpha", "bridge", "cloud", "delta", "ember", "forest", "glow", "harbor", "island", "jungle", "kite", "lunar", "meadow", "nova", "orbit", "pixel"];
+const WORDS: &[&str] = &["alpha", "bridge", "cloud", "delta", "ember", "forest", "glow", "harbor", "island", "jungle", "oskl", "lunar", "meadow", "nova", "orbit", "pixel"];
 
 fn pick(list: &[&str]) -> String {
     list[fastrand::usize(..list.len())].to_string()
