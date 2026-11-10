@@ -87,7 +87,8 @@ pub async fn find_page(c: &Client, db: &str, coll: &str, q: &FindQuery, offset: 
         Some(l) => (l - offset).min(page as u64),
         None => page as u64,
     };
-    let sort = f.sort.clone().or_else(|| column_sort.map(|(col, desc)| doc! { col: if *desc { -1 } else { 1 } }));
+    // A column header clicked sorts by it (over the bar's own sort), across every page.
+    let sort = column_sort.map(|(col, desc)| doc! { col: if *desc { -1 } else { 1 } }).or_else(|| f.sort.clone());
     let docs: Vec<Document> = if take == 0 {
         Vec::new()
     } else {
@@ -1078,6 +1079,15 @@ mod live {
         let qq = q.clone();
         let p = wait(engine::mongo(cc, move |cl| async move { find_page(&cl, &db, &coll, &qq, 3, 3, None).await })).unwrap();
         assert_eq!(p.grid.rows.len(), 2, "the limit ends the last page");
+
+        // A column header sort covers every page (and wins over the bar's own sort): page 2 continues page 1.
+        let (cc, db, coll) = on(&c);
+        let p = wait(engine::mongo(cc, move |cl| async move {
+            find_page(&cl, &db, &coll, &FindQuery { sort: "{name: 1}".into(), ..Default::default() }, 3, 3, Some(&("n".to_string(), true))).await
+        }))
+        .unwrap();
+        let ns: Vec<String> = p.grid.rows.iter().map(|r| r[p.grid.columns.iter().position(|c| c == "n").unwrap()].clone().unwrap()).collect();
+        assert_eq!(ns, ["26", "25", "24"]);
 
         // Explain: the index it used.
         let (cc, db, coll) = on(&c);

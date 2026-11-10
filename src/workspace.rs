@@ -8952,6 +8952,8 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         click_on(cx, "db-col-1");
         wait_for(cx, "sorted", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         assert_eq!(tab.read_with(cx, |t, _| t.table_scroll_x()), x, "still where it was");
+        let (cols, _, _) = tab.read_with(cx, |t, _| t.data_summary()).unwrap();
+        assert_eq!(&cols[..3], ["_id", "n", "name"], "the columns kept their order: {cols:?}");
         let grid = cx.debug_bounds("db-grid").unwrap();
         cx.simulate_event(gpui::ScrollEvent { position: grid.center(), delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-120.))), ..Default::default() });
         cx.run_until_parked();

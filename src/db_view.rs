@@ -143,6 +143,20 @@ struct Data {
     names: assist::Shared,
 }
 
+/// Puts a grid's columns in the order of `old` (those it has), the others after them.
+fn keep_column_order(old: &[String], g: &mut Grid) {
+    let mut order: Vec<usize> = old.iter().filter_map(|c| g.columns.iter().position(|x| x == c)).collect();
+    let rest: Vec<usize> = (0..g.columns.len()).filter(|i| !order.contains(i)).collect();
+    order.extend(rest);
+    if order.iter().enumerate().all(|(a, b)| a == *b) {
+        return;
+    }
+    g.columns = order.iter().map(|i| g.columns[*i].clone()).collect();
+    for row in &mut g.rows {
+        *row = order.iter().map(|i| row.get(*i).cloned().flatten()).collect();
+    }
+}
+
 /// Remembers the fields (columns) of results, for suggestions; MongoDB's nested ones as `a.b`.
 fn learn_fields(names: &assist::Shared, g: &Grid) {
     let mut n = names.borrow_mut();
@@ -486,7 +500,13 @@ impl DbView {
                     d.loading = false;
                     let keep_cols = d.grid.as_ref().map(|g| g.grid.columns.clone());
                     d.grid = r.as_ref().ok().map(|p| {
-                        let mut g = GridView::new(p.grid.clone());
+                        let mut grid = p.grid.clone();
+                        // Columns stay in the order shown (sorting puts other documents first,
+                        // whose fields may come in another order); new ones go at the end.
+                        if let Some(old) = &keep_cols {
+                            keep_column_order(old, &mut grid);
+                        }
+                        let mut g = GridView::new(grid);
                         // Same columns (another page, a search): keep their widths, so nothing jumps.
                         if keep_cols.as_ref() == Some(&p.grid.columns)
                             && let Some(old) = &d.grid
@@ -3104,6 +3124,14 @@ impl Render for DbView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn columns_keep_their_order() {
+        let mut g = crate::db::Grid { columns: vec!["_id".into(), "zzz".into(), "n".into()], rows: vec![vec![Some("1".into()), Some("z".into()), Some("5".into())]], ..Default::default() };
+        super::keep_column_order(&["_id".into(), "n".into(), "name".into()], &mut g);
+        assert_eq!(g.columns, ["_id", "n", "zzz"]);
+        assert_eq!(g.rows[0], [Some("1".into()), Some("5".into()), Some("z".into())]);
+    }
+
     #[test]
     fn counts_read_easily() {
         assert_eq!(super::group_digits(1234567), "1,234,567");
