@@ -492,8 +492,13 @@ impl DbView {
                             && let Some(old) = &d.grid
                         {
                             g.widths = old.widths.clone();
-                            // And the same columns in view: sorting or paging doesn't scroll back to the first.
+                        }
+                        // Sorting, paging, a save or refresh keeps the place: the columns in view (sorted
+                        // documents can list their fields in another order, so whatever they are), and
+                        // what was opened in the documents.
+                        if let Some(old) = &d.grid {
                             g.hscroll = old.hscroll.clone();
+                            g.unfolded = old.unfolded.clone();
                         }
                         g
                     });
@@ -789,8 +794,8 @@ impl DbView {
     fn set_doc_mode(&mut self, mode: DocMode, cx: &mut Context<Self>) {
         // A key or value being typed is kept; a document typed as JSON becomes its change, so
         // every view shows it (with Cancel and Update) until it's saved or dropped.
-        if self.editing.is_some() {
-            self.commit_edit_quietly(cx);
+        if self.editing.is_some() && !self.commit_edit_quietly(cx) {
+            return; // fix what's typed first (the bar says why)
         }
         let mut carried: Vec<(Option<usize>, usize, mongodb::bson::Document)> = Vec::new();
         if let Body::Data(d) = &self.body
@@ -1977,8 +1982,9 @@ impl DbView {
     }
 
     /// What's typed in an edit box goes into the document (switching views).
-    fn commit_edit_quietly(&mut self, cx: &mut Context<Self>) {
-        let Some(ed) = self.editing.take() else { return };
+    /// False when it can't be (the edit box stays open, the reason shown in the bar).
+    fn commit_edit_quietly(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(ed) = self.editing.take() else { return true };
         let text = ed.editor.read(cx).text();
         let (which, row) = (ed.which, ed.row);
         let op = if ed.key {
@@ -1993,10 +1999,21 @@ impl DbView {
             }
         } else {
             let value = if ed.fresh && !ed.ty_chosen { compass::edit_value(&text, None) } else { compass::typed_value(&text, ed.ty) };
-            value.ok().map(|v| (compass::Op::Set(ed.path.clone(), v), ed.path.clone()))
+            match value {
+                Ok(v) => Some((compass::Op::Set(ed.path.clone(), v), ed.path.clone())),
+                Err(e) => {
+                    if let Some(d) = self.doc_edit(which, row) {
+                        d.error = Some(e);
+                    }
+                    self.editing = Some(ed);
+                    self.remeasure(which, row, cx);
+                    return false;
+                }
+            }
         };
-        if let Some((op, mark)) = op {
-            self.edit_op(which, row, op, Some(mark), cx);
+        match op {
+            Some((op, mark)) => self.edit_op(which, row, op, Some(mark), cx),
+            None => true,
         }
     }
 
@@ -2060,8 +2077,8 @@ impl DbView {
         let [db, coll] = d.path.as_slice() else { return };
         let (conn, db, coll) = (d.conn.clone(), db.clone(), coll.clone());
         // What's still in an edit box is part of it.
-        if self.editing.as_ref().is_some_and(|e| e.which == which && e.row == row) {
-            self.commit_edit_quietly(cx);
+        if self.editing.as_ref().is_some_and(|e| e.which == which && e.row == row) && !self.commit_edit_quietly(cx) {
+            return; // what's typed isn't a value of its type: said in the bar
         }
         let Some(e) = self.doc_edit(which, row) else { return };
         if e.saving || e.ops.is_empty() {
@@ -2106,6 +2123,19 @@ impl DbView {
     pub fn set_table_scroll_x(&self, x: f32) {
         if let Some(g) = self.grid_of(None) {
             g.hscroll.set_offset(gpui::point(gpui::px(-x), gpui::px(0.)));
+        }
+    }
+
+    #[cfg(test)]
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.load(cx);
+    }
+
+    #[cfg(test)]
+    pub fn choose_type(&mut self, ty: &'static str) {
+        if let Some(ed) = self.editing.as_mut() {
+            ed.ty = ty;
+            ed.ty_chosen = true;
         }
     }
 
@@ -2416,6 +2446,7 @@ impl DbView {
                         let piece = v.sel.text_piece(((row * 100_000 + id) as u64, 0), format!("{key_text}: "), theme::fg_bright(), true);
                         let renamable = w.editable && matches!(seg, Seg::Key(_)) && !top_id;
                         let path_k = here.clone();
+                        let refold = container.then(|| fold.clone());
                         Some(
                             div()
                                 .id(("db-key", id))
@@ -2425,6 +2456,10 @@ impl DbView {
                                     d.on_click(cx.listener(move |v, ev: &ClickEvent, window, cx| {
                                         if ev.click_count() == 2 {
                                             cx.stop_propagation();
+                                            // The first click of the two folded or unfolded it: put it back.
+                                            if let Some(f) = &refold {
+                                                v.toggle_fold(which, row, f.clone(), cx);
+                                            }
                                             v.edit_anchor = None;
                                             v.start_edit(which, row, path_k.clone(), true, false, window, cx);
                                         }

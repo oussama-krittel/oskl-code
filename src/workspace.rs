@@ -8804,6 +8804,33 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(cx.debug_bounds("db-doc-bar-0").is_none());
         assert_eq!(read_back(&conn), saved, "nothing saved");
 
+        // An object opened stays open while a field in it is edited, and after the save.
+        click_on(cx, "db-value-0-6");
+        assert!(cx.debug_bounds("db-value-0-7").is_some(), "addr opened: city");
+        dbl(cx, "db-value-0-7");
+        assert!(cx.debug_bounds("db-value-0-8").is_some(), "still open while typing");
+        type_in(cx, "Bergen");
+        click_on(cx, "db-doc-update-0");
+        wait_for(cx, "saved", |cx| cx.debug_bounds("db-doc-bar-0").is_none());
+        assert!(read_back(&conn).contains("city: 'Bergen'"), "{}", read_back(&conn));
+        wait_for(cx, "shown again", |cx| cx.debug_bounds("db-value-0-3").is_some());
+        assert!(cx.debug_bounds("db-value-0-7").is_some(), "addr still open after saving");
+
+        // Not a value of its type (an ObjectId here): the bar says why, nothing is saved.
+        let before = read_back(&conn);
+        dbl(cx, "db-value-0-4");
+        tab.update(cx, |t, _| t.choose_type("ObjectId"));
+        let ed = tab.read_with(cx, |t, _| t.editor_in_card()).unwrap();
+        ed.update(cx, |e, cx| e.set_text("not-an-id", cx));
+        click_on(cx, "db-doc-update-0");
+        assert!(tab.read_with(cx, |t, _| t.card_error(0)).is_some_and(|e| e.contains("ObjectId")), "{:?}", tab.read_with(cx, |t, _| t.card_error(0)));
+        assert!(cx.debug_bounds("db-doc-bar-0").is_some(), "shown in the bar");
+        assert!(tab.read_with(cx, |t, _| t.editor_in_card()).is_some(), "the box stays to fix it");
+        cx.simulate_keystrokes("enter");
+        assert!(tab.read_with(cx, |t, _| t.card_error(0)).is_some(), "Enter says so too");
+        assert_eq!(read_back(&conn), before, "nothing saved");
+        click_on(cx, "db-doc-cancel-0");
+
         // Changed on the server meanwhile: Update says so and saves nothing.
         dbl(cx, "db-value-0-4");
         type_in(cx, "Cy");
@@ -8914,6 +8941,14 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         cx.run_until_parked();
         let x = tab.read_with(cx, |t, _| t.table_scroll_x());
         assert!(x > 0., "the table scrolls sideways in a narrow window");
+        // A second document whose fields come in another order: sorting changes the columns' order.
+        shell(&conn, "db.edit_more.insertOne({zzz: 1, n: -5, name: 'first'})");
+        tab.update(cx, |t, cx| t.reload(cx));
+        wait_for(cx, "two", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 2));
+        tab.update(cx, |t, _| t.set_table_scroll_x(60.));
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+        let x = tab.read_with(cx, |t, _| t.table_scroll_x());
         click_on(cx, "db-col-1");
         wait_for(cx, "sorted", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         assert_eq!(tab.read_with(cx, |t, _| t.table_scroll_x()), x, "still where it was");
@@ -8921,6 +8956,9 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         cx.simulate_event(gpui::ScrollEvent { position: grid.center(), delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-120.))), ..Default::default() });
         cx.run_until_parked();
         assert_eq!(tab.read_with(cx, |t, _| t.table_scroll_x()), x, "not sideways");
+        shell(&conn, "db.edit_more.deleteOne({zzz: 1})");
+        tab.update(cx, |t, cx| t.reload(cx));
+        wait_for(cx, "one again", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 1));
         cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(900.)));
         cx.run_until_parked();
         click_on(cx, "db-mode-json");
