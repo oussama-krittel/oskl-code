@@ -21,7 +21,7 @@ fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
-const CODE_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "rs", "py", "go", "css", "scss"];
+const CODE_EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "rs", "py", "go", "css", "scss", "java"];
 
 /// What ⌘ over `pos` points at: the import string, or the name.
 pub enum Hit {
@@ -298,6 +298,16 @@ pub fn find(buf: &Buffer, pos: usize, file: Option<&Path>, root: Option<&Path>) 
         },
         Hit::Name(name, range) => {
             let here = file.map(Path::to_path_buf).unwrap_or_default();
+            // Java: packages and imports.
+            if let Some(f) = file.filter(|f| f.extension().is_some_and(|e| e == "java")) {
+                if let Some(t) = crate::java::find(&text, range.clone(), &name, f, root) {
+                    return Found::At(t);
+                }
+                // A package in an import isn't anywhere; other names may be members elsewhere.
+                let line = buf.line(buf.pos_to_rc(range.start).0);
+                let t = line.trim_start();
+                return if t.starts_with("import ") || t.starts_with("package ") { Found::Nothing } else { Found::Search(name) };
+            }
             let rust = file.filter(|f| f.extension().is_some_and(|e| e == "rs"));
             // Rust paths (`use a::b`, `a::b::c`) and names their `use`s bring in.
             if let Some(f) = rust
@@ -361,7 +371,7 @@ pub fn search_project(root: &Path, name: &str, skip: Option<&Path>, exported_onl
     let mut fallback: Option<Target> = None;
     let n = regex::escape(name);
     let exported = re(&format!(
-        r"(?m)\bexport\s+(?:declare\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?|class|abstract\s+class|interface|type|enum|namespace|const|let|var)\s+({n})\b|\bpub(?:\([^)]*\))?\s+(?:async\s+)?(?:fn|struct|enum|trait|type|const|mod)\s+({n})\b"
+        r"(?m)\bexport\s+(?:declare\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?|class|abstract\s+class|interface|type|enum|namespace|const|let|var)\s+({n})\b|\bpub(?:\([^)]*\))?\s+(?:async\s+)?(?:fn|struct|enum|trait|type|const|mod)\s+({n})\b|\bpublic\s+(?:(?:abstract|final|sealed|static)\s+)*(?:class|interface|enum|record)\s+({n})\b"
     ));
     while let Some(dir) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
@@ -389,7 +399,7 @@ pub fn search_project(root: &Path, name: &str, skip: Option<&Path>, exported_onl
             if !text.contains(name) {
                 continue;
             }
-            if let Some(m) = exported.captures(&text).and_then(|c| c.get(1).or(c.get(2))) {
+            if let Some(m) = exported.captures(&text).and_then(|c| c.get(1).or(c.get(2)).or(c.get(3))) {
                 let (row, col) = row_col(&text, m.start());
                 return Some(Target { path: p, row, col });
             }
