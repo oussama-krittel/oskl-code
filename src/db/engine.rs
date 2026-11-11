@@ -28,11 +28,22 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Handle {
     })
 }
 
-/// Runs `work` on the database thread; awaitable from GPUI's executor.
+/// Stops the work when what's waiting for it goes (a newer query, Stop, the tab closed).
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Runs `work` on the database thread; awaitable from GPUI's executor. Dropping the returned
+/// future stops the work.
 pub fn run<T: Send + 'static>(work: impl Future<Output = Result<T>> + Send + 'static) -> impl Future<Output = Result<T, String>> {
-    let task = runtime().spawn(async move { tokio::time::timeout(Duration::from_secs(10 * 60), work).await.map_err(|_| anyhow!("timed out"))? });
+    let task = AbortOnDrop(runtime().spawn(async move { tokio::time::timeout(Duration::from_secs(10 * 60), work).await.map_err(|_| anyhow!("timed out"))? }));
     async move {
-        match task.await {
+        let mut task = task;
+        match (&mut task.0).await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(clean_error(&format!("{e:#}"))),
             Err(_) => Err("stopped".into()),
@@ -240,6 +251,20 @@ pub async fn query(conn: Conn, scope: Scope, text: String) -> Result<Vec<Grid>> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dropped_work_stops() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        let work = super::run(async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            DONE.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        drop(work);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!DONE.load(Ordering::SeqCst), "stopped when nobody waits for it");
+    }
+
     #[test]
     fn driver_errors_read_cleanly() {
         assert_eq!(super::clean_error("db error: error: relation \"x\" does not exist"), "relation \"x\" does not exist");

@@ -356,6 +356,8 @@ pub struct Editor {
     pub chat: bool,
     /// One line, but brackets and quotes close themselves as in code (a query box).
     pub pairs: bool,
+    /// Enter always submits (a suggestion shown is taken with Tab instead).
+    pub enter_submits: bool,
     /// Suggestions from outside (the chat's @files and /commands): given the line up to the
     /// cursor, the text the choice replaces and the choices.
     pub suggest: Option<Rc<dyn Fn(&str) -> Option<(String, Vec<complete::Item>)>>>,
@@ -448,6 +450,7 @@ impl Editor {
             secret: false,
             chat: false,
             pairs: false,
+            enter_submits: false,
             suggest: None,
             read_only: false,
             scroll_x: 0.,
@@ -1634,7 +1637,10 @@ impl Editor {
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
         if self.completion.is_some() {
-            return self.accept_completion(cx);
+            if !self.enter_submits {
+                return self.accept_completion(cx);
+            }
+            self.completion = None;
         }
         match self.mode {
             EditorMode::SingleLine => cx.emit(EditorEvent::Submit),

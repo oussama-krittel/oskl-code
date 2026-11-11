@@ -8876,6 +8876,124 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
 
     /// With the test MongoDB server running (OSKL_DB_LIVE=1, port 57017).
     #[gpui::test]
+    fn mongodb_tables_handle_clicks_scrolls_and_selection(cx: &mut TestAppContext) {
+        if std::env::var_os("OSKL_DB_LIVE").is_none() {
+            return;
+        }
+        let (ws, cx) = setup(cx);
+        let id = live_mongo_docs("table_ux", 40, cx);
+        let conn = crate::db::load().into_iter().find(|c| c.id == id).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id.clone(), path: vec!["oskl_test".into(), "table_ux".into()] }, window, cx));
+        let tab = db_tab(&ws, cx).expect("a data tab");
+        wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
+        let dbl = |cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>| {
+            for n in [1, 2] {
+                cx.simulate_event(gpui::MouseDownEvent { position: at, button: gpui::MouseButton::Left, click_count: n, ..Default::default() });
+                cx.simulate_event(gpui::MouseUpEvent { position: at, button: gpui::MouseButton::Left, click_count: n, ..Default::default() });
+            }
+            cx.run_until_parked();
+        };
+
+        // Switching the view keeps the documents in view.
+        tab.update(cx, |t, _| t.scroll_docs_to(10));
+        cx.run_until_parked();
+        click_on(cx, "db-mode-json");
+        assert_eq!(tab.read_with(cx, |t, _| t.docs_scroll_top()), 10, "still at the 11th document");
+        tab.update(cx, |t, _| t.scroll_docs_to(0));
+
+        // Table: a double-click edits the cell without opening the row.
+        click_on(cx, "db-mode-table");
+        let name_col = cx.debug_bounds("db-col-2").unwrap();
+        let cell = gpui::point(name_col.left() + gpui::px(20.), name_col.bottom() + gpui::px(13.));
+        dbl(cx, cell);
+        assert!(cx.debug_bounds("db-cell-editor").is_some(), "typing in the cell");
+        assert!(cx.debug_bounds("db-fields").is_none(), "the row didn't open");
+        // + adds a field: its name asked for (said so), then its value; the bar names it.
+        click_on(cx, "db-cell-add");
+        assert!(cx.debug_bounds("db-cell-label").is_some(), "New field name");
+        let ed = tab.read_with(cx, |t, _| t.editor_in_card()).unwrap();
+        ed.update(cx, |e, cx| e.set_text("extra", cx));
+        cx.simulate_keystrokes("enter");
+        let ed = tab.read_with(cx, |t, _| t.editor_in_card()).unwrap();
+        ed.update(cx, |e, cx| e.set_text("1", cx));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(tab.read_with(cx, |t, _| t.added_fields(0)), ["extra"]);
+        click_on(cx, "db-doc-cancel-0");
+
+        // ⌘A, ⌘C: every row of the page, tab-separated, with the column names.
+        let grid = cx.debug_bounds("db-grid").unwrap();
+        cx.simulate_click(gpui::point(grid.right() - gpui::px(5.), grid.bottom() - gpui::px(5.)), gpui::Modifiers::none());
+        tab.update_in(cx, |t, window, cx| window.focus(&gpui::Focusable::focus_handle(t, cx), cx));
+        cx.simulate_keystrokes("cmd-a cmd-c");
+        let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default();
+        assert_eq!(copied.lines().count(), 26, "the header and 25 rows");
+        assert!(copied.starts_with("_id\tn\tname"), "{}", &copied[..60.min(copied.len())]);
+
+        // A column's edge dragged: wider; double-clicked: as it was.
+        let w0 = tab.read_with(cx, |t, _| t.col_width(1));
+        let edge = cx.debug_bounds("db-col-resize-1").unwrap().center();
+        cx.simulate_mouse_down(edge, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(gpui::point(edge.x + gpui::px(60.), edge.y), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_up(gpui::point(edge.x + gpui::px(60.), edge.y), gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!((tab.read_with(cx, |t, _| t.col_width(1)) - (w0 + 60.)).abs() < 1., "dragged wider");
+        let edge = cx.debug_bounds("db-col-resize-1").unwrap().center();
+        dbl(cx, edge);
+        assert!((tab.read_with(cx, |t, _| t.col_width(1)) - w0).abs() < 1., "back as it was");
+
+        // Scrolled sideways: the numbers and _id stay on the left.
+        assert!(cx.debug_bounds("db-pinned-0").is_none());
+        cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(700.)));
+        tab.update(cx, |t, _| t.set_table_scroll_x(200.));
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+        let pinned = cx.debug_bounds("db-pinned-0").expect("pinned when scrolled");
+        let grid = cx.debug_bounds("db-grid").unwrap();
+        assert!((pinned.left() - grid.left()).abs() < gpui::px(2.), "at the left edge");
+        cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(900.)));
+        tab.update(cx, |t, _| t.set_table_scroll_x(0.));
+        cx.run_until_parked();
+
+        // The query bar: Enter finds, even with suggestions shown.
+        let (filter, shell) = tab.read_with(cx, |t, _| t.editors());
+        tab.update_in(cx, |_, window, cx| window.focus(&filter.read(cx).focus_target(cx), cx));
+        filter.update(cx, |e, cx| e.set_text("", cx));
+        cx.simulate_input("{ na");
+        assert!(!filter.read_with(cx, |e, _| e.completion_labels()).is_empty());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(filter.read_with(cx, |e, _| e.text()), "{ na}", "not completed");
+        assert!(tab.read_with(cx, |t, _| t.bar_error()).is_some(), "Find ran (and said what's wrong)");
+        filter.update(cx, |e, cx| e.set_text("", cx));
+
+        // Stop: a slow query stopped.
+        click_on(cx, "db-tab-query");
+        shell.update(cx, |e, cx| e.set_text("db.table_ux.find({$where: 'sleep(100) || true'})", cx));
+        tab.update(cx, |t, cx| t.run_shell_for_test(cx));
+        assert!(tab.read_with(cx, |t, _| t.query_status()).0, "running");
+        click_on(cx, "db-run");
+        assert_eq!(tab.read_with(cx, |t, _| t.query_status()), (false, Some("Stopped".into())));
+        let _ = conn;
+
+        // The side panel: folding a database away doesn't open its page again.
+        ws.update_in(cx, |ws, window, cx| {
+            ws.db_panel.update(cx, |p, cx| p.reload_and_expand(None, cx));
+            ws.select_side(super::Side::Databases, window, cx)
+        });
+        cx.run_until_parked();
+        click_on(cx, "db-conn-Mongo");
+        wait_for(cx, "the databases", |cx| cx.debug_bounds("db-node-oskl_test").is_some());
+        click_on(cx, "db-node-oskl_test");
+        let open_db_tabs = |ws: &gpui::Entity<Workspace>, cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.tabs.iter().filter(|t| matches!(&t.kind, TabKind::Db(v) if v.read(cx).title().0 == "oskl_test")).count());
+        assert_eq!(open_db_tabs(&ws, cx), 1, "opened, its page shown");
+        let ix = ws.read_with(cx, |ws, _| ws.active.unwrap());
+        ws.update_in(cx, |ws, window, cx| ws.close_tab(ix, true, window, cx));
+        click_on(cx, "db-node-oskl_test");
+        assert_eq!(open_db_tabs(&ws, cx), 0, "folded away: no page opened");
+    }
+
+    /// With the test MongoDB server running (OSKL_DB_LIVE=1, port 57017).
+    #[gpui::test]
     fn mongodb_edits_keep_data_safe(cx: &mut TestAppContext) {
         if std::env::var_os("OSKL_DB_LIVE").is_none() {
             return;
@@ -9234,8 +9352,8 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert_eq!(filter.read_with(cx, |e, _| e.text()), "{}", "closed");
         cx.simulate_input(" na");
         assert_eq!(filter.read_with(cx, |e, _| e.completion_labels()).first().map(String::as_str), Some("name"));
-        cx.simulate_keystrokes("enter");
-        assert_eq!(filter.read_with(cx, |e, _| e.text()), "{ name}");
+        cx.simulate_keystrokes("tab");
+        assert_eq!(filter.read_with(cx, |e, _| e.text()), "{ name}", "Tab takes the suggestion");
         filter.update(cx, |e, cx| e.set_text("", cx));
         // The shell suggests the database's collections after db.
         click_on(cx, "db-tab-query");
@@ -9889,6 +10007,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         for mode in ["db-mode-json", "db-mode-list"] {
             click_on(cx, mode);
             tab.update(cx, |t, _| t.scroll_docs_to_top());
+            cx.update(|w, _| w.refresh());
             cx.run_until_parked();
             // The wheel over a value (not between the cards) scrolls the documents.
             let card = cx.debug_bounds("db-card-0").expect("the first card");

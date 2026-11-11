@@ -24,13 +24,14 @@ mod sel;
 use compass_ui::{AGG, Compass};
 pub use compass_ui::CTab;
 
-actions!(db_view, [RunQuery, CopyCell, RefreshData, RowUp, RowDown, CloseDetail]);
+actions!(db_view, [RunQuery, CopyCell, RefreshData, RowUp, RowDown, CloseDetail, SelectAllRows]);
 
 pub fn bind_keys() {
     crate::keybindings::collect([
         crate::keybindings::kb("cmd-enter", RunQuery, Some("DbView")),
         crate::keybindings::kb("cmd-enter", RunQuery, Some("DbView > Editor")),
         crate::keybindings::kb("cmd-c", CopyCell, Some("DbView")),
+        crate::keybindings::kb("cmd-a", SelectAllRows, Some("DbView")),
         crate::keybindings::kb("cmd-r", RefreshData, Some("DbView")),
         crate::keybindings::kb("up", RowUp, Some("DbView")),
         crate::keybindings::kb("down", RowDown, Some("DbView")),
@@ -77,6 +78,10 @@ pub struct DbView {
     editing: Option<Editing>,
     /// Table: the cell the next edit box opens over.
     edit_anchor: Option<usize>,
+    /// Table: the opened row before the last click (a double-click puts it back).
+    open_before: Option<Option<usize>>,
+    /// A column's edge being dragged: (grid, column, where the drag started, its width then).
+    col_drag: Option<(Option<usize>, usize, gpui::Pixels, f32)>,
 }
 
 enum Body {
@@ -199,6 +204,11 @@ pub(crate) fn confirm_destructive(what: &str, on: &str, weak: gpui::WeakEntity<D
     }));
 }
 
+/// Whether a table's first column is an id, kept in view when it scrolls sideways.
+fn pinned_first(columns: &[String]) -> bool {
+    columns.first().is_some_and(|c| c == "_id" || c.eq_ignore_ascii_case("id"))
+}
+
 /// Remembers the fields (columns) of results, for suggestions; MongoDB's nested ones as `a.b`.
 fn learn_fields(names: &assist::Shared, g: &Grid) {
     let mut n = names.borrow_mut();
@@ -263,6 +273,8 @@ enum Menu {
 /// the unfolded parts of its documents.
 struct GridView {
     grid: Arc<Grid>,
+    /// The widths the columns started with (a double-click on a header's edge puts one back).
+    auto_widths: Vec<f32>,
     widths: Vec<f32>,
     types: Vec<String>,
     list: ListState,
@@ -331,12 +343,12 @@ impl GridView {
             .collect();
         let types = column_types(&grid);
         // The header shows the name and (MongoDB) its type: room for both.
-        let widths = widths.into_iter().enumerate().map(|(c, w): (usize, f32)| {
+        let widths: Vec<f32> = widths.into_iter().enumerate().map(|(c, w): (usize, f32)| {
             let head = grid.columns[c].chars().count() + types.get(c).map(|t| t.len() + 1).unwrap_or(0) + 3;
             w.max((head as f32 * 7.6 + 26.).min(420.))
         }).collect();
         let list = ListState::new(grid.rows.len(), ListAlignment::Top, gpui::px(600.));
-        GridView { grid: Arc::new(grid), widths, types, list, hscroll: ScrollHandle::new(), sel: None, open: None, unfolded: HashSet::new(), edits: HashMap::new(), json_edits: HashMap::new() }
+        GridView { grid: Arc::new(grid), auto_widths: widths.clone(), widths, types, list, hscroll: ScrollHandle::new(), sel: None, open: None, unfolded: HashSet::new(), edits: HashMap::new(), json_edits: HashMap::new() }
     }
 
     fn selected_text(&self) -> Option<(String, Option<String>)> {
@@ -424,7 +436,7 @@ impl DbView {
                 None => Body::Missing("This connection was deleted.".into()),
             },
         };
-        let mut v = DbView { focus: cx.focus_handle(), open, body, _subs: subs, sel: sel::Selection::default(), editing: None, edit_anchor: None };
+        let mut v = DbView { focus: cx.focus_handle(), open, body, _subs: subs, sel: sel::Selection::default(), editing: None, edit_anchor: None, open_before: None, col_drag: None };
         v.load(cx);
         v.learn_names(cx);
         v.load_overview(cx);
@@ -963,8 +975,51 @@ impl DbView {
         self.sel.reset();
         let agg = d.compass.as_deref_mut().and_then(|c| c.agg.as_mut());
         for gv in d.grid.iter_mut().chain(d.results.iter_mut()).chain(agg) {
+            // The same document stays at the top (the rows are measured again for the new view).
+            let top = gv.list.logical_scroll_top().item_ix;
             gv.list.reset(gv.grid.rows.len());
+            gv.list.scroll_to(gpui::ListOffset { item_ix: top, offset_in_item: px(0.) });
         }
+        cx.notify();
+    }
+
+    /// Refresh, or Stop while reading (the rows shown stay).
+    fn stop_or_load(&mut self, cx: &mut Context<Self>) {
+        if let Body::Data(d) = &mut self.body
+            && d.loading
+        {
+            d.task = None; // dropping it stops the work
+            d.loading = false;
+            d.spec = d.grid.as_ref().map(|_| d.loaded_spec.clone()).unwrap_or_else(|| d.spec.clone());
+            return cx.notify();
+        }
+        self.load(cx);
+    }
+
+    /// Run, or Stop while running.
+    fn stop_or_run(&mut self, cx: &mut Context<Self>) {
+        if let Body::Data(d) = &mut self.body
+            && d.running.is_some()
+        {
+            d.query_task = None;
+            d.tick = None;
+            d.took = d.running.take().map(|t| t.elapsed());
+            d.query_error = Some("Stopped".into());
+            return cx.notify();
+        }
+        self.run_query(&RunQuery, &mut None, cx);
+    }
+
+    /// ⌘A: every row shown (the page), as ⌘C copies it: tab-separated in a table, documents as text.
+    fn select_all_rows(&mut self, _: &SelectAllRows, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((which, _)) = self.shown_grid() else { return };
+        let Some(gv) = self.grid_of(which) else { return };
+        let g = &gv.grid;
+        let text = match (self.doc_mode(gv), &g.trees) {
+            (DocMode::Table, _) | (_, None) => std::iter::once(g.columns.join("\t")).chain(g.rows.iter().map(|r| r.iter().map(|c| c.clone().unwrap_or_default()).collect::<Vec<_>>().join("\t"))).collect::<Vec<_>>().join("\n"),
+            (mode, Some(trees)) => trees.iter().map(|t| t.text(if mode == DocMode::Json { TextStyle::Json } else { TextStyle::Shell })).collect::<Vec<_>>().join("\n"),
+        };
+        self.sel.select_all(text);
         cx.notify();
     }
 
@@ -1549,6 +1604,28 @@ impl DbView {
     /// place when clicked; only what's on screen is drawn.
     fn render_grid(&self, which: Option<usize>, gv: &GridView, sortable: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let mode = self.doc_mode(gv);
+        // Only text drawn in this frame is under the pointer (rows scrolled away aren't).
+        self.sel.begin_frame();
+        // A drag past the top or bottom of the rows scrolls them, the selection following.
+        let edge_scroll = {
+            let (sel, list) = (self.sel.clone(), gv.list.clone());
+            move |ev: &gpui::MouseMoveEvent, window: &mut Window, _: &mut App| {
+                if !ev.dragging() || !sel.dragging() {
+                    return;
+                }
+                let vb = list.viewport_bounds();
+                let step = if ev.position.y < vb.top() + px(12.) {
+                    -px(18.)
+                } else if ev.position.y > vb.bottom() - px(12.) {
+                    px(18.)
+                } else {
+                    return;
+                };
+                list.scroll_by(step);
+                sel.drag_to(ev.position, window);
+                window.refresh();
+            }
+        };
         let body = list(gv.list.clone(), cx.processor(move |v: &mut DbView, ix: usize, _w, cx| v.render_item(which, ix, cx))).with_sizing_behavior(gpui::ListSizingBehavior::Auto).flex_1();
         if mode != DocMode::Table {
             let sel = self.sel.clone();
@@ -1561,6 +1638,7 @@ impl DbView {
                 .min_h_0()
                 // A press beside the text (an empty part of a line) starts a selection there too.
                 .on_mouse_down(MouseButton::Left, move |ev, window, _| sel.press(ev, window))
+                .on_mouse_move(edge_scroll)
                 .child(body)
                 .into_any_element();
         }
@@ -1570,7 +1648,26 @@ impl DbView {
             Body::Data(d) if sortable => d.spec.sort.clone(),
             _ => None,
         };
+        // Scrolled sideways: the row numbers and an id column stay on the left (drawn over the rest).
+        let shift = -gv.hscroll.offset().x;
+        let pin_first = pinned_first(&g.columns);
+        let pinned_head = (shift > px(0.)).then(|| {
+            div()
+                .absolute()
+                .top(px(0.))
+                .left(shift)
+                .h_full()
+                .flex()
+                .bg(theme::bg_side())
+                .border_r_1()
+                .border_color(theme::border())
+                .child(div().w(px(44.)).flex_none())
+                .when(pin_first, |d| {
+                    d.child(div().w(px(gv.widths[0])).flex_none().flex().items_center().px(px(8.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).overflow_hidden().whitespace_nowrap().child(g.columns[0].clone()))
+                })
+        });
         let header = div()
+            .relative()
             .flex()
             .flex_none()
             .h(px(28.))
@@ -1604,7 +1701,34 @@ impl DbView {
                     .child(div().min_w_0().overflow_hidden().text_ellipsis().font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(c.clone()))
                     .when(!ty.is_empty(), |d| d.child(div().flex_none().text_size(px(11.)).text_color(theme::fg_muted()).child(ty)))
                     .child(div().flex_none().text_color(theme::fg_muted()).child(arrow))
-            }));
+                    // Its right edge: dragged, the column's width; double-clicked, its width as at first.
+                    .relative()
+                    .child(
+                        div()
+                            .id(("db-col-resize", i))
+                            .debug_selector(move || format!("db-col-resize-{i}"))
+                            .absolute()
+                            .top(px(0.))
+                            .right(px(0.))
+                            .w(px(6.))
+                            .h_full()
+                            .cursor(gpui::CursorStyle::ResizeLeftRight)
+                            .hover(|s| s.bg(theme::focus_border()))
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |v, ev: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                let Some(gv) = v.grid_of_mut(which) else { return };
+                                if ev.click_count == 2 {
+                                    gv.widths[i] = gv.auto_widths[i];
+                                    v.col_drag = None;
+                                } else {
+                                    v.col_drag = Some((which, i, ev.position.x, gv.widths[i]));
+                                }
+                                cx.notify();
+                            }))
+                            .on_click(|_, _, cx| cx.stop_propagation()),
+                    )
+            }))
+            .children(pinned_head);
         div()
             .id(SharedString::from(format!("db-hscroll-{}", which.map(|i| i.to_string()).unwrap_or_default())))
             .debug_selector(|| "db-grid".into())
@@ -1615,6 +1739,7 @@ impl DbView {
             .restrict_scroll_to_axis()
             .track_scroll(&gv.hscroll)
             .on_mouse_down(MouseButton::Left, { let sel = self.sel.clone(); move |ev, window, _| sel.press(ev, window) })
+            .on_mouse_move(edge_scroll)
             // At least as wide as the pane: few columns share its width.
             .child(div().min_w(px(total_w)).w_full().h_full().flex().flex_col().text_size(px(12.5)).child(header).child(body))
             .into_any_element()
@@ -1953,6 +2078,12 @@ impl DbView {
         let Some(ed) = &self.editing else { return div().into_any_element() };
         let path = ed.path.clone();
         let (p_add, p_del) = (path.clone(), path.clone());
+        // A field being added has no column: say what's being typed.
+        let label = match (ed.key, ed.fresh, path.last()) {
+            (true, _, _) => Some("New field name".to_string()),
+            (false, true, Some(Seg::Key(k))) => Some(format!("{k} =")),
+            _ => None,
+        };
         deferred(
             div()
                 .debug_selector(|| "db-cell-editor".into())
@@ -1973,6 +2104,7 @@ impl DbView {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 // Clicks in it aren't clicks on the cell under it.
                 .on_click(|_, _, cx| cx.stop_propagation())
+                .when_some(label, |d, l| d.child(div().debug_selector(|| "db-cell-label".into()).flex_none().font_family(theme::UI_FONT).text_size(px(11.5)).text_color(theme::fg_dim()).child(l)))
                 .child(div().flex_1().min_w_0().h(px(22.)).px(px(6.)).flex().items_center().rounded(px(3.)).bg(theme::bg_input()).border_1().border_color(theme::focus_border()).font_family(theme::MONO_FONT).child(ed.editor.clone()))
                 .child(self.type_picker(cx))
                 .child(
@@ -2019,6 +2151,11 @@ impl DbView {
         // Modified only when it differs from the document as loaded (a value put back isn't a change).
         let modified = e.working != e.original;
         let (saving, error) = (e.saving, e.error.clone());
+        // Fields added (a table has no column for them yet).
+        let added: Vec<String> = match (&e.working, &e.original) {
+            (Tree::Object(w), Tree::Object(o)) => w.iter().filter(|(k, _)| !k.is_empty() && !o.iter().any(|(n, _)| n == k)).map(|(k, _)| k.clone()).collect(),
+            _ => Vec::new(),
+        };
         (modified || typing || error.is_some()).then(|| {
             div()
                 .debug_selector(move || format!("db-doc-bar-{r}"))
@@ -2032,6 +2169,7 @@ impl DbView {
                 .when(!modified && error.is_none(), |d| d.bg(theme::bg_side()))
                 .child(div().flex_1().min_w_0().text_color(theme::fg_bright()).child(match &error {
                     Some(e) => e.clone(),
+                    None if modified && !added.is_empty() => format!("Document modified. New field{}: {}", if added.len() == 1 { "" } else { "s" }, added.join(", ")),
                     None if modified => "Document modified.".to_string(),
                     None => String::new(),
                 }))
@@ -2348,6 +2486,35 @@ impl DbView {
     }
 
     #[cfg(test)]
+    pub fn col_width(&self, i: usize) -> f32 {
+        self.grid_of(None).map(|g| g.widths[i]).unwrap_or(0.)
+    }
+
+    #[cfg(test)]
+    pub fn scroll_docs_to(&self, item: usize) {
+        if let Some(g) = self.grid_of(None) {
+            g.list.scroll_to(gpui::ListOffset { item_ix: item, offset_in_item: px(0.) });
+        }
+    }
+
+    #[cfg(test)]
+    pub fn added_fields(&self, row: usize) -> Vec<String> {
+        let Some(e) = self.grid_of(None).and_then(|g| g.edits.get(&row)) else { return Vec::new() };
+        match (&e.working, &e.original) {
+            (Tree::Object(w), Tree::Object(o)) => w.iter().filter(|(k, _)| !o.iter().any(|(n, _)| n == k)).map(|(k, _)| k.clone()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn query_status(&self) -> (bool, Option<String>) {
+        match &self.body {
+            Body::Data(d) => (d.running.is_some(), d.query_error.clone()),
+            _ => (false, None),
+        }
+    }
+
+    #[cfg(test)]
     pub fn bar_sort(&self, cx: &App) -> String {
         match &self.body {
             Body::Data(d) => d.compass.as_ref().map(|c| c.sort_text(cx)).unwrap_or_default(),
@@ -2460,6 +2627,16 @@ impl DbView {
                         if editable && ev.click_count() == 2 && !container_cell {
                             let col = v.grid_of(which).and_then(|g| g.grid.columns.get(c).cloned());
                             if let Some(col) = col.filter(|c| c != "_id") {
+                                // The first click of the two opened (or closed) the row: as it was.
+                                if let Some(before) = v.open_before.take()
+                                    && let Some(gv) = v.grid_of_mut(which)
+                                    && gv.open != before
+                                {
+                                    for row in [gv.open, before].into_iter().flatten() {
+                                        gv.list.splice(row..row + 1, 1);
+                                    }
+                                    gv.open = before;
+                                }
                                 v.edit_anchor = Some(c);
                                 return v.start_edit(which, r, vec![Seg::Key(col)], false, false, window, cx);
                             }
@@ -2471,12 +2648,44 @@ impl DbView {
                         window.focus(&v.focus, cx);
                         // A drag selected text: not a click on the row.
                         if !v.sel.has_selection() {
+                            v.open_before = v.grid_of(which).map(|g| g.open);
                             v.toggle_row(which, r, Some(c), cx);
                         }
                     }))
                     .when(edit_col == Some(c), |d| d.relative().overflow_hidden().child(self.cell_editor(which, r, cx)))
                     .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(self.sel.text_piece(((r * 100_000) as u64, c as u32), text, color, false).join("\t")))
             }));
+        // Scrolled sideways: its number and id stay on the left (over the cells scrolled under them).
+        let line = if shift > px(0.) {
+            let pin_first = pinned_first(&grid.columns);
+            let id_text = pin_first.then(|| match fields.and_then(|f| f.iter().find(|(k, _)| Some(k) == grid.columns.first()).map(|(_, t)| t)) {
+                Some(t) => (table_text(t), tree_color(t)),
+                None => (row.first().cloned().flatten().unwrap_or_default(), theme::fg()),
+            });
+            let w0 = widths.first().copied().unwrap_or(100.);
+            line.relative().child(
+                div()
+                    .id(("db-pinned", r))
+                    .debug_selector(move || format!("db-pinned-{r}"))
+                    .absolute()
+                    .top(px(0.))
+                    .left(shift)
+                    .h_full()
+                    .flex()
+                    .bg(if open == Some(r) { theme::selected() } else { theme::bg_editor() })
+                    .border_r_1()
+                    .border_color(theme::border())
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |v, _, window, cx| {
+                        window.focus(&v.focus, cx);
+                        v.toggle_row(which, r, Some(0), cx);
+                    }))
+                    .child(div().w(px(44.)).flex_none().flex().items_center().justify_end().pr(px(8.)).text_color(theme::fg_muted()).text_size(px(11.)).child((first + r + 1).to_string()))
+                    .when_some(id_text, |d, (t, c)| d.child(div().w(px(w0)).flex_none().flex().items_center().px(px(8.)).overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(c).child(t))),
+            )
+        } else {
+            line
+        };
         let bar = self.doc_bar(which, r, cx).map(|b| if view_w > px(0.) { b.ml(shift).w(view_w) } else { b });
         if open != Some(r) {
             return match bar {
@@ -2537,14 +2746,13 @@ impl DbView {
                         div()
                             .id(("db-fields-close", r))
                             .debug_selector(move || format!("db-fields-close-{r}"))
+                            // In the margin left of the fields: it never covers a value.
                             .absolute()
-                            .top(px(6.))
-                            .right(px(10.))
+                            .top(px(8.))
+                            .left(px(14.))
                             .flex()
                             .items_center()
-                            .gap(px(4.))
-                            .px(px(6.))
-                            .py(px(2.))
+                            .p(px(3.))
                             .rounded(px(4.))
                             .border_1()
                             .border_color(theme::border_input())
@@ -2564,8 +2772,7 @@ impl DbView {
                                 }
                                 cx.notify();
                             }))
-                            .child(ui::small_icon("collapse-all", theme::fg_dim()))
-                            .child("Collapse"),
+                            .child(ui::small_icon("collapse-all", theme::fg_dim())),
                     ),
             )
             .children(bar)
@@ -3003,7 +3210,8 @@ impl DbView {
                     .gap(px(8.))
                     .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(17.)).text_color(theme::fg_bright()).child(format!("{what}: {name}")))
                     .when(kind == Kind::RabbitMq && what == "Queue", |d| d.child(button("db-peek", "Peek messages", Some("eye"), false).on_click(cx.listener(|v, _, _, cx| v.peek_messages(cx)))))
-                    .child(button("db-refresh", if d.loading { "Loading…" } else { "Refresh" }, Some("refresh"), true).on_click(cx.listener(|v, _, _, cx| v.load(cx))))
+                    // While reading: Stop.
+                    .child(button("db-refresh", if d.loading { "Stop" } else { "Refresh" }, Some(if d.loading { "stop" } else { "refresh" }), true).on_click(cx.listener(|v, _, _, cx| v.stop_or_load(cx))))
                     .when(pageable, |d2| d2.child(button("db-export", if d.exporting { "Exporting…" } else { "Export CSV" }, Some("arrow-down"), true).on_click(cx.listener(|v, _, _, cx| v.export_csv(cx))))),
             )
             .when_some(d.compass.as_deref(), |el, c| el.child(self.render_query_bar(c, cx)))
@@ -3135,7 +3343,7 @@ impl DbView {
                     .h(px(38.))
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(button("db-run", if d.running.is_some() { "Running…" } else { "Run" }, Some("arrow-right"), true).on_click(cx.listener(|v, _, _, cx| v.run_query(&RunQuery, &mut None, cx))))
+                    .child(button("db-run", if d.running.is_some() { "Stop" } else { "Run" }, Some(if d.running.is_some() { "stop" } else { "arrow-right" }), true).on_click(cx.listener(|v, _, _, cx| v.stop_or_run(cx))))
                     .child(div().text_size(px(11.)).text_color(theme::fg_muted()).child("⌘↵"))
                     .child(div().text_size(px(12.)).text_color(theme::fg_dim()).child(format!("on {where_}")))
                     .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.)).text_color(theme::fg_muted()).child(hint))
@@ -3364,10 +3572,24 @@ impl Render for DbView {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::run))
             .on_action(cx.listener(Self::copy_cell))
+            .on_action(cx.listener(Self::select_all_rows))
             .on_action(cx.listener(Self::refresh_data))
             .on_action(cx.listener(Self::row_up))
             .on_action(cx.listener(Self::row_down))
             .on_action(cx.listener(Self::close_detail))
+            // A column's edge dragged: its width follows the pointer.
+            .on_mouse_move(cx.listener(|v, ev: &gpui::MouseMoveEvent, _, cx| {
+                let Some((which, col, x0, w0)) = v.col_drag else { return };
+                if !ev.dragging() {
+                    v.col_drag = None;
+                    return;
+                }
+                if let Some(gv) = v.grid_of_mut(which) {
+                    gv.widths[col] = (w0 + (ev.position.x - x0) / px(1.)).max(48.);
+                }
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|v, _, _, _| v.col_drag = None))
             // A press anywhere starts afresh: the old selection goes (a drag makes a new one).
             .capture_any_mouse_down(cx.listener(|v, _, _, cx| {
                 if v.sel.has_selection() {

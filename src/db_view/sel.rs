@@ -19,6 +19,8 @@ struct Piece {
     layout: TextLayout,
     /// Put before it when it follows another piece of the same line ("" for a key and its value, a tab between cells).
     join: &'static str,
+    /// The frame it was last drawn in (only those drawn now are under the pointer).
+    seen: u64,
 }
 
 #[derive(Default)]
@@ -27,6 +29,9 @@ pub struct State {
     anchor: Option<(Order, usize)>,
     head: Option<(Order, usize)>,
     dragging: bool,
+    frame: u64,
+    /// ⌘A: everything, as it reads (rows not drawn included).
+    all: Option<String>,
 }
 
 /// A view's selection, shared by its pieces of text.
@@ -44,12 +49,39 @@ impl Selection {
         s.anchor = None;
         s.head = None;
         s.dragging = false;
+        s.all = None;
+    }
+
+    /// A new frame is being drawn: pieces drawn before and not since aren't on screen any more
+    /// (scrolled away). Those far from the selection are forgotten, so the list stays small.
+    pub fn begin_frame(&self) {
+        let mut s = self.0.borrow_mut();
+        s.frame += 1;
+        if s.pieces.len() > 4000 {
+            let (frame, range) = (s.frame, Self::range(&s));
+            s.pieces.retain(|o, p| p.seen + 2 >= frame || range.is_some_and(|(a, b)| a.0 <= *o && *o <= b.0));
+        }
+    }
+
+    /// ⌘A: all of it (`text`, as copied).
+    pub fn select_all(&self, text: String) {
+        let mut s = self.0.borrow_mut();
+        let (first, last) = (s.pieces.keys().next().copied(), s.pieces.iter().next_back().map(|(o, p)| (*o, p.text.len())));
+        if let (Some(f), Some(l)) = (first, last) {
+            s.anchor = Some((f, 0));
+            s.head = Some(l);
+        }
+        s.all = Some(text);
+    }
+
+    pub fn dragging(&self) -> bool {
+        self.0.borrow().dragging
     }
 
     /// Something is selected (not just clicked).
     pub fn has_selection(&self) -> bool {
         let s = self.0.borrow();
-        matches!((s.anchor, s.head), (Some(a), Some(h)) if a != h)
+        s.all.is_some() || matches!((s.anchor, s.head), (Some(a), Some(h)) if a != h)
     }
 
     fn range(s: &State) -> Option<((Order, usize), (Order, usize))> {
@@ -57,11 +89,36 @@ impl Selection {
         (a != h).then(|| if a <= h { (a, h) } else { (h, a) })
     }
 
+    /// A drag past the top or bottom of the rows (which then scroll): the selection follows to the
+    /// nearest line in view.
+    pub fn drag_to(&self, pos: Point<Pixels>, window: &mut Window) {
+        let mut s = self.0.borrow_mut();
+        if !s.dragging {
+            return;
+        }
+        // The nearest line drawn now, above or below the pointer.
+        let mut best: Option<(Pixels, Order, usize)> = None;
+        for (order, p) in s.pieces.iter().filter(|(_, p)| p.seen == s.frame) {
+            let b = p.layout.bounds();
+            let dy = if pos.y < b.top() { b.top() - pos.y } else if pos.y >= b.bottom() { pos.y - b.bottom() } else { Pixels::ZERO };
+            let at = if pos.y < b.top() { 0 } else { p.text.len() };
+            if best.as_ref().is_none_or(|(d, o, _)| dy < *d || (dy == *d && (pos.y < b.top()) == (*order < *o))) {
+                best = Some((dy, *order, at));
+            }
+        }
+        if let Some((_, o, i)) = best
+            && s.head != Some((o, i))
+        {
+            s.head = Some((o, i));
+            window.refresh();
+        }
+    }
+
     /// The place in the text under `pos`: the piece on that line the pointer is over (or the
     /// nearest one, at its start or end). None between lines.
     fn locate(s: &State, pos: Point<Pixels>) -> Option<(Order, usize)> {
         let mut best: Option<(Pixels, Order, usize)> = None;
-        for (order, p) in &s.pieces {
+        for (order, p) in s.pieces.iter().filter(|(_, p)| p.seen == s.frame) {
             let b = p.layout.bounds();
             if pos.y < b.top() || pos.y >= b.bottom() {
                 continue;
@@ -85,7 +142,13 @@ impl Selection {
     pub fn press(&self, ev: &MouseDownEvent, window: &mut Window) {
         let mut s = self.0.borrow_mut();
         let Some(at) = Self::locate(&s, ev.position) else { return };
+        s.all = None;
         match ev.click_count {
+            // Shift-click: the selection reaches here.
+            1 if ev.modifiers.shift && s.anchor.is_some() => {
+                s.head = Some(at);
+                s.dragging = true;
+            }
             1 => {
                 s.anchor = Some(at);
                 s.head = Some(at);
@@ -116,6 +179,9 @@ impl Selection {
     /// The selected text, as it reads.
     pub fn text(&self) -> String {
         let s = self.0.borrow();
+        if let Some(all) = &s.all {
+            return all.clone();
+        }
         let Some((start, end)) = Self::range(&s) else { return String::new() };
         let mut out = String::new();
         let mut last_line = None;
@@ -221,14 +287,17 @@ impl Element for SelText {
         let order = self.order;
         {
             let mut s = self.sel.0.borrow_mut();
-            s.pieces.insert(order, Piece { text: self.text.clone(), layout: layout.clone(), join: self.join });
-            // The selected part of this piece.
-            if let Some((start, end)) = Selection::range(&s)
-                && start.0 <= order
-                && order <= end.0
-            {
-                let from = if start.0 == order { start.1 } else { 0 }.min(self.text.len());
-                let to = if end.0 == order { end.1 } else { self.text.len() }.min(self.text.len());
+            let seen = s.frame;
+            s.pieces.insert(order, Piece { text: self.text.clone(), layout: layout.clone(), join: self.join, seen });
+            // The selected part of this piece (all of it with ⌘A).
+            let part = if s.all.is_some() {
+                Some((0, self.text.len()))
+            } else {
+                Selection::range(&s).filter(|(start, end)| start.0 <= order && order <= end.0).map(|(start, end)| {
+                    (if start.0 == order { start.1 } else { 0 }.min(self.text.len()), if end.0 == order { end.1 } else { self.text.len() }.min(self.text.len()))
+                })
+            };
+            if let Some((from, to)) = part {
                 if from < to
                     && let (Some(a), Some(b)) = (layout.position_for_index(from), layout.position_for_index(to))
                 {

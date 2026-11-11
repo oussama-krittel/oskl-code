@@ -542,8 +542,9 @@ impl DbPanel {
                             cx.emit(Request::Db(DbRequest::Open(Open::Data { conn: id.clone(), path: path.clone() })));
                         } else {
                             p.toggle(&id, path.clone(), cx);
-                            // A MongoDB database also opens its page of collections, like Compass.
-                            if mongo_db {
+                            // A MongoDB database also opens its page of collections, like Compass
+                            // (when it's opened, not when it's folded away).
+                            if mongo_db && !open {
                                 cx.emit(Request::Db(DbRequest::Open(Open::Database { conn: id.clone(), db: path[0].clone() })));
                             }
                         }

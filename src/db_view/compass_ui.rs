@@ -101,6 +101,10 @@ impl Compass {
                 e.pairs = true;
             });
         }
+        // The bar: Enter finds (Tab takes a suggestion).
+        for e in [&filter, &project, &sort, &collation, &hint, &max_time, &skip, &limit] {
+            e.update(cx, |e, _| e.enter_submits = true);
+        }
         Compass {
             tab: CTab::Documents,
             filter,
@@ -542,6 +546,11 @@ impl DbView {
 
     // ------------------------------------------------------------ test hooks
 
+    #[cfg(test)]
+    pub fn bar_error(&self) -> Option<String> {
+        self.compass().and_then(|c| c.bar_error.clone())
+    }
+
     /// The query bar's filter box, and the Shell tab's editor (tests).
     #[cfg(test)]
     pub fn editors(&self) -> (Entity<Editor>, Entity<Editor>) {
@@ -875,7 +884,18 @@ impl DbView {
                             .flex()
                             .items_center()
                             .gap(px(10.))
-                            .child(button("db-agg-run", if c.agg_running.is_some() { "Running…" } else { "Run" }, Some("arrow-right"), true).on_click(cx.listener(|v, _, _, cx| v.run_pipeline(cx))))
+                            .child(button("db-agg-run", if c.agg_running.is_some() { "Stop" } else { "Run" }, Some(if c.agg_running.is_some() { "stop" } else { "arrow-right" }), true).on_click(cx.listener(|v, _, _, cx| {
+                                // Running: Stop (dropping the work stops it).
+                                if let Some(c) = v.compass_mut()
+                                    && c.agg_running.is_some()
+                                {
+                                    c.agg_task = None;
+                                    c.agg_running = None;
+                                    c.agg_error = Some("Stopped".into());
+                                    return cx.notify();
+                                }
+                                v.run_pipeline(cx)
+                            })))
                             .child(div().text_size(px(11.)).text_color(theme::fg_muted()).child("⌘↵"))
                             .child(div().flex_1().debug_selector(|| "db-agg-status".into()).text_size(px(12.)).text_color(if c.agg_error.is_some() { theme::git_deleted() } else { theme::fg_dim() }).child(status))
                             .when(c.agg.as_ref().is_some_and(|g| g.grid.trees.is_some()), |el| el.child(super::mode_switch(d.doc_mode, cx))),
