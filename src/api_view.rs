@@ -413,6 +413,15 @@ struct Live {
 /// The most live messages kept on screen.
 const MAX_EVENTS: usize = 1000;
 
+impl ReqTab {
+    /// The response below the request: chosen, or because the tab is too narrow for both
+    /// side by side.
+    fn is_stacked(&self) -> bool {
+        let w = self.split_area.get().size.width;
+        self.stacked || (w > px(0.) && w < px(640.))
+    }
+}
+
 struct ReqTab {
     coll: Option<String>,
     /// Where it goes when saved (a folder of `coll`).
@@ -1620,6 +1629,7 @@ impl ApiView {
             .debug_selector(|| "api-save-dialog".into())
             .occlude()
             .w(px(460.))
+            .max_w(gpui::relative(0.94))
             .flex()
             .flex_col()
             .gap(px(12.))
@@ -2017,7 +2027,7 @@ fn dropdown(id: impl Into<SharedString>, label: impl Into<SharedString>, color: 
         .border_color(theme::border_input())
         .cursor_pointer()
         .hover(|s| s.bg(theme::hover()))
-        .child(div().text_color(color.unwrap_or(theme::fg())).when(color.is_some(), |d| d.font_weight(FontWeight::BOLD)).child(label.into()))
+        .child(div().max_w(px(200.)).overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(color.unwrap_or(theme::fg())).when(color.is_some(), |d| d.font_weight(FontWeight::BOLD)).child(label.into()))
         .child(ui::small_icon("chevron-down", theme::fg_dim()))
 }
 
@@ -2117,15 +2127,15 @@ impl ApiView {
             .text_size(px(11.))
             .text_color(theme::fg_muted())
             .child(div().w(px(15.)))
-            .child(div().flex_1().child(match id {
+            .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(match id {
                 KvId::Vars | KvId::FolderVars => "VARIABLE",
                 KvId::Headers | KvId::FolderHeaders => "HEADER",
                 KvId::Path => "PATH PARAMETER",
                 _ => "KEY",
             }))
-            .child(div().flex_1().child("VALUE"))
-            .when(id != KvId::Path, |d| d.child(div().flex_1().child("DESCRIPTION")))
-            .child(div().w(px(if matches!(id, KvId::Multipart | KvId::Vars) { 74. } else { 22. })));
+            .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child("VALUE"))
+            .when(id != KvId::Path, |d| d.child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child("DESCRIPTION")))
+            .child(div().flex_none().w(px(if matches!(id, KvId::Multipart | KvId::Vars) { 74. } else { 22. })));
         let rows = kv.rows.iter().enumerate().map(|(i, r)| {
             let last = i + 1 == n && !fixed_keys;
             let blank = last && Kv::is_blank(r, cx);
@@ -2399,27 +2409,30 @@ impl ApiView {
         });
         let top = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(8.))
-            .child(div().w(px(260.)).child(field(&t.name)))
-            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.5)).text_color(theme::fg_muted()).child(match &where_ {
+            .child(div().w(px(260.)).min_w(px(120.)).max_w_full().child(field(&t.name)))
+            .child(div().flex_1().min_w(px(60.)).overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.5)).text_color(theme::fg_muted()).child(match &where_ {
                 Some(w) => format!("{w}{}", if t.dirty && t.saved { "  •  unsaved changes" } else { "" }),
                 None => "Not saved yet".into(),
             }))
             .child(opens(dropdown("api-env", active.as_ref().map(|e| e.name.clone()).unwrap_or_else(|| "No environment".into()), None), env_items, cx))
             .child(self.history_button(&t.req.id, cx))
-            .child(icon_btn("api-layout", if t.stacked { "split" } else { "inline" }, "Response beside / below").on_click(cx.listener(|v, _, _, cx| {
+            .child(icon_btn("api-layout", if t.is_stacked() { "split" } else { "inline" }, "Response beside / below").on_click(cx.listener(|v, _, _, cx| {
                 if let Body_::Req(t) = &mut v.body {
                     t.stacked = !t.stacked;
                 }
                 cx.notify();
             })));
+        // In a narrow tab Send and Save go under the address (it keeps a readable width).
         let url_bar = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(6.))
             .child(opens(dropdown("api-method", method.clone(), Some(method_color(&method))).w(px(96.)).justify_between(), method_menu, cx))
-            .child(div().flex_1().min_w_0().child(field(&t.url).h(px(30.))))
+            .child(div().flex_1().min_w(px(200.)).child(field(&t.url).h(px(30.))))
             .child(button("api-send", send_label, Some(send_icon), true).on_click(cx.listener(move |v, _, _, cx| {
                 let busy = matches!(&v.body, Body_::Req(t) if t.sending.is_some() || t.live.as_ref().is_some_and(|l| l.connected));
                 if busy { v.cancel(cx) } else { v.send(cx) }
@@ -2463,7 +2476,7 @@ impl ApiView {
             }))
         }));
         let section = self.render_section(t, cx);
-        let req_pane = div().flex().flex_col().flex_none().when(t.stacked, |d| d.h(gpui::relative(t.split))).when(!t.stacked, |d| d.w(gpui::relative(t.split))).min_w_0().min_h_0().child(tabs).child(div().id("api-sec-body").flex_1().min_h_0().overflow_y_scroll().pt(px(10.)).child(section));
+        let req_pane = div().flex().flex_col().flex_none().when(t.is_stacked(), |d| d.h(gpui::relative(t.split))).when(!t.is_stacked(), |d| d.w(gpui::relative(t.split))).min_w_0().min_h_0().child(tabs).child(div().id("api-sec-body").flex_1().min_h_0().overflow_y_scroll().pt(px(10.)).child(section));
         let resp_pane = self.render_response(t, window, cx);
         let missing = t.resp.as_ref().map(|r| r.missing.clone()).unwrap_or_default();
         div()
@@ -2496,7 +2509,7 @@ impl ApiView {
                 d.child(div().text_size(px(12.)).text_color(if ok { theme::fg_dim() } else { theme::git_deleted() }).child(text))
             })
             .child({
-                let stacked = t.stacked;
+                let stacked = t.is_stacked();
                 let area = t.split_area.clone();
                 // The divider: drag it to give either side more room.
                 let divider = div()
@@ -2548,7 +2561,7 @@ impl ApiView {
                             return;
                         }
                         let b = t.split_area.get();
-                        let (moved, total) = if t.stacked { (ev.position.y - p0.y, b.size.height) } else { (ev.position.x - p0.x, b.size.width) };
+                        let (moved, total) = if t.is_stacked() { (ev.position.y - p0.y, b.size.height) } else { (ev.position.x - p0.x, b.size.width) };
                         if total > px(1.) {
                             t.split = (f0 + moved / total).clamp(0.15, 0.85);
                             LAST_SPLIT.store(t.split.to_bits(), std::sync::atomic::Ordering::Relaxed);
@@ -3088,8 +3101,11 @@ impl ApiView {
         let cookies: Vec<&str> = r.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie")).map(|(_, v)| v.as_str()).collect();
         let summary = div()
             .flex()
+            .flex_wrap()
+            .whitespace_nowrap()
             .items_center()
-            .gap(px(14.))
+            .gap_x(px(14.))
+            .gap_y(px(4.))
             .text_size(px(12.5))
             .child(div().px(px(8.)).py(px(2.)).rounded(px(4.)).bg(status_color(r.status).opacity(0.18)).text_color(status_color(r.status)).font_weight(FontWeight::BOLD).child(format!("{} {}", r.status, r.reason)))
             .child(div().text_color(theme::fg_dim()).child(format!("{} ms", r.ms)))
@@ -3107,7 +3123,7 @@ impl ApiView {
             (RespSection::Timeline, "Timeline", None),
             (RespSection::Console, "Console", count(resp.logs.len())),
         ];
-        let tabs = div().flex().items_center().gap(px(2.)).border_b_1().border_color(theme::border()).children(tabs.into_iter().map(|(s, name, c)| {
+        let tabs = div().id("api-resp-sections").flex().flex_none().overflow_x_scroll().items_center().gap(px(2.)).border_b_1().border_color(theme::border()).children(tabs.into_iter().map(|(s, name, c)| {
             sub_tab(format!("api-resp-{name}"), name, c, t.resp_section == s).on_click(cx.listener(move |v, _, _, cx| {
                 if let Body_::Req(t) = &mut v.body {
                     t.resp_section = s;
@@ -3125,7 +3141,7 @@ impl ApiView {
                     .border_b_1()
                     .border_color(theme::border())
                     .text_size(px(12.5))
-                    .child(div().w(px(200.)).flex_none().text_color(theme::fg_dim()).child(k))
+                    .child(div().w(gpui::relative(0.32)).max_w(px(200.)).min_w(px(90.)).flex_none().text_color(theme::fg_dim()).child(k))
                     .child(div().flex_1().min_w_0().text_color(theme::fg()).font_family(theme::MONO_FONT).child(v))
             }))
         };
@@ -3370,10 +3386,11 @@ impl ApiView {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(10.))
                             .child(ui::icon("globe", theme::accent()).size(px(22.)))
-                            .child(div().w(px(280.)).child(field(&t.name)))
+                            .child(div().w(px(280.)).min_w(px(120.)).max_w_full().child(field(&t.name)))
                             .when(t.env.global, |d| d.child(ui::badge("global", theme::badge())))
                             .when(t.env.project.is_some(), |d| d.child(ui::badge("workspace", theme::badge())))
                             .child(div().flex_1())
@@ -3506,10 +3523,11 @@ impl ApiView {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(10.))
                             .child(ui::icon(if is_root { "collection" } else { "folder" }, theme::accent()).size(px(22.)))
-                            .child(div().w(px(300.)).child(field(&t.name)))
+                            .child(div().w(px(300.)).min_w(px(120.)).max_w_full().child(field(&t.name)))
                             .child(div().text_size(px(11.5)).text_color(theme::fg_muted()).child(if is_root { "Collection" } else { "Folder" }))
                             .child(div().flex_1())
                             .child(button("api-folder-run", "Run", Some("play"), false).on_click(cx.listener(move |_, _, _, cx| cx.emit(WsRequest::Api(ApiRequest::Open(ApiOpen::Runner { coll: coll.clone(), folder: folder.clone() }))))))

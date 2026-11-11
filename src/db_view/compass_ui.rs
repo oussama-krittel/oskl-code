@@ -745,6 +745,7 @@ impl DbView {
                     .top(px(40.))
                     .left(px(8.))
                     .w(px(520.))
+                    .max_w(gpui::relative(0.96))
                     .max_h(px(320.))
                     .overflow_y_scroll()
                     .py(px(4.))
@@ -1183,13 +1184,16 @@ fn schema_row(i: usize, f: &compass::Field, sampled: u64) -> gpui::AnyElement {
         .border_color(theme::border())
         .child(
             div()
-                .w(px(240.))
+                // A third of the width, up to 240: in a narrow split the chart keeps most of it.
+                .w(gpui::relative(0.34))
+                .max_w(px(240.))
+                .min_w(px(90.))
                 .flex_none()
                 .flex()
                 .flex_col()
                 .gap(px(2.))
-                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).font_family(theme::MONO_FONT).child(SharedString::from(f.name.clone())))
-                .child(div().text_size(px(11.5)).text_color(theme::fg_dim()).child(format!("in {:.0}% of documents", pct(f.count).min(100.)))),
+                .child(div().overflow_hidden().text_ellipsis().whitespace_nowrap().font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).font_family(theme::MONO_FONT).child(SharedString::from(f.name.clone())))
+                .child(div().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.5)).text_color(theme::fg_dim()).child(format!("in {:.0}% of documents", pct(f.count).min(100.)))),
         )
         .child(
             div()

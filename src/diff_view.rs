@@ -410,15 +410,20 @@ impl DiffView {
                         .child(label),
                 )
             })
-            .child(ui::file_icon(&self.spec.path))
-            .child(div().text_color(theme::fg_bright()).child(self.spec.path.clone()))
+            // One line, whatever the width: a long path and the two versions' names shorten.
+            .child(ui::file_icon(&self.spec.path).flex_none())
+            .child(div().min_w(px(40.)).overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_bright()).child(self.spec.path.clone()))
             .child(
                 div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
                     .text_color(theme::fg_muted())
                     .child(format!("{} ↔ {}", self.spec.left.label(), self.spec.right.label())),
             )
-            .child(div().text_color(theme::git_added()).child(format!("+{added}")))
-            .child(div().text_color(theme::git_deleted()).child(format!("-{removed}")))
+            .child(div().flex_none().text_color(theme::git_added()).child(format!("+{added}")))
+            .child(div().flex_none().text_color(theme::git_deleted()).child(format!("-{removed}")))
             .child(div().flex_1())
             .child(ui::icon_button("prev-hunk", "arrow-up").on_click(cx.listener(|v, _, w, cx| v.prev_hunk(&PrevHunk, w, cx))))
             .child(ui::icon_button("next-hunk", "arrow-down").on_click(cx.listener(|v, _, w, cx| v.next_hunk(&NextHunk, w, cx))))

@@ -1705,11 +1705,15 @@ impl AgentView {
             .px(px(10.))
             .border_b_1()
             .border_color(theme::border())
+            // Nothing here breaks onto a second line; in a narrow split the title shortens first.
+            .overflow_hidden()
+            .whitespace_nowrap()
             .child(ui::small_icon("sparkle", theme::accent()))
-            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(12.)).text_color(theme::fg_bright()).child(self.title()))
+            .child(div().flex_1().min_w(px(48.)).overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(12.)).text_color(theme::fg_bright()).child(self.title()))
             .children(ctx.map(|p| {
                 div()
                     .id("agent-context")
+                    .flex_none()
                     .px(px(4.))
                     .cursor_pointer()
                     .text_size(px(11.))
@@ -1723,6 +1727,7 @@ impl AgentView {
                     div()
                         .id("agent-limits")
                         .flex()
+                        .flex_none()
                         .items_center()
                         .gap(px(8.))
                         .px(px(5.))
@@ -1746,7 +1751,7 @@ impl AgentView {
                         })),
                 )
             })
-            .children(cost.map(|c| div().text_size(px(11.)).text_color(theme::fg_muted()).child(c)))
+            .children(cost.map(|c| div().flex_none().text_size(px(11.)).text_color(theme::fg_muted()).child(c)))
             .when(!jobs.is_empty(), |d| {
                 d.child(
                     div()
@@ -2133,6 +2138,7 @@ impl AgentView {
             .top(px(40.))
             .right(px(12.))
             .w(px(360.))
+            .max_w(relative(0.94))
             .max_h(px(420.))
             .overflow_y_scroll()
             .p(px(10.))

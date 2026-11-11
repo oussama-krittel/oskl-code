@@ -5198,6 +5198,7 @@ impl Workspace {
             div()
                 .id(SharedString::from(format!("{gid}-{id}")))
                 .flex()
+                .flex_none()
                 .items_center()
                 .justify_center()
                 .size(px(18.))
@@ -5207,6 +5208,9 @@ impl Workspace {
                 .tooltip(ui::tooltip(tip))
                 .child(ui::small_icon(icon, theme::fg_dim()).size(px(12.)))
         };
+        // A narrow pane keeps its tabs and the buttons it can't do without (split, maximize, close).
+        let pane_w = self.pane_bounds.borrow().get(&id).map(|b| b.size.width / gpui::px(1.) / ui::scale()).unwrap_or(f32::MAX);
+        let (roomy, tight) = (pane_w >= 420., pane_w < 260.);
         let header = div()
             .id(SharedString::from(format!("pane-header-{id}")))
             .on_click(cx.listener(move |ws, ev: &ClickEvent, _, cx| {
@@ -5337,8 +5341,8 @@ impl Workspace {
                     )
                 })),
             )
-            .child(div().flex_1().h(px(1.)).bg(frame.opacity(0.5)))
-            .when(count > 1, |d| {
+            .child(div().flex_1().min_w(px(4.)).h(px(1.)).bg(frame.opacity(0.5)))
+            .when(count > 1 && roomy, |d| {
                 d.child(glyph("prev", "chevron-left", "Previous file in pane (⌃⇧Tab)").on_click(cx.listener(move |ws, _, w, cx| {
                     ws.set_focused_pane(id);
                     ws.cycle_buffer(-1, w, cx);
@@ -5348,7 +5352,7 @@ impl Workspace {
                     ws.cycle_buffer(1, w, cx);
                 })))
             })
-            .when(can_back || can_fwd, |d| {
+            .when((can_back || can_fwd) && roomy, |d| {
                 // Back / forward through where you've been in this split (⌃- / ⌃⇧-).
                 d.child(
                     glyph("nav-back", "arrow-left", "Go back (⌃-)")
@@ -5367,13 +5371,13 @@ impl Workspace {
                         })),
                 )
             })
-            .when(can_preview, |d| {
+            .when(can_preview && !tight, |d| {
                 d.child(glyph("preview", "eye", "Open preview to the side (⌘K V · ⇧⌘V here)").on_click(cx.listener(move |ws, _, w, cx| {
                     ws.set_focused_pane(id);
                     ws.preview_to_side(&PreviewToSide, w, cx);
                 })))
             })
-            .when(is_editor, |d| {
+            .when(is_editor && roomy, |d| {
                 // Word wrap toggle (same as ⌥Z / the status bar): lit while wrapping.
                 let on = crate::editor::word_wrap();
                 d.child(
@@ -5389,14 +5393,14 @@ impl Workspace {
                 ws.set_focused_pane(id);
                 ws.split(true, w, cx);
             })))
-            .child(glyph("split-d", "inline", "Split down (⌘⇧\\)").on_click(cx.listener(move |ws, _, w, cx| {
+            .when(!tight, |d| d.child(glyph("split-d", "inline", "Split down (⌘⇧\\)").on_click(cx.listener(move |ws, _, w, cx| {
                 ws.set_focused_pane(id);
                 ws.split(false, w, cx);
-            })))
-            .child(glyph("term", "terminal", "Terminal here (⌘T)").on_click(cx.listener(move |ws, _, w, cx| {
+            }))))
+            .when(roomy, |d| d.child(glyph("term", "terminal", "Terminal here (⌘T)").on_click(cx.listener(move |ws, _, w, cx| {
                 ws.set_focused_pane(id);
                 ws.open_terminal_view(None, w, cx);
-            })))
+            }))))
             .when(self.panes.len() > 1, |d| {
                 d.child(glyph("max", "maximize", "Maximize / restore (⌘⌥Enter · double-click title)").on_click(cx.listener(move |ws, _, _, cx| {
                     ws.set_focused_pane(id);
@@ -5519,7 +5523,7 @@ impl Workspace {
                             .min_h_0()
                             .child(content)
                             .when(self.find_target(cx).is_some_and(|p| p == id), |d| {
-                                d.child(div().absolute().top(px(4.)).right(px(14.)).child(self.find.clone()))
+                                d.child(div().absolute().top(px(4.)).left(px(6.)).right(px(14.)).flex().justify_end().child(self.find.clone()))
                             }),
                     )
                     .when_some(self.drop_hint.filter(|(p, _)| *p == id && cx.has_active_drag()).map(|(_, z)| z), |d, zone| {
@@ -5829,6 +5833,7 @@ impl Workspace {
             .top(px(30.))
             .right(px(8.))
             .w(px(380.))
+            .max_w(relative(0.94))
             .max_h(px((self.output_h - 36.).max(120.)))
             .py(px(4.))
             .flex()
@@ -5897,8 +5902,8 @@ impl Workspace {
                 .bg(theme::bg_editor())
                 .border_color(theme::focus_border())
                 .child(div().w(px(24.)).flex().justify_center().font_family(theme::MONO_FONT).text_color(theme::accent()).child(prefix))
-                .child(div().flex_1().min_w_0().font_family(theme::MONO_FONT).child(self.cmd.clone()))
-                .child(div().px(px(10.)).text_color(theme::fg_muted()).child(hint));
+                .child(div().flex_1().min_w(px(180.)).font_family(theme::MONO_FONT).child(self.cmd.clone()))
+                .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().px(px(10.)).text_color(theme::fg_muted()).child(hint));
         }
 
         let branch = repo.branch_label();
@@ -5928,12 +5933,16 @@ impl Workspace {
                 lang,
             )
         });
-        let item = |id: &'static str| div().id(id).debug_selector(move || id.to_string()).flex().items_center().gap(px(4.)).px(px(8.)).h_full().cursor_pointer().hover(|s| s.bg(theme::hover()));
-        let _ = window;
-        let chip = |label: String, bg: Hsla| div().flex().items_center().h_full().px(px(8.)).bg(bg).text_color(theme::bg_app()).font_weight(FontWeight::BOLD).child(label);
+        let item = |id: &'static str| div().id(id).debug_selector(move || id.to_string()).flex().flex_none().whitespace_nowrap().items_center().gap(px(4.)).px(px(8.)).h_full().cursor_pointer().hover(|s| s.bg(theme::hover()));
+        // Nothing in the bar is squeezed: as the window narrows, the less needed items leave it.
+        let room = window.viewport_size().width / gpui::px(1.) / ui::scale();
+        let (show_hints, show_toggles, show_format) = (room >= 1380., room >= 1040., room >= 780.);
+        let chip = |label: String, bg: Hsla| div().flex().flex_none().whitespace_nowrap().items_center().h_full().px(px(8.)).bg(bg).text_color(theme::bg_app()).font_weight(FontWeight::BOLD).child(label);
         let hint = |key: &str, label: &str| {
             div()
                 .flex()
+                .flex_none()
+                .whitespace_nowrap()
                 .items_center()
                 .gap(px(4.))
                 .px(px(6.))
@@ -5944,7 +5953,7 @@ impl Workspace {
         base.child(chip(if self.zoomed { " oskl · MAX ".into() } else { " oskl ".into() }, theme::frame_focused()))
         .child(
             item("status-branch")
-                .when(!branch.is_empty(), |d| d.child(ui::small_icon("git", theme::fg())).child(branch.clone()))
+                .when(!branch.is_empty(), |d| d.child(ui::small_icon("git", theme::fg())).child(div().max_w(px(180.)).overflow_hidden().text_ellipsis().whitespace_nowrap().child(branch.clone())))
                 .on_click(cx.listener(|ws, _, window, cx| ws.open_cmd(CmdMode::Command, "checkout ", window, cx))),
         )
         .when(!sync.is_empty(), |d| {
@@ -5955,7 +5964,7 @@ impl Workspace {
                     .on_click(cx.listener(|ws, _, _, cx| ws.git.update(cx, |r, cx| r.run_git(vec!["pull".into()], cx)))),
             )
         })
-        .when_some(repo.busy.clone(), |d, busy| d.child(div().px(px(8.)).text_color(theme::fg_dim()).child(format!("⟳ {busy}"))))
+        .when_some(repo.busy.clone(), |d, busy| d.child(div().flex_none().max_w(px(200.)).overflow_hidden().text_ellipsis().whitespace_nowrap().px(px(8.)).text_color(theme::fg_dim()).child(format!("⟳ {busy}"))))
         .child(
             div()
                 .flex_1()
@@ -5965,7 +5974,7 @@ impl Workspace {
                 .whitespace_nowrap()
                 .when_some(self.message.clone(), |d, (msg, err)| d.text_color(if err { theme::git_deleted() } else { theme::fg() }).child(msg)),
         )
-        .when(self.message.is_none(), |d| {
+        .when(self.message.is_none() && show_hints, |d| {
             // Hints show the shortcuts as currently configured (they're editable).
             let k = |name: &str, fallback: &str| crate::keybindings::shortcut_label(name).unwrap_or_else(|| fallback.to_string());
             let dirs = crate::keybindings::direction_letters();
@@ -5988,12 +5997,10 @@ impl Workspace {
         })
         .when_some(editor_info, |d, (pos, indent, eol, lang)| {
             d.child(item("status-pos").child(pos).on_click(cx.listener(|ws, _, w, cx| ws.go_to_line(&GoToLine, w, cx))))
-                .child(item("status-indent").child(indent))
-                .child(item("status-enc").child("UTF-8"))
-                .child(item("status-eol").child(eol))
+                .when(show_format, |d| d.child(item("status-indent").child(indent)).child(item("status-enc").child("UTF-8")).child(item("status-eol").child(eol)))
                 .child(item("status-lang").child(lang))
         })
-        .when_some(blame_on, |d, on| {
+        .when_some(blame_on.filter(|_| show_format), |d, on| {
             d.child(
                 item("status-blame")
                     .tooltip(ui::tooltip("Blame: who wrote each line, on both sides of a diff (⌥⌘B)"))
@@ -6003,7 +6010,7 @@ impl Workspace {
                     .on_click(cx.listener(|ws, _, w, cx| ws.toggle_blame(&ToggleBlame, w, cx))),
             )
         })
-        .child({
+        .when(show_toggles, |d| d.child({
             let on = self.settings.format_on_save;
             item("status-format")
                 .tooltip(ui::tooltip("Format on ⌘S with your project's formatter (click to toggle, :formatonsave on|off)"))
@@ -6048,7 +6055,7 @@ impl Workspace {
                     let on = !ws.settings.autosave;
                     ws.set_autosave(on, cx);
                 }))
-        })
+        }))
         .child(
             item("status-keys")
                 .child(ui::small_icon("terminal", theme::fg()))
@@ -6108,6 +6115,7 @@ impl Workspace {
                         .occlude()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .w(px(640.))
+                        .max_w(relative(0.96))
                         .p(px(4.))
                         .mb(px(4.))
                         .bg(theme::bg_popup())
@@ -6269,7 +6277,8 @@ impl Render for Workspace {
                 .child(div().w(gpui::px(2.)).h_full().group_hover("side-resize", |s| s.bg(theme::focus_border())).when(self.resizing_side, |d| d.bg(theme::focus_border())));
             let panel = div()
                 .flex_none()
-                .w(px(self.side_w))
+                // Its width is kept, but in a small window it leaves the editors their room.
+                .w(px(self.side_w.min((window.viewport_size().width / gpui::px(1.) / ui::scale() - ACTIVITY_W - 260.).max(170.))))
                 .h_full()
                 .min_w_0()
                 .overflow_hidden()
@@ -6452,7 +6461,10 @@ impl Render for Workspace {
                         } else {
                             (ev.position.y - b.top()) / b.size.height
                         };
-                        *ratio = r.clamp(0.1, 0.9);
+                        // Neither side goes under a usable size (or under a tenth, in a small window).
+                        let total = if *vertical { b.size.width } else { b.size.height } / gpui::px(1.);
+                        let least = (if *vertical { 200. } else { 110. } * ui::scale() / total.max(1.)).clamp(0.1, 0.5);
+                        *ratio = r.clamp(least, 1. - least);
                         cx.notify();
                     }
                     return;

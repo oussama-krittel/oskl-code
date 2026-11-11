@@ -1367,8 +1367,13 @@ fn button(id: impl Into<SharedString>, label: &str, icon: Option<&str>, primary:
         .child(label.to_string())
 }
 
+/// Under a row's fields, in line with them; in a narrow form it takes the whole width instead.
+fn indented(el: impl IntoElement) -> gpui::Div {
+    div().flex().flex_wrap().child(div().w(px(140.)).flex_none()).child(div().flex_1().min_w(px(220.)).child(el))
+}
+
 fn field_box(e: &Entity<Editor>, w: f32) -> gpui::Div {
-    div().w(px(w)).h(px(26.)).px(px(6.)).flex().items_center().rounded(px(4.)).bg(theme::bg_input()).border_1().border_color(theme::border_input()).child(e.clone())
+    div().w(px(w)).min_w(px(90.)).max_w_full().h(px(26.)).px(px(6.)).flex().items_center().rounded(px(4.)).bg(theme::bg_input()).border_1().border_color(theme::border_input()).child(e.clone())
 }
 
 fn switch(id: &'static str, on: bool) -> gpui::Stateful<gpui::Div> {
@@ -1400,7 +1405,8 @@ pub fn kind_badge(kind: Kind) -> gpui::Svg {
 impl DbView {
     fn render_form(&self, f: &Form, cx: &mut Context<Self>) -> gpui::AnyElement {
         let kind = f.conn.kind;
-        let row = || div().flex().items_center().gap(px(10.)).min_h(px(30.));
+        // In a narrow form a row's fields go onto the next line (they aren't squeezed).
+        let row = || div().flex().flex_wrap().items_center().gap(px(10.)).min_h(px(30.));
         let types = div().flex().flex_wrap().gap(px(6.)).children(Kind::ALL.map(|k| {
             let on = k == kind;
             let id = format!("db-type-{}", k.id());
@@ -1489,7 +1495,7 @@ impl DbView {
         };
         let fields = if f.conn.use_url && url_ok {
             div().flex().flex_col().gap(px(8.)).child(row().child(label("Connection string")).child(field_box(&f.url, 520.))).child(
-                div().pl(px(140.)).text_size(px(11.)).text_color(theme::fg_muted()).child("Kept in your Keychain, like passwords."),
+                indented(div().text_size(px(11.)).text_color(theme::fg_muted()).child("Kept in your Keychain, like passwords.")),
             )
         } else {
             div()
@@ -1505,7 +1511,7 @@ impl DbView {
                         .child(div().w(px(80.)).text_color(theme::fg_dim()).child("Password"))
                         .child(field_box(&f.password, 200.)),
                 )
-                .when(f.saved, |d| d.child(div().pl(px(470.)).text_size(px(11.)).text_color(theme::fg_muted()).child("Saved in your Keychain: leave it to keep it")))
+                .when(f.saved, |d| d.child(indented(div().text_size(px(11.)).text_color(theme::fg_muted()).child("Password saved in your Keychain: leave it empty to keep it"))))
                 .child(row().child(label(db_label)).child(field_box(&f.database, 240.)))
         };
         let options = div()
@@ -1513,7 +1519,6 @@ impl DbView {
             .flex_wrap()
             .items_center()
             .gap(px(22.))
-            .pl(px(140.))
             .when(!(f.conn.use_url && url_ok), |d| {
                 d.child(toggle("db-tls", tls_label, f.conn.tls, |c, on| c.tls = on, cx))
                     .when(f.conn.tls || kind == Kind::SqlServer, |d| d.child(toggle("db-trust", "Trust server certificate", f.conn.trust_cert, |c, on| c.trust_cert = on, cx)))
@@ -1557,24 +1562,24 @@ impl DbView {
                                     .child(scope_choice("db-scope-workspace", "Workspace", workspace, f.project.is_some(), true, cx)),
                             ),
                     )
-                    .child(div().pl(px(140.)).text_size(px(11.)).text_color(theme::fg_muted()).child(if workspace {
+                    .child(indented(div().text_size(px(11.)).text_color(theme::fg_muted()).child(if workspace {
                         format!("Shown only in this workspace ({}).", f.project.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
                     } else {
                         "Shown in every window.".to_string()
-                    }))
+                    })))
                     .child(div().h(px(1.)).bg(theme::border()))
                     .child(div().text_color(theme::fg_dim()).child("Server type"))
                     .child(types)
                     .child(div().h(px(4.)))
                     .child(fields)
-                    .child(options)
-                    .when_some(note, |d, n| d.child(div().ml(px(140.)).p(px(8.)).rounded(px(4.)).bg(theme::bg_input()).text_size(px(12.)).text_color(theme::fg_dim()).child(n)))
-                    .child(
+                    .child(indented(options))
+                    .when_some(note, |d, n| d.child(indented(div().p(px(8.)).rounded(px(4.)).bg(theme::bg_input()).text_size(px(12.)).text_color(theme::fg_dim()).child(n))))
+                    .child(indented(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(8.))
-                            .pl(px(140.))
                             .pt(px(6.))
                             .child(button("db-test", if f.busy { "Testing…" } else { "Test" }, Some("sync"), false).on_click(cx.listener(|v, _, _, cx| v.test(cx))))
                             .child(button("db-save", "Save", Some("check"), false).on_click(cx.listener(|v, _, _, cx| {
@@ -1583,16 +1588,15 @@ impl DbView {
                             .child(button("db-connect", "Connect", Some("plus"), true).on_click(cx.listener(|v, _, w, cx| v.connect(w, cx))))
                             .child(button("db-close", "Close", Some("close"), false).on_click(cx.listener(|_, _, _, cx| cx.emit(Request::Db(DbRequest::Close)))))
                             .when(f.saved, |el| el.child(div().flex_1()).child(button("db-delete", "Delete", Some("trash"), false).text_color(theme::git_deleted()).on_click(cx.listener(|v, _, _, cx| v.ask_delete(cx))))),
-                    )
+                    ))
                     .when_some(status, |d, s| {
                         let (ok, text) = match s {
                             Ok(t) => (true, t),
                             Err(e) => (false, e),
                         };
-                        d.child(
+                        d.child(indented(
                             div()
                                 .debug_selector(|| "db-form-status".into())
-                                .ml(px(140.))
                                 .flex()
                                 .gap(px(6.))
                                 .items_start()
@@ -1600,7 +1604,7 @@ impl DbView {
                                 .child(ui::small_icon(if ok { "check" } else { "error" }, if ok { theme::git_added() } else { theme::git_deleted() }))
                                 // Long errors wrap, within the form.
                                 .child(div().flex_1().min_w_0().child(text)),
-                        )
+                        ))
                     }),
             )
             .into_any_element()
@@ -2080,7 +2084,7 @@ impl DbView {
     }
 
     /// Table: the edit box over a cell, with its type, add a field after it, remove it.
-    fn cell_editor(&self, which: Option<usize>, r: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn cell_editor(&self, which: Option<usize>, r: usize, (width, left): (gpui::Pixels, gpui::Pixels), cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(ed) = &self.editing else { return div().into_any_element() };
         let path = ed.path.clone();
         let (p_add, p_del) = (path.clone(), path.clone());
@@ -2095,8 +2099,8 @@ impl DbView {
                 .debug_selector(|| "db-cell-editor".into())
                 .absolute()
                 .top(px(-4.))
-                .left(px(0.))
-                .w(px(440.))
+                .left(left)
+                .w(width)
                 .flex()
                 .items_center()
                 .gap(px(6.))
@@ -2593,6 +2597,20 @@ impl DbView {
             Some(Tree::Object(f)) => Some(f),
             _ => None,
         };
+        // The edit box stays inside the part of the table in view: no wider than it, and moved
+        // left when its cell is near the right edge.
+        let edit_place = edit_col.map(|c| {
+            let unit = px(1.);
+            let vw = view_w / unit;
+            if vw <= 0. {
+                return (px(440.), px(0.));
+            }
+            let bases: f32 = widths.iter().sum();
+            let grown = ((vw - 44. - bases).max(0.)) / widths.len().max(1) as f32;
+            let x = 44. + widths.iter().take(c).sum::<f32>() + grown * c as f32 - shift / unit;
+            let w = 440f32.min(vw - 12.).max(220.);
+            (px(w), px((vw - 6. - w - x).min(0.).max(-x)))
+        });
         let line = div()
             .flex()
             .w_full()
@@ -2658,7 +2676,7 @@ impl DbView {
                             v.toggle_row(which, r, Some(c), cx);
                         }
                     }))
-                    .when(edit_col == Some(c), |d| d.relative().overflow_hidden().child(self.cell_editor(which, r, cx)))
+                    .when(edit_col == Some(c), |d| d.relative().overflow_hidden().child(self.cell_editor(which, r, edit_place.unwrap_or((px(440.), px(0.))), cx)))
                     .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(self.sel.text_piece(((r * 100_000) as u64, c as u32), text, color, false).join("\t")))
             }));
         // Scrolled sideways: its number and id stay on the left (over the cells scrolled under them).
@@ -2716,7 +2734,7 @@ impl DbView {
                         .items_center()
                         .gap(px(10.))
                         .h(px(24.))
-                        .child(div().w(px(200.)).flex_none().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_dim()).child(col.clone()))
+                        .child(div().w(gpui::relative(0.3)).min_w(px(80.)).max_w(px(200.)).flex_none().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_dim()).child(col.clone()))
                         .child(one_line(("db-field-value", i), match val {
                             Some(v) => div().child(self.sel.text_piece(((r * 100_000 + 1 + i) as u64, 1), v.replace(['\n', '\r'], " ⏎ "), theme::fg_bright(), false).join("\t")),
                             None => div().italic().text_color(theme::fg_muted()).child("NULL"),
@@ -3136,7 +3154,8 @@ impl DbView {
                     }
                     cx.notify();
                 }))
-                .child(text)
+                .flex_none()
+                .child(div().max_w(px(170.)).overflow_hidden().text_ellipsis().whitespace_nowrap().child(text))
                 .child(ui::small_icon("chevron-down", theme::fg_dim()))
         };
         let menu = match d.menu {
@@ -3178,8 +3197,7 @@ impl DbView {
                         .debug_selector(|| "db-menu".into())
                         .absolute()
                         .top(px(34.))
-                        .when(m == Menu::Columns, |d| d.right(px(110.)))
-                        .when(m == Menu::Sizes, |d| d.right(px(0.)))
+                        .right(px(0.))
                         .w(px(200.))
                         .max_h(px(300.))
                         .overflow_y_scroll()
@@ -3194,7 +3212,9 @@ impl DbView {
             }
         };
         // The rows menu opens under its own button: in the search row, or (MongoDB) in the toolbar.
+        // Each list opens under its own button.
         let (menu, toolbar_menu) = if d.compass.is_some() { (None, menu) } else { (menu, None) };
+        let (columns_menu, sizes_menu) = if d.menu == Some(Menu::Columns) { (menu, None) } else { (None, menu) };
         let body: gpui::AnyElement = match (&d.page, &d.grid) {
             (Some(Err(e)), _) => div().p(px(14.)).min_w_0().text_color(theme::git_deleted()).child(e.clone()).into_any_element(),
             (_, Some(gv)) if !gv.grid.columns.is_empty() => div().flex().flex_col().flex_1().min_h_0().child(self.render_grid(None, gv, kind != Kind::RabbitMq && kind != Kind::Redis, cx)).into_any_element(),
@@ -3227,13 +3247,13 @@ impl DbView {
                     div()
                         .relative()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .gap(px(8.))
-                        .when(searchable, |el| el.child(div().flex_1().h(px(28.)).px(px(8.)).flex().items_center().rounded(px(4.)).bg(theme::bg_input()).border_1().border_color(theme::border_input()).child(d.search.clone())))
+                        .when(searchable, |el| el.child(div().flex_1().min_w(px(160.)).h(px(28.)).px(px(8.)).flex().items_center().rounded(px(4.)).bg(theme::bg_input()).border_1().border_color(theme::border_input()).child(d.search.clone())))
                         .when(!searchable, |el| el.child(div().flex_1()))
-                        .when(searchable && kind != Kind::Redis, |el| el.child(dropdown("db-columns", col_label, Menu::Columns, cx)))
-                        .when(pageable, |el| el.child(dropdown("db-sizes", format!("{} rows", d.spec.limit), Menu::Sizes, cx)))
-                        .children(menu),
+                        .when(searchable && kind != Kind::Redis, |el| el.child(div().relative().flex_none().child(dropdown("db-columns", col_label, Menu::Columns, cx)).children(columns_menu)))
+                        .when(pageable, |el| el.child(div().relative().flex_none().child(dropdown("db-sizes", format!("{} rows", d.spec.limit), Menu::Sizes, cx)).children(sizes_menu))),
                 )
             })
             .when(!matches!(d.page, Some(Err(_))), |el| {
@@ -3343,7 +3363,8 @@ impl DbView {
             .flex()
             .flex_col()
             .size_full()
-            .child(div().h(px(220.)).flex_none().border_b_1().border_color(theme::border()).child(d.query.clone()))
+            // In a short split the query leaves the results their part.
+            .child(div().h(px(220.)).max_h(gpui::relative(0.45)).flex_none().border_b_1().border_color(theme::border()).child(d.query.clone()))
             .child(
                 div()
                     .flex()
@@ -3355,18 +3376,23 @@ impl DbView {
                     .border_b_1()
                     .border_color(theme::border())
                     .child(button("db-run", if d.running.is_some() { "Stop" } else { "Run" }, Some(if d.running.is_some() { "stop" } else { "arrow-right" }), true).on_click(cx.listener(|v, _, _, cx| v.stop_or_run(cx))))
-                    .child(div().text_size(px(11.)).text_color(theme::fg_muted()).child("⌘↵"))
-                    .child(div().text_size(px(12.)).text_color(theme::fg_dim()).child(format!("on {where_}")))
+                    .child(div().flex_none().text_size(px(11.)).text_color(theme::fg_muted()).child("⌘↵"))
+                    .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(12.)).text_color(theme::fg_dim()).child(format!("on {where_}")))
                     .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.)).text_color(theme::fg_muted()).child(hint))
                     .when(d.results.get(d.result_ix).is_some_and(|g| g.grid.trees.is_some()), |el| el.child(mode_switch(d.doc_mode, cx)))
-                    .child(div().debug_selector(|| "db-query-status".into()).text_size(px(12.)).text_color(if d.query_error.is_some() { theme::git_deleted() } else { theme::fg_dim() }).child(status)),
+                    .child(div().debug_selector(|| "db-query-status".into()).flex_none().max_w(gpui::relative(0.5)).overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(12.)).text_color(if d.query_error.is_some() { theme::git_deleted() } else { theme::fg_dim() }).child(status)),
             )
             .when(d.results.len() > 1, |el| {
-                el.child(div().flex().flex_none().gap(px(2.)).px(px(8.)).pt(px(4.)).children(d.results.iter().enumerate().map(|(i, g)| {
+                el.child(div().id("db-result-tabs").flex().flex_none().overflow_x_scroll().gap(px(2.)).px(px(8.)).pt(px(4.)).children(d.results.iter().enumerate().map(|(i, g)| {
                     let on = i == d.result_ix;
                     let text = if g.grid.columns.is_empty() { format!("{} · {}", i + 1, g.grid.note) } else { format!("Result {}", i + 1) };
                     div()
                         .id(("db-result-tab", i))
+                        .flex_none()
+                        .max_w(px(260.))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
                         .px(px(10.))
                         .py(px(3.))
                         .rounded_t(px(4.))

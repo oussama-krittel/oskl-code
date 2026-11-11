@@ -351,6 +351,7 @@ impl Render for FindBar {
             .on_action(cx.listener(|b, _: &ToggleFindRegex, _, cx| b.toggle(2, cx)))
             .occlude()
             .w(px(440.))
+            .max_w_full()
             .p(px(5.))
             .flex()
             .gap(px(4.))

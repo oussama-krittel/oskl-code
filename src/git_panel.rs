@@ -972,6 +972,11 @@ impl GitPanel {
         cx.notify();
     }
 
+    /// A popup this wide, hung from the panel's right edge, stays inside the window.
+    fn popup_fits(&self, w: f32) -> bool {
+        self.panel_bounds.get().right() - px(8.) - px(w) >= px(0.)
+    }
+
     fn render_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let graph_all = self.repo.read(cx).graph_all;
         let items: [(&str, &str); 17] = [
@@ -998,7 +1003,8 @@ impl GitPanel {
             .occlude()
             .absolute()
             .top(px(32.))
-            .right(px(8.))
+            // Under its button; from the panel's left edge when the panel is too narrow for it.
+            .map(|d| if self.popup_fits(250.) { d.right(px(8.)) } else { d.left(px(8.)) })
             .w(px(250.))
             .py(px(4.))
             .bg(theme::bg_popup())
@@ -1221,7 +1227,7 @@ impl GitPanel {
             .occlude()
             .absolute()
             .top(gpui::px(top))
-            .right(px(8.))
+            .map(|d| if self.popup_fits(270.) { d.right(px(8.)) } else { d.left(px(8.)) })
             .w(px(270.))
             .py(px(4.))
             .bg(theme::bg_popup())
