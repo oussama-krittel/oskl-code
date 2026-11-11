@@ -8968,7 +8968,8 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
 
         // Stop: a slow query stopped.
         click_on(cx, "db-tab-query");
-        shell.update(cx, |e, cx| e.set_text("db.table_ux.find({$where: 'sleep(100) || true'})", cx));
+        // (One document, half a second: the server finishes it alone after Stop, briefly.)
+        shell.update(cx, |e, cx| e.set_text("db.table_ux.find({$where: 'sleep(500) || true'}).limit(1)", cx));
         tab.update(cx, |t, cx| t.run_shell_for_test(cx));
         assert!(tab.read_with(cx, |t, _| t.query_status()).0, "running");
         click_on(cx, "db-run");
