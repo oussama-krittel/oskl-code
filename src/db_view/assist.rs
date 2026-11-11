@@ -28,6 +28,27 @@ fn word(before: &str) -> &str {
     &before[start..]
 }
 
+/// Whether the end of `before` is inside a string or after a line comment (no suggestions there).
+/// `sql`: -- comments and 'strings'; else // comments and '…', "…", `…` strings.
+fn in_text(before: &str, sql: bool) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = before.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(_) if c == '\\' && !sql => {
+                chars.next();
+            }
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || (!sql && (c == '"' || c == '`')) => quote = Some(c),
+            None if sql && c == '-' && chars.peek() == Some(&'-') => return true,
+            None if !sql && c == '/' && chars.peek() == Some(&'/') => return true,
+            None => {}
+        }
+    }
+    quote.is_some()
+}
+
 /// Those starting with `prefix` (ignoring case) first, then those containing it.
 fn pick(prefix: &str, all: Vec<Item>) -> Vec<Item> {
     let p = prefix.to_lowercase();
@@ -87,7 +108,11 @@ const MONGO_HELPERS: &[(&str, &str, usize)] = &[("ObjectId", "('')", 2), ("ISODa
 /// Suggestions for MongoDB's shell syntax (the Shell tab, pipelines, the query bar, validation rules).
 pub fn mongo(names: Shared) -> Suggest {
     Rc::new(move |before: &str| {
+        // In a comment: nothing. In a string: only `$` (a field path or operator in an aggregation).
         let w = word(before);
+        if in_text(before, false) && !w.starts_with('$') {
+            return None;
+        }
         let head = &before[..before.len() - w.len()];
         let n = names.borrow();
         let methods = |list: &[(&str, &'static str, usize)]| list.iter().map(|(m, s, b)| item(m, Kind::Word, s, *b)).collect::<Vec<_>>();
@@ -133,7 +158,7 @@ const SQL_FUNCTIONS: &[&str] = &[
 pub fn sql(names: Shared) -> Suggest {
     Rc::new(move |before: &str| {
         let w = word(before);
-        if w.is_empty() || w.starts_with('$') {
+        if w.is_empty() || w.starts_with('$') || in_text(before, true) {
             return None;
         }
         let head = before[..before.len() - w.len()].trim_end().to_uppercase();
@@ -177,6 +202,8 @@ mod tests {
         assert_eq!(labels(&s, "{ sta"), ["status", "stage"]);
         assert_eq!(labels(&s, "{ _id: Obj"), ["ObjectId"]);
         assert!(s("{ ").is_none(), "nothing typed, nothing shown");
+        assert!(s("{ name: 'sta").is_none(), "not in a string");
+        assert!(s("// sta").is_none(), "not in a comment");
         let (_, l) = s("db.users.upd").unwrap();
         assert_eq!((l[0].suffix, l[0].back), ("({}, {$set: {}})", 13), "the cursor lands in the filter");
     }
@@ -190,5 +217,8 @@ mod tests {
         assert_eq!(labels(&s, "sel"), ["select"], "lower case as typed");
         assert_eq!(labels(&s, "SEL"), ["SELECT"]);
         assert!(labels(&s, "SELECT coun").contains(&"count".to_string()));
+        assert!(s("SELECT * FROM t WHERE name = 'ord").is_none(), "not in a string");
+        assert!(s("SELECT 1 -- ord").is_none(), "not in a comment");
+        assert!(!labels(&s, "SELECT 'it''s' FROM ord").is_empty(), "after a string with '' in it");
     }
 }

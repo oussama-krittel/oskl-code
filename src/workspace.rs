@@ -8973,7 +8973,20 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(tab.read_with(cx, |t, _| t.query_status()).0, "running");
         click_on(cx, "db-run");
         assert_eq!(tab.read_with(cx, |t, _| t.query_status()), (false, Some("Stopped".into())));
-        let _ = conn;
+        // A collection made in the Shell: suggested after db. right away.
+        futures::executor::block_on(crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("oskl_test".into()), collection: None }, "db.fresh_one.drop()".into()))).ok();
+        shell.update(cx, |e, cx| e.set_text("db.createCollection('fresh_one')", cx));
+        tab.update(cx, |t, cx| t.run_shell_for_test(cx));
+        wait_for(cx, "made", |cx| !tab.read_with(cx, |t, _| t.query_status()).0);
+        for _ in 0..40 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        shell.update(cx, |e, cx| e.set_text("", cx));
+        tab.update_in(cx, |_, window, cx| window.focus(&shell.read(cx).focus_target(cx), cx));
+        cx.simulate_input("db.fresh");
+        assert!(shell.read_with(cx, |e, _| e.completion_labels()).contains(&"fresh_one".to_string()), "{:?}", shell.read_with(cx, |e, _| e.completion_labels()));
+        futures::executor::block_on(crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("oskl_test".into()), collection: None }, "db.fresh_one.drop()".into()))).ok();
 
         // The side panel: folding a database away doesn't open its page again.
         ws.update_in(cx, |ws, window, cx| {

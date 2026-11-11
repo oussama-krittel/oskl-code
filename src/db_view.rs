@@ -242,7 +242,8 @@ fn learn_fields(names: &assist::Shared, g: &Grid) {
 fn query_lang(kind: Kind) -> &'static str {
     match kind {
         Kind::MongoDb => "js",
-        Kind::Postgres | Kind::SqlServer => "sql",
+        Kind::Postgres => "sql",
+        Kind::SqlServer => "tsql",
         Kind::Redis | Kind::RabbitMq => "",
     }
 }
@@ -674,13 +675,10 @@ impl DbView {
             Ok::<_, anyhow::Error>(found)
         });
         cx.spawn(async move |_, _| {
-            if let Ok(found) = work.await {
-                let mut n = names.borrow_mut();
-                for t in found {
-                    if !n.tables.contains(&t) {
-                        n.tables.push(t);
-                    }
-                }
+            // As they are now (one dropped is gone, one created there).
+            if let Ok(mut found) = work.await {
+                found.dedup();
+                names.borrow_mut().tables = found;
             }
         })
         .detach();
@@ -739,6 +737,7 @@ impl DbView {
     }
 
     fn refresh_data(&mut self, _: &RefreshData, _: &mut Window, cx: &mut Context<Self>) {
+        self.learn_names(cx);
         self.load(cx);
     }
 
@@ -849,6 +848,9 @@ impl DbView {
             let weak = cx.entity().downgrade();
             return confirm_destructive(&what, &d.conn.title(), weak, |v, cx| v.run_query_checked(true, cx), cx);
         }
+        // Tables or collections made, dropped or renamed: the suggestions learn them again after.
+        let lower = text.to_lowercase();
+        let reshapes = ["create ", "drop", "rename", "alter ", "createcollection"].iter().any(|w| lower.contains(w));
         let scope = scope_of(d.conn.kind, &d.path);
         let work = engine::run(engine::query(d.conn.clone(), scope, text));
         d.running = Some(Instant::now());
@@ -882,6 +884,9 @@ impl DbView {
                         }
                         Err(e) => d.query_error = Some(e),
                     }
+                }
+                if reshapes {
+                    v.learn_names(cx);
                 }
                 cx.notify();
             })
@@ -993,6 +998,7 @@ impl DbView {
             d.spec = d.grid.as_ref().map(|_| d.loaded_spec.clone()).unwrap_or_else(|| d.spec.clone());
             return cx.notify();
         }
+        self.learn_names(cx);
         self.load(cx);
     }
 

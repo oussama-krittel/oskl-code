@@ -84,6 +84,8 @@ pub enum Lang {
     Tsv,
     /// SQL (keywords, strings, numbers, comments, functions): colored by a small lexer.
     Sql,
+    /// SQL Server's SQL: [bracketed names] too.
+    Tsql,
     Java,
 }
 
@@ -106,6 +108,7 @@ pub fn detect(path: &Path) -> Option<Lang> {
         "csv" => Lang::Csv,
         "tsv" | "tab" => Lang::Tsv,
         "sql" | "psql" | "pgsql" => Lang::Sql,
+        "tsql" => Lang::Tsql,
         "tf" | "tfvars" | "hcl" | "tftest" => Lang::Terraform,
         "java" => Lang::Java,
         _ if name == ".zshrc" || name == ".bashrc" || name.ends_with(".env") || name == ".envrc" => Lang::Bash,
@@ -139,7 +142,7 @@ fn build(lang: Lang) -> Option<HighlightConfiguration> {
         Lang::Toml => (tree_sitter_toml_ng::LANGUAGE.into(), tree_sitter_toml_ng::HIGHLIGHTS_QUERY.into(), ""),
         Lang::Terraform => (tree_sitter_hcl::LANGUAGE.into(), include_str!("hcl_highlights.scm").into(), ""),
         // Colored by `columns`, not tree-sitter.
-        Lang::Csv | Lang::Tsv | Lang::Sql => return None,
+        Lang::Csv | Lang::Tsv | Lang::Sql | Lang::Tsql => return None,
         Lang::Java => (tree_sitter_java::LANGUAGE.into(), tree_sitter_java::HIGHLIGHTS_QUERY.into(), ""),
     };
     let mut config = HighlightConfiguration::new(language, format!("{lang:?}"), &highlights, injections, "").ok()?;
@@ -160,7 +163,8 @@ pub fn highlight(lang: Lang, text: &str) -> Option<LineSpans> {
     match lang {
         Lang::Csv => return Some(columns(text, crate::table::separator(std::path::Path::new("x.csv"), text.lines().next().unwrap_or("")))),
         Lang::Tsv => return Some(columns(text, b'\t')),
-        Lang::Sql => return Some(sql(text)),
+        Lang::Sql => return Some(sql(text, false)),
+        Lang::Tsql => return Some(sql(text, true)),
         _ => {}
     }
     let config = config(lang)?;
@@ -216,15 +220,34 @@ pub const SQL_KEYWORDS: &[&str] = &[
 
 /// Colors SQL: keywords, 'strings', numbers, -- and /* */ comments, "quoted names", and names
 /// called like functions.
-fn sql(text: &str) -> LineSpans {
+/// `tsql`: SQL Server's dialect, where [brackets] quote names (elsewhere, PostgreSQL's
+/// $$ … $$ / $tag$ … $tag$ strings).
+fn sql(text: &str, tsql: bool) -> LineSpans {
     let idx = |n: &str| NAMES.iter().position(|x| *x == n).unwrap_or(0) as u8;
     let (kw, string, number, comment, func, prop, op) = (idx("keyword"), idx("string"), idx("number"), idx("comment"), idx("function"), idx("property"), idx("operator"));
     let mut out: LineSpans = Vec::new();
     let mut in_block = false;
+    // Inside a dollar-quoted string: its tag ("$$", "$body$").
+    let mut in_dollar: Option<Vec<char>> = None;
+    let ends_at = |c: &[char], from: usize, tag: &[char]| (from..c.len().saturating_sub(tag.len() - 1)).find(|&j| c[j..].starts_with(tag));
     for line in text.split('\n') {
         let c: Vec<char> = line.chars().collect();
         let mut row = Vec::new();
         let mut i = 0;
+        if let Some(tag) = in_dollar.clone() {
+            match ends_at(&c, 0, &tag) {
+                Some(j) => {
+                    row.push((0..j + tag.len(), string));
+                    i = j + tag.len();
+                    in_dollar = None;
+                }
+                None => {
+                    row.push((0..c.len(), string));
+                    out.push(row);
+                    continue;
+                }
+            }
+        }
         if in_block {
             match line.find("*/") {
                 Some(b) => {
@@ -259,7 +282,21 @@ fn sql(text: &str) -> LineSpans {
                     in_block = true;
                     break;
                 }
-            } else if ch == '\'' || ch == '"' || ch == '`' || ch == '[' {
+            } else if ch == '$' && !tsql && let Some(len) = c[i + 1..].iter().position(|x| *x == '$').filter(|n| c[i + 1..i + 1 + n].iter().all(|x| x.is_alphanumeric() || *x == '_') && !c.get(i + 1).is_some_and(|x| x.is_ascii_digit())) {
+                // $$ … $$ or $tag$ … $tag$ (perhaps over several lines).
+                let tag: Vec<char> = c[i..i + len + 2].to_vec();
+                match ends_at(&c, i + tag.len(), &tag) {
+                    Some(j) => {
+                        row.push((i..j + tag.len(), string));
+                        i = j + tag.len();
+                    }
+                    None => {
+                        row.push((i..c.len(), string));
+                        in_dollar = Some(tag);
+                        break;
+                    }
+                }
+            } else if ch == '\'' || ch == '"' || ch == '`' || (ch == '[' && tsql) {
                 let close = if ch == '[' { ']' } else { ch };
                 let mut j = i + 1;
                 while j < c.len() && c[j] != close {
@@ -344,7 +381,7 @@ mod tests {
             l.iter().map(|(r, h)| (c[r.clone()].iter().collect(), super::NAMES[*h as usize])).collect()
         };
         let text = "SELECT count(*) FROM \"users\" WHERE name = 'a''b' AND n > 2 -- note\n/* one\ntwo */ select 1";
-        let s = super::sql(text);
+        let s = super::sql(text, false);
         let lines: Vec<&str> = text.split('\n').collect();
         let first = names(&s[0], lines[0]);
         assert_eq!(first[0], ("SELECT".to_string(), "keyword"));
@@ -356,6 +393,24 @@ mod tests {
         let third = names(&s[2], lines[2]);
         assert_eq!(third[0], ("two */".to_string(), "comment"));
         assert_eq!(third[1], ("select".to_string(), "keyword"), "lower case too");
+    }
+
+    #[test]
+    fn sql_dialects_quote_their_way() {
+        let names = |l: &Vec<(std::ops::Range<usize>, u8)>, text: &str| -> Vec<(String, &'static str)> {
+            let c: Vec<char> = text.chars().collect();
+            l.iter().map(|(r, h)| (c[r.clone()].iter().collect(), super::NAMES[*h as usize])).collect()
+        };
+        // PostgreSQL: an array index isn't a name; $$ strings, over lines.
+        let pg = "select tags[1] from t; do $$ begin\nraise 'x'; end $$;";
+        let s = super::sql(pg, false);
+        let first = names(&s[0], pg.lines().next().unwrap());
+        assert!(first.contains(&("1".to_string(), "number")), "{first:?}");
+        assert!(first.iter().any(|(t, n)| t.starts_with("$$ begin") && *n == "string"), "{first:?}");
+        assert_eq!(names(&s[1], "raise 'x'; end $$;")[0], ("raise 'x'; end $$".to_string(), "string"));
+        // SQL Server: [names].
+        let ms = "select [order] from t";
+        assert!(names(&super::sql(ms, true)[0], ms).contains(&("[order]".to_string(), "property")));
     }
 
     #[test]
