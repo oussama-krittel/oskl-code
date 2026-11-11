@@ -192,10 +192,10 @@ impl DbView {
         }));
     }
 
-    /// Every collection's size is known (tests).
+    /// These collections' sizes are known (tests).
     #[cfg(test)]
-    pub fn overview_sized(&self) -> bool {
-        matches!(&self.body, Body::Overview(o) if o.list.as_ref().is_some_and(|l| l.as_ref().is_ok_and(|l| l.iter().all(|c| c.docs.is_some() || c.props.iter().any(|p| p == "view")))))
+    pub fn overview_sized(&self, names: &[&str]) -> bool {
+        matches!(&self.body, Body::Overview(o) if o.list.as_ref().is_some_and(|l| l.as_ref().is_ok_and(|l| names.iter().all(|n| l.iter().any(|c| c.name == *n && c.docs.is_some())))))
     }
 
     #[cfg(test)]

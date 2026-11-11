@@ -3212,9 +3212,10 @@ impl DbView {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.))
-                    .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(17.)).text_color(theme::fg_bright()).child(format!("{what}: {name}")))
+                    .child(div().flex_1().min_w(px(120.)).overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(17.)).text_color(theme::fg_bright()).child(format!("{what}: {name}")))
                     .when(kind == Kind::RabbitMq && what == "Queue", |d| d.child(button("db-peek", "Peek messages", Some("eye"), false).on_click(cx.listener(|v, _, _, cx| v.peek_messages(cx)))))
                     // While reading: Stop.
                     .child(button("db-refresh", if d.loading { "Stop" } else { "Refresh" }, Some(if d.loading { "stop" } else { "refresh" }), true).on_click(cx.listener(|v, _, _, cx| v.stop_or_load(cx))))
@@ -3237,16 +3238,20 @@ impl DbView {
             })
             .when(!matches!(d.page, Some(Err(_))), |el| {
                 let docs = d.grid.as_ref().is_some_and(|g| g.grid.trees.is_some());
+                // Narrow (a small split): the controls go on a line of their own rather than off the edge.
                 el.child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .gap(px(10.))
                         .text_size(px(12.))
                         .text_color(theme::fg_dim())
-                        .child(showing)
-                        .when_some(note, |d, n| d.child(div().text_color(theme::fg_muted()).child(format!("· {n}"))))
+                        // (MongoDB: the range on the right says how many.)
+                        .when(d.compass.is_none(), |el| el.child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(showing)))
+                        .when_some(note, |d, n| d.child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_muted()).child(format!("· {n}"))))
                         .child(div().flex_1())
+                        .child(div().flex().flex_wrap().justify_end().min_w_0().items_center().gap(px(10.))
                         .when(d.compass.is_some(), |el| {
                             let limit = d.spec.limit.max(1);
                             let offset = d.spec.offset;
@@ -3264,7 +3269,7 @@ impl DbView {
                                 .child(arrow("db-prev", "chevron-left", page_no > 1).when(page_no > 1, |b| b.on_click(cx.listener(move |v, _, _, cx| v.set_page(offset.saturating_sub(limit), cx)))))
                                 .child(arrow("db-next", "chevron-right", page_no < last).when(page_no < last, |b| b.on_click(cx.listener(move |v, _, _, cx| v.set_page(offset + limit, cx)))))
                         })
-                        .when(docs || d.compass.is_some(), |el| el.child(mode_switch(d.doc_mode, cx))),
+                        .when(docs || d.compass.is_some(), |el| el.child(mode_switch(d.doc_mode, cx)))),
                 )
             })
             .child(match d.compass.as_deref().and_then(|c| self.render_explain(c, cx)) {

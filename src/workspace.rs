@@ -8948,6 +8948,13 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         tab.update(cx, |t, _| t.set_table_scroll_x(200.));
         cx.update(|w, _| w.refresh());
         cx.run_until_parked();
+        // Narrow: the view switch wraps under, never off the edge.
+        let (switch, area) = (cx.debug_bounds("db-mode-table").unwrap(), cx.debug_bounds("db-grid").unwrap());
+        assert!(switch.right() <= area.right() + gpui::px(1.), "in view: {switch:?} in {area:?}");
+        for b in ["db-find", "db-options", "db-export"] {
+            let r = cx.debug_bounds(b).unwrap();
+            assert!(r.right() <= area.right() + gpui::px(1.), "{b} in view: {r:?} in {area:?}");
+        }
         let pinned = cx.debug_bounds("db-pinned-0").expect("pinned when scrolled");
         let grid = cx.debug_bounds("db-grid").unwrap();
         assert!((pinned.left() - grid.left()).abs() < gpui::px(2.), "at the left edge");
@@ -9438,7 +9445,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(h < gpui::px(42.), "one line: {h:?}");
         cx.simulate_resize(gpui::size(gpui::px(1800.), gpui::px(900.)));
         cx.run_until_parked();
-        wait_for(cx, "the sizes", |cx| tab.read_with(cx, |t, _| t.overview_sized()));
+        wait_for(cx, "the sizes", |cx| tab.read_with(cx, |t, _| t.overview_sized(&["overview_big", "overview_small"])));
         // Sorted by documents, most first.
         click_on(cx, "db-sort-docs");
         let names = tab.read_with(cx, |t, _| t.overview_names()).unwrap().unwrap();

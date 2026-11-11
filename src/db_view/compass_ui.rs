@@ -617,7 +617,7 @@ impl DbView {
     // ------------------------------------------------------------ drawing
 
     /// The tabs across the top: Documents (with the count), Aggregations, Schema, Indexes, Validation, and the shell.
-    pub(super) fn render_compass_tabs(&self, d: &Data, c: &Compass, cx: &mut Context<Self>) -> gpui::Div {
+    pub(super) fn render_compass_tabs(&self, d: &Data, c: &Compass, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let total = match &d.page {
             Some(Ok(p)) => p.total,
             _ => None,
@@ -650,6 +650,9 @@ impl DbView {
         };
         let data = d.inner == Inner::DataView;
         div()
+            .id("db-compass-tabs")
+            // Narrower than the tabs: they scroll sideways instead of being cut off.
+            .overflow_x_scroll()
             .flex()
             .flex_none()
             .h(px(36.))
@@ -796,9 +799,11 @@ impl DbView {
             .border_1()
             .border_color(theme::border_input())
             .bg(theme::bg_side())
+            // Narrow: the buttons go under the filter rather than off the edge.
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.))
                     .child(
@@ -824,7 +829,7 @@ impl DbView {
                             .child(ui::small_icon("history", theme::fg()))
                             .child(ui::small_icon("chevron-down", theme::fg_dim())),
                     )
-                    .child(field(&c.filter).debug_selector(|| "db-filter".into()))
+                    .child(field(&c.filter).min_w(px(160.)).debug_selector(|| "db-filter".into()))
                     .child(button("db-explain", "Explain", None, false).on_click(cx.listener(|v, _, _, cx| v.explain(cx))))
                     .child(button("db-reset", "Reset", None, false).on_click(cx.listener(|v, _, _, cx| v.reset_bar(cx))))
                     .child(button("db-find", "Find", None, true).on_click(cx.listener(|v, _, _, cx| v.find(cx))))
