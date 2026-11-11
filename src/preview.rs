@@ -477,6 +477,31 @@ impl PreviewView {
         }
     }
 
+    /// Pictures on the web the page shows (README badges, screenshots): downloaded once, off the
+    /// main thread, into a cache; the page is drawn again with them.
+    fn fetch_remote_images(&mut self, cx: &mut Context<Self>) {
+        for url in REMOTE_WANTED.with(|w| std::mem::take(&mut *w.borrow_mut())) {
+            if !REMOTE_BUSY.lock().unwrap().insert(url.clone()) {
+                continue;
+            }
+            let file = remote_image_file(&url);
+            let get = cx.background_executor().spawn(async move {
+                let ok = download_image(&url, &file);
+                REMOTE_BUSY.lock().unwrap().remove(&url);
+                if !ok {
+                    REMOTE_FAILED.lock().unwrap().insert(url);
+                }
+                ok
+            });
+            cx.spawn(async move |this, cx| {
+                if get.await {
+                    this.update(cx, |v, cx| v.mark_stale(cx)).ok();
+                }
+            })
+            .detach();
+        }
+    }
+
     pub fn mark_stale(&mut self, cx: &mut Context<Self>) {
         self.stale = true;
         cx.notify();
@@ -794,6 +819,7 @@ impl Render for PreviewView {
         let body = match self.kind {
             Kind::Markdown => {
                 let (page, shown, wanted) = self.render_markdown(cx);
+                self.fetch_remote_images(cx);
                 self.note_loaded(wanted, window, cx);
                 self.keep_pictures(shown, window, cx);
                 page
@@ -1226,6 +1252,35 @@ fn forget_diagram(path: &Path, window: &mut Window, cx: &mut App) {
         }
     }
     DIAGRAMS.lock().unwrap().retain(|_, v| v.as_ref().map(|x| x.path.as_path() != path).unwrap_or(true));
+}
+
+thread_local! {
+    /// Web pictures a page wanted while it was drawn (fetched after).
+    static REMOTE_WANTED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+/// Being downloaded, and those that couldn't be (not tried again this run).
+static REMOTE_BUSY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+static REMOTE_FAILED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
+/// Where a web picture is kept once downloaded.
+fn remote_image_file(url: &str) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    home.join("Library/Caches/oskl/images").join(format!("{:016x}", hash(url)))
+}
+
+/// Downloads a picture (at most 5 MB, 15 s) to `file`; whether it worked.
+fn download_image(url: &str, file: &Path) -> bool {
+    use std::io::Read;
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(15))).build().into();
+    let Ok(mut resp) = agent.get(url).call() else { return false };
+    let mut bytes = Vec::new();
+    if resp.body_mut().as_reader().take(5 * 1024 * 1024 + 1).read_to_end(&mut bytes).is_err() || bytes.is_empty() || bytes.len() > 5 * 1024 * 1024 {
+        return false;
+    }
+    let Some(dir) = file.parent() else { return false };
+    std::fs::create_dir_all(dir).ok();
+    let tmp = file.with_extension("part");
+    std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, file).is_ok()
 }
 
 fn hash(s: &str) -> u64 {
@@ -2037,9 +2092,15 @@ impl Renderer {
 
     /// A picture: its own size (or the `width`/`height` HTML asked for), no wider than the page.
     fn image(&mut self, url: &str, alt: &str, want_w: Option<f32>, want_h: Option<f32>) -> AnyElement {
+        let web = url.starts_with("https://") || url.starts_with("http://");
         let local = !url.contains("://") && !url.starts_with("data:");
-        let path = self.base.join(url.split(['?', '#']).next().unwrap_or(url));
-        if local && path.is_file() {
+        // A picture on the web: shown once downloaded (asked for now, drawn again when it's here).
+        let cached = web.then(|| remote_image_file(url)).filter(|f| f.is_file());
+        if web && cached.is_none() && !REMOTE_FAILED.lock().unwrap().contains(url) {
+            REMOTE_WANTED.with(|w| w.borrow_mut().push(url.to_string()));
+        }
+        let path = cached.clone().unwrap_or_else(|| self.base.join(url.split(['?', '#']).next().unwrap_or(url)));
+        if (local || cached.is_some()) && path.is_file() {
             let alt = alt.to_string();
             let el = img(path.clone()).image_cache(&self.images).object_fit(ObjectFit::Contain).with_fallback(move || div().text_color(theme::fg_dim()).child(format!("[{alt}]")).into_any_element());
             let natural = image_size(&path).filter(|(w, h)| *w > 0 && *h > 0).map(|(w, h)| (w as f32, h as f32));
@@ -2100,8 +2161,29 @@ fn html_blocks(html: &str) -> Vec<Block> {
         inline: Inline,
         style: Style,
         link: Option<(usize, String)>,
+        /// Inside a <table>: its rows so far, and the row being read.
+        table: Option<(Vec<Vec<Inline>>, Vec<Inline>)>,
     }
     impl P {
+        /// The cell being read ends: its text goes in the row.
+        fn end_cell(&mut self) {
+            let cell = std::mem::take(&mut self.inline);
+            if let Some((_, row)) = &mut self.table {
+                let mut cell = cell;
+                let trimmed = cell.text.trim_end().len();
+                let mut cut = cell.text.len() - trimmed;
+                while cut > 0 && let Some(last) = cell.runs.last_mut() {
+                    let take = cut.min(last.0);
+                    last.0 -= take;
+                    cut -= take;
+                    if last.0 == 0 {
+                        cell.runs.pop();
+                    }
+                }
+                cell.text.truncate(trimmed);
+                row.push(cell);
+            }
+        }
         fn push(&mut self, t: &str) {
             // HTML runs spaces and line breaks together; none at the start of a line.
             let mut s = String::new();
@@ -2230,6 +2312,7 @@ fn html_blocks(html: &str) -> Vec<Block> {
         let closing = tag.starts_with('/');
         let name = tag.trim_start_matches('/').split(|c: char| c.is_whitespace() || c == '/').next().unwrap_or("").to_ascii_lowercase();
         match (name.as_str(), closing) {
+            ("p" | "div" | "center" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "section" | "header" | "footer" | "blockquote", _) if p.table.is_some() => {}
             ("p" | "div" | "center" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "section" | "header" | "footer" | "blockquote", false) => {
                 p.end_group();
                 let a = attrs(tag);
@@ -2278,6 +2361,54 @@ fn html_blocks(html: &str) -> Vec<Block> {
             ("hr", _) => {
                 p.end_group();
                 p.out.push(Block::Rule);
+            }
+            // A table: its rows (the first is the header), cells as text with their links and styles.
+            ("table", false) => {
+                p.end_group();
+                p.table = Some((Vec::new(), Vec::new()));
+            }
+            ("td" | "th", false) if p.table.is_some() => {
+                p.inline = Inline::default();
+                p.style.bold = name == "th";
+            }
+            ("td" | "th", true) if p.table.is_some() => {
+                p.end_cell();
+                p.style.bold = false;
+            }
+            ("tr", true) if p.table.is_some() => {
+                if !p.inline.text.trim().is_empty() {
+                    p.end_cell();
+                }
+                if let Some((rows, row)) = &mut p.table
+                    && !row.is_empty()
+                {
+                    rows.push(std::mem::take(row));
+                }
+            }
+            ("table", true) => {
+                if let Some((mut rows, row)) = p.table.take() {
+                    if !row.is_empty() {
+                        rows.push(row);
+                    }
+                    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+                    for r in &mut rows {
+                        r.resize_with(cols, Inline::default);
+                    }
+                    if cols > 0 {
+                        p.out.push(Block::Table(vec![Alignment::None; cols], rows));
+                    }
+                }
+                p.inline = Inline::default();
+            }
+            // <details>: always open here; its <summary> a bold line.
+            ("details", _) => p.end_group(),
+            ("summary", false) => {
+                p.end_group();
+                p.style.bold = true;
+            }
+            ("summary", true) => {
+                p.end_group();
+                p.style.bold = false;
             }
             _ => {}
         }
@@ -2394,6 +2525,46 @@ mod tests {
         // Badges side by side.
         let b = parse("<p><img src=\"a.png\"> <img src=\"b.png\"></p>");
         assert!(matches!(&b[0], super::Block::Row(r) if r.len() == 2), "{b:?}");
+    }
+
+    #[test]
+    fn web_pictures_are_downloaded_into_a_cache() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut s = stream.unwrap();
+                let mut req = [0u8; 1024];
+                let n = s.read(&mut req).unwrap_or(0);
+                let found = String::from_utf8_lossy(&req[..n]).starts_with("GET /badge.svg");
+                let body = b"<svg xmlns='http://www.w3.org/2000/svg' width='20' height='10'/>";
+                if found {
+                    write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                    s.write_all(body).unwrap();
+                } else {
+                    write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/badge.svg");
+        let file = std::env::temp_dir().join(format!("oskl-img-{port}"));
+        assert!(super::download_image(&url, &file), "downloaded");
+        assert!(std::fs::read_to_string(&file).unwrap().starts_with("<svg"));
+        assert!(!super::download_image(&format!("http://127.0.0.1:{port}/missing.png"), &file.with_extension("x")), "a 404 isn't a picture");
+        std::fs::remove_file(&file).ok();
+        assert_ne!(super::remote_image_file("https://a/x.png"), super::remote_image_file("https://a/y.png"), "one file per address");
+    }
+
+    #[test]
+    fn html_tables_and_details_are_drawn() {
+        let b = parse("<table>\n<tr><th>Name</th><th>Size</th></tr>\n<tr><td>a <b>b</b></td><td><a href=\"x\">1</a></td></tr>\n</table>\n\n<details><summary>More</summary>\n\nHidden text\n\n</details>");
+        let Block::Table(aligns, rows) = &b[0] else { panic!("{b:?}") };
+        assert_eq!(aligns.len(), 2);
+        assert_eq!(rows.iter().map(|r| r.iter().map(|c| c.text.clone()).collect::<Vec<_>>()).collect::<Vec<_>>(), [vec!["Name", "Size"], vec!["a b", "1"]]);
+        assert_eq!(rows[1][1].links.len(), 1, "the link kept");
+        assert!(b.iter().any(|x| matches!(x, Block::Para(i) if i.text == "More" && i.runs.iter().any(|r| r.1.bold))), "the summary, bold: {b:?}");
+        assert!(b.iter().any(|x| matches!(x, Block::Para(i) if i.text == "Hidden text")), "the details shown");
     }
 
     #[test]

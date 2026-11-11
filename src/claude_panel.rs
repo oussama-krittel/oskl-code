@@ -18,7 +18,7 @@ use std::time::UNIX_EPOCH;
 
 // ---------------------------------------------------------------- token usage
 
-#[derive(Clone, Copy, Default, Debug, PartialEq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tokens {
     pub input: u64,
     pub output: u64,
@@ -57,9 +57,32 @@ fn day_of(ts: &str) -> Option<i64> {
 }
 
 /// A session file's replies. Claude Code writes a reply once per content block, so the last line per message id counts.
+/// A session file's replies, read line by line (files can be large: never held whole).
+fn replies_in(path: &Path) -> Vec<Reply> {
+    use std::io::BufRead;
+    let Ok(f) = std::fs::File::open(path) else { return Vec::new() };
+    let lines = std::io::BufReader::new(f).lines().map_while(Result::ok).filter(|l| l.contains("\"usage\"") && l.contains("\"assistant\""));
+    totals(replies_of(lines))
+}
+
+/// Replies added up by day and model (what the windows and models count), to keep little.
+fn totals(list: Vec<Reply>) -> Vec<Reply> {
+    let mut by: HashMap<(i64, String), Tokens> = HashMap::new();
+    for (day, model, t) in list {
+        by.entry((day, model)).or_default().add(&t);
+    }
+    by.into_iter().map(|((d, m), t)| (d, m, t)).collect()
+}
+
+#[cfg(test)]
 fn replies(jsonl: &str) -> Vec<Reply> {
+    replies_of(jsonl.lines().map(str::to_string).filter(|l| l.contains("\"usage\"") && l.contains("\"assistant\"")))
+}
+
+fn replies_of(lines: impl Iterator<Item = String>) -> Vec<Reply> {
     let mut by_id: HashMap<String, Reply> = HashMap::new();
-    for line in jsonl.lines().filter(|l| l.contains("\"usage\"") && l.contains("\"assistant\"")) {
+    for line in lines {
+        let line = line.as_str();
         let Ok(r) = serde_json::from_str::<Value>(line) else { continue };
         let (m, u) = (&r["message"], &r["message"]["usage"]);
         let (Some(id), Some(day)) = (m["id"].as_str(), r["timestamp"].as_str().and_then(day_of)) else { continue };
@@ -70,8 +93,30 @@ fn replies(jsonl: &str) -> Vec<Reply> {
     by_id.into_values().filter(|r| r.1 != "<synthetic>").collect()
 }
 
-/// Replies by file, with the file's (mtime, size) they were read at: counting again reads only changed files.
-static REPLIES: LazyLock<Mutex<HashMap<PathBuf, ((i64, u64), Arc<Vec<Reply>>)>>> = LazyLock::new(Default::default);
+/// Replies by file, with the file's (mtime, size) they were read at: counting again reads only
+/// changed files. Kept on disk too, so the next launch doesn't read them all again.
+static REPLIES: LazyLock<Mutex<HashMap<PathBuf, ((i64, u64), Arc<Vec<Reply>>)>>> = LazyLock::new(|| Mutex::new(load_usage_cache()));
+
+fn usage_cache_file() -> PathBuf {
+    home().join(".config/oskl/claude-usage.json")
+}
+
+fn load_usage_cache() -> HashMap<PathBuf, ((i64, u64), Arc<Vec<Reply>>)> {
+    let Ok(text) = std::fs::read_to_string(usage_cache_file()) else { return HashMap::new() };
+    let saved: Vec<(PathBuf, (i64, u64), Vec<Reply>)> = serde_json::from_str(&text).unwrap_or_default();
+    saved.into_iter().map(|(p, stamp, r)| (p, (stamp, Arc::new(r)))).collect()
+}
+
+fn save_usage_cache(map: &HashMap<PathBuf, ((i64, u64), Arc<Vec<Reply>>)>) {
+    let list: Vec<(&PathBuf, (i64, u64), &Vec<Reply>)> = map.iter().map(|(p, (stamp, r))| (p, *stamp, r.as_ref())).collect();
+    if let Ok(text) = serde_json::to_string(&list) {
+        let file = usage_cache_file();
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        std::fs::write(file, text).ok();
+    }
+}
 
 pub struct Usage {
     /// Last 7 days, last 30 days, all time.
@@ -84,6 +129,8 @@ pub struct Usage {
 pub fn token_usage(today: i64) -> Usage {
     let mut stack = vec![home().join(".claude/projects")];
     let mut all = Vec::new();
+    let mut changed = false;
+    let mut present = HashSet::new();
     while let Some(dir) = stack.pop() {
         for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let (path, Ok(meta)) = (e.path(), e.metadata()) else { continue };
@@ -95,16 +142,26 @@ pub fn token_usage(today: i64) -> Usage {
                 continue;
             }
             let stamp = (meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as i64), meta.len());
+            present.insert(path.clone());
             let cached = REPLIES.lock().unwrap().get(&path).filter(|c| c.0 == stamp).map(|c| c.1.clone());
             let r = match cached {
                 Some(r) => r,
                 None => {
-                    let r = Arc::new(std::fs::read_to_string(&path).map(|t| replies(&t)).unwrap_or_default());
+                    let r = Arc::new(replies_in(&path));
                     REPLIES.lock().unwrap().insert(path, (stamp, r.clone()));
+                    changed = true;
                     r
                 }
             };
             all.push(r);
+        }
+    }
+    {
+        let mut cache = REPLIES.lock().unwrap();
+        let before = cache.len();
+        cache.retain(|p, _| present.contains(p));
+        if changed || cache.len() != before {
+            save_usage_cache(&cache);
         }
     }
     let mut windows = [("Last 7 days", Tokens::default()), ("Last 30 days", Tokens::default()), ("All time", Tokens::default())];
@@ -354,7 +411,10 @@ impl ClaudePanel {
                         .group_hover("claude-session", |s| s.visible())
                         .child(ui::icon_button(("claude-session-term", i), "terminal").tooltip(ui::tooltip("Resume in a terminal")).on_click(cx.listener(move |_, _, _, cx| {
                             cx.stop_propagation();
-                            cx.emit(Request::RunInTerminal { dir: root.clone(), command: format!("claude --resume {id2}") });
+                            // Only a well-formed session id goes into the command line (it runs in a shell).
+                            if crate::agent::is_uuid(&id2) {
+                                cx.emit(Request::RunInTerminal { dir: root.clone(), command: format!("claude --resume {id2}") });
+                            }
                         })))
                         .child(ui::icon_button(("claude-session-del", i), "trash").tooltip(ui::tooltip("Move to Trash")).on_click(cx.listener(move |_, _, _, cx| {
                             cx.stop_propagation();
@@ -514,6 +574,19 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].2, Tokens { input: 2, output: 40, cache_read: 90, cache_write: 8 });
         assert!((r[0].2.cache_hit() - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_file_is_read_line_by_line_and_added_up() {
+        let line = |id: &str, out: u64| format!(r#"{{"type":"assistant","timestamp":"2026-11-09T10:00:00Z","message":{{"id":"{id}","model":"claude-opus-5-5","usage":{{"input_tokens":1,"output_tokens":{out},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#);
+        let dir = std::env::temp_dir().join(format!("oskl-usage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.jsonl");
+        std::fs::write(&file, format!("{}\n{}\n{}\n{{\"type\":\"user\"}}\n", line("a", 1), line("a", 5), line("b", 7))).unwrap();
+        let r = replies_in(&file);
+        assert_eq!(r.len(), 1, "one day, one model");
+        assert_eq!(r[0].2, Tokens { input: 2, output: 12, cache_read: 0, cache_write: 0 }, "a counted once (its last), plus b");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

@@ -70,7 +70,8 @@ pub fn claude_bin() -> Result<PathBuf, String> {
         .ok_or_else(|| "Claude Code isn't installed: no `claude` on your shell's PATH. Install it (claude.com/claude-code), run `claude` once in a terminal to sign in, then try again.".into())
 }
 
-fn is_uuid(s: &str) -> bool {
+/// A session id as Claude Code writes them (safe to put in a command line).
+pub(crate) fn is_uuid(s: &str) -> bool {
     s.len() == 36 && s.bytes().enumerate().all(|(i, b)| if [8, 13, 18, 23].contains(&i) { b == b'-' } else { b.is_ascii_hexdigit() })
 }
 

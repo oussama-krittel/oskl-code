@@ -926,9 +926,10 @@ impl AgentView {
     }
 
     fn open_in_terminal(&mut self, cx: &mut Context<Self>) {
+        // Only a well-formed session id goes into the command line (it runs in a shell).
         let cmd = match &self.log.session {
-            Some(id) => format!("claude --resume {id}"),
-            None => "claude".into(),
+            Some(id) if crate::agent::is_uuid(id) => format!("claude --resume {id}"),
+            _ => "claude".into(),
         };
         self.stop_proc(); // one Claude Code per conversation
         cx.emit(Request::RunInTerminal { dir: self.root.clone(), command: cmd });

@@ -238,7 +238,24 @@ fn remember(r: Recent) {
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir).ok();
         }
-        std::fs::write(p, serde_json::to_string(&all).unwrap_or_default()).ok();
+        write_history(&p, &all);
+    }
+}
+
+/// Saved readable by this user only (queries can hold values filtered on).
+fn write_history(p: &std::path::Path, all: &[Recent]) {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::write(p, serde_json::to_string(all).unwrap_or_default()).is_ok() {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).ok();
+    }
+}
+
+/// Forgets a collection's recent queries.
+fn forget_history(conn: &str, db: &str, coll: &str) {
+    let mut all = read_history();
+    all.retain(|r| !(r.conn == conn && r.db == db && r.coll == coll));
+    if let Some(p) = history_file() {
+        write_history(&p, &all);
     }
 }
 
@@ -733,7 +750,35 @@ impl DbView {
                     .border_1()
                     .border_color(theme::border_input())
                     .shadow_lg()
-                    .child(div().px(px(12.)).py(px(4.)).text_size(px(11.)).text_color(theme::fg_muted()).child("RECENT"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .px(px(12.))
+                            .py(px(4.))
+                            .text_size(px(11.))
+                            .text_color(theme::fg_muted())
+                            .child(div().flex_1().child("RECENT"))
+                            .child(
+                                div()
+                                    .id("db-history-clear")
+                                    .debug_selector(|| "db-history-clear".into())
+                                    .px(px(6.))
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::hover()).text_color(theme::fg()))
+                                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(|v, _, _, cx| {
+                                        if let Body::Data(d) = &v.body
+                                            && let [db, coll] = d.path.as_slice()
+                                        {
+                                            forget_history(&d.conn.id, db, coll);
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child("Clear"),
+                            ),
+                    )
                     .children(rows),
             )
             .with_priority(1)

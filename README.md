@@ -13,8 +13,8 @@
 
 | | OSKL Code | Typical Electron editor |
 |---|---|---|
-| Memory with a project open | ~100 MB | 500 MB – 1.5 GB |
-| App size | ~20 MB | 300+ MB |
+| Memory with a project open | ~130 MB | 500 MB – 1.5 GB |
+| App size | ~55 MB | 300+ MB |
 | Startup | instant (native, GPU-drawn) | seconds |
 | Git tools | built in: graph, blame, editable diffs, merge editor | extensions |
 | Terminal | real terminal (alacritty) in any split | panel at the bottom |
