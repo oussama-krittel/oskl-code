@@ -721,20 +721,49 @@ pub fn apply_tree(t: &mut Tree, op: &Op) -> Result<(), String> {
     Ok(())
 }
 
-/// A document's _id, from how it was shown, to find it again.
-fn id_of(t: &Tree) -> Result<Bson> {
-    let Tree::Object(f) = t else { bail!("not a document") };
-    let id = f.iter().find(|(k, _)| k == "_id").map(|(_, v)| v).ok_or_else(|| anyhow!("The document has no _id"))?;
-    Ok(match id {
+/// A value back from how it was shown (for finding a document by its _id, any shape).
+fn tree_to_bson(t: &Tree) -> Result<Bson> {
+    Ok(match t {
+        Tree::Null => Bson::Null,
+        Tree::Bool(b) => Bson::Boolean(*b),
         Tree::Str(s) => Bson::String(s.clone()),
         Tree::Num(n) => Bson::Int32(n.parse()?),
         Tree::Typed("Long", n) => Bson::Int64(n.parse()?),
         Tree::Typed("Double", n) => Bson::Double(n.parse()?),
+        Tree::Typed("Decimal128", n) => Bson::Decimal128(n.parse().map_err(|_| anyhow!("not a decimal: {n}"))?),
         Tree::Typed("ObjectId", h) => Bson::ObjectId(mongodb::bson::oid::ObjectId::parse_str(h)?),
         Tree::Typed("UUID", u) => Bson::Binary(mongodb::bson::Binary::from_uuid(mongodb::bson::Uuid::parse_str(u)?)),
         Tree::Typed("Date", d) => Bson::DateTime(mongodb::bson::DateTime::parse_rfc3339_str(d)?),
+        Tree::Array(a) => Bson::Array(a.iter().map(tree_to_bson).collect::<Result<_>>()?),
+        Tree::Object(f) => Bson::Document(f.iter().map(|(k, v)| Ok((k.clone(), tree_to_bson(v)?))).collect::<Result<Document>>()?),
         other => bail!("Documents with an _id like {} can't be edited here", other.short(TextStyle::Shell)),
     })
+}
+
+/// A document's _id, from how it was shown, to find it again.
+fn id_of(t: &Tree) -> Result<Bson> {
+    let Tree::Object(f) = t else { bail!("not a document") };
+    let id = f.iter().find(|(k, _)| k == "_id").map(|(_, v)| v).ok_or_else(|| anyhow!("The document has no _id"))?;
+    tree_to_bson(id)
+}
+
+/// Whether a document shown can be found again by its _id (edited, cloned, deleted); why not.
+pub fn editable(t: &Tree) -> Result<(), String> {
+    id_of(t).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// A document as it is on the server (with `ops` applied), as Extended JSON to edit whole:
+/// every type and every character kept (the views shorten long values and write some types simply).
+pub async fn doc_json(c: &Client, db: &str, coll: &str, original: &Tree, ops: &[Op]) -> Result<String> {
+    let id = id_of(original)?;
+    let mut doc = c.database(db).collection::<Document>(coll).find_one(doc! { "_id": id }).await?.ok_or_else(|| anyhow!("The document was deleted meanwhile"))?;
+    if &tree(&Bson::Document(doc.clone())) != original {
+        bail!("The document changed since it was shown: refresh, then edit it again");
+    }
+    for op in ops {
+        apply(&mut doc, op)?;
+    }
+    Ok(serde_json::to_string_pretty(&Bson::Document(doc).into_relaxed_extjson())?)
 }
 
 /// Saves a card's changes: the document is read again, checked unchanged since it was shown,

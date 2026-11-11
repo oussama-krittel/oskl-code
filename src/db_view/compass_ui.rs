@@ -170,6 +170,33 @@ impl Compass {
     }
 }
 
+impl Compass {
+    #[cfg(test)]
+    pub(super) fn sort_text(&self, cx: &App) -> String {
+        self.sort.read(cx).text()
+    }
+
+    /// The Options' Sort, set from a column header clicked.
+    pub(super) fn set_sort_text(&self, text: &str, cx: &mut App) {
+        self.sort.update(cx, |e, cx| e.set_text(text, cx));
+    }
+}
+
+/// `{ name: -1 }` → ("name", descending); None for anything else (several fields, empty…).
+fn simple_sort(text: &str) -> Option<(String, bool)> {
+    let t = text.trim().strip_prefix('{')?.strip_suffix('}')?.trim();
+    let (k, v) = t.split_once(':')?;
+    let k = k.trim().trim_matches(['\'', '"']);
+    if k.is_empty() || k.contains(',') || v.contains(',') {
+        return None;
+    }
+    match v.trim() {
+        "1" => Some((k.to_string(), false)),
+        "-1" => Some((k.to_string(), true)),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------- query history
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
@@ -263,6 +290,8 @@ impl DbView {
             let [db, coll] = d.path.as_slice() else { return };
             remember(Recent { conn: d.conn.id.clone(), db: db.clone(), coll: coll.clone(), q: q.clone() });
         }
+        // The column headers show the bar's sort when it's a single field ({ name: 1 }).
+        d.spec.sort = simple_sort(&q.sort);
         d.spec.mongo = Some(q);
         d.spec.offset = 0;
         self.load(cx);
@@ -304,6 +333,11 @@ impl DbView {
     }
 
     pub(super) fn run_pipeline(&mut self, cx: &mut Context<Self>) {
+        self.run_pipeline_checked(false, cx);
+    }
+
+    /// A pipeline writing somewhere ($out, $merge) is asked about first (unless `confirmed`).
+    fn run_pipeline_checked(&mut self, confirmed: bool, cx: &mut Context<Self>) {
         let Some((conn, db, coll)) = self.target() else { return };
         let Some(c) = self.compass_mut() else { return };
         if c.agg_running.is_some() {
@@ -313,6 +347,10 @@ impl DbView {
         if !text.trim_start().starts_with('[') {
             c.agg_error = Some("A pipeline is an array of stages: [ { $match: {…} }, { $group: {…} } ]".into());
             return cx.notify();
+        }
+        if !confirmed && let Some(what) = super::destructive(crate::db::Kind::MongoDb, &text) {
+            let weak = cx.entity().downgrade();
+            return super::confirm_destructive(&what, &format!("{db}.{coll}"), weak, |v, cx| v.run_pipeline_checked(true, cx), cx);
         }
         let work = engine::run(engine::query(conn, Scope { database: Some(db), collection: Some(coll) }, text));
         c.agg_running = Some(Instant::now());

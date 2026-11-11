@@ -118,6 +118,8 @@ struct Data {
     inner: Inner,
     // Data View
     spec: PageSpec,
+    /// What was last read (put back when unsaved changes are kept instead of reading again).
+    loaded_spec: PageSpec,
     page: Option<Result<Page, String>>,
     grid: Option<GridView>,
     loading: bool,
@@ -155,6 +157,46 @@ fn keep_column_order(old: &[String], g: &mut Grid) {
     for row in &mut g.rows {
         *row = order.iter().map(|i| row.get(*i).cloned().flatten()).collect();
     }
+}
+
+/// The first statement of a query that changes or deletes data (dropping, deleting, emptying,
+/// updating many…), to ask before running it.
+pub(crate) fn destructive(kind: Kind, text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let words: &[&str] = match kind {
+        Kind::MongoDb => &["dropdatabase(", ".drop(", "dropindex", "dropindexes", "deletemany(", "deleteone(", ".remove(", "updatemany(", "replaceone(", "renamecollection", "\"$out\"", "$out:", "'$out'", "\"$merge\"", "$merge:", "'$merge'", "findoneanddelete", "findandmodify"],
+        Kind::Postgres | Kind::SqlServer => &["drop ", "truncate ", "delete ", "update ", "alter ", "merge "],
+        Kind::Redis => &["flushall", "flushdb", "del ", "unlink ", "rename "],
+        Kind::RabbitMq => &["delete ", "/purge", "/contents"],
+    };
+    let sql = matches!(kind, Kind::Postgres | Kind::SqlServer);
+    for (line, low) in text.lines().zip(lower.lines()) {
+        let l = low.trim_start();
+        // SQL: a statement starting with it (not a column named update_at…); others: anywhere.
+        let hit = if sql { words.iter().any(|w| l.starts_with(w) || l.contains(&format!("; {w}")) || l.contains(&format!(";{w}"))) } else { words.iter().any(|w| l.contains(w)) };
+        if hit && !l.starts_with("--") && !l.starts_with("//") {
+            let shown: String = line.trim().chars().take(120).collect();
+            return Some(shown);
+        }
+    }
+    None
+}
+
+/// "This changes data: run it?" — `go` runs it when answered yes.
+pub(crate) fn confirm_destructive(what: &str, on: &str, weak: gpui::WeakEntity<DbView>, go: fn(&mut DbView, &mut Context<DbView>), cx: &mut Context<DbView>) {
+    cx.emit(Request::Ask(crate::dialog::Ask {
+        title: "Run a query that changes data?".into(),
+        detail: format!("On {on}:\n{what}\n\nIt changes or deletes data, and can't be undone here."),
+        buttons: vec!["Run".into()],
+        danger: true,
+        cancel_default: true,
+        cancel_label: None,
+        on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
+            if let Some(v) = weak.upgrade() {
+                v.update(cx, |v, cx| go(v, cx));
+            }
+        }),
+    }));
 }
 
 /// Remembers the fields (columns) of results, for suggestions; MongoDB's nested ones as `a.b`.
@@ -268,6 +310,8 @@ struct Editing {
 /// A document typed whole, as JSON, in its card.
 struct JsonEdit {
     editor: Entity<Editor>,
+    /// The text it started with (unchanged: nothing to keep when the view is switched).
+    initial: String,
     /// Why the text isn't a document (Update waits until it is).
     invalid: Option<String>,
     error: Option<String>,
@@ -354,6 +398,7 @@ impl DbView {
                         has_data,
                         inner: if has_data { Inner::DataView } else { Inner::Query },
                         spec: PageSpec { limit: PAGE_SIZES[0], mongo: compass.as_ref().map(|_| Default::default()), ..Default::default() },
+                        loaded_spec: PageSpec::default(),
                         page: None,
                         grid: None,
                         loading: false,
@@ -486,11 +531,57 @@ impl DbView {
 
     // ------------------------------------------------------------ data view
 
+    /// Documents changed in place and not saved yet (or being typed into).
+    fn has_unsaved(&self, cx: &App) -> bool {
+        let Body::Data(d) = &self.body else { return false };
+        let Some(g) = &d.grid else { return false };
+        self.editing.as_ref().is_some_and(|e| e.which.is_none())
+            || g.edits.values().any(|e| e.working != e.original)
+            || g.json_edits.values().any(|j| j.editor.read(cx).text() != j.initial)
+    }
+
+    /// Reads the rows (again). Unsaved changes in them are asked about first: kept, nothing is
+    /// read and the view stays as it was (its sort, page, query); or discarded.
     fn load(&mut self, cx: &mut Context<Self>) {
+        if !self.has_unsaved(cx) {
+            return self.load_now(cx);
+        }
+        let Body::Data(d) = &mut self.body else { return };
+        let wanted = std::mem::replace(&mut d.spec, d.loaded_spec.clone());
+        let weak = cx.entity().downgrade();
+        cx.emit(Request::Ask(crate::dialog::Ask {
+            title: "Discard unsaved changes?".into(),
+            detail: "The documents are read again: changes not saved with Update are lost.".into(),
+            buttons: vec!["Discard changes".into()],
+            danger: true,
+            cancel_default: true,
+            cancel_label: Some("Keep editing"),
+            on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
+                let wanted = wanted.clone();
+                if let Some(v) = weak.upgrade() {
+                    v.update(cx, |v, cx| {
+                        v.editing = None;
+                        if let Body::Data(d) = &mut v.body {
+                            d.spec = wanted;
+                            if let Some(g) = &mut d.grid {
+                                g.edits.clear();
+                                g.json_edits.clear();
+                            }
+                        }
+                        v.load_now(cx);
+                    });
+                }
+            }),
+        }));
+        cx.notify();
+    }
+
+    fn load_now(&mut self, cx: &mut Context<Self>) {
         let Body::Data(d) = &mut self.body else { return };
         if !d.has_data {
             return;
         }
+        d.loaded_spec = d.spec.clone();
         d.loading = true;
         let work = engine::run(engine::page(d.conn.clone(), d.path.clone(), d.spec.clone()));
         d.task = Some(cx.spawn(async move |this, cx| {
@@ -507,11 +598,13 @@ impl DbView {
                             keep_column_order(old, &mut grid);
                         }
                         let mut g = GridView::new(grid);
-                        // Same columns (another page, a search): keep their widths, so nothing jumps.
-                        if keep_cols.as_ref() == Some(&p.grid.columns)
-                            && let Some(old) = &d.grid
-                        {
-                            g.widths = old.widths.clone();
+                        // Columns seen before keep their widths (also as dragged), so nothing jumps.
+                        if let Some(old) = &d.grid {
+                            for (i, c) in g.grid.columns.iter().enumerate() {
+                                if let Some(j) = old.grid.columns.iter().position(|x| x == c) {
+                                    g.widths[i] = old.widths[j];
+                                }
+                            }
                         }
                         // Sorting, paging, a save or refresh keeps the place: the columns in view (sorted
                         // documents can list their fields in another order, so whatever they are), and
@@ -618,6 +711,17 @@ impl DbView {
                 _ => Some((col, false)),
             };
             d.spec.offset = 0;
+            // MongoDB: the query bar's Sort says it too (one sort, shown where it's set).
+            if let Some(c) = d.compass.as_deref() {
+                let text = match &d.spec.sort {
+                    Some((col, desc)) => format!("{{ {}: {} }}", Tree::key(col, TextStyle::Shell), if *desc { -1 } else { 1 }),
+                    None => String::new(),
+                };
+                c.set_sort_text(&text, cx);
+                if let Some(q) = &mut d.spec.mongo {
+                    q.sort = text;
+                }
+            }
             self.load(cx);
         }
     }
@@ -715,6 +819,11 @@ impl DbView {
     }
 
     fn run_query(&mut self, _: &RunQuery, _: &mut Option<()>, cx: &mut Context<Self>) {
+        self.run_query_checked(false, cx);
+    }
+
+    /// Asks first when the query changes or deletes data (unless `confirmed`).
+    fn run_query_checked(&mut self, confirmed: bool, cx: &mut Context<Self>) {
         let Body::Data(d) = &mut self.body else { return };
         if d.running.is_some() {
             return;
@@ -724,6 +833,10 @@ impl DbView {
         let ed = d.query.read(cx);
         let sel = ed.buf.sel.range();
         let text = if sel.is_empty() { ed.text() } else { ed.buf.slice(sel) };
+        if !confirmed && let Some(what) = destructive(d.conn.kind, &text) {
+            let weak = cx.entity().downgrade();
+            return confirm_destructive(&what, &d.conn.title(), weak, |v, cx| v.run_query_checked(true, cx), cx);
+        }
         let scope = scope_of(d.conn.kind, &d.path);
         let work = engine::run(engine::query(d.conn.clone(), scope, text));
         d.running = Some(Instant::now());
@@ -822,9 +935,21 @@ impl DbView {
             && let Some(g) = &d.grid
         {
             for (r, j) in &g.json_edits {
-                if let Ok(doc) = compass::parse_document(&j.editor.read(cx).text()) {
+                let text = j.editor.read(cx).text();
+                if text != j.initial
+                    && let Ok(doc) = compass::parse_document(&text)
+                {
                     carried.push((None, *r, doc));
                 }
+            }
+        }
+        // Opened and not typed in: just closed.
+        if let Body::Data(d) = &mut self.body
+            && let Some(g) = &mut d.grid
+        {
+            let untouched: Vec<usize> = g.json_edits.iter().filter(|(_, j)| j.editor.read(cx).text() == j.initial).map(|(r, _)| *r).collect();
+            for r in untouched {
+                g.json_edits.remove(&r);
             }
         }
         for (which, r, doc) in carried {
@@ -1579,6 +1704,12 @@ impl DbView {
 
     /// Applies a change to a card's document; `mark` is the field to highlight.
     fn edit_op(&mut self, which: Option<usize>, row: usize, op: compass::Op, mark: Option<Vec<Seg>>, cx: &mut Context<Self>) -> bool {
+        if let Some(t) = self.doc_tree(which, row)
+            && let Err(e) = compass::editable(&t)
+        {
+            cx.emit(Request::Error(e));
+            return false;
+        }
         let Some(e) = self.doc_edit(which, row) else { return false };
         let ok = match compass::apply_tree(&mut e.working, &op) {
             Ok(()) => {
@@ -1615,6 +1746,26 @@ impl DbView {
     /// Double-click: types into a key (or value) in place.
     fn start_edit(&mut self, which: Option<usize>, row: usize, path: Vec<Seg>, key: bool, fresh: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_edit(window, cx);
+        if let Some(t) = self.doc_tree(which, row)
+            && let Err(e) = compass::editable(&t)
+        {
+            return cx.emit(Request::Error(e));
+        }
+        // A string too long to show whole (it ends in …): edited as JSON, where it's whole.
+        let long = self.grid_of(which).and_then(|g| g.edits.get(&row).map(|e| e.working.clone()).or_else(|| g.grid.trees.as_ref()?.get(row).cloned())).and_then(|t| {
+            let mut t = Some(t);
+            for s in &path {
+                t = match (t, s) {
+                    (Some(Tree::Object(f)), Seg::Key(k)) => f.into_iter().find(|(n, _)| n == k).map(|(_, v)| v),
+                    (Some(Tree::Array(a)), Seg::Idx(i)) => a.into_iter().nth(*i),
+                    _ => None,
+                };
+            }
+            t
+        });
+        if !key && matches!(&long, Some(Tree::Str(s)) if s.len() > 100_000) {
+            return cx.emit(Request::Error("This value is too long to edit here: edit the document as JSON (the pencil, in the JSON view)".into()));
+        }
         let Some(e) = self.doc_edit(which, row) else { return };
         let mut ty = "String";
         let text = match (key, path.last()) {
@@ -1901,12 +2052,33 @@ impl DbView {
     }
 
     /// The pencil in JSON: the card becomes its document as text, checked as it's typed.
+    /// The text is the document as it is on the server (with the changes made so far), in exact
+    /// Extended JSON: every type and character kept, so saving it changes only what was typed.
     fn start_json_edit(&mut self, which: Option<usize>, r: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let edited = self.grid_of(which).and_then(|g| g.edits.get(&r)).map(|e| e.working.clone());
-        let Some(t) = edited.or_else(|| self.doc_tree(which, r)) else { return };
+        let Body::Data(d) = &self.body else { return };
+        let [db, coll] = d.path.as_slice() else { return };
+        let (conn, db, coll) = (d.conn.clone(), db.clone(), coll.clone());
+        let edit = self.grid_of(which).and_then(|g| g.edits.get(&r)).map(|e| (e.original.clone(), e.ops.clone()));
+        let Some((original, ops)) = edit.or_else(|| self.doc_tree(which, r).map(|t| (t, Vec::new()))) else { return };
+        if let Err(e) = compass::editable(&original) {
+            return cx.emit(Request::Error(e));
+        }
+        let work = engine::run(engine::mongo(conn, move |cl| async move { compass::doc_json(&cl, &db, &coll, &original, &ops).await }));
+        cx.spawn_in(window, async move |this, cx| {
+            let text = work.await;
+            this.update_in(cx, |v, window, cx| match text {
+                Ok(text) => v.open_json_editor(which, r, text, window, cx),
+                Err(e) => cx.emit(Request::Error(e)),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_json_editor(&mut self, which: Option<usize>, r: usize, text: String, window: &mut Window, cx: &mut Context<Self>) {
         let editor = cx.new(|cx| {
             let mut ed = Editor::new(EditorMode::Full, cx);
-            ed.set_text(&t.text(TextStyle::Json), cx);
+            ed.set_text(&text, cx);
             ed.set_language("json", cx);
             ed
         });
@@ -1921,7 +2093,7 @@ impl DbView {
             }
         });
         if let Some(gv) = self.grid_of_mut(which) {
-            gv.json_edits.insert(r, JsonEdit { editor, invalid: None, error: None, saving: false, _sub: sub });
+            gv.json_edits.insert(r, JsonEdit { editor, initial: text, invalid: None, error: None, saving: false, _sub: sub });
         }
         self.remeasure(which, r, cx);
     }
@@ -1991,6 +2163,8 @@ impl DbView {
     }
 
     fn ask_delete_doc(&mut self, which: Option<usize>, r: usize, cx: &mut Context<Self>) {
+        // The document clicked, kept now: the rows may be read again while the question is open.
+        let Some(target) = self.doc_tree(which, r) else { return };
         let weak = cx.entity().downgrade();
         cx.emit(Request::Ask(crate::dialog::Ask {
             title: "Delete this document?".into(),
@@ -2001,8 +2175,8 @@ impl DbView {
             cancel_label: None,
             on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
                 if let Some(v) = weak.upgrade() {
+                    let original = target.clone();
                     v.update(cx, |v, cx| {
-                        let Some(original) = v.doc_tree(which, r) else { return };
                         v.doc_call(which, r, "Document deleted", move |cl, db, coll| async move { compass::delete_doc(&cl, &db, &coll, &original).await }, cx);
                     });
                 }
@@ -2171,6 +2345,27 @@ impl DbView {
             ed.ty = ty;
             ed.ty_chosen = true;
         }
+    }
+
+    #[cfg(test)]
+    pub fn bar_sort(&self, cx: &App) -> String {
+        match &self.body {
+            Body::Data(d) => d.compass.as_ref().map(|c| c.sort_text(cx)).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn sort_for_test(&mut self, col: &str, desc: bool, cx: &mut Context<Self>) {
+        if let Body::Data(d) = &mut self.body {
+            d.spec.sort = Some((col.to_string(), desc));
+        }
+        self.load(cx);
+    }
+
+    #[cfg(test)]
+    pub fn run_shell_for_test(&mut self, cx: &mut Context<Self>) {
+        self.run_query_checked(false, cx);
     }
 
     #[cfg(test)]
@@ -3197,6 +3392,19 @@ impl Render for DbView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queries_that_change_data_are_spotted() {
+        use crate::db::Kind;
+        assert!(super::destructive(Kind::MongoDb, "db.users.find({})\ndb.users.deleteMany({})").unwrap().contains("deleteMany"));
+        assert!(super::destructive(Kind::MongoDb, "db.dropDatabase()").is_some());
+        assert!(super::destructive(Kind::MongoDb, "[{$match: {}}, {$out: 'copy'}]").is_some());
+        assert!(super::destructive(Kind::MongoDb, "db.users.find({status: 'drop'})").is_none());
+        assert!(super::destructive(Kind::Postgres, "SELECT updated_at FROM t;\nDELETE FROM t").is_some());
+        assert!(super::destructive(Kind::Postgres, "select update_count from t").is_none(), "a column name isn't a statement");
+        assert!(super::destructive(Kind::Postgres, "-- drop table t\nselect 1").is_none(), "comments don't count");
+        assert!(super::destructive(Kind::Redis, "FLUSHDB").is_some());
+    }
+
     #[test]
     fn columns_keep_their_order() {
         let mut g = crate::db::Grid { columns: vec!["_id".into(), "zzz".into(), "n".into()], rows: vec![vec![Some("1".into()), Some("z".into()), Some("5".into())]], ..Default::default() };

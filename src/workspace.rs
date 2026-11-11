@@ -8876,6 +8876,115 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
 
     /// With the test MongoDB server running (OSKL_DB_LIVE=1, port 57017).
     #[gpui::test]
+    fn mongodb_edits_keep_data_safe(cx: &mut TestAppContext) {
+        if std::env::var_os("OSKL_DB_LIVE").is_none() {
+            return;
+        }
+        use mongodb::bson::{Binary, Regex, Timestamp, doc, spec::BinarySubtype};
+        let (ws, cx) = setup(cx);
+        let id = live_mongo_docs("safe_docs", 0, cx);
+        let conn = crate::db::load().into_iter().find(|c| c.id == id).unwrap();
+        let long = "x".repeat(150_000);
+        let (c2, l2) = (conn.clone(), long.clone());
+        futures::executor::block_on(crate::db::engine::run(crate::db::engine::mongo(c2, move |cl| async move {
+            let coll = cl.database("oskl_test").collection::<mongodb::bson::Document>("safe_docs");
+            coll.insert_one(doc! { "_id": 1, "fee": 3.0f64, "ts": Timestamp { time: 5, increment: 1 }, "bin": Binary { subtype: BinarySubtype::Generic, bytes: b"hi".to_vec() }, "re": Regex { pattern: "^a".into(), options: "i".into() }, "long": l2, "name": "one" }).await?;
+            coll.insert_one(doc! { "_id": { "a": 1, "b": "x" }, "name": "two" }).await?;
+            Ok(())
+        })))
+        .unwrap();
+        let shell = |conn: &crate::db::Conn, q: &str| futures::executor::block_on(crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("oskl_test".into()), collection: None }, q.into()))).unwrap();
+        let count = |conn: &crate::db::Conn, filter: &str| shell(conn, &format!("db.safe_docs.countDocuments({filter})"))[0].rows[0][0].clone().unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "safe_docs".into()] }, window, cx));
+        let tab = db_tab(&ws, cx).expect("a data tab");
+        wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 2));
+
+        // Edited as JSON: the document as it is (types, the whole long string); saved, nothing else changes.
+        click_on(cx, "db-mode-json");
+        let card = cx.debug_bounds("db-card-0").unwrap();
+        cx.simulate_mouse_move(card.center(), None, gpui::Modifiers::none());
+        click_on(cx, "db-doc-edit-0");
+        wait_for(cx, "the JSON", |cx| tab.read_with(cx, |t, _| t.json_editor(0)).is_some());
+        let (json, _) = tab.read_with(cx, |t, _| t.json_editor(0)).unwrap();
+        let text = json.read_with(cx, |e, _| e.text());
+        assert!(text.contains("\"fee\": 3.0") && text.contains("$timestamp") && text.contains(&long), "exact: {}", &text[..300.min(text.len())]);
+        json.update(cx, |e, cx| e.set_text(&text.replace("\"one\"", "\"uno\""), cx));
+        cx.run_until_parked();
+        click_on(cx, "db-json-update-0");
+        wait_for(cx, "saved", |cx| tab.read_with(cx, |t, _| t.json_editor(0)).is_none());
+        assert_eq!(count(&conn, "{name: 'uno', fee: {$type: 'double'}, ts: {$type: 'timestamp'}, bin: {$type: 'binData'}, re: {$type: 'regex'}}"), "1", "types kept");
+        let (c3, l3) = (conn.clone(), long.clone());
+        let kept = futures::executor::block_on(crate::db::engine::run(crate::db::engine::mongo(c3, move |cl| async move {
+            Ok(cl.database("oskl_test").collection::<mongodb::bson::Document>("safe_docs").find_one(doc! { "_id": 1 }).await?.unwrap().get_str("long")? == l3)
+        })))
+        .unwrap();
+        assert!(kept, "the long string saved whole");
+
+        // Opened as JSON and left untouched: switching view isn't a change.
+        let card = cx.debug_bounds("db-card-0").unwrap();
+        cx.simulate_mouse_move(card.center(), None, gpui::Modifiers::none());
+        click_on(cx, "db-doc-edit-0");
+        wait_for(cx, "the JSON", |cx| tab.read_with(cx, |t, _| t.json_editor(0)).is_some());
+        click_on(cx, "db-mode-list");
+        assert!(!tab.read_with(cx, |t, _| t.card_modified(0)), "nothing changed");
+
+        // An _id that's an object: edited like any other.
+        let row = (0..2).find(|r| tab.read_with(cx, |t, _| t.doc_text(*r, crate::db::TextStyle::Shell)).is_some_and(|t| t.contains("two"))).unwrap();
+        let sel: &'static str = Box::leak(format!("db-value-{row}-2").into_boxed_str());
+        let at = cx.debug_bounds(sel).unwrap().center();
+        for n in [1, 2] {
+            cx.simulate_event(gpui::MouseDownEvent { position: at, button: gpui::MouseButton::Left, click_count: n, ..Default::default() });
+            cx.simulate_event(gpui::MouseUpEvent { position: at, button: gpui::MouseButton::Left, click_count: n, ..Default::default() });
+        }
+        cx.run_until_parked();
+        let ed = tab.read_with(cx, |t, _| t.editor_in_card()).expect("editing a document with an object _id");
+        ed.update(cx, |e, cx| e.set_text("deux", cx));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        // Unsaved, then a sort asked for: asked first; kept, nothing is read again.
+        click_on(cx, "db-mode-table");
+        click_on(cx, "db-col-0");
+        assert!(ws.read_with(cx, |ws, _| ws.ask.is_some()), "asked before losing the change");
+        click_on(cx, "dialog-button-Keep editing");
+        assert!(tab.read_with(cx, |t, _| t.card_modified(row)), "the change is still there");
+        assert!(tab.read_with(cx, |t, _| t.data_summary()).is_some());
+        let upd: &'static str = Box::leak(format!("db-doc-update-{row}").into_boxed_str());
+        click_on(cx, upd);
+        wait_for(cx, "saved", |cx| !tab.read_with(cx, |t, _| t.card_modified(row)));
+        assert_eq!(count(&conn, "{_id: {a: 1, b: 'x'}, name: 'deux'}"), "1");
+
+        // A header sort shows in the bar's Sort.
+        click_on(cx, "db-col-0");
+        wait_for(cx, "sorted", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
+        assert_eq!(tab.read_with(cx, |t, cx| t.bar_sort(cx)), "{ _id: 1 }");
+
+        // Delete: the document clicked, even if the rows are read again meanwhile.
+        click_on(cx, "db-mode-json");
+        let card = cx.debug_bounds("db-card-0").unwrap();
+        let first = tab.read_with(cx, |t, _| t.doc_text(0, crate::db::TextStyle::Shell)).unwrap();
+        cx.simulate_mouse_move(card.center(), None, gpui::Modifiers::none());
+        click_on(cx, "db-doc-delete-0");
+        tab.update(cx, |t, cx| t.sort_for_test("_id", true, cx));
+        wait_for(cx, "re-sorted", |cx| tab.read_with(cx, |t, _| t.doc_text(0, crate::db::TextStyle::Shell)).is_some_and(|t| t != first));
+        click_on(cx, "dialog-button-Delete");
+        wait_for(cx, "deleted", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 1));
+        let left = tab.read_with(cx, |t, _| t.doc_text(0, crate::db::TextStyle::Shell)).unwrap();
+        assert_ne!(left, first, "the one clicked was deleted");
+
+        // The Shell asks before deleting.
+        click_on(cx, "db-tab-query");
+        let (_, shell_ed) = tab.read_with(cx, |t, _| t.editors());
+        shell_ed.update(cx, |e, cx| e.set_text("db.safe_docs.deleteMany({})", cx));
+        tab.update(cx, |t, cx| t.run_shell_for_test(cx));
+        cx.run_until_parked();
+        assert!(ws.read_with(cx, |ws, _| ws.ask.is_some()), "asked first");
+        click_on(cx, "dialog-button-Cancel");
+        assert_eq!(count(&conn, "{}"), "1", "nothing deleted");
+    }
+
+    /// With the test MongoDB server running (OSKL_DB_LIVE=1, port 57017).
+    #[gpui::test]
     fn mongodb_table_cells_and_json_cards_are_edited(cx: &mut TestAppContext) {
         if std::env::var_os("OSKL_DB_LIVE").is_none() {
             return;
@@ -8919,6 +9028,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         let card = cx.debug_bounds("db-card-0").unwrap();
         cx.simulate_mouse_move(card.center(), None, gpui::Modifiers::none());
         click_on(cx, "db-doc-edit-0");
+        wait_for(cx, "the JSON", |cx| tab.read_with(cx, |t, _| t.json_editor(0)).is_some());
         let (json, _) = tab.read_with(cx, |t, _| t.json_editor(0)).expect("the JSON editor");
         let text = json.read_with(cx, |e, _| e.text());
         assert!(text.contains("\"$oid\""), "{text}");
@@ -8939,6 +9049,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         let card = cx.debug_bounds("db-card-0").unwrap();
         cx.simulate_mouse_move(card.center(), None, gpui::Modifiers::none());
         click_on(cx, "db-doc-edit-0");
+        wait_for(cx, "the JSON", |cx| tab.read_with(cx, |t, _| t.json_editor(0)).is_some());
         let (json, _) = tab.read_with(cx, |t, _| t.json_editor(0)).unwrap();
         let text = json.read_with(cx, |e, _| e.text());
         json.update(cx, |e, cx| e.set_text(&text.replace("\"Zed\"", "\"Kept\""), cx));
@@ -9236,7 +9347,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         let seed = crate::db::engine::run(crate::db::engine::query(
             c.clone(),
             crate::db::Scope { database: Some("oskl_test".into()), collection: None },
-            format!("db.{coll}.drop()\ndb.{coll}.insertMany([{}])", docs.join(", ")),
+            if n == 0 { format!("db.{coll}.drop()") } else { format!("db.{coll}.drop()\ndb.{coll}.insertMany([{}])", docs.join(", ")) },
         ));
         futures::executor::block_on(seed).unwrap();
         c.id

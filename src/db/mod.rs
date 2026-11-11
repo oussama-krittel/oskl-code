@@ -520,6 +520,20 @@ impl Tree {
             (Tree::Num(n), _) => out.push_str(n),
             (Tree::Str(s), TextStyle::Shell) => out.push_str(&quote(s, '\'')),
             (Tree::Str(s), TextStyle::Json) => out.push_str(&quote(s, '"')),
+            // JSON: a Double keeps its decimal point (3.0, not 3, which reads back as an integer).
+            (Tree::Typed("Double", r), TextStyle::Json) => {
+                if r.parse::<f64>().is_ok_and(|f| !f.is_finite()) || !r.chars().all(|c| c.is_ascii_digit() || "-+.eE".contains(c)) {
+                    out.push_str(&format!("{{\"$numberDouble\": {}}}", quote(r, '"')));
+                } else if r.contains(['.', 'e', 'E']) {
+                    out.push_str(r);
+                } else {
+                    out.push_str(&format!("{r}.0"));
+                }
+            }
+            (Tree::Typed("Regex", r), TextStyle::Json) => {
+                let (pattern, options) = r.strip_prefix('/').and_then(|x| x.rsplit_once('/')).unwrap_or((r.as_str(), ""));
+                out.push_str(&format!("{{\"$regularExpression\": {{\"pattern\": {}, \"options\": {}}}}}", quote(pattern, '"'), quote(options, '"')));
+            }
             (Tree::Typed("Regex" | "Double", r), _) => out.push_str(r),
             (Tree::Typed(t, v), TextStyle::Shell) => {
                 let name = match *t {
