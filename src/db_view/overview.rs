@@ -87,12 +87,42 @@ impl DbView {
     pub(super) fn load_overview(&mut self, cx: &mut Context<Self>) {
         let Some(o) = self.overview_mut() else { return };
         let (conn, db) = (o.conn.clone(), o.db.clone());
-        let work = engine::run(engine::mongo(conn, move |cl| async move { compass::collections(&cl, &db).await }));
+        // The names first (one call, shown at once), then the sizes as they come.
+        let (c2, db2) = (conn.clone(), db.clone());
+        let names = engine::run(engine::mongo(conn, move |cl| async move { compass::collection_list(&cl, &db).await }));
         o.task = Some(cx.spawn(async move |this, cx| {
-            let r = work.await;
+            let r = names.await;
+            let wanted: Vec<String> = r.as_ref().map(|l| l.iter().filter(|c| !c.props.iter().any(|p| p == "view")).map(|c| c.name.clone()).collect()).unwrap_or_default();
+            let ok = r.is_ok();
             this.update(cx, |v, cx| {
                 if let Some(o) = v.overview_mut() {
-                    o.list = Some(r);
+                    // Sizes already known (a refresh) stay until the new ones come.
+                    let old = o.list.take().and_then(|l| l.ok()).unwrap_or_default();
+                    o.list = Some(r.map(|mut l| {
+                        for c in &mut l {
+                            if let Some(prev) = old.iter().find(|p| p.name == c.name) {
+                                (c.storage, c.data, c.docs, c.avg, c.indexes, c.index_size) = (prev.storage, prev.data, prev.docs, prev.avg, prev.indexes, prev.index_size);
+                            }
+                        }
+                        l
+                    }));
+                }
+                cx.notify();
+            })
+            .ok();
+            if !ok || wanted.is_empty() {
+                return;
+            }
+            let stats = engine::run(engine::mongo(c2, move |cl| async move { compass::collection_stats(&cl, &db2, wanted).await })).await;
+            this.update(cx, |v, cx| {
+                if let (Some(o), Ok(stats)) = (v.overview_mut(), stats)
+                    && let Some(Ok(list)) = &mut o.list
+                {
+                    for st in stats {
+                        if let Some(c) = list.iter_mut().find(|c| c.name == st.name) {
+                            (c.storage, c.data, c.docs, c.avg, c.indexes, c.index_size) = (st.storage, st.data, st.docs, st.avg, st.indexes, st.index_size);
+                        }
+                    }
                 }
                 cx.notify();
             })
@@ -160,6 +190,12 @@ impl DbView {
                 });
             }),
         }));
+    }
+
+    /// Every collection's size is known (tests).
+    #[cfg(test)]
+    pub fn overview_sized(&self) -> bool {
+        matches!(&self.body, Body::Overview(o) if o.list.as_ref().is_some_and(|l| l.as_ref().is_ok_and(|l| l.iter().all(|c| c.docs.is_some() || c.props.iter().any(|p| p == "view")))))
     }
 
     #[cfg(test)]

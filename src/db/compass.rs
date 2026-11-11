@@ -465,30 +465,12 @@ pub struct CollStat {
     pub index_size: Option<u64>,
 }
 
-/// The collections of a database with their sizes, like Compass's database page.
-pub async fn collections(c: &Client, db: &str) -> Result<Vec<CollStat>> {
-    let database = c.database(db);
-    let specs: Vec<mongodb::results::CollectionSpecification> = database.list_collections().await?.try_collect().await?;
-    let stats = specs.iter().map(|s| {
-        let database = database.clone();
-        let (name, view) = (s.name.clone(), matches!(s.collection_type, mongodb::results::CollectionType::View));
-        async move {
-            if view {
-                return Document::new();
-            }
-            async {
-                let mut cur = database.collection::<Document>(&name).aggregate([doc! { "$collStats": { "storageStats": {} } }]).await?;
-                Ok::<_, anyhow::Error>(cur.try_next().await?.and_then(|d| d.get_document("storageStats").ok().cloned()).unwrap_or_default())
-            }
-            .await
-            .unwrap_or_default()
-        }
-    });
-    let stats = futures::future::join_all(stats).await;
+/// A database's collections, at once (their names and kinds; sizes come from `collection_stats`).
+pub async fn collection_list(c: &Client, db: &str) -> Result<Vec<CollStat>> {
+    let specs: Vec<mongodb::results::CollectionSpecification> = c.database(db).list_collections().await?.try_collect().await?;
     let mut out: Vec<CollStat> = specs
         .into_iter()
-        .zip(stats)
-        .map(|(s, st)| {
+        .map(|s| {
             let mut props = Vec::new();
             match s.collection_type {
                 mongodb::results::CollectionType::View => props.push("view".to_string()),
@@ -504,11 +486,34 @@ pub async fn collections(c: &Client, db: &str) -> Result<Vec<CollStat>> {
             if s.options.validator.as_ref().is_some_and(|v| !v.is_empty()) {
                 props.push("validation".into());
             }
-            let n = |k: &str| st.get(k).map(|_| int(&st, k).max(0) as u64);
-            CollStat { name: s.name, props, storage: n("storageSize"), data: n("size"), docs: n("count"), avg: n("avgObjSize").or(st.get("count").map(|_| 0)), indexes: n("nindexes"), index_size: n("totalIndexSize") }
+            CollStat { name: s.name, props, ..Default::default() }
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// The sizes of collections (views have none), several at a time.
+pub async fn collection_stats(c: &Client, db: &str, names: Vec<String>) -> Result<Vec<CollStat>> {
+    use futures::StreamExt;
+    let database = c.database(db);
+    let out: Vec<CollStat> = futures::stream::iter(names)
+        .map(|name| {
+            let database = database.clone();
+            async move {
+                let st: Document = async {
+                    let mut cur = database.collection::<Document>(&name).aggregate([doc! { "$collStats": { "storageStats": {} } }]).await?;
+                    Ok::<_, anyhow::Error>(cur.try_next().await?.and_then(|d| d.get_document("storageStats").ok().cloned()).unwrap_or_default())
+                }
+                .await
+                .unwrap_or_default();
+                let n = |k: &str| st.get(k).map(|_| int(&st, k).max(0) as u64);
+                CollStat { name, props: Vec::new(), storage: n("storageSize"), data: n("size"), docs: n("count"), avg: n("avgObjSize").or(st.get("count").map(|_| 0)), indexes: n("nindexes"), index_size: n("totalIndexSize") }
+            }
+        })
+        .buffer_unordered(8)
+        .collect()
+        .await;
     Ok(out)
 }
 

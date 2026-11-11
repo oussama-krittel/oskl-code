@@ -9438,6 +9438,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert!(h < gpui::px(42.), "one line: {h:?}");
         cx.simulate_resize(gpui::size(gpui::px(1800.), gpui::px(900.)));
         cx.run_until_parked();
+        wait_for(cx, "the sizes", |cx| tab.read_with(cx, |t, _| t.overview_sized()));
         // Sorted by documents, most first.
         click_on(cx, "db-sort-docs");
         let names = tab.read_with(cx, |t, _| t.overview_names()).unwrap().unwrap();
