@@ -170,6 +170,14 @@ pub struct PdfView {
     pub area: Rc<std::cell::Cell<Bounds<Pixels>>>,
     width: f32,
     scale: f32,
+    /// The text, read by PDFKit on the first press (selecting, copying).
+    text: Option<crate::pdf_text::PdfText>,
+    /// What's selected, where the press started, and whether it's being dragged.
+    picked: Option<crate::pdf_text::Picked>,
+    press: Option<crate::pdf_text::Spot>,
+    dragging: bool,
+    /// Where each page on screen was last drawn (to find the place under the pointer).
+    boxes: Rc<std::cell::RefCell<HashMap<usize, Bounds<Pixels>>>>,
 }
 
 impl PdfView {
@@ -190,6 +198,11 @@ impl PdfView {
             area: Default::default(),
             width: 0.,
             scale: 2.,
+            text: None,
+            picked: None,
+            press: None,
+            dragging: false,
+            boxes: Default::default(),
         };
         v.reload(cx);
         v
@@ -210,6 +223,7 @@ impl PdfView {
             }
         }
         self.dropped.extend(self.drawn.drain().map(|(_, (_, i))| i));
+        (self.text, self.picked, self.press) = (None, None, None);
         self.list.reset(self.sizes.len());
         cx.notify();
     }
@@ -217,6 +231,73 @@ impl PdfView {
     #[cfg(test)]
     pub fn pages(&self) -> usize {
         self.sizes.len()
+    }
+
+    /// The selected text (⌘C).
+    pub fn selected_text(&self) -> String {
+        self.picked.as_ref().map(|p| p.text.clone()).unwrap_or_default()
+    }
+
+    /// ⌘A: the whole document.
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        if let Some(t) = self.text_reader() {
+            self.picked = t.everything();
+        }
+        cx.notify();
+    }
+
+    fn text_reader(&mut self) -> Option<&crate::pdf_text::PdfText> {
+        if self.text.is_none() && self.error.is_none() {
+            self.text = crate::pdf_text::PdfText::open(&self.path);
+        }
+        self.text.as_ref()
+    }
+
+    /// The page and the place on it under `pos` (fractions of the page). Off the pages (while
+    /// dragging): the nearest page, at its edge.
+    fn spot(&self, pos: gpui::Point<Pixels>, nearest: bool) -> Option<crate::pdf_text::Spot> {
+        let boxes = self.boxes.borrow();
+        let frac = |n: usize, b: &Bounds<Pixels>| (n, ((pos.x - b.left()) / b.size.width).clamp(0., 1.), ((pos.y - b.top()) / b.size.height).clamp(0., 1.));
+        if let Some((n, b)) = boxes.iter().find(|(_, b)| b.contains(&pos)) {
+            return Some(frac(*n, b));
+        }
+        if !nearest {
+            return None;
+        }
+        let dist = |b: &Bounds<Pixels>| if pos.y < b.top() { b.top() - pos.y } else if pos.y > b.bottom() { pos.y - b.bottom() } else { gpui::px(0.) };
+        boxes.iter().min_by(|a, b| dist(a.1).partial_cmp(&dist(b.1)).unwrap_or(std::cmp::Ordering::Equal)).map(|(n, b)| frac(*n, b))
+    }
+
+    /// A press on a page: starts a selection there; twice selects the word, three times the
+    /// line; with shift, the selection reaches here.
+    fn press(&mut self, ev: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(at) = self.spot(ev.position, false) else {
+            self.picked = None;
+            return cx.notify();
+        };
+        let anchor = self.press;
+        let Some(t) = self.text_reader() else { return };
+        self.picked = match ev.click_count {
+            1 if ev.modifiers.shift && anchor.is_some() => anchor.and_then(|a| t.between(a, at)),
+            1 => None,
+            2 => t.around(at, false),
+            _ => t.around(at, true),
+        };
+        if ev.click_count == 1 && !(ev.modifiers.shift && anchor.is_some()) {
+            self.press = Some(at);
+        }
+        self.dragging = ev.click_count == 1;
+        cx.notify();
+    }
+
+    fn drag(&mut self, ev: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.dragging || !ev.dragging() {
+            return;
+        }
+        let (Some(a), Some(b)) = (self.press, self.spot(ev.position, true)) else { return };
+        let picked = self.text.as_ref().and_then(|t| t.between(a, b));
+        self.picked = picked;
+        cx.notify();
     }
 
     /// How wide a page is shown (points), at the zoom.
@@ -289,6 +370,9 @@ impl PdfView {
             self.draw(n, cx);
         }
         let pic = self.drawn.get(&n).map(|(_, p)| p.clone());
+        let boxes = self.boxes.clone();
+        // The selected text on this page, highlighted as in Preview.
+        let marks: Vec<[f32; 4]> = self.picked.as_ref().and_then(|p| p.boxes.get(&n).cloned()).unwrap_or_default();
         div()
             .w_full()
             .flex()
@@ -296,12 +380,19 @@ impl PdfView {
             .py(px(8.))
             .child(
                 div()
+                    .debug_selector(move || format!("pdf-page-{n}"))
+                    .relative()
                     .w(gpui::px(w))
                     .h(gpui::px(h))
                     .flex_none()
                     .bg(theme::c(0xffffff))
                     .shadow_md()
-                    .children(pic.map(|p| img(p).size_full())),
+                    .cursor_text()
+                    .child(gpui::canvas(move |b, _, _| { boxes.borrow_mut().insert(n, b); }, |_, _, _, _| {}).absolute().size_full())
+                    .children(pic.map(|p| img(p).size_full()))
+                    .children(marks.into_iter().map(move |[l, t, r, b]| {
+                        div().absolute().left(gpui::px(l * w)).top(gpui::px(t * h)).w(gpui::px((r - l) * w)).h(gpui::px((b - t) * h)).bg(theme::c(0x3390ff).opacity(0.35))
+                    })),
             )
             .into_any_element()
     }
@@ -334,11 +425,16 @@ impl Render for PdfView {
         }
         let area = self.area.clone();
         let first = self.list.logical_scroll_top().item_ix + 1;
+        // Pages drawn this frame put their places back.
+        self.boxes.borrow_mut().clear();
         div()
             .size_full()
             .flex()
             .flex_col()
             .bg(theme::c(0x3a3d41))
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|v, ev: &gpui::MouseDownEvent, _, cx| v.press(ev, cx)))
+            .on_mouse_move(cx.listener(|v, ev: &gpui::MouseMoveEvent, _, cx| v.drag(ev, cx)))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|v, _, _, _| v.dragging = false))
             .child(
                 div()
                     .debug_selector(|| "pdf".into())

@@ -20,7 +20,7 @@ use std::time::Instant;
 mod assist;
 mod compass_ui;
 mod overview;
-mod sel;
+use crate::sel;
 use compass_ui::{AGG, Compass};
 pub use compass_ui::CTab;
 

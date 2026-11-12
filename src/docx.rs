@@ -95,6 +95,23 @@ pub enum Block {
     Image { path: PathBuf, w: f32, h: f32, align: u8 },
 }
 
+/// The document's text as it reads: paragraphs on lines, a table's cells joined by tabs.
+fn blocks_text(blocks: &[Block]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for b in blocks {
+        match b {
+            Block::Para { runs, .. } => out.push(runs.iter().map(|r| if r.props.caps == Some(true) { r.text.to_uppercase() } else { r.text.clone() }).collect()),
+            Block::Table { rows, .. } => {
+                for row in rows {
+                    out.push(row.iter().map(|c| blocks_text(&c.blocks).replace('\n', " ")).collect::<Vec<_>>().join("\t"));
+                }
+            }
+            Block::Image { .. } => {}
+        }
+    }
+    out.join("\n")
+}
+
 pub struct Document {
     pub blocks: Vec<Block>,
     /// The width text runs in (points), between the page's margins.
@@ -649,6 +666,8 @@ pub struct DocView {
     pub error: Option<String>,
     list: ListState,
     pub zoom: f32,
+    /// Text selected (drag, double / triple click), copied with ⌘C.
+    pub sel: crate::sel::Selection,
     pub area: Rc<std::cell::Cell<Bounds<Pixels>>>,
 }
 
@@ -667,7 +686,7 @@ impl DocView {
             Err(e) => (None, Some(e)),
         };
         let n = doc.as_ref().map(|d| d.blocks.len()).unwrap_or(0);
-        DocView { seen: Default::default(), loaded: Default::default(), doc, error, list: ListState::new(n + 2, ListAlignment::Top, gpui::px(800.)), zoom: 1., area: Default::default() }
+        DocView { seen: Default::default(), loaded: Default::default(), doc, error, list: ListState::new(n + 2, ListAlignment::Top, gpui::px(800.)), zoom: 1., sel: Default::default(), area: Default::default() }
     }
 
     pub fn replace(&mut self, result: Result<Document, String>, cx: &mut Context<Self>) {
@@ -703,7 +722,15 @@ impl DocView {
         fit.max(0.3) * self.zoom
     }
 
-    fn render_block(&self, b: &Block, k: f32, width: f32) -> AnyElement {
+    /// ⌘A: the whole document (pages scrolled away too).
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        let text = self.doc.as_ref().map(|d| blocks_text(&d.blocks)).unwrap_or_default();
+        self.sel.select_all(text);
+        cx.notify();
+    }
+
+    /// `line`: the copy order of the paragraphs drawn (each a line of its own).
+    fn render_block(&self, b: &Block, k: f32, width: f32, line: &mut u64) -> AnyElement {
         let base = self.doc.as_ref().map(|d| d.base.clone()).unwrap_or_default();
         match b {
             Block::Para { props, runs, list, level } => {
@@ -734,7 +761,9 @@ impl DocView {
                 let before = props.before.unwrap_or(if heading > 0 { 12. } else { 0. });
                 let after = props.after.unwrap_or(if heading > 0 { 4. } else { 8. });
                 let indent = props.indent.unwrap_or(0.) + if list.is_some() { 18. + *level as f32 * 18. } else { 0. };
-                let styled = StyledText::new(if empty { " ".to_string() } else { text }).with_highlights(marks);
+                *line += 1;
+                let shown: SharedString = if empty { " ".into() } else { text.into() };
+                let styled = self.sel.styled_piece((*line, 0), if empty { SharedString::default() } else { shown.clone() }, StyledText::new(shown).with_highlights(marks));
                 div()
                     .w(gpui::px(width))
                     .pt(gpui::px(before * k))
@@ -779,7 +808,7 @@ impl DocView {
                 let cols = rows.iter().map(|r| r.iter().map(|c| c.span).sum::<usize>()).max().unwrap_or(1).max(1);
                 // The table's own column widths, scaled to fit the text width.
                 let col_w: Vec<f32> = if widths.len() >= cols && total > 0. { widths.iter().map(|w| w * (width / k / total).min(1.)).collect() } else { vec![width / k / cols as f32; cols] };
-                let line = theme::c(if *borders { 0x000000 } else { 0xD0D0D0 });
+                let rule = theme::c(if *borders { 0x000000 } else { 0xD0D0D0 });
                 div()
                     .w(gpui::px(width))
                     .py(gpui::px(6. * k))
@@ -795,9 +824,9 @@ impl DocView {
                                 .flex_none()
                                 .p(gpui::px(4. * k))
                                 .border(gpui::px(0.5))
-                                .border_color(line)
+                                .border_color(rule)
                                 .when_some(cell.shade, |d, s| d.bg(theme::c(s)))
-                                .children(cell.blocks.iter().map(|b| self.render_block(b, k, (w - 8.) * k)))
+                                .children(cell.blocks.iter().map(|b| self.render_block(b, k, (w - 8.) * k, line)).collect::<Vec<_>>())
                         }))
                     }))
                     .into_any_element()
@@ -816,7 +845,9 @@ impl DocView {
             return div().w_full().flex().justify_center().pt(gpui::px(if ix == 0 { 16. } else { 0. })).pb(gpui::px(if ix == 0 { 0. } else { 24. })).child(div().w(gpui::px(text_w + margin * 2.)).h(gpui::px(margin)).bg(theme::c(PAPER))).into_any_element();
         }
         let b = &d.blocks[ix - 1];
-        page(self.render_block(b, k, text_w)).into_any_element()
+        // Lines numbered from the item's place, so they read in order across items.
+        let mut line = (ix as u64) << 20;
+        page(self.render_block(b, k, text_w, &mut line)).into_any_element()
     }
 }
 
@@ -829,13 +860,22 @@ impl Render for DocView {
             self.loaded.remove(&gone);
         }
         self.loaded.extend(seen);
+        self.sel.begin_frame();
         let area = self.area.clone();
         let body: AnyElement = match &self.error {
             Some(e) => div().size_full().flex().items_center().justify_center().text_color(theme::fg_dim()).child(format!("Can't show this document: {e}.")).into_any_element(),
             None => list(self.list.clone(), cx.processor(|v: &mut DocView, ix: usize, _, cx| v.render_item(ix, cx))).size_full().into_any_element(),
         };
+        let sel = self.sel.clone();
         div()
             .debug_selector(|| "docx".into())
+            // A press starts afresh: the old selection goes (a drag makes a new one).
+            .capture_any_mouse_down(move |_, window, _| {
+                if sel.has_selection() {
+                    sel.clear();
+                    window.refresh();
+                }
+            })
             .relative()
             .size_full()
             .bg(theme::c(0xE8E8E8))

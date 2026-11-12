@@ -16,6 +16,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+actions!(preview, [CopyText, SelectAllText]);
+
+/// ⌘C / ⌘A in a preview: its text (Markdown, Word, PDF) or its cells (CSV, Excel).
+pub fn bind_keys() {
+    crate::keybindings::collect([crate::keybindings::kb("cmd-c", CopyText, Some("Preview")), crate::keybindings::kb("cmd-a", SelectAllText, Some("Preview"))]);
+}
+
 /// Prose in Markdown reads better in the system font than in the code font.
 const PROSE_FONT: &str = ".SystemUIFont";
 
@@ -109,6 +116,8 @@ pub struct PreviewView {
     /// The page's pictures (diagrams, images), decoded here rather than in GPUI's app-wide
     /// cache, so the ones not shown any more and all of them on closing are really freed.
     images: Entity<RetainAllImageCache>,
+    /// Text selected in the Markdown page.
+    sel: crate::sel::Selection,
     _sub: Option<Subscription>,
 }
 
@@ -150,10 +159,59 @@ impl PreviewView {
             settle: None,
             relief: None,
             images: RetainAllImageCache::new(cx),
+            sel: Default::default(),
             _sub: sub,
         };
         view.refresh(window, cx);
         view
+    }
+
+    fn copy_text(&mut self, _: &CopyText, _: &mut Window, cx: &mut Context<Self>) {
+        let text = match self.kind {
+            Kind::Markdown => self.sel.text(),
+            Kind::Doc => self.doc.as_ref().map(|d| d.read(cx).sel.text()).unwrap_or_default(),
+            Kind::Table | Kind::Sheet => self.table.as_ref().map(|t| t.read(cx).copy_text()).unwrap_or_default(),
+            Kind::Pdf => self.pdf.as_ref().map(|p| p.read(cx).selected_text()).unwrap_or_default(),
+            Kind::Image | Kind::Svg => String::new(),
+        };
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn select_all_text(&mut self, _: &SelectAllText, _: &mut Window, cx: &mut Context<Self>) {
+        match self.kind {
+            Kind::Markdown => self.sel.select_drawn(),
+            Kind::Doc => {
+                if let Some(d) = &self.doc {
+                    d.update(cx, |d, cx| d.select_all(cx));
+                }
+            }
+            Kind::Table | Kind::Sheet => {
+                if let Some(t) = &self.table {
+                    t.update(cx, |t, cx| t.select_all(cx));
+                }
+            }
+            Kind::Pdf => {
+                if let Some(p) = &self.pdf {
+                    p.update(cx, |p, cx| p.select_all(cx));
+                }
+            }
+            Kind::Image | Kind::Svg => {}
+        }
+        cx.notify();
+    }
+
+    /// What ⌘C would copy now (tests).
+    #[cfg(test)]
+    pub fn selected_text(&self, cx: &App) -> String {
+        match self.kind {
+            Kind::Markdown => self.sel.text(),
+            Kind::Doc => self.doc.as_ref().map(|d| d.read(cx).sel.text()).unwrap_or_default(),
+            Kind::Table | Kind::Sheet => self.table.as_ref().map(|t| t.read(cx).copy_text()).unwrap_or_default(),
+            Kind::Pdf => self.pdf.as_ref().map(|p| p.read(cx).selected_text()).unwrap_or_default(),
+            Kind::Image | Kind::Svg => String::new(),
+        }
     }
 
     pub fn title(&self) -> String {
@@ -692,7 +750,11 @@ impl PreviewView {
         let blocks = self.blocks.clone();
         // Every size on the page follows the zoom while it's built (see `px`).
         PAGE_SCALE.with(|s| s.set(self.zoom));
+        self.sel.begin_frame();
         let mut r = Renderer {
+            sel: Some(self.sel.clone()),
+            line: 0,
+            cell: None,
             base: self.path.parent().map(Path::to_path_buf).unwrap_or_default(),
             open: {
                 let weak = cx.entity().downgrade();
@@ -835,7 +897,24 @@ impl Render for PreviewView {
                 None => div().size_full().flex().items_center().justify_center().text_color(theme::fg_dim()).child(if self.info.is_empty() { "Reading…".to_string() } else { self.info.clone() }).into_any_element(),
             },
         };
-        div().key_context("Preview").track_focus(&self.focus).size_full().bg(theme::bg_editor()).child(body)
+        div()
+            .key_context("Preview")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(Self::copy_text))
+            .on_action(cx.listener(Self::select_all_text))
+            // A press starts afresh (a drag makes a new selection); ⌘C then works here.
+            .capture_any_mouse_down(cx.listener(|v, _, window, cx| {
+                if v.sel.has_selection() {
+                    v.sel.clear();
+                    cx.notify();
+                }
+                if !matches!(v.kind, Kind::Table | Kind::Sheet) {
+                    window.focus(&v.focus, cx);
+                }
+            }))
+            .size_full()
+            .bg(theme::bg_editor())
+            .child(body)
     }
 }
 
@@ -1384,6 +1463,9 @@ impl Markdown {
     /// The blocks in a column; relative links and pictures are from `base`, files open with `open`.
     pub fn render(&self, base: &Path, images: &Entity<RetainAllImageCache>, open: Opener) -> AnyElement {
         let mut r = Renderer {
+            sel: None,
+            line: 0,
+            cell: None,
             base: base.to_path_buf(),
             open,
             n: 0,
@@ -1765,6 +1847,11 @@ struct Renderer {
     paras: usize,
     /// Code blocks wrap their long lines (the chat) instead of scrolling sideways.
     wrap: bool,
+    /// The page's selectable text (None: plain text), the lines given out so far, and the
+    /// table row and column being drawn (its cells are one line, joined by tabs).
+    sel: Option<crate::sel::Selection>,
+    line: u64,
+    cell: Option<(u64, u32)>,
 }
 
 /// Opens a file link: the file and the line it names, if any.
@@ -1834,6 +1921,24 @@ impl Renderer {
     fn inline(&mut self, inl: &Inline, bold: bool) -> AnyElement {
         let runs: Vec<TextRun> = inl.runs.iter().map(|(len, st)| self.run(*len, *st, bold)).collect();
         let styled = StyledText::new(inl.text.clone()).with_runs(runs);
+        if let Some(sel) = self.sel.clone() {
+            let (order, join) = match self.cell {
+                Some((line, c)) => ((line, c), "\t"),
+                None => {
+                    self.line += 1;
+                    ((self.line, 0), "")
+                }
+            };
+            let ranges: Vec<Range<usize>> = inl.links.iter().map(|(r, _)| r.clone()).collect();
+            let urls: Vec<String> = inl.links.iter().map(|(_, u)| u.clone()).collect();
+            let (base, open) = (self.base.clone(), self.open.clone());
+            let on_link: crate::sel::OnLink = Rc::new(move |ix, window, cx| {
+                if let Some(url) = urls.get(ix) {
+                    open_link(url, &base, &open, window, cx);
+                }
+            });
+            return sel.styled_piece(order, inl.text.clone(), styled).join(join).links(ranges, on_link).into_any_element();
+        }
         if inl.links.is_empty() {
             return styled.into_any_element();
         }
@@ -1875,7 +1980,10 @@ impl Renderer {
                 self.paras += 1;
                 div().debug_selector(move || format!("md-para-{n}")).child(self.inline(inl, false)).into_any_element()
             }
-            Block::Code(text, spans) => code_block(self.id(), text, spans.as_deref(), self.wrap),
+            Block::Code(text, spans) => {
+                let id = self.id();
+                code_block(id, text, spans.as_deref(), self.wrap, self.sel.clone().map(|s| (s, &mut self.line)))
+            }
             Block::Quote(blocks) => {
                 let color = std::mem::replace(&mut self.color, theme::fg_dim());
                 let children: Vec<AnyElement> = blocks.iter().map(|b| self.block(b)).collect();
@@ -1914,9 +2022,14 @@ impl Renderer {
                 let mut out = Vec::new();
                 for (r, row) in rows.iter().enumerate() {
                     let mut cells = Vec::new();
+                    // A row copies as one line, its cells joined by tabs.
+                    self.line += 1;
+                    let row_line = self.line;
                     for (c, weight) in weights.iter().enumerate() {
                         let a = align.get(c).copied().unwrap_or(Alignment::None);
+                        self.cell = Some((row_line, c as u32));
                         let text = row.get(c).map(|cell| self.inline(cell, r == 0));
+                        self.cell = None;
                         let selector = format!("md-cell-{table_id}-{r}-{c}");
                         let text_sel = format!("md-cell-text-{table_id}-{r}-{c}");
                         cells.push(
@@ -2084,7 +2197,10 @@ impl Renderer {
                     .flex_col()
                     .gap(px(6.))
                     .child(div().debug_selector(move || format!("md-mermaid-error-{id}")).text_size(px(12.)).text_color(theme::git_deleted()).child(format!("Mermaid diagram not drawn: {e}")))
-                    .child(code_block(self.id(), src, None, self.wrap))
+                    .child({
+                        let id = self.id();
+                        code_block(id, src, None, self.wrap, self.sel.clone().map(|s| (s, &mut self.line)))
+                    })
                     .into_any_element()
             }
         }
@@ -2436,14 +2552,24 @@ fn string_index() -> u8 {
     (0..u8::MAX).find(|i| highlight::name(*i) == "string").unwrap_or(0)
 }
 
-fn code_block(id: usize, text: &str, spans: Option<&LineSpans>, wrap: bool) -> AnyElement {
+fn code_block(id: usize, text: &str, spans: Option<&LineSpans>, wrap: bool, mut sel: Option<(crate::sel::Selection, &mut u64)>) -> AnyElement {
     let lines: Vec<AnyElement> = text
         .split('\n')
         .enumerate()
         .map(|(i, line)| {
             let shown = if line.is_empty() { " " } else { line };
             let runs = code_runs(shown, spans.and_then(|s| s.get(i)));
-            div().when(!wrap, |d| d.whitespace_nowrap()).child(StyledText::new(shown.to_string()).with_runs(runs)).into_any_element()
+            let styled = StyledText::new(shown.to_string()).with_runs(runs);
+            let el = match &mut sel {
+                // Each line of code its own line (an empty one copies as empty).
+                Some((s, n)) => {
+                    **n += 1;
+                    let piece = if line.is_empty() { s.styled_piece((**n, 0), "", StyledText::new(" ")) } else { s.styled_piece((**n, 0), shown.to_string(), styled) };
+                    piece.into_any_element()
+                }
+                None => styled.into_any_element(),
+            };
+            div().when(!wrap, |d| d.whitespace_nowrap()).child(el).into_any_element()
         })
         .collect();
     div()

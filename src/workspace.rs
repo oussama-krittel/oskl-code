@@ -6605,6 +6605,7 @@ mod ui_tests {
             crate::file_tree::bind_keys();
             crate::git_panel::bind_keys();
             crate::db_view::bind_keys();
+            crate::preview::bind_keys();
             crate::api_view::bind_keys();
             crate::diff_view::bind_keys();
             crate::commit_view::bind_keys();
@@ -7905,6 +7906,104 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
             _ => None,
         })).expect("a PDF opens as a preview, not text");
         assert_eq!(preview.read_with(cx, |v, cx| v.pdf_pages(cx)), Some(2));
+    }
+
+    #[gpui::test]
+    fn previews_copy_what_is_selected(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let preview = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.tabs.iter().rev().find_map(|t| match &t.kind {
+            TabKind::Preview(v) => Some(v.clone()),
+            _ => None,
+        }));
+        let copied = |cx: &mut VisualTestContext| {
+            cx.simulate_keystrokes("cmd-c");
+            cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default()
+        };
+        let drag = |cx: &mut VisualTestContext, from: gpui::Point<gpui::Pixels>, to: gpui::Point<gpui::Pixels>| {
+            cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_move(to, Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+            cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        };
+
+        // Markdown: a drag over a paragraph; ⌘A the page (a table's cells by tabs, code by lines).
+        std::fs::write(root.join("note.md"), "# Title\n\nFirst para with **bold** and [a link](https://example.com).\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```\nlet x = 1;\nlet y = 2;\n```\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("note.md"), None, false, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-k v");
+        wait_for(cx, "the page", |cx| cx.debug_bounds("md-para-0").is_some());
+        let para = cx.debug_bounds("md-para-0").unwrap();
+        drag(cx, para.origin + gpui::point(gpui::px(1.), gpui::px(4.)), gpui::point(para.right() - gpui::px(1.), para.top() + gpui::px(4.)));
+        assert_eq!(copied(cx), "First para with bold and a link.", "a drag over the paragraph");
+        cx.simulate_keystrokes("cmd-a");
+        assert_eq!(copied(cx), "Title\nFirst para with bold and a link.\na\tb\n1\t2\nlet x = 1;\nlet y = 2;", "⌘A: the whole page");
+        // A click starts afresh: nothing selected.
+        cx.simulate_click(para.center(), gpui::Modifiers::none());
+        assert!(preview(cx).unwrap().read_with(cx, |v, cx| v.selected_text(cx)).is_empty());
+
+        // CSV: a range of cells, by tabs and lines.
+        std::fs::write(root.join("people.csv"), "name,city\nAda,London\nGrace,NYC\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("people.csv"), None, false, window, cx));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-k v");
+        wait_for(cx, "the table", |cx| preview(cx).is_some_and(|p| p.read_with(cx, |v, _| v.table()).is_some()) && cx.debug_bounds("table").is_some());
+        let table = preview(cx).unwrap().read_with(cx, |v, _| v.table()).unwrap();
+        let c = cx.debug_bounds("table").unwrap().center();
+        cx.simulate_click(c, gpui::Modifiers::none());
+        table.update(cx, |t, cx| {
+            t.sel = Some((1, 0));
+            t.sel_end = Some((2, 1));
+            cx.notify();
+        });
+        assert_eq!(copied(cx), "Ada\tLondon\nGrace\tNYC");
+        cx.simulate_keystrokes("cmd-a");
+        assert_eq!(copied(cx), "name\tcity\nAda\tLondon\nGrace\tNYC");
+
+        // PDF: a drag along the first line of text, then a double click on a word.
+        let content = "BT /F1 20 Tf 20 150 Td (Hello brave world) Tj 0 -40 Td (Second line here) Tj ET";
+        let objs = [
+            "<</Type/Catalog/Pages 2 0 R>>".to_string(),
+            "<</Type/Pages/Kids[3 0 R]/Count 1>>".to_string(),
+            "<</Type/Page/Parent 2 0 R/MediaBox[0 0 400 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>".to_string(),
+            format!("<</Length {}>>stream\n{content}\nendstream", content.len()),
+            "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>".to_string(),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj{o}endobj\n", i + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1));
+        for o in offsets {
+            pdf.push_str(&format!("{o:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!("trailer<</Size {}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1));
+        std::fs::write(root.join("text.pdf"), pdf).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("text.pdf"), None, false, window, cx));
+        wait_for(cx, "the page", |cx| cx.debug_bounds("pdf-page-0").is_some());
+        let page = cx.debug_bounds("pdf-page-0").unwrap();
+        let at = |u: f32, v: f32| page.origin + gpui::point(page.size.width * u, page.size.height * v);
+        drag(cx, at(0.02, 0.22), at(0.98, 0.22));
+        assert_eq!(copied(cx).trim(), "Hello brave world", "a drag along the line");
+        cx.simulate_event(gpui::MouseDownEvent { position: at(0.26, 0.22), button: gpui::MouseButton::Left, click_count: 2, ..Default::default() });
+        cx.simulate_event(gpui::MouseUpEvent { position: at(0.26, 0.22), button: gpui::MouseButton::Left, click_count: 2, ..Default::default() });
+        assert_eq!(copied(cx), "brave", "a double click: the word");
+
+        // Word: ⌘A copies the document (pages scrolled away too).
+        crate::office::tests::zip(&root.join("memo.docx"), &[(
+            "word/document.xml",
+            r#"<w:document><w:body><w:p><w:r><w:t>Dear team</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Qty</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>Thanks</w:t></w:r></w:p></w:body></w:document>"#,
+        )]);
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("memo.docx"), None, false, window, cx));
+        wait_for(cx, "the document", |cx| cx.debug_bounds("docx").is_some());
+        let c = cx.debug_bounds("docx").unwrap().center();
+        cx.simulate_click(c, gpui::Modifiers::none());
+        cx.simulate_keystrokes("cmd-a");
+        assert_eq!(copied(cx), "Dear team\nName\tQty\nThanks");
     }
 
     #[gpui::test]

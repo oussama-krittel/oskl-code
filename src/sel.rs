@@ -1,12 +1,14 @@
-//! Text in the database views that can be selected by dragging across it: keys and values of
-//! documents (List, JSON) and table cells, over as many lines and cells as the drag covers.
+//! Text that can be selected by dragging across it, over as many lines and pieces as the drag
+//! covers: the database views (keys, values, table cells) and the previews (Markdown, Word).
 //! Each piece of text registers itself as it's drawn; ⌘C copies the selection in reading
-//! order (cells joined by tabs, lines by new lines).
+//! order (cells joined by tabs, lines by new lines). A piece may hold links, opened by a
+//! click that selects nothing.
 
 use gpui::{
     App, Bounds, Element, ElementId, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, SharedString, StyledText, TextLayout, TextStyleRefinement, Window, fill,
 };
+use std::ops::Range;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -61,6 +63,17 @@ impl Selection {
             let (frame, range) = (s.frame, Self::range(&s));
             s.pieces.retain(|o, p| p.seen + 2 >= frame || range.is_some_and(|(a, b)| a.0 <= *o && *o <= b.0));
         }
+    }
+
+    /// ⌘A when every piece is drawn (a page, not a list): from the first to the last.
+    pub fn select_drawn(&self) {
+        let mut s = self.0.borrow_mut();
+        let (first, last) = (s.pieces.keys().next().copied(), s.pieces.iter().next_back().map(|(o, p)| (*o, p.text.len())));
+        if let (Some(f), Some(l)) = (first, last) {
+            s.anchor = Some((f, 0));
+            s.head = Some(l);
+        }
+        s.all = None;
     }
 
     /// ⌘A: all of it (`text`, as copied).
@@ -202,9 +215,17 @@ impl Selection {
     /// A piece of text that takes part in the selection.
     pub fn text_piece(&self, order: Order, text: impl Into<SharedString>, color: Hsla, bold: bool) -> SelText {
         let text = text.into();
-        SelText { sel: self.clone(), order, styled: StyledText::new(text.clone()), text, style: TextStyleRefinement { color: Some(color), font_weight: bold.then_some(FontWeight::SEMIBOLD), ..Default::default() }, join: "" }
+        SelText { sel: self.clone(), order, styled: StyledText::new(text.clone()), text, style: TextStyleRefinement { color: Some(color), font_weight: bold.then_some(FontWeight::SEMIBOLD), ..Default::default() }, join: "", links: None }
+    }
+
+    /// A piece already styled (runs or highlights): `text` must be what `styled` shows.
+    pub fn styled_piece(&self, order: Order, text: impl Into<SharedString>, styled: StyledText) -> SelText {
+        SelText { sel: self.clone(), order, styled, text: text.into(), style: TextStyleRefinement::default(), join: "", links: None }
     }
 }
+
+/// Opens the link (by its index) clicked in a piece.
+pub type OnLink = std::rc::Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 pub struct SelText {
     sel: Selection,
@@ -213,9 +234,18 @@ pub struct SelText {
     styled: StyledText,
     style: TextStyleRefinement,
     join: &'static str,
+    links: Option<(Vec<Range<usize>>, OnLink)>,
 }
 
 impl SelText {
+    /// Parts of the text that are links (byte ranges): a click on one (not a drag) opens it.
+    pub fn links(mut self, ranges: Vec<Range<usize>>, open: OnLink) -> Self {
+        if !ranges.is_empty() {
+            self.links = Some((ranges, open));
+        }
+        self
+    }
+
     /// What separates it from the piece before it on the same line, when copied.
     pub fn join(mut self, s: &'static str) -> Self {
         self.join = s;
@@ -318,6 +348,23 @@ impl Element for SelText {
         let style = self.style.clone();
         window.with_text_style(Some(style), |window| self.styled.paint(id, inspector_id, bounds, &mut (), &mut (), window, cx));
 
+        // Over a link: the hand.
+        if let Some((ranges, open)) = self.links.clone() {
+            if hitbox.is_hovered(window) && ranges.iter().any(|r| r.contains(&index_at(&layout, window.mouse_position()))) {
+                window.set_cursor_style(gpui::CursorStyle::PointingHand, hitbox);
+            }
+            // A click (nothing selected) on a link opens it.
+            let (sel, hb, layout) = (self.sel.clone(), hitbox.clone(), layout.clone());
+            window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
+                if !phase.bubble() || ev.button != MouseButton::Left || !hb.is_hovered(window) || sel.has_selection() {
+                    return;
+                }
+                let at = index_at(&layout, ev.position);
+                if let Some(ix) = ranges.iter().position(|r| r.contains(&at)) {
+                    open(ix, window, cx);
+                }
+            });
+        }
         // A press on it starts a selection; a drag over it moves the selection's end.
         let (sel, hb) = (self.sel.clone(), hitbox.clone());
         window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, _| {

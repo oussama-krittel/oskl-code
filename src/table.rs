@@ -275,8 +275,12 @@ pub struct TableView {
     /// Columns in colors (CSV, like the editor shows them).
     rainbow: bool,
     pub area: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
-    /// The selected cell (row, column), as in a spreadsheet.
+    /// The selected cell (row, column), as in a spreadsheet, and the far corner of a range
+    /// (shift-click, a drag, shift-arrows, ⌘A); ⌘C copies it (cells by tabs, rows by lines).
     pub sel: Option<(usize, usize)>,
+    pub sel_end: Option<(usize, usize)>,
+    /// A press is being dragged over cells.
+    dragging: bool,
     /// A column being resized: (column, where the drag started, its width then).
     resizing: Option<(usize, Pixels, f32)>,
     focus: gpui::FocusHandle,
@@ -290,7 +294,7 @@ pub struct TableView {
 
 impl TableView {
     pub fn new(sheets: Vec<Sheet>, rainbow: bool, cx: &mut Context<Self>) -> TableView {
-        TableView { sheets, current: 0, list: UniformListScrollHandle::new(), zoom: 1., rainbow, area: Default::default(), sel: None, resizing: None, focus: cx.focus_handle(), hx: 0., hx_max: 0., sideways: None, last_scroll: None }
+        TableView { sheets, current: 0, list: UniformListScrollHandle::new(), zoom: 1., rainbow, area: Default::default(), sel: None, sel_end: None, dragging: false, resizing: None, focus: cx.focus_handle(), hx: 0., hx_max: 0., sideways: None, last_scroll: None }
     }
 
     #[cfg(test)]
@@ -305,17 +309,72 @@ impl TableView {
         s.row(r).get(c).map(|t| t.trim_start_matches(crate::office::NUMBER).to_string()).unwrap_or_default()
     }
 
-    fn select(&mut self, r: usize, c: usize, window: &mut Window, cx: &mut Context<Self>) {
-        // A merged range selects as its first cell.
-        let (r, c) = self.sheets.get(self.current).and_then(|s| s.paper.as_ref()).and_then(|p| p.covered.get(&(r, c)).copied()).unwrap_or((r, c));
-        self.sel = Some((r, c));
+    fn select(&mut self, r: usize, c: usize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if extend && self.sel.is_some() {
+            self.sel_end = Some((r, c));
+        } else {
+            // A merged range selects as its first cell.
+            let (r, c) = self.sheets.get(self.current).and_then(|s| s.paper.as_ref()).and_then(|p| p.covered.get(&(r, c)).copied()).unwrap_or((r, c));
+            self.sel = Some((r, c));
+            self.sel_end = None;
+        }
+        self.dragging = true;
         window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// A drag over cells: the range reaches this one.
+    fn drag_over(&mut self, r: usize, c: usize, cx: &mut Context<Self>) {
+        if self.dragging && self.sel.is_some() {
+            let end = if self.sel == Some((r, c)) { None } else { Some((r, c)) };
+            if self.sel_end != end {
+                self.sel_end = end;
+                cx.notify();
+            }
+        }
+    }
+
+    /// The selected rows and columns (first, last), both ways.
+    fn range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let a = self.sel?;
+        let b = self.sel_end.unwrap_or(a);
+        Some(((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1))))
+    }
+
+    fn in_range(&self, r: usize, c: usize) -> bool {
+        self.range().is_some_and(|((r0, c0), (r1, c1))| (r0..=r1).contains(&r) && (c0..=c1).contains(&c))
+    }
+
+    /// ⌘C: the selected cells as they read (cells by tabs, rows by lines), values whole.
+    pub fn copy_text(&self) -> String {
+        let (Some(s), Some(((r0, c0), (r1, c1)))) = (self.sheets.get(self.current), self.range()) else { return String::new() };
+        let r1 = r1.min(s.rows().saturating_sub(1));
+        (r0..=r1)
+            .map(|r| {
+                let row = s.row(r);
+                (c0..=c1).map(|c| row.get(c).map(|t| t.trim_start_matches(crate::office::NUMBER).to_string()).unwrap_or_default()).collect::<Vec<_>>().join("\t")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// ⌘A: every cell of the sheet (a CSV's first row included).
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        let Some(s) = self.sheets.get(self.current) else { return };
+        if s.rows() == 0 || s.cols == 0 {
+            return;
+        }
+        self.sel = Some((0, 0));
+        self.sel_end = Some((s.rows() - 1, s.cols - 1));
         cx.notify();
     }
 
     /// Arrow keys move the selection, the view follows it down.
     fn key(&mut self, ev: &gpui::KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some((r, c)) = self.sel else { return };
+        let Some(at) = self.sel else { return };
+        // With shift, the range's far corner moves.
+        let extend = ev.keystroke.modifiers.shift && ev.keystroke.key != "tab";
+        let (r, c) = if extend { self.sel_end.unwrap_or(at) } else { at };
         let Some(s) = self.sheets.get(self.current) else { return };
         let header = s.header as usize;
         let last_row = if s.paper.is_some() { s.rows().max(1) + 29 } else { s.rows().saturating_sub(1).max(header) };
@@ -326,11 +385,20 @@ impl TableView {
             "right" | "tab" => (r, (c + 1).min(s.cols.saturating_sub(1))),
             "escape" => {
                 self.sel = None;
+                self.sel_end = None;
                 cx.notify();
                 return;
             }
             _ => return,
         };
+        if extend {
+            self.sel_end = Some((nr, nc));
+            self.list.scroll_to_item(nr - header, gpui::ScrollStrategy::Top);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        self.sel_end = None;
         // Past a merged range it covers, to the next cell.
         let (nr, nc) = s.paper.as_ref().and_then(|p| p.covered.get(&(nr, nc)).copied()).filter(|o| *o != (r, c)).unwrap_or((nr, nc));
         self.sel = Some((nr, nc));
@@ -371,13 +439,18 @@ impl TableView {
             .children((0..s.cols).map(|c| {
                 let text = cells.get(c).map(|t| cut(t)).unwrap_or_default();
                 let numeric = !text.is_empty() && text.trim().parse::<f64>().is_ok();
-                let on = self.sel == Some((r, c));
+                let on = self.in_range(r, c);
                 let full = cells.get(c).cloned().unwrap_or_default();
                 let cw = s.widths[c] * z;
-                let long = on && (full.contains('\n') || full.chars().count() as f32 * 12.5 * z * 0.62 > cw - 14. * z);
+                let long = self.sel == Some((r, c)) && self.sel_end.is_none() && (full.contains('\n') || full.chars().count() as f32 * 12.5 * z * 0.62 > cw - 14. * z);
                 div()
                     .relative()
-                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |t, _, w, cx| t.select(r, c, w, cx)))
+                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |t, ev: &gpui::MouseDownEvent, w, cx| t.select(r, c, ev.modifiers.shift, w, cx)))
+                    .on_mouse_move(cx.listener(move |t, ev: &gpui::MouseMoveEvent, _, cx| {
+                        if ev.dragging() {
+                            t.drag_over(r, c, cx);
+                        }
+                    }))
                     .when(on, |d| d.bg(theme::selected_focused()))
                     .when(long, |d| {
                         d.child(gpui::deferred(
@@ -512,7 +585,9 @@ impl TableView {
             };
             let size = look.size.unwrap_or(11.) * 1.2 * z;
             let b = look.borders;
+            // The active cell has Excel's frame; the rest of a range is tinted.
             let selected = self.sel == Some((r, c));
+            let ranged = !selected && self.in_range(r, c);
             let col = c;
             let mut cell = div()
                 .relative()
@@ -533,7 +608,13 @@ impl TableView {
                 .when(look.italic, |d| d.italic())
                 .when(look.underline, |d| d.underline())
                 .when(look.strike, |d| d.line_through())
-                .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |t, _, w, cx| t.select(r, col, w, cx)));
+                .when(ranged, |d| d.bg(theme::c(HEAD_SEL)))
+                .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |t, ev: &gpui::MouseDownEvent, w, cx| t.select(r, col, ev.modifiers.shift, w, cx)))
+                .on_mouse_move(cx.listener(move |t, ev: &gpui::MouseMoveEvent, _, cx| {
+                    if ev.dragging() {
+                        t.drag_over(r, col, cx);
+                    }
+                }));
             // Its own borders where it has them (as heavy as set); hairline gridlines elsewhere.
             cell = if b == 0 {
                 edges(cell, 2 | 8, HAIR).border_color(theme::c(GRID))
@@ -543,7 +624,7 @@ impl TableView {
             // The selected cell: Excel's green frame. Text too long for it opens in place, as
             // wide as its column, down over the cells below until it all shows.
             let full = raw.trim_start_matches(crate::office::NUMBER);
-            let long = selected && (full.contains('\n') || full.chars().count() as f32 * size * 0.55 > w - 8. * z);
+            let long = selected && self.sel_end.is_none() && (full.contains('\n') || full.chars().count() as f32 * size * 0.55 > w - 8. * z);
             let cell = cell.when(selected && !long, |d| d.child(div().absolute().top_0().left_0().size_full().border_2().border_color(theme::c(SELECT))));
             let cell = cell.when(long, |d| {
                 d.child(gpui::deferred(
@@ -725,7 +806,10 @@ impl Render for TableView {
                     cx.notify();
                 }
             }))
-            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|t, _, _, _| t.resizing = None))
+            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|t, _, _, _| {
+                t.resizing = None;
+                t.dragging = false;
+            }))
             .size_full()
             .flex()
             .flex_col()
