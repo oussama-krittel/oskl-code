@@ -73,37 +73,131 @@ fn re(s: &str) -> Regex {
     Regex::new(s).expect("valid regex")
 }
 
-/// The file an import spec points at.
+/// The file an import spec points at: relative, a tsconfig path alias, a package.json `#import`,
+/// or a package (its `exports`, types first, as TypeScript reads them).
 pub fn resolve_module(spec: &str, from: &Path, root: Option<&Path>) -> Option<PathBuf> {
     let dir = from.parent()?;
-    let base = if spec.starts_with('.') {
-        dir.join(spec)
-    } else if let Some((p, target)) = crate::complete::aliases(from, root).into_iter().find(|(p, _)| spec.starts_with(p.as_str())) {
-        target.join(&spec[p.len()..])
-    } else if let Some(rest) = spec.strip_prefix("@/").or_else(|| spec.strip_prefix("~/")) {
-        let r = root?;
-        if r.join("src").is_dir() { r.join("src").join(rest) } else { r.join(rest) }
-    } else {
-        // A package: the nearest node_modules up from the file.
-        let mut d = Some(dir);
-        loop {
-            let cand = d?.join("node_modules").join(spec);
-            if cand.exists() || cand.with_extension("js").exists() || cand.with_extension("d.ts").exists() {
-                break cand;
-            }
-            if d == root {
-                return None;
-            }
-            d = d?.parent();
+    if spec.starts_with('.') || spec.starts_with('/') {
+        return resolve_file(&dir.join(spec));
+    }
+    if let Some((p, target)) = crate::complete::aliases(from, root).into_iter().find(|(p, _)| spec.starts_with(p.as_str()))
+        && let Some(f) = resolve_file(&target.join(&spec[p.len()..]))
+    {
+        return Some(f);
+    }
+    if spec.starts_with('#') {
+        return package_import(spec, dir);
+    }
+    if let Some(rest) = spec.strip_prefix("@/").or_else(|| spec.strip_prefix("~/"))
+        && let Some(r) = root
+    {
+        let base = if r.join("src").is_dir() { r.join("src").join(rest) } else { r.join(rest) };
+        if let Some(f) = resolve_file(&base) {
+            return Some(f);
         }
-    };
-    resolve_file(&base)
+    }
+    package(spec, dir)
+}
+
+fn read_json(p: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
+}
+
+/// `#name` through the nearest package.json's `imports`.
+fn package_import(spec: &str, dir: &Path) -> Option<PathBuf> {
+    let mut d = Some(dir);
+    while let Some(here) = d {
+        if let Some(pkg) = read_json(&here.join("package.json")) {
+            let target = subpath(&pkg["imports"], spec)?;
+            return resolve_file(&here.join(target));
+        }
+        d = here.parent();
+    }
+    None
+}
+
+/// A package from the nearest node_modules up: its `exports` for the subpath, else the folder.
+fn package(spec: &str, dir: &Path) -> Option<PathBuf> {
+    let mut parts = spec.splitn(if spec.starts_with('@') { 3 } else { 2 }, '/');
+    let name = if spec.starts_with('@') { format!("{}/{}", parts.next()?, parts.next()?) } else { parts.next()?.to_string() };
+    let rest = parts.next().unwrap_or("");
+    let mut d = Some(dir);
+    while let Some(here) = d {
+        let pkg_dir = here.join("node_modules").join(&name);
+        if pkg_dir.is_dir() {
+            if let Some(pkg) = read_json(&pkg_dir.join("package.json"))
+                && !pkg["exports"].is_null()
+            {
+                let key = if rest.is_empty() { ".".to_string() } else { format!("./{rest}") };
+                let exports = &pkg["exports"];
+                // `"exports": "./x.js"` or conditions only: that's ".".
+                let map = if exports.is_string() || exports.as_object().is_some_and(|o| !o.keys().any(|k| k.starts_with('.'))) { serde_json::json!({ ".": exports }) } else { exports.clone() };
+                if let Some(t) = subpath(&map, &key)
+                    && let Some(f) = resolve_file(&pkg_dir.join(t))
+                {
+                    return Some(f);
+                }
+            }
+            // Its own @types package, else the folder (its "types" / "main" / index).
+            if rest.is_empty() {
+                let types = here.join("node_modules/@types").join(name.trim_start_matches('@').replace('/', "__"));
+                return resolve_file(&pkg_dir).or_else(|| resolve_file(&types));
+            }
+            return resolve_file(&pkg_dir.join(rest));
+        }
+        d = here.parent();
+    }
+    None
+}
+
+/// The target `map` gives `key` (exact, or a `*` pattern, the longest first), conditions read
+/// types first.
+fn subpath(map: &serde_json::Value, key: &str) -> Option<String> {
+    let obj = map.as_object()?;
+    if let Some(v) = obj.get(key) {
+        return condition(v).map(String::from);
+    }
+    let mut best: Option<(usize, String)> = None;
+    for (k, v) in obj {
+        let Some((pre, post)) = k.split_once('*') else { continue };
+        if key.starts_with(pre) && key.ends_with(post) && key.len() >= pre.len() + post.len() && best.as_ref().is_none_or(|(l, _)| pre.len() > *l) {
+            let star = &key[pre.len()..key.len() - post.len()];
+            if let Some(t) = condition(v) {
+                best = Some((pre.len(), t.replace('*', star)));
+            }
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+/// A target or conditions (`types`, `import`, `node`, `require`, `default`…): the first that applies.
+fn condition(v: &serde_json::Value) -> Option<&str> {
+    match v {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Array(a) => a.iter().find_map(condition),
+        serde_json::Value::Object(o) => ["types", "typings", "import", "module", "node", "require", "default"].iter().find_map(|k| o.get(*k).and_then(condition)),
+        _ => None,
+    }
+}
+
+/// `a/./b/../c` → `a/c` (without asking the disk), so a file opens as one tab.
+fn normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if out.file_name().is_some() => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn resolve_file(base: &Path) -> Option<PathBuf> {
-    if base.is_file() {
-        return Some(base.to_path_buf());
-    }
+    let base = &normalize(base);
     let s = base.to_string_lossy();
     // TypeScript imports name the compiled file: `./x.js` for x.ts, `.mjs` for .mts…
     for (js, ts) in [(".js", &[".ts", ".tsx", ".d.ts"][..]), (".jsx", &[".tsx"][..]), (".mjs", &[".mts", ".d.mts"][..]), (".cjs", &[".cts", ".d.cts"][..])] {
@@ -115,6 +209,9 @@ fn resolve_file(base: &Path) -> Option<PathBuf> {
                 }
             }
         }
+    }
+    if base.is_file() {
+        return Some(base.to_path_buf());
     }
     for ext in ["ts", "tsx", "d.ts", "js", "jsx", "mjs", "cjs", "json"] {
         let p = PathBuf::from(format!("{s}.{ext}"));
@@ -143,13 +240,13 @@ fn resolve_file(base: &Path) -> Option<PathBuf> {
 
 /// One name brought in by an import: `local` here, `imported` in the module (`default`, `*`).
 #[derive(Debug, PartialEq)]
-struct Binding {
-    local: String,
-    imported: String,
-    spec: String,
+pub(crate) struct Binding {
+    pub local: String,
+    pub imported: String,
+    pub spec: String,
 }
 
-fn imports(text: &str) -> Vec<Binding> {
+pub(crate) fn imports(text: &str) -> Vec<Binding> {
     let mut out = Vec::new();
     let imp = re(r#"(?s)\bimport\s+(?:type\s+)?([^;'"]*?)\s+from\s*['"]([^'"]+)['"]"#);
     for c in imp.captures_iter(text) {
@@ -195,6 +292,8 @@ fn declaration(text: &str, name: &str, skip: Option<usize>) -> Option<(usize, us
         // Methods: `  name(args) {` and `async name() {`, object/class members `name = (` / `name: (`.
         format!(r"(?m)^[ \t]*(?:(?:public|private|protected|static|readonly|async|get|set|override)\s+)*({n})\s*(?:<[^>]*>)?\([^)]*\)\s*(?::\s*[^{{=]+)?\{{\s*$"),
         format!(r"(?m)^[ \t]*(?:(?:public|private|protected|static|readonly)\s+)*({n})\s*[:=]\s*(?:async\s*)?(?:\([^)]*\)|[\w$]+)\s*=>"),
+        // A constructor's parameter property: `private readonly name: Type`.
+        format!(r"(?m)\b(?:public|private|protected|readonly)\s+(?:readonly\s+)?({n})\s*[?!]?\s*:"),
         // Destructured or plain parameters/bindings: `const { name }`, `[name, setName]`.
         format!(r"(?m)\b(?:const|let|var)\s*[\{{\[][^=]*?\b({n})\b[^=]*?[\}}\]]\s*="),
     ];
@@ -218,7 +317,7 @@ fn row_col(text: &str, byte: usize) -> (usize, usize) {
 }
 
 /// Where module `file` exports `name` (`default` for the default export), following re-exports.
-fn export_in(file: &Path, name: &str, root: Option<&Path>, depth: u32) -> Option<Target> {
+pub(crate) fn export_in(file: &Path, name: &str, root: Option<&Path>, depth: u32) -> Option<Target> {
     let text = std::fs::read_to_string(file).ok()?;
     let at = |byte: usize| {
         let (row, col) = row_col(&text, byte);
@@ -335,6 +434,15 @@ pub fn find(buf: &Buffer, pos: usize, file: Option<&Path>, root: Option<&Path>) 
                 && let Some(module) = resolve_module(&b.spec, f, root)
             {
                 return export_in(&module, &name, root, 0).map_or(Found::Search(name), Found::At);
+            }
+            // `this.service.method`, `dto.field`: through the declared types.
+            if rust.is_none()
+                && let (Some(chain), Some(f)) = (crate::js_types::receiver_chain(&before), file)
+            {
+                let at = text.char_indices().nth(range.start).map_or(text.len(), |(b, _)| b);
+                if let Some(t) = crate::js_types::member_target(&text, f, root, &chain, &name, at) {
+                    return Found::At(t);
+                }
             }
             if qualifier.is_none()
                 && let Some(b) = bindings.iter().find(|b| b.local == name)
@@ -500,6 +608,56 @@ mod tests {
         assert_eq!(go("theme", 0), Some(("theme.rs".into(), 0, 0)), "a module in a use path");
         assert_eq!(go("fg", 1), Some(("theme.rs".into(), 0, 7)), "a path in code");
         assert_eq!(go("prelude", 0), Some(("theme.rs".into(), 1, 8)), "an inline module, through a glob");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn members_aliases_and_packages_like_typescript() {
+        let d = tmp("members");
+        let w = |p: &str, t: &str| {
+            let p = d.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, t).unwrap();
+        };
+        w("package.json", r##"{ "type": "module", "imports": { "#/*": "./src/*" } }"##);
+        w("tsconfig.json", r#"{ "compilerOptions": { "paths": { "@app/*": ["./src/*"] } } }"#);
+        w("src/services/base.service.ts", "export abstract class BaseService {\n  protected log(msg: string) {}\n}\n");
+        w("src/services/order.service.ts", "import { BaseService } from './base.service.js';\nimport { OrderRepo } from '@app/repo/order.repo.js';\n\nexport class OrderService extends BaseService {\n  constructor(private readonly repo: OrderRepo) {\n    super();\n  }\n\n  async listOrders(q: string): Promise<string[]> {\n    this.log(q);\n    return [];\n  }\n\n  getRepo(): OrderRepo {\n    return this.repo;\n  }\n}\n");
+        w("src/repo/order.repo.ts", "export class OrderRepo {\n  findAll() {\n    return [];\n  }\n}\n");
+        w("src/models/dto/order.dto.ts", "export class ListOrdersQueryDto {\n  page?: number;\n  @IsString()\n  status!: string;\n}\n");
+        w("src/models/dto/index.ts", "export * from './order.dto.js';\n");
+        w("node_modules/@acme/kit/package.json", r#"{ "name": "@acme/kit", "exports": { "./core/*": { "types": "./dist/core/*.d.ts", "import": "./dist/core/*.js" } } }"#);
+        w("node_modules/@acme/kit/dist/core/errors.d.ts", "export declare const HttpErrors: {};\n");
+        w("node_modules/@acme/kit/dist/core/errors.js", "export const HttpErrors = {};\n");
+        let src = "import { OrderService } from '#/services/order.service.js';\nimport { ListOrdersQueryDto } from './models/dto/index.js';\nimport { HttpErrors } from '@acme/kit/core/errors';\n\nexport class C {\n  constructor(\n    private readonly orderService: OrderService,\n  ) {}\n\n  async run(query: ListOrdersQueryDto) {\n    this.orderService.getRepo().findAll();\n    this.orderService.log('x');\n    const repo = this.orderService.getRepo();\n    return this.orderService\n      .listOrders(String(query.page) + query.status);\n  }\n}\n";
+        w("src/controller.ts", src);
+        let file = d.join("src/controller.ts");
+        let buf = Buffer::new(src);
+        let go = |needle: &str, nth: usize| {
+            let byte = src.match_indices(needle).nth(nth).unwrap().0;
+            match find(&buf, src[..byte].chars().count() + 1, Some(&file), Some(&d)) {
+                Found::At(t) => Some((t.path.strip_prefix(&d).unwrap().to_string_lossy().to_string(), t.row, t.col)),
+                _ => None,
+            }
+        };
+        assert_eq!(go("listOrders", 0), Some(("src/services/order.service.ts".into(), 8, 8)), "a method through an injected service (across a line break)");
+        assert_eq!(go("orderService", 1), Some(("src/controller.ts".into(), 6, 21)), "this.orderService: the constructor's property");
+        assert_eq!(go("page", 0), Some(("src/models/dto/order.dto.ts".into(), 1, 2)), "a field through a parameter's type");
+        assert_eq!(go("status", 0), Some(("src/models/dto/order.dto.ts".into(), 3, 2)), "a decorated field");
+        assert_eq!(go("getRepo", 0), Some(("src/services/order.service.ts".into(), 13, 2)));
+        assert_eq!(go("log", 0), Some(("src/services/base.service.ts".into(), 1, 12)), "inherited, from the class it extends");
+        assert_eq!(go("OrderService", 0), Some(("src/services/order.service.ts".into(), 3, 13)), "a #/ import (package.json imports)");
+        assert_eq!(go("ListOrdersQueryDto", 0), Some(("src/models/dto/order.dto.ts".into(), 0, 13)), "index.js → index.ts and export *");
+        assert_eq!(go("HttpErrors", 0), Some(("node_modules/@acme/kit/dist/core/errors.d.ts".into(), 0, 21)), "a package's exports, its types");
+        assert_eq!(go("'#/services", 0).map(|t| t.0), Some("src/services/order.service.ts".into()), "the import path opens the module");
+        // In the service: this.repo (a parameter property), and a member of its type.
+        let svc = std::fs::read_to_string(d.join("src/services/order.service.ts")).unwrap();
+        let sbuf = Buffer::new(&svc);
+        let sfile = d.join("src/services/order.service.ts");
+        let byte = svc.find("this.log").unwrap() + 5;
+        assert!(matches!(find(&sbuf, svc[..byte].chars().count() + 1, Some(&sfile), Some(&d)), Found::At(t) if t.path.ends_with("base.service.ts")));
+        let byte = svc.find("this.repo;").unwrap() + 5;
+        assert!(matches!(find(&sbuf, svc[..byte].chars().count() + 1, Some(&sfile), Some(&d)), Found::At(t) if t.path.ends_with("order.service.ts") && t.row == 4));
         std::fs::remove_dir_all(&d).ok();
     }
 

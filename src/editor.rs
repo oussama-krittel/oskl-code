@@ -326,15 +326,6 @@ pub struct HoverCard {
     info: crate::signature::Info,
 }
 
-/// What TypeScript said about a name (see `tsserver`).
-#[derive(Clone)]
-enum TsDef {
-    At(Range<usize>, crate::definition::Target),
-    Nothing,
-    /// TypeScript couldn't be asked: the guesser answers instead.
-    Unavailable,
-}
-
 /// What a project-wide definition search is for.
 enum Then {
     Underline,
@@ -387,9 +378,6 @@ pub struct Editor {
     /// don't search twice.
     def_cache: std::collections::HashMap<String, (std::time::Instant, Option<crate::definition::Target>)>,
     def_pending: std::collections::HashSet<String>,
-    /// TypeScript's answers for this version of the text, by the name's range.
-    ts_defs: (u64, std::collections::HashMap<Range<usize>, TsDef>),
-    ts_pending: std::collections::HashSet<(u64, Range<usize>)>,
     layout: Option<Layout>,
     drag: Option<DragMode>,
     scroll_drag: Option<f32>,
@@ -475,8 +463,6 @@ impl Editor {
             cmd_held: false,
             def_cache: Default::default(),
             def_pending: Default::default(),
-            ts_defs: (0, Default::default()),
-            ts_pending: Default::default(),
             layout: None,
             drag: None,
             scroll_drag: None,
@@ -1140,19 +1126,6 @@ impl Editor {
         if !module && self.inert(&range) {
             return None;
         }
-        // JavaScript / TypeScript: underlined where TypeScript has a definition, over the span it
-        // gives (as in VS Code).
-        let color = cap.map(highlight::color).unwrap_or_else(theme::fg);
-        match self.ts_def(&range) {
-            Some(TsDef::At(span, _)) => return Some((span, color)),
-            Some(TsDef::Nothing) => return None,
-            Some(TsDef::Unavailable) => {}
-            None if self.ts_on() => {
-                self.ask_typescript(range, Then::Underline, cx);
-                return None;
-            }
-            None => {}
-        }
         let version = self.buf.version();
         let ok = match &self.link_memo {
             Some((r, v, ok)) if *r == range && *v == version => *ok,
@@ -1195,60 +1168,6 @@ impl Editor {
     fn modifiers_changed(&mut self, ev: &ModifiersChangedEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.cmd_held = ev.modifiers.platform;
         self.update_link(cx);
-    }
-
-    /// Whether TypeScript is asked about this file's names.
-    fn ts_on(&self) -> bool {
-        self.mode == EditorMode::Full && self.path.as_deref().is_some_and(crate::tsserver::handles)
-    }
-
-    fn ts_def(&self, range: &Range<usize>) -> Option<TsDef> {
-        if self.ts_defs.0 != self.buf.version() {
-            return None;
-        }
-        self.ts_defs.1.get(range).cloned()
-    }
-
-    /// Asks TypeScript (off the UI thread) where the name at `range` leads, then does `then`.
-    fn ask_typescript(&mut self, range: Range<usize>, then: Then, cx: &mut Context<Self>) {
-        let Some(path) = self.path.clone() else { return };
-        let version = self.buf.version();
-        if !self.ts_pending.insert((version, range.clone())) && matches!(then, Then::Underline) {
-            return;
-        }
-        let (root, text, pos) = (self.root.clone(), self.buf.text(), range.start);
-        cx.spawn(async move |this, cx| {
-            let answer = cx.background_spawn(async move { crate::tsserver::definition(root.as_deref(), &path, &text, pos) }).await;
-            let def = match answer {
-                Ok(Some((span, t))) => TsDef::At(span.unwrap_or(range.clone()), t),
-                Ok(None) => TsDef::Nothing,
-                Err(_) => TsDef::Unavailable,
-            };
-            this.update(cx, |ed, cx| {
-                ed.ts_pending.remove(&(version, range.clone()));
-                if ed.buf.version() != version {
-                    return;
-                }
-                if ed.ts_defs.0 != version {
-                    ed.ts_defs = (version, Default::default());
-                }
-                ed.ts_defs.1.insert(range.clone(), def.clone());
-                match then {
-                    Then::Underline => {
-                        ed.link_memo = None;
-                        ed.update_link(cx);
-                    }
-                    Then::Go => match def {
-                        TsDef::At(_, t) => ed.land(t, cx),
-                        TsDef::Nothing => cx.emit(EditorEvent::Notice("No definition found".into())),
-                        TsDef::Unavailable => ed.guess_definition(pos, cx),
-                    },
-                    Then::Hover(..) => {}
-                }
-            })
-            .ok();
-        })
-        .detach();
     }
 
     fn cached_definition(&self, name: &str) -> Option<Option<crate::definition::Target>> {
@@ -1314,27 +1233,8 @@ impl Editor {
     /// Jumps to what's at `pos`: in this file directly, in another through the workspace, or
     /// after a project-wide search in the background.
     pub fn go_to_definition(&mut self, pos: usize, cx: &mut Context<Self>) {
-        self.completion = None;
-        // JavaScript / TypeScript: where TypeScript says, like VS Code.
-        if self.ts_on()
-            && let Some(hit) = crate::definition::hit_at(&self.buf, pos)
-        {
-            let range = match hit {
-                crate::definition::Hit::Module(_, r) | crate::definition::Hit::Name(_, r) => r,
-            };
-            match self.ts_def(&range) {
-                Some(TsDef::At(_, t)) => return self.land(t, cx),
-                Some(TsDef::Nothing) => return cx.emit(EditorEvent::Notice("No definition found".into())),
-                Some(TsDef::Unavailable) => {}
-                None => return self.ask_typescript(range, Then::Go, cx),
-            }
-        }
-        self.guess_definition(pos, cx);
-    }
-
-    /// Without TypeScript: the guesser in `definition` (imports, this file, then the project).
-    fn guess_definition(&mut self, pos: usize, cx: &mut Context<Self>) {
         use crate::definition::Found;
+        self.completion = None;
         match crate::definition::find(&self.buf, pos, self.path.as_deref(), self.root.as_deref()) {
             Found::At(t) => self.land(t, cx),
             Found::Nothing => {}
