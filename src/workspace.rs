@@ -6951,6 +6951,9 @@ mod ui_tests {
         let link = |cx: &mut gpui::VisualTestContext, needle: &str, nth: usize| {
             let byte = src.match_indices(needle).nth(nth).unwrap().0;
             let pos = src[..byte].chars().count() + 1;
+            // TypeScript (or, without it, the guesser) answers in the background first.
+            ed.update(cx, |e, cx| e.link_for_pos(pos, cx));
+            cx.run_until_parked();
             let r = ed.update(cx, |e, cx| e.link_for_pos(pos, cx));
             cx.run_until_parked();
             r.map(|(r, c)| (src.chars().skip(r.start).take(r.end - r.start).collect::<String>(), c))

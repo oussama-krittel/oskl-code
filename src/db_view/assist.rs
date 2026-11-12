@@ -192,9 +192,9 @@ mod tests {
 
     #[test]
     fn mongo_suggests_by_place() {
-        let names: Shared = Rc::new(RefCell::new(Names { tables: vec!["users".into(), "advances".into()], fields: vec!["status".into(), "stage".into()] }));
+        let names: Shared = Rc::new(RefCell::new(Names { tables: vec!["users".into(), "orders".into()], fields: vec!["status".into(), "stage".into()] }));
         let s = mongo(names);
-        assert_eq!(labels(&s, "db.ad")[0], "advances");
+        assert_eq!(labels(&s, "db.or")[0], "orders");
         assert!(labels(&s, "db.").contains(&"users".to_string()), "every collection right after db.");
         assert_eq!(labels(&s, "db.users.fi"), ["find", "findOne"]);
         assert_eq!(labels(&s, "db.users.find({}).li"), ["limit"]);

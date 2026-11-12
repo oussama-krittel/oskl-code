@@ -105,6 +105,17 @@ fn resolve_file(base: &Path) -> Option<PathBuf> {
         return Some(base.to_path_buf());
     }
     let s = base.to_string_lossy();
+    // TypeScript imports name the compiled file: `./x.js` for x.ts, `.mjs` for .mts…
+    for (js, ts) in [(".js", &[".ts", ".tsx", ".d.ts"][..]), (".jsx", &[".tsx"][..]), (".mjs", &[".mts", ".d.mts"][..]), (".cjs", &[".cts", ".d.cts"][..])] {
+        if let Some(stem) = s.strip_suffix(js) {
+            for t in ts {
+                let p = PathBuf::from(format!("{stem}{t}"));
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
     for ext in ["ts", "tsx", "d.ts", "js", "jsx", "mjs", "cjs", "json"] {
         let p = PathBuf::from(format!("{s}.{ext}"));
         if p.is_file() {

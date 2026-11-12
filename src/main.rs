@@ -50,6 +50,7 @@ mod terminal;
 mod theme;
 mod tools;
 mod tserror;
+mod tsserver;
 mod ui;
 mod util;
 mod workspace;
