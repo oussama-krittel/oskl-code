@@ -1063,7 +1063,8 @@ impl Workspace {
 
     fn handle_request(&mut self, req: &Request, window: &mut Window, cx: &mut Context<Self>) {
         match req {
-            Request::Db(crate::db_view::DbRequest::Open(open)) => self.open_db(open.clone(), window, cx),
+            Request::Db(crate::db_view::DbRequest::Open(open)) => self.open_db(open.clone(), false, window, cx),
+            Request::Db(crate::db_view::DbRequest::Preview(open)) => self.open_db(open.clone(), true, window, cx),
             Request::Db(crate::db_view::DbRequest::Changed { expand }) => {
                 let expand = expand.clone();
                 self.db_panel.update(cx, |p, cx| p.reload_and_expand(expand.clone(), cx));
@@ -2491,9 +2492,19 @@ impl Workspace {
     }
 
     /// Opens a database tab (or shows the one already showing the same thing).
-    fn open_db(&mut self, open: crate::db_view::Open, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_db(&mut self, open: crate::db_view::Open, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Db(v) if v.read(cx).shows(&open))) {
+            if !preview {
+                self.tabs[ix].preview = false;
+            }
             return self.activate(ix, window, cx);
+        }
+        // The preview tab here is kept (not replaced) once it has changes or a query in it.
+        if preview && let Some(pane) = self.pane(self.focused_pane) {
+            let keep: Vec<usize> = pane.items.iter().filter_map(|t| self.tab_ix(*t)).filter(|ix| self.tabs[*ix].preview && matches!(&self.tabs[*ix].kind, TabKind::Db(v) if v.read(cx).wants_keeping(cx))).collect();
+            for ix in keep {
+                self.tabs[ix].preview = false;
+            }
         }
         let project = self.db_roots(cx).into_iter().next();
         let view = cx.new(|cx| crate::db_view::DbView::new(open, project, window, cx));
@@ -2506,7 +2517,7 @@ impl Workspace {
                 ws.handle_request(req, window, cx);
             }
         });
-        self.add_tab(TabKind::Db(view), sub, false, window, cx);
+        self.add_tab(TabKind::Db(view), sub, preview, window, cx);
         cx.notify();
     }
 
@@ -7097,6 +7108,38 @@ mod ui_tests {
         click(cx, "commit-file-src/b.rs", 1);
         assert_eq!(diff_shown(cx).as_deref(), Some("src/b.rs"), "a file shows that commit's diff");
 
+        // Its text is selectable and copies, on one side: a line (three clicks), a word, a drag.
+        click(cx, "commit-file-a.txt", 1);
+        assert_eq!(diff_shown(cx).as_deref(), Some("a.txt"));
+        let diff = ws.read_with(cx, |ws, _| ws.active.and_then(|ix| match &ws.tabs[ix].kind {
+            TabKind::Diff(d) => Some(d.clone()),
+            _ => None,
+        })).unwrap();
+        let text_at = |cx: &mut VisualTestContext, sel: &str| {
+            let sel: &'static str = Box::leak(sel.to_string().into_boxed_str());
+            let b = cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} on screen"));
+            b.origin + gpui::point(gpui::px(3.), b.size.height / 2.)
+        };
+        let at = text_at(cx, "diff-text-1-new");
+        for n in 1..=3 {
+            cx.simulate_event(gpui::MouseDownEvent { position: at, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: n, first_mouse: false });
+            cx.simulate_event(gpui::MouseUpEvent { position: at, modifiers: gpui::Modifiers::none(), button: gpui::MouseButton::Left, click_count: n });
+        }
+        cx.run_until_parked();
+        assert_eq!(diff.read_with(cx, |d, _| d.selection_text()), "A", "the new line");
+        assert_eq!(diff_shown(cx).as_deref(), Some("a.txt"), "twice on text selects; it doesn't open the file");
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("A"));
+        let (from, to) = (text_at(cx, "diff-text-0-new"), text_at(cx, "diff-text-1-new") + gpui::point(gpui::px(200.), gpui::px(0.)));
+        cx.simulate_mouse_down(from - gpui::point(gpui::px(2.), gpui::px(0.)), gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(to, Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("a\nA"), "a drag over both lines, the new side only");
+        cx.simulate_keystrokes("cmd-a cmd-c");
+        assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("a\nA\n"), "⌘A: the whole new version, as in the file");
+
         // Rows that go away keep their old debug bounds, so ask the panel what's open.
         let open = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.git_panel.read(cx).expanded_count());
         click(cx, row, 1);
@@ -7906,6 +7949,23 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
             _ => None,
         })).expect("a PDF opens as a preview, not text");
         assert_eq!(preview.read_with(cx, |v, cx| v.pdf_pages(cx)), Some(2));
+    }
+
+    #[gpui::test]
+    fn database_items_open_in_one_preview_tab_until_kept(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let data = |c: &str| crate::db_view::Open::Data { conn: "nowhere".into(), path: vec!["db".into(), c.into()] };
+        let db_tabs = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.tabs.iter().filter(|t| matches!(t.kind, TabKind::Db(_))).map(|t| t.preview).collect::<Vec<_>>());
+        ws.update_in(cx, |ws, window, cx| ws.open_db(data("a"), true, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(data("b"), true, window, cx));
+        cx.run_until_parked();
+        assert_eq!(db_tabs(cx), [true], "one click each: the preview tab is replaced");
+        ws.update_in(cx, |ws, window, cx| ws.open_db(data("b"), false, window, cx));
+        assert_eq!(db_tabs(cx), [false], "a double click keeps it");
+        ws.update_in(cx, |ws, window, cx| ws.open_db(data("c"), true, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(data("d"), true, window, cx));
+        cx.run_until_parked();
+        assert_eq!(db_tabs(cx), [false, true], "the kept one stays; one preview beside it");
     }
 
     #[gpui::test]
@@ -8872,7 +8932,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
             let q = crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("oskl_test".into()), collection: None }, "db.edit_docs.findOne({})".into()));
             futures::executor::block_on(q).unwrap()[0].trees.clone().unwrap()[0].text(crate::db::TextStyle::Shell)
         };
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "edit_docs".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "edit_docs".into()] }, false, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the document", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         let dbl = |cx: &mut VisualTestContext, sel: &str| {
@@ -8997,7 +9057,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         let (ws, cx) = setup(cx);
         let id = live_mongo_docs("table_ux", 40, cx);
         let conn = crate::db::load().into_iter().find(|c| c.id == id).unwrap();
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id.clone(), path: vec!["oskl_test".into(), "table_ux".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id.clone(), path: vec!["oskl_test".into(), "table_ux".into()] }, false, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         let dbl = |cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>| {
@@ -9148,7 +9208,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         .unwrap();
         let shell = |conn: &crate::db::Conn, q: &str| futures::executor::block_on(crate::db::engine::run(crate::db::engine::query(conn.clone(), crate::db::Scope { database: Some("oskl_test".into()), collection: None }, q.into()))).unwrap();
         let count = |conn: &crate::db::Conn, filter: &str| shell(conn, &format!("db.safe_docs.countDocuments({filter})"))[0].rows[0][0].clone().unwrap();
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "safe_docs".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "safe_docs".into()] }, false, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some_and(|s| s.1 == 2));
 
@@ -9250,7 +9310,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
             futures::executor::block_on(q).unwrap()
         };
         let first = |conn: &crate::db::Conn| shell(conn, "db.edit_more.findOne({})")[0].trees.clone().unwrap()[0].text(crate::db::TextStyle::Shell);
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "edit_more".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "edit_more".into()] }, false, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the document", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
 
@@ -9398,7 +9458,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         }
         let (ws, cx) = setup(cx);
         let id = live_mongo_docs("select_docs", 3, cx);
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "select_docs".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "select_docs".into()] }, false, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         for (mode, want) in [("db-mode-table", ""), ("db-mode-list", "name: 'person 0'"), ("db-mode-json", "\"name\": \"person 0\"")] {
@@ -9436,7 +9496,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         use crate::db_view::CTab;
         let (ws, cx) = setup(cx);
         let id = live_mongo_docs("compass_ui", 40, cx);
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "compass_ui".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "compass_ui".into()] }, false, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         for t in ["db-tab-data", "db-tab-aggregations", "db-tab-schema", "db-tab-indexes", "db-tab-validation", "db-tab-query", "db-filter", "db-find", "db-explain", "db-reset", "db-options", "db-history-button", "db-range"] {
@@ -9545,7 +9605,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         let (ws, cx) = setup(cx);
         let id = live_mongo_docs("overview_big", 30, cx);
         live_mongo_docs("overview_small", 2, cx);
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Database { conn: id.clone(), db: "oskl_test".into() }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Database { conn: id.clone(), db: "oskl_test".into() }, false, window, cx));
         let tab = db_tab(&ws, cx).expect("a database tab");
         assert_eq!(ws.read_with(cx, |ws, cx| ws.tab_title(&ws.tabs[ws.active.unwrap()], cx).0), "oskl_test");
         wait_for(cx, "the collections", |cx| tab.read_with(cx, |t, _| t.overview_names()).is_some());
@@ -9555,6 +9615,9 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(700.)));
         cx.run_until_parked();
         assert!(cx.debug_bounds("db-overview-x").is_some());
+        // The buttons go under the name rather than over it.
+        let (title, buttons) = (cx.debug_bounds("db-overview-title").unwrap(), cx.debug_bounds("db-overview-buttons").unwrap());
+        assert!(!title.intersects(&buttons), "{title:?} {buttons:?}");
         let h = cx.debug_bounds("db-coll-0").unwrap().size.height;
         assert!(h < gpui::px(42.), "one line: {h:?}");
         cx.simulate_resize(gpui::size(gpui::px(1800.), gpui::px(900.)));
@@ -10113,7 +10176,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
             "db.ui_users.drop()\ndb.ui_users.insertMany([{name: 'Ann', age: 34, tags: ['a'], addr: {city: 'Oslo'}}, {name: 'Bob', age: 25}])".into(),
         ));
         futures::executor::block_on(seed).unwrap();
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "ui_users".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "ui_users".into()] }, false, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         // Like Compass: cards of fields at first; JSON and Table a click away.
@@ -10137,7 +10200,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         }
         let (ws, cx) = setup(cx);
         let id = live_mongo_docs("scroll_docs", 40, cx);
-        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "scroll_docs".into()] }, window, cx));
+        ws.update_in(cx, |ws, window, cx| ws.open_db(crate::db_view::Open::Data { conn: id, path: vec!["oskl_test".into(), "scroll_docs".into()] }, false, window, cx));
         let tab = db_tab(&ws, cx).expect("a data tab");
         wait_for(cx, "the documents", |cx| tab.read_with(cx, |t, _| t.data_summary()).is_some());
         for mode in ["db-mode-json", "db-mode-list"] {

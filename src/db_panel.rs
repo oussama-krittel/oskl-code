@@ -535,17 +535,23 @@ impl DbPanel {
                 let queryable = matches!(n.kind, db::NodeKind::Database) || leaf;
                 let mongo_db = c.kind == db::Kind::MongoDb && matches!(n.kind, db::NodeKind::Database) && path.len() == 1;
                 base.debug_selector(move || format!("db-node-{label}"))
-                    .on_click(cx.listener(move |p, _, w, cx| {
+                    .on_click(cx.listener(move |p, ev: &gpui::ClickEvent, w, cx| {
                         p.selected = Some(rk.clone());
                         w.focus(&p.focus, cx);
+                        // One click shows it in a preview tab (the next click replaces it); two keep it.
+                        let keep = ev.click_count() >= 2;
+                        let req = if keep { DbRequest::Open } else { DbRequest::Preview };
                         if leaf {
-                            cx.emit(Request::Db(DbRequest::Open(Open::Data { conn: id.clone(), path: path.clone() })));
+                            cx.emit(Request::Db(req(Open::Data { conn: id.clone(), path: path.clone() })));
+                        } else if keep && mongo_db {
+                            // The second click of two keeps the database's page (it stays unfolded).
+                            cx.emit(Request::Db(DbRequest::Open(Open::Database { conn: id.clone(), db: path[0].clone() })));
                         } else {
                             p.toggle(&id, path.clone(), cx);
                             // A MongoDB database also opens its page of collections, like Compass
                             // (when it's opened, not when it's folded away).
                             if mongo_db && !open {
-                                cx.emit(Request::Db(DbRequest::Open(Open::Database { conn: id.clone(), db: path[0].clone() })));
+                                cx.emit(Request::Db(DbRequest::Preview(Open::Database { conn: id.clone(), db: path[0].clone() })));
                             }
                         }
                     }))

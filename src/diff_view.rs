@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-actions!(diff_view, [NextRow, PrevRow, NextHunk, PrevHunk, ToggleBlame, ToggleInline, OpenFile, CopyRow, Top, Bottom, PageDownRows, PageUpRows]);
+actions!(diff_view, [NextRow, PrevRow, NextHunk, PrevHunk, ToggleBlame, ToggleInline, OpenFile, CopyRow, SelectAllNew, Top, Bottom, PageDownRows, PageUpRows]);
 
 pub fn bind_keys() {
     let c = Some("DiffView");
@@ -33,6 +33,7 @@ pub fn bind_keys() {
         crate::keybindings::kb("enter", OpenFile, c),
         crate::keybindings::kb("o", OpenFile, c),
         crate::keybindings::kb("cmd-c", CopyRow, c),
+        crate::keybindings::kb("cmd-a", SelectAllNew, c),
         crate::keybindings::kb("g", Top, c),
         crate::keybindings::kb("shift-g", Bottom, c),
         crate::keybindings::kb("space", PageDownRows, c),
@@ -92,6 +93,9 @@ pub struct DiffView {
     find: Option<regex::Regex>,
     find_hits: Vec<(usize, bool, Range<usize>)>,
     find_current: Option<usize>,
+    /// Text selected by dragging, on each side (old, new; inline uses the new one): ⌘C copies it.
+    sel_old: crate::sel::Selection,
+    sel_new: crate::sel::Selection,
     _tasks: Vec<Task<()>>,
 }
 
@@ -119,6 +123,8 @@ impl DiffView {
             find: None,
             find_hits: Vec::new(),
             find_current: None,
+            sel_old: Default::default(),
+            sel_new: Default::default(),
             _tasks: Vec::new(),
         };
         view.reload(cx);
@@ -358,13 +364,32 @@ impl DiffView {
         cx.emit(Request::OpenFile { path: self.root.join(&self.spec.path), line, preview: false });
     }
 
+    /// ⌘C: the selected text (either side), else the selected row's line.
     fn copy_row(&mut self, _: &CopyRow, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = [&self.sel_new, &self.sel_old].into_iter().map(|s| s.text()).find(|t| !t.is_empty()) {
+            return cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
         let Some(data) = &self.data else { return };
         let Some(row) = self.selected.and_then(|s| self.rows().get(s)) else { return };
         let text = row.r.map(|i| data.right[i].clone()).or_else(|| row.l.map(|i| data.left[i].clone()));
         if let Some(text) = text {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+    }
+
+    /// ⌘A: the whole new version (the old one for a deleted file).
+    fn select_all_new(&mut self, _: &SelectAllNew, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(data) = &self.data else { return };
+        let lines = if data.right.is_empty() { &data.left } else { &data.right };
+        self.sel_old.clear();
+        self.sel_new.select_all(lines.join("\n"));
+        cx.notify();
+    }
+
+    /// What ⌘C copies now (tests).
+    #[cfg(test)]
+    pub fn selection_text(&self) -> String {
+        [&self.sel_new, &self.sel_old].into_iter().map(|s| s.text()).find(|t| !t.is_empty()).unwrap_or_default()
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -677,9 +702,18 @@ impl DiffView {
         .child(
             div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(
                 div()
+                    .debug_selector(move || format!("diff-text-{row_ix}-{}", if left { "old" } else { "new" }))
                     .flex()
                     .ml(px(-self.scroll_x))
-                    .child(styled_line(text, syntax, &highlights))
+                    .child({
+                        // Selectable, on its own side (a drag doesn't mix old and new).
+                        let styled = styled_line(text, syntax, &highlights);
+                        let sel = if left && !self.show_inline() { &self.sel_old } else { &self.sel_new };
+                        match line {
+                            Some(_) => sel.styled_piece((row_ix as u64, 0), text.replace('\t', "    "), styled).into_any_element(),
+                            None => styled.into_any_element(),
+                        }
+                    })
                     // The selected line says who wrote it, GitLens-style (the column does that when on).
                     .when_some(commit.filter(|_| selected && !self.show_blame), |d, c| {
                         let who = if self.user_email.as_deref() == Some(c.email.as_str()) || c.is_uncommitted() { "You".to_string() } else { c.author.clone() };
@@ -700,6 +734,8 @@ impl Focusable for DiffView {
 
 impl Render for DiffView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sel_old.begin_frame();
+        self.sel_new.begin_frame();
         let body: AnyElement = if let Some(err) = &self.error {
             div().p(px(20.)).text_color(theme::fg_muted()).child(err.clone()).into_any_element()
         } else if let Some(data) = self.data.clone() {
@@ -728,7 +764,8 @@ impl Render for DiffView {
                                     .when(selected, |d| d.border_1().border_color(theme::focus_border()))
                                     .on_click(cx.listener(move |view, ev: &ClickEvent, _, cx| {
                                         view.selected = Some(ix);
-                                        if ev.click_count() >= 2 {
+                                        // Twice on a word selects it; twice elsewhere on the row opens the file there.
+                                        if ev.click_count() >= 2 && !view.sel_new.has_selection() && !view.sel_old.has_selection() {
                                             let line = view.rows().get(ix).and_then(|r| r.r.or(r.l));
                                             view.emit_open(line, cx);
                                         }
@@ -786,6 +823,15 @@ impl Render for DiffView {
             .on_action(cx.listener(Self::toggle_inline))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::copy_row))
+            .on_action(cx.listener(Self::select_all_new))
+            // A press starts afresh: the old selection goes (a drag on text makes a new one).
+            .capture_any_mouse_down(cx.listener(|view, _, _, cx| {
+                if view.sel_old.has_selection() || view.sel_new.has_selection() {
+                    view.sel_old.clear();
+                    view.sel_new.clear();
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(Self::top))
             .on_action(cx.listener(Self::bottom))
             .on_action(cx.listener(Self::page_down))

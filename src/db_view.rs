@@ -57,6 +57,9 @@ pub enum Open {
 /// What a database tab asks of the workspace and the panel.
 pub enum DbRequest {
     Open(Open),
+    /// Opened by a single click: a preview tab, replaced by the next one (a double click, or an
+    /// unsaved change in it, keeps it), like files in the explorer.
+    Preview(Open),
     /// Saved connections changed (expand this one in the panel, if any).
     Changed { expand: Option<String> },
     /// This connection was connected (from the panel): its tabs load.
@@ -545,6 +548,11 @@ impl DbView {
     // ------------------------------------------------------------ data view
 
     /// Documents changed in place and not saved yet (or being typed into).
+    /// Worth keeping when a preview would replace it: unsaved changes, or a query typed.
+    pub fn wants_keeping(&self, cx: &App) -> bool {
+        self.has_unsaved(cx) || matches!(&self.body, Body::Data(d) if !d.query.read(cx).text().trim().is_empty())
+    }
+
     fn has_unsaved(&self, cx: &App) -> bool {
         let Body::Data(d) = &self.body else { return false };
         let Some(g) = &d.grid else { return false };

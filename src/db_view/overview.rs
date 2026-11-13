@@ -273,7 +273,7 @@ impl DbView {
                         .border_color(theme::border())
                         .cursor_pointer()
                         .hover(|s| s.bg(theme::hover()))
-                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(Request::Db(DbRequest::Open(Open::Data { conn: conn.clone(), path: vec![db.clone(), name.clone()] })))))
+                        .on_click(cx.listener(move |_, ev: &gpui::ClickEvent, _, cx| cx.emit(Request::Db(if ev.click_count() >= 2 { DbRequest::Open } else { DbRequest::Preview }(Open::Data { conn: conn.clone(), path: vec![db.clone(), name.clone()] })))))
                         .child(div().flex_1().min_w(px(NAME_MIN)).px(px(10.)).overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_bright()).child(SharedString::from(c.name.clone())))
                         .child(div().w(px(150.)).flex_none().px(px(10.)).flex().flex_wrap().gap(px(4.)).when(c.props.is_empty(), |d| d.child("-")).children(c.props.iter().map(|p| ui::badge(p.to_uppercase(), theme::bg_input()))))
                         .child(cell(opt(c.storage, size_text), 130.))
@@ -313,12 +313,29 @@ impl DbView {
             .pb(px(10.))
             .gap(px(10.))
             .child(
+                // In a narrow split the buttons go under the name (nothing is drawn over it), and
+                // the name shortens with … only when even its own line is too narrow.
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.))
-                    .child(div().flex_1().min_w_0().flex().items_center().gap(px(6.)).text_size(px(14.)).child(div().text_color(theme::git_added()).child(o.conn.title())).child(div().text_color(theme::fg_muted()).child("›")).child(div().text_color(theme::fg_bright()).child(o.db.clone())))
-                    .child(button("db-open-shell", "Open MongoDB shell", Some("terminal"), false).on_click(cx.listener(move |_, _, _, cx| cx.emit(Request::Db(DbRequest::Open(Open::Query { conn: conn_id.clone(), path: vec![db.clone()] }))))))
+                    .child(
+                        div()
+                            .debug_selector(|| "db-overview-title".into())
+                            .flex_1()
+                            .min_w(px(160.))
+                            .overflow_hidden()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .whitespace_nowrap()
+                            .text_size(px(14.))
+                            .child(div().min_w_0().overflow_hidden().text_ellipsis().text_color(theme::git_added()).child(o.conn.title()))
+                            .child(div().flex_none().text_color(theme::fg_muted()).child("›"))
+                            .child(div().min_w_0().overflow_hidden().text_ellipsis().text_color(theme::fg_bright()).child(o.db.clone())),
+                    )
+                    .child(div().debug_selector(|| "db-overview-buttons".into()).flex().flex_wrap().items_center().gap(px(8.)).child(button("db-open-shell", "Open MongoDB shell", Some("terminal"), false).on_click(cx.listener(move |_, _, _, cx| cx.emit(Request::Db(DbRequest::Open(Open::Query { conn: conn_id.clone(), path: vec![db.clone()] }))))))
                     .child(button("db-coll-new", "Create collection", Some("plus"), true).on_click(cx.listener(|v, _, window, cx| {
                         if let Some(o) = v.overview_mut() {
                             o.status = None;
@@ -338,7 +355,7 @@ impl DbView {
                         }
                         cx.notify();
                     })))
-                    .child(button("db-overview-refresh", "Refresh", Some("refresh"), false).on_click(cx.listener(|v, _, _, cx| v.load_overview(cx)))),
+                    .child(button("db-overview-refresh", "Refresh", Some("refresh"), false).on_click(cx.listener(|v, _, _, cx| v.load_overview(cx))))),
             )
             .when_some(o.creating.clone(), |el, e| {
                 el.child(
