@@ -2712,17 +2712,9 @@ impl Workspace {
         if let TabKind::Preview(v) = &self.tabs[ix].kind {
             v.clone().update(cx, |v, cx| v.release(window, cx));
         }
-        let db_conn = match &self.tabs[ix].kind {
-            TabKind::Db(v) => v.read(cx).conn_id(),
-            _ => None,
-        };
+        // A database stays connected when its tabs close (Disconnect in the panel, or closing
+        // the window, ends it).
         self.drop_tab(id);
-        // A connection's last tab closed: it's disconnected (connect again from the panel).
-        if let Some(conn) = db_conn
-            && !self.tabs.iter().any(|t| matches!(&t.kind, TabKind::Db(v) if v.read(cx).conn_id().as_deref() == Some(conn.as_str())))
-        {
-            self.db_panel.update(cx, |p, cx| p.disconnect(&conn, cx));
-        }
         if let Some(p) = pane {
             if self.pane(p).is_some_and(|p| p.items.is_empty()) && self.panes.len() > 1 {
                 return self.close_pane(p, window, cx);
@@ -7989,7 +7981,12 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     #[gpui::test]
     fn database_items_open_in_one_preview_tab_until_kept(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
-        let data = |c: &str| crate::db_view::Open::Data { conn: "nowhere".into(), path: vec!["db".into(), c.into()] };
+        // A saved connection (nothing listens there: the tabs show their error, as offline).
+        let mut conn = crate::db::Conn::new(crate::db::Kind::MongoDb);
+        conn.port = 1;
+        crate::db::save(&conn, None).unwrap();
+        let id = conn.id.clone();
+        let data = |c: &str| crate::db_view::Open::Data { conn: id.clone(), path: vec!["db".into(), c.into()] };
         let db_tabs = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.tabs.iter().filter(|t| matches!(t.kind, TabKind::Db(_))).map(|t| t.preview).collect::<Vec<_>>());
         ws.update_in(cx, |ws, window, cx| ws.open_db(data("a"), true, window, cx));
         ws.update_in(cx, |ws, window, cx| ws.open_db(data("b"), true, window, cx));
@@ -9009,6 +9006,13 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         type_in(cx, "extra");
         type_in(cx, "42");
         // The note removed.
+        let line = cx.debug_bounds("db-value-0-7").unwrap();
+        cx.simulate_mouse_move(line.center(), None, gpui::Modifiers::none());
+        click_on(cx, "db-remove-0-7");
+        // Still shown, in red, with its undo: until Update or Cancel.
+        assert!(cx.debug_bounds("db-removed-0-7").is_some(), "the removed field stays, marked");
+        click_on(cx, "db-undo-0-7");
+        assert!(cx.debug_bounds("db-removed-0-7").is_none(), "undo: it stays");
         let line = cx.debug_bounds("db-value-0-7").unwrap();
         cx.simulate_mouse_move(line.center(), None, gpui::Modifiers::none());
         click_on(cx, "db-remove-0-7");
@@ -10321,12 +10325,12 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         click_on(cx, "db-node-fruit_order");
         assert_eq!(db_tab(&ws, cx), Some(tab));
         assert_eq!(ws.read_with(cx, |ws, _| ws.tabs.iter().filter(|t| matches!(t.kind, TabKind::Db(_))).count()), 1);
-        // Its last tab closed: disconnected, and it says so (Connect is shown again).
+        // Its last tab closed: still connected (only Disconnect, or closing the window, ends it).
         assert!(crate::db::engine::connected(&c.id));
         cx.simulate_keystrokes("cmd-w");
         cx.run_until_parked();
-        assert!(!crate::db::engine::connected(&c.id), "closing the last tab disconnects");
-        assert!(cx.debug_bounds("db-connect-0").is_some(), "Connect is shown");
+        assert!(crate::db::engine::connected(&c.id), "closing the last tab keeps it connected");
+        assert!(cx.debug_bounds("db-connect-0").is_none(), "Connect isn't shown");
     }
 }
 

@@ -47,6 +47,18 @@ pub struct DbPanel {
     tasks: HashMap<String, Task<()>>,
     /// Connections being connected (until their first listing comes back).
     connecting: HashSet<String>,
+    /// Connections this window connected: they stay connected (tabs closed or not) until
+    /// Disconnect, or until the window closes.
+    mine: HashSet<String>,
+}
+
+impl Drop for DbPanel {
+    /// The project's window closed: what it connected is disconnected.
+    fn drop(&mut self) {
+        for id in &self.mine {
+            engine::forget(id);
+        }
+    }
 }
 
 /// A node's key: its connection and path.
@@ -75,6 +87,7 @@ impl DbPanel {
             scroll: UniformListScrollHandle::new(),
             tasks: HashMap::new(),
             connecting: HashSet::new(),
+            mine: HashSet::new(),
         };
         p.reload(cx);
         p
@@ -222,6 +235,7 @@ impl DbPanel {
     /// Connects (opens it and lists what's in it); a failure says so in a popup.
     pub fn connect(&mut self, conn_id: &str, cx: &mut Context<Self>) {
         engine::open(conn_id);
+        self.mine.insert(conn_id.to_string());
         self.connecting.insert(conn_id.to_string());
         self.forget_tree(conn_id);
         let k = key(conn_id, &[]);
@@ -289,6 +303,7 @@ impl DbPanel {
 
     pub fn disconnect(&mut self, conn_id: &str, cx: &mut Context<Self>) {
         self.connecting.remove(conn_id);
+        self.mine.remove(conn_id);
         engine::forget(conn_id);
         let k = key(conn_id, &[]);
         self.open.retain(|o| o != &k && !o.starts_with(&format!("{k}\u{1f}")));

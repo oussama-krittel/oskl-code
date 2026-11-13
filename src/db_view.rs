@@ -136,6 +136,8 @@ struct Data {
     search_task: Option<Task<()>>,
     // Query
     query: Entity<Editor>,
+    /// What the query box started with (a preview tab is kept once it says something else).
+    starter: String,
     results: Vec<GridView>,
     result_ix: usize,
     query_error: Option<String>,
@@ -300,8 +302,56 @@ struct DocEdit {
     ops: Vec<compass::Op>,
     /// Fields changed or added, highlighted.
     changed: HashSet<Vec<Seg>>,
+    /// Fields removed but still shown (in red, with an undo) until Update or Cancel.
+    removed: Vec<Vec<Seg>>,
     saving: bool,
     error: Option<String>,
+}
+
+impl DocEdit {
+    /// Anything to save: a change, or a field removed.
+    fn modified(&self) -> bool {
+        self.working != self.original || !self.removed.is_empty()
+    }
+
+    /// The changes as sent: the edits, then the removals (an array's last items first, so the
+    /// places of the others hold; nothing inside a field that's removed anyway).
+    fn all_ops(&self) -> Vec<compass::Op> {
+        let mut gone: Vec<Vec<Seg>> = self.removed.iter().filter(|p| !self.removed.iter().any(|q| q.len() < p.len() && p.starts_with(q))).cloned().collect();
+        gone.sort_by(|a, b| {
+            for (x, y) in a.iter().zip(b) {
+                let o = match (x, y) {
+                    (Seg::Idx(i), Seg::Idx(j)) => i.cmp(j),
+                    (Seg::Key(k), Seg::Key(l)) => k.cmp(l),
+                    (Seg::Key(_), Seg::Idx(_)) => std::cmp::Ordering::Less,
+                    (Seg::Idx(_), Seg::Key(_)) => std::cmp::Ordering::Greater,
+                };
+                if o != std::cmp::Ordering::Equal {
+                    return o.reverse();
+                }
+            }
+            b.len().cmp(&a.len())
+        });
+        self.ops.iter().cloned().chain(gone.into_iter().map(compass::Op::Remove)).collect()
+    }
+
+    /// An edit moved things: removals waiting keep pointing at the same fields (a rename, an
+    /// array item put before them).
+    fn follow(&mut self, op: &compass::Op) {
+        for p in &mut self.removed {
+            match op {
+                compass::Op::Rename(at, new) if p.len() >= at.len() && p.starts_with(at) => p[at.len() - 1] = Seg::Key(new.clone()),
+                compass::Op::Insert(parent, at, None, _) if p.len() > parent.len() && p.starts_with(parent) => {
+                    if let Seg::Idx(i) = &mut p[parent.len()]
+                        && *i >= *at
+                    {
+                        *i += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// The key or value being typed into, in a document's card.
@@ -422,6 +472,7 @@ impl DbView {
                         menu: None,
                         search_task: None,
                         query,
+                        starter: starter.clone(),
                         results: Vec::new(),
                         result_ix: 0,
                         query_error: None,
@@ -550,14 +601,14 @@ impl DbView {
     /// Documents changed in place and not saved yet (or being typed into).
     /// Worth keeping when a preview would replace it: unsaved changes, or a query typed.
     pub fn wants_keeping(&self, cx: &App) -> bool {
-        self.has_unsaved(cx) || matches!(&self.body, Body::Data(d) if !d.query.read(cx).text().trim().is_empty())
+        self.has_unsaved(cx) || matches!(&self.body, Body::Data(d) if d.query.read(cx).text().trim() != d.starter.trim())
     }
 
     fn has_unsaved(&self, cx: &App) -> bool {
         let Body::Data(d) = &self.body else { return false };
         let Some(g) = &d.grid else { return false };
         self.editing.as_ref().is_some_and(|e| e.which.is_none())
-            || g.edits.values().any(|e| e.working != e.original)
+            || g.edits.values().any(|e| e.modified())
             || g.json_edits.values().any(|j| j.editor.read(cx).text() != j.initial)
     }
 
@@ -1834,7 +1885,7 @@ impl DbView {
     fn doc_edit(&mut self, which: Option<usize>, row: usize) -> Option<&mut DocEdit> {
         let gv = self.grid_of_mut(which)?;
         let t = gv.grid.trees.as_ref()?.get(row)?.clone();
-        Some(gv.edits.entry(row).or_insert_with(|| DocEdit { original: t.clone(), working: t, ops: Vec::new(), changed: HashSet::new(), saving: false, error: None }))
+        Some(gv.edits.entry(row).or_insert_with(|| DocEdit { original: t.clone(), working: t, ops: Vec::new(), changed: HashSet::new(), removed: Vec::new(), saving: false, error: None }))
     }
 
     /// Redraws a card (its height may change).
@@ -1868,10 +1919,11 @@ impl DbView {
                 if let Some(m) = mark {
                     e.changed.insert(m);
                 }
+                e.follow(&op);
                 e.ops.push(op);
                 e.error = None;
                 // Back to the document as loaded: nothing to save, nothing highlighted.
-                if e.working == e.original {
+                if e.working == e.original && e.removed.is_empty() {
                     e.ops.clear();
                     e.changed.clear();
                 }
@@ -1884,6 +1936,31 @@ impl DbView {
         };
         self.remeasure(which, row, cx);
         ok
+    }
+
+    /// The trash on a field: it's marked removed (red, with an undo) and goes with Update.
+    fn mark_removed(&mut self, which: Option<usize>, row: usize, path: Vec<Seg>, cx: &mut Context<Self>) {
+        if let Some(t) = self.doc_tree(which, row)
+            && let Err(e) = compass::editable(&t)
+        {
+            return cx.emit(Request::Error(e));
+        }
+        let Some(e) = self.doc_edit(which, row) else { return };
+        if !e.removed.contains(&path) {
+            e.removed.push(path);
+        }
+        self.remeasure(which, row, cx);
+    }
+
+    /// The undo on a removed field: it stays.
+    fn unremove(&mut self, which: Option<usize>, row: usize, path: Vec<Seg>, cx: &mut Context<Self>) {
+        let Some(e) = self.doc_edit(which, row) else { return };
+        e.removed.retain(|p| *p != path);
+        if e.working == e.original && e.removed.is_empty() {
+            e.ops.clear();
+            e.changed.clear();
+        }
+        self.remeasure(which, row, cx);
     }
 
     /// Double-click: types into a key (or value) in place.
@@ -2167,7 +2244,7 @@ impl DbView {
         let e = gv.edits.get(&r)?;
         let typing = self.editing.as_ref().is_some_and(|ed| ed.which == which && ed.row == r);
         // Modified only when it differs from the document as loaded (a value put back isn't a change).
-        let modified = e.working != e.original;
+        let modified = e.modified();
         let (saving, error) = (e.saving, e.error.clone());
         // Fields added (a table has no column for them yet).
         let added: Vec<String> = match (&e.working, &e.original) {
@@ -2214,7 +2291,7 @@ impl DbView {
         let Body::Data(d) = &self.body else { return };
         let [db, coll] = d.path.as_slice() else { return };
         let (conn, db, coll) = (d.conn.clone(), db.clone(), coll.clone());
-        let edit = self.grid_of(which).and_then(|g| g.edits.get(&r)).map(|e| (e.original.clone(), e.ops.clone()));
+        let edit = self.grid_of(which).and_then(|g| g.edits.get(&r)).map(|e| (e.original.clone(), e.all_ops()));
         let Some((original, ops)) = edit.or_else(|| self.doc_tree(which, r).map(|t| (t, Vec::new()))) else { return };
         if let Err(e) = compass::editable(&original) {
             return cx.emit(Request::Error(e));
@@ -2445,11 +2522,11 @@ impl DbView {
             return; // what's typed isn't a value of its type: said in the bar
         }
         let Some(e) = self.doc_edit(which, row) else { return };
-        if e.saving || e.ops.is_empty() || e.working == e.original {
+        if e.saving || !e.modified() {
             return;
         }
         e.saving = true;
-        let (original, ops) = (e.original.clone(), e.ops.clone());
+        let (original, ops) = (e.original.clone(), e.all_ops());
         let work = engine::run(engine::mongo(conn, move |cl| async move { compass::update_doc(&cl, &db, &coll, &original, &ops).await }));
         cx.spawn(async move |this, cx| {
             let r = work.await;
@@ -2555,7 +2632,7 @@ impl DbView {
 
     #[cfg(test)]
     pub fn card_modified(&self, row: usize) -> bool {
-        self.grid_of(None).and_then(|g| g.edits.get(&row)).is_some_and(|e| e.working != e.original)
+        self.grid_of(None).and_then(|g| g.edits.get(&row)).is_some_and(|e| e.modified())
     }
 
     #[cfg(test)]
@@ -2814,7 +2891,7 @@ impl DbView {
     /// A MongoDB document as a card: its fields one per line (List), or as JSON.
     fn render_card(&mut self, which: Option<usize>, r: usize, json: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(gv) = self.grid_of(which) else { return div().into_any_element() };
-        let edit = gv.edits.get(&r).map(|e| (e.working.clone(), !e.ops.is_empty(), e.saving, e.error.clone()));
+        let edit = gv.edits.get(&r).map(|e| (e.working.clone(), !e.ops.is_empty() || !e.removed.is_empty(), e.saving, e.error.clone()));
         let Some(t) = edit.as_ref().map(|e| e.0.clone()).or_else(|| gv.grid.trees.as_ref().and_then(|t| t.get(r)).cloned()) else { return div().into_any_element() };
         let copy = t.text(if json { TextStyle::Json } else { TextStyle::Shell });
         let lines = self.tree_lines(which, r, &t, json, cx);
@@ -2909,6 +2986,7 @@ impl DbView {
         // Edited in the List view only: JSON and a table's opened row are to look at (and select).
         let editable = !json && which.is_none() && self.doc_mode(gv) == DocMode::List && matches!(&self.body, Body::Data(d) if d.compass.is_some());
         let changed = gv.edits.get(&row).map(|e| e.changed.clone()).unwrap_or_default();
+        let removed = gv.edits.get(&row).map(|e| e.removed.clone()).unwrap_or_default();
         let editing = self.editing.as_ref().filter(|e| e.which == which && e.row == row).map(|e| (e.path.clone(), e.key, e.editor.clone()));
         let mut out = Vec::new();
         let mut n = 0usize;
@@ -2920,6 +2998,7 @@ impl DbView {
             unfolded: &'a HashSet<String>,
             editable: bool,
             changed: &'a HashSet<Vec<Seg>>,
+            removed: &'a [Vec<Seg>],
             editing: Option<(Vec<Seg>, bool, Entity<Editor>)>,
         }
         fn walk(v: &DbView, w: &W, entries: Vec<(String, &Tree)>, path: &str, segs: &[Seg], depth: usize, out: &mut Vec<gpui::AnyElement>, n: &mut usize, cx: &mut Context<DbView>) {
@@ -2952,6 +3031,9 @@ impl DbView {
                 *n += 1;
                 let id = *n;
                 let top_id = depth == 0 && key == "_id";
+                // Removed (or inside a removed field): shown struck out until Update or Cancel.
+                let gone_here = w.removed.contains(&here);
+                let gone = w.removed.iter().any(|r| here.starts_with(r));
                 let edit_key = w.editing.as_ref().filter(|(ep, k, _)| *ep == here && *k).map(|(_, _, e)| e.clone());
                 let edit_value = w.editing.as_ref().filter(|(ep, k, _)| *ep == here && !*k).map(|(_, _, e)| e.clone());
                 // The box as wide as the name in it (the whole name shows), as tall as the text needs.
@@ -2964,7 +3046,7 @@ impl DbView {
                     (Some(e), _) => Some(div().flex().items_center().gap(px(4.)).mr(px(6.)).child(field_box(e, false, cx)).child(":").into_any_element()),
                     (None, false) => {
                         let piece = v.sel.text_piece(((row * 100_000 + id) as u64, 0), format!("{key_text}: "), theme::fg_bright(), true);
-                        let renamable = w.editable && matches!(seg, Seg::Key(_)) && !top_id;
+                        let renamable = w.editable && matches!(seg, Seg::Key(_)) && !top_id && !gone;
                         let path_k = here.clone();
                         let refold = container.then(|| fold.clone());
                         Some(
@@ -2995,7 +3077,7 @@ impl DbView {
                     Some(e) => div().flex_1().flex().items_center().gap(px(6.)).child(field_box(e, true, cx)).child(v.type_picker(cx)).into_any_element(),
                     None => {
                         let path_v = here.clone();
-                        let editable_value = w.editable && !container && !top_id;
+                        let editable_value = w.editable && !container && !top_id && !gone;
                         one_line(("db-tree-value", id), div().child(v.sel.text_piece(((row * 100_000 + id) as u64, 1), summary, color, false)))
                             .debug_selector(move || format!("db-value-{row}-{id}"))
                             .when(editable_value, |d| {
@@ -3011,7 +3093,27 @@ impl DbView {
                     }
                 };
                 let gutter = w.editable.then(|| {
-                    let (path_del, path_add) = (here.clone(), here.clone());
+                    let (path_del, path_add, path_back) = (here.clone(), here.clone(), here.clone());
+                    // A removed field: its undo, always shown (nothing else to do on it).
+                    if gone {
+                        return div().w(px(36.)).flex_none().flex().items_center().when(gone_here, |d| {
+                            d.child(
+                                div()
+                                    .id(("db-line-undo", id))
+                                    .debug_selector(move || format!("db-undo-{row}-{id}"))
+                                    .p(px(1.))
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::hover()))
+                                    .tooltip(ui::tooltip("Keep this field"))
+                                    .on_click(cx.listener(move |v, _, _, cx| {
+                                        cx.stop_propagation();
+                                        v.unremove(which, row, path_back.clone(), cx);
+                                    }))
+                                    .child(ui::small_icon("discard", theme::git_deleted())),
+                            )
+                        });
+                    }
                     div()
                         .w(px(36.))
                         .flex_none()
@@ -3032,7 +3134,7 @@ impl DbView {
                                     .tooltip(ui::tooltip("Remove"))
                                     .on_click(cx.listener(move |v, _, _, cx| {
                                         cx.stop_propagation();
-                                        v.edit_op(which, row, compass::Op::Remove(path_del.clone()), None, cx);
+                                        v.mark_removed(which, row, path_del.clone(), cx);
                                     }))
                                     .child(ui::small_icon("trash", theme::fg_dim())),
                             )
@@ -3064,8 +3166,9 @@ impl DbView {
                         .items_center()
                         .h(px(if editing_here { 28. } else { 21. }))
                         .whitespace_nowrap()
-                        // Changed, or being changed: highlighted.
+                        // Changed, or being changed: highlighted; removed: red and struck out.
                         .when(w.changed.contains(&here) || editing_here, |d| d.bg(theme::git_modified().opacity(0.18)))
+                        .when(gone, |d| d.bg(theme::git_deleted().opacity(0.2)).line_through().debug_selector(move || format!("db-removed-{row}-{id}")))
                         .children(gutter)
                         .child(div().w(px(depth as f32 * 18.)).flex_none())
                         // One click opens or closes; a second and third select a word, the line.
@@ -3099,7 +3202,7 @@ impl DbView {
         }
         let Tree::Object(fields) = t else { return out };
         let unfolded = gv.unfolded.clone();
-        let w = W { which, row, json, style: if json { TextStyle::Json } else { TextStyle::Shell }, unfolded: &unfolded, editable, changed: &changed, editing };
+        let w = W { which, row, json, style: if json { TextStyle::Json } else { TextStyle::Shell }, unfolded: &unfolded, editable, changed: &changed, removed: &removed, editing };
         if json {
             out.push(div().h(px(21.)).flex().items_center().child(self.sel.text_piece(((row * 100_000) as u64, 0), "{", theme::fg_dim(), false)).into_any_element());
         }
