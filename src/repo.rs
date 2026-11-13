@@ -203,7 +203,7 @@ impl Repo {
         let root = self.root.clone();
         let is_git = self.is_git;
         let task = cx.background_executor().spawn(async move {
-            let mut files = if is_git { git::list_files(&root) } else { walk_files(&root, 20_000) };
+            let mut files = if is_git { git::list_files(&root) } else { walk_files(&root, 100_000) };
             // Env files are usually git-ignored (and hidden), but you still want to find them.
             files.extend(env_files(&root));
             files.sort();
@@ -334,10 +334,22 @@ pub fn env_files(root: &Path) -> Vec<String> {
     out
 }
 
-fn walk_files(root: &Path, limit: usize) -> Vec<String> {
+/// The files of a folder that isn't a repository itself. A repository inside it (a folder of
+/// several projects) lists its own files, as git does: what it ignores (build output, coverage,
+/// dependencies) isn't listed.
+pub fn walk_files(root: &Path, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        if dir != root && dir.join(".git").exists() {
+            let rel = dir.strip_prefix(root).map(|r| r.to_string_lossy().to_string()).unwrap_or_default();
+            out.extend(git::list_files(&dir).into_iter().map(|f| format!("{rel}/{f}")));
+            if out.len() >= limit {
+                out.truncate(limit);
+                return out;
+            }
+            continue;
+        }
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();

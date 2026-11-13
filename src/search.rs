@@ -72,8 +72,28 @@ struct FileResult {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Row {
+    /// A folder of the tree view (an index in `dirs`).
+    Dir(usize),
     File(usize),
     Match(usize, usize),
+}
+
+/// A folder in the tree view: its path, what's shown (single-child chains joined: `src/a/b`), its
+/// matches.
+struct TreeDir {
+    path: String,
+    label: String,
+    count: usize,
+}
+
+/// Whether a replace / a dismissal of `scope` covers match `mi` of file `fi` (at `path`).
+fn in_scope(scope: Option<Row>, dirs: &[TreeDir], fi: usize, mi: usize, path: &str) -> bool {
+    match scope {
+        None => true,
+        Some(Row::Dir(d)) => dirs.get(d).is_some_and(|t| path.starts_with(&format!("{}/", t.path))),
+        Some(Row::File(x)) => x == fi,
+        Some(Row::Match(x, y)) => x == fi && y == mi,
+    }
 }
 
 /// A planned replacement, applied by the workspace (open files are edited in their editor).
@@ -95,6 +115,14 @@ pub struct SearchPanel {
     show_filters: bool,
     results: Vec<FileResult>,
     rows: Vec<Row>,
+    /// Each row's indent (the tree view's depth).
+    depth: Vec<usize>,
+    /// Results as a folder tree (else a list of files), and the folders folded in it.
+    tree: bool,
+    dirs: Vec<TreeDir>,
+    folded: HashSet<String>,
+    /// Files git ignores (build output, dist, coverage, dependencies) are left out: on by default.
+    skip_ignored: bool,
     selected: Option<Row>,
     searching: bool,
     truncated: bool,
@@ -159,6 +187,11 @@ impl SearchPanel {
             show_filters: false,
             results: Vec::new(),
             rows: Vec::new(),
+            depth: Vec::new(),
+            tree: false,
+            dirs: Vec::new(),
+            folded: HashSet::new(),
+            skip_ignored: true,
             selected: None,
             searching: false,
             truncated: false,
@@ -222,11 +255,14 @@ impl SearchPanel {
         let repo = self.repo.read(cx);
         let root = repo.root.clone();
         let files = repo.files.clone();
+        let all = !self.skip_ignored;
         self.error = None;
         self.searching = true;
         self.last_search = Some(key);
         cx.notify();
         let work = cx.background_executor().spawn(async move {
+            // Ignored files too: every file under the folder (git's own folder aside).
+            let files = if all { std::sync::Arc::new(every_file(&root, 300_000)) } else { files };
             let candidates: Vec<&String> = files
                 .iter()
                 .filter(|f| (inc.is_empty() || inc.iter().any(|g| g.is_match(f))) && !exc.iter().any(|g| g.is_match(f)))
@@ -249,17 +285,13 @@ impl SearchPanel {
 
     fn rebuild_rows(&mut self) {
         self.rows.clear();
-        for (fi, f) in self.results.iter().enumerate() {
-            if f.dismissed {
-                continue;
-            }
-            self.rows.push(Row::File(fi));
-            if !f.collapsed {
-                for (mi, m) in f.matches.iter().enumerate() {
-                    if !m.dismissed {
-                        self.rows.push(Row::Match(fi, mi));
-                    }
-                }
+        self.depth.clear();
+        self.dirs.clear();
+        if self.tree {
+            self.build_tree();
+        } else {
+            for fi in 0..self.results.len() {
+                self.push_file(fi, 0);
             }
         }
         if let Some(sel) = self.selected
@@ -267,6 +299,104 @@ impl SearchPanel {
         {
             self.selected = None;
         }
+    }
+
+    /// A file's row and, unfolded, its matches' rows.
+    fn push_file(&mut self, fi: usize, depth: usize) {
+        let f = &self.results[fi];
+        if f.dismissed {
+            return;
+        }
+        self.rows.push(Row::File(fi));
+        self.depth.push(depth);
+        if !f.collapsed {
+            let shown: Vec<usize> = f.matches.iter().enumerate().filter(|(_, m)| !m.dismissed).map(|(mi, _)| mi).collect();
+            for mi in shown {
+                self.rows.push(Row::Match(fi, mi));
+                self.depth.push(depth + 1);
+            }
+        }
+    }
+
+    /// The results as folders and files, like VS Code's "View as Tree": a folder with one
+    /// folder in it and nothing else shows as one (`src/modules/auth`).
+    fn build_tree(&mut self) {
+        #[derive(Default)]
+        struct Node {
+            dirs: std::collections::BTreeMap<String, Node>,
+            files: Vec<usize>,
+            count: usize,
+        }
+        let mut top = Node::default();
+        for (fi, f) in self.results.iter().enumerate() {
+            let n = f.matches.iter().filter(|m| !m.dismissed).count();
+            if f.dismissed || n == 0 {
+                continue;
+            }
+            let mut node = &mut top;
+            node.count += n;
+            let parts: Vec<&str> = f.path.split('/').collect();
+            for part in &parts[..parts.len() - 1] {
+                node = node.dirs.entry(part.to_string()).or_default();
+                node.count += n;
+            }
+            node.files.push(fi);
+        }
+        fn emit(p: &mut SearchPanel, node: &Node, prefix: &str, depth: usize) {
+            for (name, child) in &node.dirs {
+                let (mut label, mut path, mut child) = (name.clone(), if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") }, child);
+                while child.files.is_empty() && child.dirs.len() == 1 {
+                    let (n, c) = child.dirs.iter().next().unwrap();
+                    label = format!("{label}/{n}");
+                    path = format!("{path}/{n}");
+                    child = c;
+                }
+                p.dirs.push(TreeDir { path: path.clone(), label, count: child.count });
+                p.rows.push(Row::Dir(p.dirs.len() - 1));
+                p.depth.push(depth);
+                if !p.folded.contains(&path) {
+                    emit(p, child, &path, depth + 1);
+                }
+            }
+            for fi in &node.files {
+                p.push_file(*fi, depth);
+            }
+        }
+        emit(self, &top, "", 0);
+    }
+
+    /// The files found, once the search is done (tests).
+    #[cfg(test)]
+    pub fn result_paths(&self) -> Option<Vec<String>> {
+        (!self.searching && self.last_search.is_some()).then(|| self.results.iter().map(|f| f.path.clone()).collect())
+    }
+
+    #[cfg(test)]
+    pub fn set_skip_ignored(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.skip_ignored = on;
+        self.run_search(cx);
+    }
+
+    /// The rows as shown: (indent, folder label or file path) (tests).
+    #[cfg(test)]
+    pub fn shown_rows(&self) -> Vec<(usize, String)> {
+        self.rows
+            .iter()
+            .zip(&self.depth)
+            .filter_map(|(r, d)| match r {
+                Row::Dir(i) => Some((*d, format!("{}/", self.dirs[*i].label))),
+                Row::File(fi) => Some((*d, self.results[*fi].path.clone())),
+                Row::Match(..) => None,
+            })
+            .collect()
+    }
+
+    /// The list or the tree.
+    pub(crate) fn set_tree(&mut self, tree: bool, cx: &mut Context<Self>) {
+        self.tree = tree;
+        self.selected = None;
+        self.rebuild_rows();
+        cx.notify();
     }
 
     fn counts(&self) -> (usize, usize) {
@@ -278,6 +408,12 @@ impl SearchPanel {
     fn dismiss(&mut self, row: Row, cx: &mut Context<Self>) {
         let pos = self.rows.iter().position(|r| *r == row);
         match row {
+            Row::Dir(d) => {
+                let Some(prefix) = self.dirs.get(d).map(|t| format!("{}/", t.path)) else { return };
+                for f in self.results.iter_mut().filter(|f| f.path.starts_with(&prefix)) {
+                    f.dismissed = true;
+                }
+            }
             Row::File(fi) => self.results[fi].dismissed = true,
             Row::Match(fi, mi) => {
                 self.results[fi].matches[mi].dismissed = true;
@@ -296,6 +432,7 @@ impl SearchPanel {
     fn open(&self, row: Row, cx: &mut Context<Self>) {
         let root = self.repo.read(cx).root.clone();
         match row {
+            Row::Dir(_) => {}
             Row::File(fi) => {
                 let f = &self.results[fi];
                 let first = f.matches.iter().find(|m| !m.dismissed);
@@ -323,11 +460,7 @@ impl SearchPanel {
                 .matches
                 .iter()
                 .enumerate()
-                .filter(|(mi, m)| !m.dismissed && match only {
-                    None => true,
-                    Some(Row::File(x)) => x == fi,
-                    Some(Row::Match(x, y)) => x == fi && y == *mi,
-                })
+                .filter(|(mi, m)| !m.dismissed && in_scope(only, &self.dirs, fi, *mi, &f.path))
                 .map(|(_, m)| m.offset)
                 .collect();
             if keep.is_empty() {
@@ -370,19 +503,16 @@ impl SearchPanel {
     pub fn after_replace(&mut self, replaced: &[PathBuf], cx: &mut Context<Self>) {
         let root = self.repo.read(cx).root.clone();
         let scope = self.pending_scope.take().flatten();
+        let dirs = std::mem::take(&mut self.dirs);
         for (fi, f) in self.results.iter_mut().enumerate() {
             if !replaced.contains(&root.join(&f.path)) {
                 continue;
             }
             let mut mi = 0;
             f.matches.retain(|m| {
-                let in_scope = match scope {
-                    None => true,
-                    Some(Row::File(x)) => x == fi,
-                    Some(Row::Match(x, y)) => x == fi && y == mi,
-                };
+                let covered = in_scope(scope, &dirs, fi, mi, &f.path);
                 mi += 1;
-                m.dismissed || !in_scope
+                m.dismissed || !covered
             });
             // Offsets are stale now; another replace in this file needs a fresh search.
             f.stamp = None;
@@ -411,6 +541,15 @@ impl SearchPanel {
     fn set_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
         let fi = match self.selected {
             Some(Row::File(fi)) | Some(Row::Match(fi, _)) => fi,
+            Some(Row::Dir(d)) => {
+                if let Some(t) = self.dirs.get(d) {
+                    let path = t.path.clone();
+                    if collapsed { self.folded.insert(path.clone()) } else { self.folded.remove(&path) };
+                    self.rebuild_rows();
+                    self.selected = self.dirs.iter().position(|t| t.path == path).map(Row::Dir);
+                }
+                return cx.notify();
+            }
             None => return,
         };
         self.results[fi].collapsed = collapsed;
@@ -464,8 +603,21 @@ impl SearchPanel {
             .child(div().flex_1().min_w_0().child(ed.clone()))
     }
 
+    /// A folder of the tree: folded, or unfolded.
+    fn toggle_dir(&mut self, d: usize) {
+        if let Some(t) = self.dirs.get(d) {
+            let path = t.path.clone();
+            if !self.folded.remove(&path) {
+                self.folded.insert(path.clone());
+            }
+            self.rebuild_rows();
+            self.selected = self.dirs.iter().position(|t| t.path == path).map(Row::Dir);
+        }
+    }
+
     fn render_row(&self, ix: usize, focused: bool, replacement: &str, cx: &mut Context<Self>) -> AnyElement {
         let row = self.rows[ix];
+        let indent = self.depth.get(ix).copied().unwrap_or(0) as f32 * 12.;
         let selected = self.selected == Some(row);
         let base = div()
             .id(("search-row", ix))
@@ -484,11 +636,13 @@ impl SearchPanel {
             .on_click(cx.listener(move |p, _, window, cx| {
                 window.focus(&p.results_focus, cx);
                 p.selected = Some(row);
-                if let Row::File(fi) = row {
-                    p.results[fi].collapsed = !p.results[fi].collapsed;
-                    p.rebuild_rows();
-                } else {
-                    p.open(row, cx);
+                match row {
+                    Row::Dir(d) => p.toggle_dir(d),
+                    Row::File(fi) => {
+                        p.results[fi].collapsed = !p.results[fi].collapsed;
+                        p.rebuild_rows();
+                    }
+                    Row::Match(..) => p.open(row, cx),
                 }
                 cx.notify();
             }));
@@ -509,10 +663,23 @@ impl SearchPanel {
                 p.dismiss(row, cx);
             })));
         match row {
+            Row::Dir(d) => {
+                let t = &self.dirs[d];
+                let path = t.path.clone();
+                base.pl(px(6. + indent))
+                    .debug_selector(move || format!("search-dir-{path}"))
+                    .child(ui::small_icon(if self.folded.contains(&t.path) { "chevron-right" } else { "chevron-down" }, theme::fg()))
+                    .child(ui::small_icon("folder", theme::fg_dim()))
+                    .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg()).child(t.label.clone()))
+                    .child(actions)
+                    .child(ui::badge(t.count.to_string(), theme::badge()))
+                    .into_any_element()
+            }
             Row::File(fi) => {
                 let f = &self.results[fi];
                 let count = f.matches.iter().filter(|m| !m.dismissed).count();
-                base.pl(px(6.))
+                let tree = self.tree;
+                base.pl(px(6. + indent))
                     .child(ui::small_icon(if f.collapsed { "chevron-right" } else { "chevron-down" }, theme::fg()))
                     .child(ui::file_icon(ui::file_name(&f.path)))
                     .child(
@@ -524,7 +691,8 @@ impl SearchPanel {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .child(div().text_color(theme::fg_bright()).child(ui::file_name(&f.path).to_string()))
-                            .child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(ui::file_dir(&f.path).to_string())),
+                            // In the tree its folder is above it.
+                            .when(!tree, |d| d.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(ui::file_dir(&f.path).to_string()))),
                     )
                     .child(actions)
                     .child(ui::badge(count.to_string(), theme::badge()))
@@ -549,7 +717,7 @@ impl SearchPanel {
                     highlights.push((mstart..text.len(), HighlightStyle { background_color: Some(theme::find_match()), color: Some(theme::fg_bright()), ..Default::default() }));
                 }
                 text.push_str(after);
-                base.pl(px(34.))
+                base.pl(px(34. + indent - if self.tree { 12. } else { 0. }))
                     .child(
                         div()
                             .flex_1()
@@ -624,6 +792,34 @@ fn search_files(root: &Path, files: &[&String], re: &Regex) -> (Vec<FileResult>,
         true
     });
     (results, truncated)
+}
+
+/// Every file under `root` (git-ignored ones too; not git's own folders), for a search that
+/// asks for them.
+fn every_file(root: &Path, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let Ok(t) = entry.file_type() else { continue };
+            if t.is_dir() {
+                stack.push(entry.path());
+            } else if t.is_file()
+                && let Ok(rel) = entry.path().strip_prefix(root)
+            {
+                out.push(rel.to_string_lossy().to_string());
+                if out.len() >= limit {
+                    return out;
+                }
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 fn search_file(root: &Path, rel: &str, re: &Regex) -> Option<FileResult> {
@@ -761,15 +957,27 @@ impl Render for SearchPanel {
                     .px(px(20.))
                     .text_size(px(10.5))
                     .child(div().flex_1().child("SEARCH"))
+                    .child(
+                        ui::icon_button("search-tree", if self.tree { "list-flat" } else { "list-tree" })
+                            .tooltip(ui::tooltip(if self.tree { "View as List" } else { "View as Tree" }))
+                            .on_click(cx.listener(|p, _, _, cx| {
+                                let tree = !p.tree;
+                                p.set_tree(tree, cx);
+                            })),
+                    )
                     .child(ui::icon_button("search-refresh", "refresh").on_click(cx.listener(|p, _, _, cx| p.run_search(cx))))
                     .child(ui::icon_button("search-clear", "close").on_click(cx.listener(|p, _, _, cx| {
                         p.query.update(cx, |q, cx| q.set_text("", cx));
                         p.run_search(cx);
                     })))
                     .child(ui::icon_button("search-collapse", "minus").on_click(cx.listener(|p, _, _, cx| {
-                        let collapse = p.results.iter().any(|f| !f.collapsed);
+                        let collapse = p.results.iter().any(|f| !f.collapsed) || (p.tree && p.folded.is_empty() && !p.dirs.is_empty());
                         for f in &mut p.results {
                             f.collapsed = collapse;
+                        }
+                        // The tree folds to its top folders.
+                        if p.tree {
+                            p.folded = if collapse { p.dirs.iter().map(|t| t.path.clone()).collect() } else { HashSet::new() };
                         }
                         p.rebuild_rows();
                         cx.notify();
@@ -834,6 +1042,27 @@ impl Render for SearchPanel {
                                     .child(div().flex().child(self.input_box(&self.include, window, cx)))
                                     .child(div().text_size(px(10.5)).text_color(theme::fg_dim()).child("files to exclude"))
                                     .child(div().flex().child(self.input_box(&self.exclude, window, cx)))
+                                    .child(
+                                        // On by default: build output, dist, coverage, dependencies… stay out.
+                                        div()
+                                            .id("search-skip-ignored")
+                                            .debug_selector(|| "search-skip-ignored".into())
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .pt(px(2.))
+                                            .cursor_pointer()
+                                            .text_size(px(11.))
+                                            .text_color(theme::fg_dim())
+                                            .hover(|s| s.text_color(theme::fg()))
+                                            .tooltip(ui::tooltip("Leave out what git ignores (build output, dist, coverage, dependencies). Off: search every file."))
+                                            .on_click(cx.listener(|p, _, _, cx| {
+                                                p.skip_ignored = !p.skip_ignored;
+                                                p.run_search(cx);
+                                            }))
+                                            .child(ui::small_icon(if self.skip_ignored { "check" } else { "close" }, if self.skip_ignored { theme::git_added() } else { theme::fg_muted() }))
+                                            .child("Skip git-ignored files"),
+                                    )
                             }),
                     ),
             )
@@ -853,14 +1082,18 @@ impl Render for SearchPanel {
                     .on_action(cx.listener(|p, _: &ResultDown, _, cx| p.move_sel(1, cx)))
                     .on_action(cx.listener(|p, _: &ResultUp, _, cx| p.move_sel(-1, cx)))
                     .on_action(cx.listener(|p, _: &OpenResult, _, cx| {
-                        if let Some(r) = p.selected {
-                            if let Row::File(fi) = r {
+                        match p.selected {
+                            Some(Row::Dir(d)) => {
+                                p.toggle_dir(d);
+                                cx.notify();
+                            }
+                            Some(Row::File(fi)) => {
                                 p.results[fi].collapsed = !p.results[fi].collapsed;
                                 p.rebuild_rows();
                                 cx.notify();
-                            } else {
-                                p.open(r, cx);
                             }
+                            Some(r) => p.open(r, cx),
+                            None => {}
                         }
                     }))
                     .on_action(cx.listener(|p, _: &DismissResult, _, cx| {

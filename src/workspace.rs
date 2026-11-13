@@ -6778,6 +6778,41 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn search_skips_what_git_ignores_and_shows_a_tree(cx: &mut TestAppContext) {
+        // A folder of two projects (each its own repository) and a note beside them.
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            for p in ["api", "web"] {
+                sh(&format!("mkdir -p {p}/src {p}/dist {p}/coverage && cd {p} && git init -q && printf 'dist/\\ncoverage/\\n' > .gitignore && echo 'login()' > src/auth.ts && echo 'login()' > dist/auth.js && echo 'login' > coverage/index.html"));
+            }
+            sh("echo 'login' > notes.md");
+        });
+        let search = ws.read_with(cx, |ws, _| ws.search.clone());
+        wait_for(cx, "the project's files", |cx| ws.read_with(cx, |ws, cx| ws.repo.read(cx).files.len() >= 3));
+        let found = |cx: &mut VisualTestContext| {
+            // Typing waits a moment before searching.
+            cx.executor().advance_clock(std::time::Duration::from_millis(300));
+            wait_for(cx, "the results", |cx| search.read_with(cx, |s, _| s.result_paths()).is_some());
+            search.read_with(cx, |s, _| s.result_paths()).unwrap()
+        };
+        search.update(cx, |s, cx| {
+            s.set_query("login", cx);
+            s.run_search(cx);
+        });
+        assert_eq!(found(cx), ["api/src/auth.ts", "notes.md", "web/src/auth.ts"], "build output and coverage are left out");
+        search.update(cx, |s, cx| s.set_skip_ignored(false, cx));
+        assert_eq!(found(cx).len(), 7, "switched off: every file");
+        search.update(cx, |s, cx| s.set_skip_ignored(true, cx));
+        assert_eq!(found(cx).len(), 3);
+        // As a tree: folders, single-folder chains joined, files under them.
+        search.update(cx, |s, cx| s.set_tree(true, cx));
+        let rows = search.read_with(cx, |s, _| s.shown_rows());
+        assert_eq!(rows, [(0, "api/src/".to_string()), (1, "api/src/auth.ts".into()), (0, "web/src/".into()), (1, "web/src/auth.ts".into()), (0, "notes.md".into())]);
+    }
+
+    #[gpui::test]
     fn find_bar_moves_between_matches_and_replaces(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let file = ws.read_with(cx, |ws, cx| ws.root(cx)).join("find.txt");
