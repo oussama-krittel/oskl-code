@@ -197,6 +197,11 @@ impl DiffView {
         }));
     }
 
+    /// The side shown rendered: the new one, or the old one when the file was deleted.
+    pub fn shown_side(&self) -> (Rev, String) {
+        self.spec.shown_side()
+    }
+
     /// New or deleted files have only one side: show it full width instead of half empty.
     fn one_sided(&self) -> bool {
         self.spec.left == Rev::Empty || self.spec.right == Rev::Empty
@@ -464,6 +469,17 @@ impl DiffView {
                     .when(self.show_blame, |b| b.bg(theme::selected()))
                     .on_click(cx.listener(|v, _, w, cx| v.on_toggle_blame(&ToggleBlame, w, cx))),
             )
+            .when(crate::preview::has_preview(std::path::Path::new(&self.spec.path)), |d| {
+                d.child(
+                    ui::icon_button("diff-preview", "eye")
+                        .debug_selector(|| "diff-preview".into())
+                        .tooltip(ui::tooltip("Show it rendered, as it is on the new side (the old side when deleted)"))
+                        .on_click(cx.listener(|v, _, _, cx| {
+                            let (rev, path) = v.shown_side();
+                            cx.emit(Request::PreviewRev { rev, path });
+                        })),
+                )
+            })
             .child(ui::icon_button("open-file", "open").on_click(cx.listener(|v, _, w, cx| v.open_file(&OpenFile, w, cx))))
     }
 }

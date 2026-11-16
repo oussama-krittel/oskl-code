@@ -68,6 +68,8 @@ pub fn has_preview(path: &Path) -> bool {
 pub struct PreviewView {
     focus: FocusHandle,
     pub path: PathBuf,
+    /// The revision shown, for a file opened from git (a commit, the index).
+    pub rev: Option<String>,
     pub kind: Kind,
     /// The editor a Markdown / SVG preview follows; None shows the file on disk.
     pub source: Option<Entity<Editor>>,
@@ -136,6 +138,7 @@ impl PreviewView {
             doc: None,
             pdf: None,
             path,
+            rev: None,
             kind,
             source,
             version: None,
@@ -215,7 +218,10 @@ impl PreviewView {
     }
 
     pub fn title(&self) -> String {
-        let name = self.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let mut name = self.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if let Some(rev) = &self.rev {
+            name = format!("{name} ({rev})");
+        }
         match self.kind {
             Kind::Image | Kind::Sheet | Kind::Pdf | Kind::Doc => name,
             Kind::Table => format!("Table {name}"),

@@ -1128,6 +1128,7 @@ impl Workspace {
                     });
                 }
             }
+            Request::PreviewRev { rev, path } => self.open_rev_preview(rev.clone(), path.clone(), false, window, cx),
             Request::OpenDiff { spec, preview } => {
                 // A single click (preview) shows the diff but leaves the keyboard where it was,
                 // like the explorer; Enter / double-click go into it.
@@ -2395,6 +2396,22 @@ impl Workspace {
 
     /// Opens a preview here, or (`side`) in the split to the right with the keyboard left where
     /// it was. A preview of the same file and source already open is shown instead.
+    /// A file (repo-relative) rendered as it is in a revision, its tab named with the revision.
+    fn open_rev_preview(&mut self, rev: Rev, path: String, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.git_root(cx);
+        let Some(file) = git::rev_file(&root, &rev, &path) else {
+            return self.flash(format!("{path} isn't in {}", rev.label()), true, cx);
+        };
+        let label = (rev != Rev::Working).then(|| rev.label());
+        self.open_preview(file.clone(), None, false, preview, window, cx);
+        if let Some(TabKind::Preview(v)) = self.tabs.iter().map(|t| &t.kind).find(|k| matches!(k, TabKind::Preview(v) if v.read(cx).path == file && v.read(cx).source.is_none())) {
+            v.update(cx, |v, cx| {
+                v.rev = label;
+                cx.notify();
+            });
+        }
+    }
+
     fn open_preview(&mut self, path: PathBuf, source: Option<Entity<Editor>>, side: bool, preview_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.focused_pane;
         if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Preview(v) if v.read(cx).path == path && v.read(cx).source == source)) {
@@ -2542,6 +2559,12 @@ impl Workspace {
     }
 
     fn open_diff(&mut self, spec: DiffSpec, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Pictures, PDFs and documents have no lines to compare: show the file as it is on the
+        // diff's new side (the old one when it was deleted).
+        if preview::opens_as_preview(Path::new(&spec.path)) {
+            let (rev, path) = spec.shown_side();
+            return self.open_rev_preview(rev, path, preview, window, cx);
+        }
         let key = spec.key();
         if spec.right == Rev::Working && self.git_root(cx).join(&spec.path).is_file() {
             if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::DiffEdit(d) if d.read(cx).spec.key() == key)) {
@@ -6636,6 +6659,48 @@ mod ui_tests {
 
     fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&std::process::Command::new("git").args(args).current_dir(dir).output().unwrap().stdout).trim().to_string()
+    }
+
+    #[gpui::test]
+    fn pictures_and_documents_in_commits_open_as_previews(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            // Binary bytes (a NUL early on), as pictures and PDFs have.
+            sh("printf '\\211PNG\\r\\n\\032\\n\\000\\000one' > pic.png && printf 'a,b\\n1,2\\n' > t.csv && git add . && git commit -qm add");
+            sh("git rm -q pic.png && printf 'a,b\\n1,3\\n' > t.csv && git commit -qam change");
+        });
+        cx.run_until_parked();
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let (first, second) = (git_out(&root, &["rev-parse", "HEAD~1"]), git_out(&root, &["rev-parse", "HEAD"]));
+        let active = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, cx| ws.panes[ws.focused_pane].active.and_then(|t| ws.tab_ix(t)).map(|ix| match &ws.tabs[ix].kind {
+            TabKind::Preview(v) => format!("preview {} {}", v.read(cx).title(), std::fs::read(&v.read(cx).path).map(|b| b.len()).unwrap_or(0)),
+            TabKind::Diff(d) => format!("diff {}", d.read(cx).spec.path),
+            _ => "other".into(),
+        }));
+        use crate::{git::Rev, request::DiffSpec};
+        let spec = |path: &str, left: Rev, right: Rev| DiffSpec { path: path.into(), old_path: None, left, right, back: None };
+        let size = git_out(&root, &["cat-file", "-s", &format!("{first}:pic.png")]);
+        // Added in the first commit: the picture as it is there, named with the commit.
+        ws.update_in(cx, |ws, window, cx| ws.open_diff(spec("pic.png", Rev::Empty, Rev::Commit(first.clone())), true, window, cx));
+        cx.run_until_parked();
+        assert_eq!(active(cx).unwrap(), format!("preview pic.png ({}) {size}", &first[..7]));
+        // Deleted in the second: its old side.
+        ws.update_in(cx, |ws, window, cx| ws.open_diff(spec("pic.png", Rev::Commit(first.clone()), Rev::Empty), true, window, cx));
+        cx.run_until_parked();
+        assert_eq!(active(cx).unwrap(), format!("preview pic.png ({}) {size}", &first[..7]));
+        // Text that renders (CSV, Markdown, SVG) keeps its line diff, and can be shown rendered.
+        ws.update_in(cx, |ws, window, cx| ws.open_diff(spec("t.csv", Rev::Commit(first.clone()), Rev::Commit(second.clone())), true, window, cx));
+        cx.run_until_parked();
+        assert_eq!(active(cx).unwrap(), "diff t.csv");
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let b = cx.debug_bounds("diff-preview").expect("a preview button");
+        cx.simulate_click(b.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(active(cx).unwrap(), format!("preview Table t.csv ({}) 8", &second[..7]));
     }
 
     #[gpui::test]

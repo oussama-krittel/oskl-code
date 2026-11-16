@@ -21,6 +21,12 @@ pub enum Back {
 }
 
 impl DiffSpec {
+    /// The side shown on its own (a picture, a rendered document): the new one, or the old one
+    /// when the file was deleted.
+    pub fn shown_side(&self) -> (Rev, String) {
+        if self.right == Rev::Empty { (self.left.clone(), self.old_path.clone().unwrap_or(self.path.clone())) } else { (self.right.clone(), self.path.clone()) }
+    }
+
     pub fn key(&self) -> String {
         format!("{}|{:?}|{:?}", self.path, self.left, self.right)
     }
@@ -38,6 +44,8 @@ pub enum Request {
     BlameShown(bool),
     /// What `other` changed since it split from `base` (the current branch when None).
     Compare { base: Option<String>, other: String },
+    /// Show a file (repo-relative) rendered as it is in a revision.
+    PreviewRev { rev: Rev, path: String },
     /// Ask which branch to compare this one to, then compare.
     CompareTo(String),
     /// A conflicted file (repo-relative) was resolved in the merge editor: stage it.

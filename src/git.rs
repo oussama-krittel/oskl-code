@@ -655,6 +655,29 @@ pub fn read_rev(root: &Path, rev: &Rev, path: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).replace("\r\n", "\n"))
 }
 
+/// A file as it is in a revision, on disk (to show pictures, PDFs and documents): the file
+/// itself for the working tree, otherwise a copy kept under the temp folder, named by its
+/// content so each version is written once.
+pub fn rev_file(root: &Path, rev: &Rev, path: &str) -> Option<PathBuf> {
+    let spec = match rev {
+        Rev::Empty => return None,
+        Rev::Working => return Some(root.join(path)).filter(|p| p.is_file()),
+        Rev::Index => format!(":{path}"),
+        Rev::Stage(n) => format!(":{n}:{path}"),
+        Rev::Commit(sha) => format!("{sha}:{path}"),
+    };
+    let out = git(root).args(["rev-parse", &spec]).output().ok().filter(|o| o.status.success())?;
+    let blob = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let name = Path::new(path).file_name()?;
+    let file = std::env::temp_dir().join("oskl-rev").join(&blob).join(name);
+    if !file.is_file() {
+        let bytes = git(root).args(["cat-file", "blob", &blob]).output().ok().filter(|o| o.status.success())?.stdout;
+        std::fs::create_dir_all(file.parent()?).ok()?;
+        std::fs::write(&file, bytes).ok()?;
+    }
+    Some(file)
+}
+
 // ---------------------------------------------------------------- blame
 
 #[derive(Debug)]
