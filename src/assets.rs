@@ -19,6 +19,8 @@ fn icon_body(name: &str) -> Option<&'static str> {
         "db-rabbitmq" => r#"<path fill="black" stroke="none" fill-rule="evenodd" d="M2.5 1.5h2.7v5.2h1.5V1.5h2.7v5.2h3.1c.8 0 1.5.7 1.5 1.5v5.3c0 .8-.7 1.5-1.5 1.5H4c-.8 0-1.5-.7-1.5-1.5zM10.3 9.2h2.1v2.1h-2.1z"/>"#,
         // The API section: "API" in a rounded badge.
         "api" => r#"<rect x="0.9" y="2.6" width="14.2" height="10.8" rx="2.4"/><path d="M3.2 10.6l1.7-5.2 1.7 5.2"/><path d="M3.8 9h2.2"/><path d="M8.2 10.6V5.4h1.3a1.4 1.4 0 0 1 0 2.8H8.2"/><path d="M12.6 5.4v5.2"/>"#,
+        "sidebar" => r#"<rect x="1.8" y="2.5" width="12.4" height="11" rx="1.5"/><path d="M6 2.5v11"/>"#,
+        "panel" => r#"<rect x="1.8" y="2.5" width="12.4" height="11" rx="1.5"/><path d="M1.8 9.5h12.4"/>"#,
         "play" => r#"<path d="M4.5 2.8v10.4L13 8z"/>"#,
         "clock" => r#"<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/>"#,
         "globe" => r#"<circle cx="8" cy="8" r="6"/><path d="M2 8h12"/><path d="M8 2c1.7 1.7 2.5 3.7 2.5 6S9.7 12.3 8 14c-1.7-1.7-2.5-3.7-2.5-6S6.3 3.7 8 2z"/>"#,
@@ -34,6 +36,7 @@ fn icon_body(name: &str) -> Option<&'static str> {
         "queue" => r#"<rect x="1.5" y="5" width="3.2" height="6" rx=".6"/><rect x="6.4" y="5" width="3.2" height="6" rx=".6"/><path d="M11.5 8h3M13 6.5L14.5 8 13 9.5"/>"#,
         "exchange" => r#"<path d="M2.5 5h9M9.5 3l2 2-2 2"/><path d="M13.5 11h-9M6.5 9l-2 2 2 2"/>"#,
         "files" => r#"<path d="M5.5 1.5h5l3 3v8h-8z"/><path d="M10.5 1.5v3h3"/><path d="M3.5 4.5v10h7"/>"#,
+        "pull-request" => r#"<circle cx="4" cy="3.2" r="1.8"/><circle cx="4" cy="12.8" r="1.8"/><circle cx="12" cy="12.8" r="1.8"/><path d="M4 5v6"/><path d="M12 11V6.2a2.2 2.2 0 0 0-2.2-2.2H6.8"/><path d="M8.8 2 6.8 4l2 2"/>"#,
         "git" => r#"<circle cx="4.5" cy="3.5" r="1.7"/><circle cx="4.5" cy="12.5" r="1.7"/><circle cx="11.5" cy="5.5" r="1.7"/><path d="M4.5 5.2v5.6"/><path d="M11.5 7.2c0 3-7 1.8-7 3.6"/>"#,
         "check" => r#"<path d="M3 8.5l3.2 3.2L13 4.8"/>"#,
         "refresh" => r#"<path d="M13 8a5 5 0 1 1-1.6-3.7"/><path d="M13 2.3v3h-3"/>"#,
@@ -73,7 +76,8 @@ fn icon_body(name: &str) -> Option<&'static str> {
         "repo" => r#"<path d="M12.5 11.5h-8a1.5 1.5 0 0 0 0 3h8v-13h-8a1.5 1.5 0 0 0-1.5 1.5v10"/><path d="M6 4.5h4"/>"#,
         "eye" => r#"<path d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8s-2.5 4.5-6.5 4.5S1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/>"#,
         "go-to-file" => r#"<path d="M7.5 14.5h-4v-13h6l3 3v2.5"/><path d="M9.5 1.5v3h3"/><circle cx="10.5" cy="10.5" r="2.5"/><path d="M12.3 12.3l2.2 2.2"/>"#,
-        "blame" => r#"<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/>"#,
+        // A person (head and shoulders) beside the lines they wrote.
+        "blame" => r#"<path d="M1.5 4h3M1.5 8h2.5M1.5 12h3"/><circle cx="10.5" cy="5.2" r="2.3"/><path d="M6.6 13.5c0-2.3 1.7-3.9 3.9-3.9s3.9 1.6 3.9 3.9"/>"#,
         "wrap" => r#"<path d="M2.5 4h11"/><path d="M2.5 8h9a2 2 0 0 1 0 4H8"/><path d="M9.5 10.5L8 12l1.5 1.5"/><path d="M2.5 12h3"/>"#,
         "terminal" => r#"<path d="M2.5 4l4 4-4 4"/><path d="M8 12h5.5"/>"#,
         "split" => r#"<rect x="1.5" y="2.5" width="13" height="11" rx="1"/><path d="M8 2.5v11"/>"#,
@@ -84,6 +88,10 @@ fn icon_body(name: &str) -> Option<&'static str> {
         "keyboard" => r#"<rect x="1.5" y="4" width="13" height="8.5" rx="1.2"/><path d="M4 6.6h.01M6.5 6.6h.01M9 6.6h.01M11.5 6.6h.01M4 9h.01M11.5 9h.01M6 10.3h4"/>"#,
         "error" => r#"<circle cx="8" cy="8" r="6"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/>"#,
         "list-tree" => r#"<path d="M2.5 3h4M5 6.5h4M5 10h4M5 13.5h4M3.5 3v10.5M3.5 6.5H5M3.5 10H5M3.5 13.5H5"/><path d="M10.5 6.5h3M10.5 10h3M10.5 13.5h3"/>"#,
+        "grip" => r#"<path d="M5.5 3.5v.01M10.5 3.5v.01M5.5 8v.01M10.5 8v.01M5.5 12.5v.01M10.5 12.5v.01" stroke-width="2.2"/>"#,
+        // Lines folding toward a middle line: hide the unchanged parts; apart: show them again.
+        "fold-changes" => r#"<path d="M2.5 8h11"/><path d="M5.5 2.5L8 5l2.5-2.5M5.5 13.5L8 11l2.5 2.5"/>"#,
+        "unfold-changes" => r#"<path d="M2.5 8h11"/><path d="M5.5 5L8 2.5 10.5 5M5.5 11L8 13.5l2.5-2.5"/>"#,
         "list-flat" => r#"<path d="M2.5 4h11M2.5 8h11M2.5 12h11"/>"#,
         "filter" => r#"<path d="M2 3h12l-4.5 5.5v4l-3 1.5v-5.5z"/>"#,
         "warning" => r#"<path d="M8 2l6.5 11.5h-13z"/><path d="M8 6.5v3.5M8 12v.01"/>"#,
@@ -160,5 +168,13 @@ mod tests {
             let tree = usvg::Tree::from_data(&svg, &usvg::Options::default()).unwrap_or_else(|e| panic!("{k:?}: {e}"));
             assert!(tree.root().has_children(), "{k:?} draws something");
         }
+    }
+
+    #[test]
+    fn blame_has_its_own_icon_not_the_history_clock() {
+        assert_ne!(super::icon_body("blame"), super::icon_body("history"));
+        let svg = super::Assets.load("icons/blame.svg").unwrap().unwrap();
+        let tree = usvg::Tree::from_data(&svg, &usvg::Options::default()).unwrap();
+        assert!(tree.root().has_children());
     }
 }

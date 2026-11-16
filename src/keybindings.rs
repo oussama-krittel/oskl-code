@@ -110,6 +110,8 @@ fn describe(name: &str, ctx: Option<&str>) -> String {
         "ToggleTerminal" => "Jump to terminal (opens one at the bottom)",
         "NewTerminal" => "New terminal in this split",
         "ToggleBlame" => "Toggle blame",
+        "ToggleZen" => "Zen mode: only the editor",
+        "ExitZen" => "Leave zen mode",
         "ZoomPane" => "Maximize split / back to all splits",
         "ClosePane" => "Close split",
         "CloseTab" => "Close the file shown in the split",
@@ -142,6 +144,7 @@ fn describe(name: &str, ctx: Option<&str>) -> String {
         "NextWindow" => "Switch project window",
         "SearchAll" => "Search in all files",
         "GoToLine" => "Go to line",
+        "GoToSymbol" => "Go to a symbol (function, class…) in this file",
         "RunShell" => "Run a shell command",
         "Save" => "Save (formats first)",
         "QuitApp" | "Quit" => "Quit",
@@ -396,6 +399,24 @@ pub fn conflict<'a>(cfg: &Config, entries: &'a [Entry], keys: &str, ctx: Option<
             && contexts_overlap(e.ctx.as_deref(), ctx)
             && cfg.effective(e).iter().any(|k| normalize(k).as_deref() == Some(wanted.as_str()))
     })
+}
+
+/// What can follow the keys typed so far (⌘K, say): each next key as a label with what it does,
+/// read from the bindings in force right now, in the focused context.
+pub fn follow_ups(window: &gpui::Window) -> Vec<(String, String)> {
+    use gpui::AsKeystroke;
+    let Some(typed) = window.pending_input_keystrokes() else { return Vec::new() };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for b in window.possible_bindings_for_input(typed) {
+        let rest: Vec<String> = b.keystrokes()[typed.len()..].iter().map(|k| label(&k.as_keystroke().unparse(gpui::OperatingSystem::Mac))).collect();
+        let row = (rest.join(" "), describe(b.action().name(), None));
+        if !out.contains(&row) {
+            out.push(row);
+        }
+    }
+    // Letters first, then the ones with a modifier; each group in order.
+    out.sort_by_key(|(k, _)| (k.chars().count() > 1, k.clone()));
+    out
 }
 
 // ---------------------------------------------------------------- labels

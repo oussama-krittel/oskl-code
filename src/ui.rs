@@ -57,6 +57,76 @@ pub fn icon_button(id: impl Into<ElementId>, name: &str) -> Stateful<Div> {
         .child(icon(name, theme::fg()))
 }
 
+/// A changed file in the flat list, in Source Control and the Git tab: the status letter in a
+/// fixed column, then the name (in the status color) with its folder dimmed beside it. `name_sel`
+/// is the name's test selector.
+pub fn change_cells(status: FileStatus, path: &str, name_sel: Option<String>) -> Div {
+    let color = status_color(status);
+    div()
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .items_center()
+        .gap(px(6.))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .child(div().flex_none().w(px(14.)).text_center().text_size(px(11.)).font_family(theme::MONO_FONT).font_weight(FontWeight::SEMIBOLD).text_color(color).child(status.letter()))
+        .child(
+            div()
+                .when_some(name_sel, |d, s| d.debug_selector(move || s))
+                .flex_none()
+                .max_w(relative(0.7))
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_color(color)
+                .when(status == FileStatus::Deleted, |d| d.line_through())
+                .child(file_name(path).to_string()),
+        )
+        .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().text_size(px(11.)).text_color(theme::fg_muted()).child(file_dir(path).to_string()))
+}
+
+/// Buttons over the right end of a row: they show with the row's hover (or `show`) and sit on
+/// top of the folder text, so nothing in the row moves when they appear. `group` is the row's
+/// group name and `bg` the color under them.
+pub fn hover_actions(group: &'static str, show: bool, bg: Hsla) -> Div {
+    div()
+        .absolute()
+        .right(px(4.))
+        .top(px(1.))
+        .bottom(px(1.))
+        .flex()
+        .items_center()
+        .gap(px(1.))
+        .pl(px(6.))
+        .rounded(px(4.))
+        .bg(bg)
+        .when(!show, |d| d.invisible().group_hover(group, |s| s.visible()))
+}
+
+/// What a pane shows when it has nothing to list: an icon, a title and a line of help.
+pub fn empty_state(name: &str, title: impl Into<SharedString>, hint: impl Into<SharedString>) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(8.))
+        .p(px(24.))
+        .text_center()
+        .text_size(px(12.))
+        .text_color(theme::fg_dim())
+        .child(icon(name, theme::fg_muted()).size(px(22.)))
+        .child(div().text_size(px(14.)).text_color(theme::fg_bright()).child(title.into()))
+        .child(div().max_w(px(380.)).min_w_0().w_full().child(hint.into()))
+}
+
+/// A dialog centered near the top of the window, over a dimmed backdrop as big as the window.
+pub fn dialog_scrim(vp: Size<Pixels>, dialog: impl IntoElement) -> Stateful<Div> {
+    div().id("dialog-scrim").occlude().w(vp.width).h(vp.height).flex().items_start().justify_center().pt(vp.height * 0.1).bg(theme::ca(0x00000066)).child(dialog)
+}
+
 pub fn status_color(s: FileStatus) -> Hsla {
     match s {
         FileStatus::Modified | FileStatus::TypeChanged => theme::git_modified(),
@@ -93,7 +163,6 @@ pub fn badge(text: impl Into<SharedString>, bg: Hsla) -> Div {
         .child(text.into())
 }
 
-/// Collapsible section header (e.g. "CHANGES", "GRAPH").
 /// A foldable section's header. Open, only its arrow and title fold it (so a missed click on
 /// the buttons or counts beside them doesn't); folded, clicking anywhere on it opens it.
 pub fn section_header(id: impl Into<ElementId>, title: &str, open: bool, toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Stateful<Div> {
@@ -111,7 +180,7 @@ pub fn section_header(id: impl Into<ElementId>, title: &str, open: bool, toggle:
         .pr(px(6.))
         .cursor_pointer()
         .child(small_icon(if open { "chevron-down" } else { "chevron-right" }, theme::fg()))
-        .child(title.to_uppercase());
+        .child(title.to_string());
     let header = div()
         .id(id)
         .debug_selector(move || sel)
@@ -122,8 +191,9 @@ pub fn section_header(id: impl Into<ElementId>, title: &str, open: bool, toggle:
         .pl(px(2.))
         .pr(px(6.))
         .gap(px(2.))
-        .font_weight(FontWeight::BOLD)
-        .text_size(px(10.5));
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::fg_dim())
+        .text_size(px(12.));
     if open {
         header.child(label.on_click(toggle)).child(div().flex_1())
     } else {
@@ -195,5 +265,65 @@ impl Render for DragChip {
             .font_family(theme::MONO_FONT)
             .text_color(theme::fg_bright())
             .child(self.0.clone())
+    }
+}
+
+/// Branch and tag labels for one commit: a local branch whose remote twin (`origin/main`)
+/// points at the same commit shows once, with a cloud mark. Each item is the ref to act on,
+/// whether it carries the mark, and its place in `refs` (for element ids).
+pub fn ref_labels(refs: &[crate::git::Ref]) -> Vec<(&crate::git::Ref, bool, usize)> {
+    use crate::git::RefKind;
+    let twin = |r: &crate::git::Ref| refs.iter().position(|l| l.kind == RefKind::Local && r.name.split_once('/').is_some_and(|(_, n)| n == l.name));
+    // shortcut: the twin is found by name (origin/<branch>), not by the branch's configured upstream.
+    refs.iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind != RefKind::Remote || twin(r).is_none())
+        .map(|(i, r)| {
+            let cloud = r.kind == RefKind::Local && refs.iter().any(|o| o.kind == RefKind::Remote && twin(o) == Some(i));
+            (r, cloud, i)
+        })
+        .collect()
+}
+
+/// A branch or tag chip: outlined in its color, filled with the accent only for the checked-out branch.
+pub fn ref_chip(r: &crate::git::Ref, cloud: bool, h: f32) -> Div {
+    use crate::git::RefKind;
+    let (color, icon) = match r.kind {
+        RefKind::Local => (theme::ref_local(), if r.is_head { "target" } else { "git" }),
+        RefKind::Remote => (theme::ref_remote(), "cloud"),
+        RefKind::Tag => (theme::ref_tag(), "tag"),
+    };
+    let text = if r.is_head { theme::on(theme::accent()) } else { color };
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(3.))
+        .pl(px(5.))
+        .pr(px(7.))
+        .h(px(h))
+        .rounded(px(h / 2.))
+        .border_1()
+        .font_family(theme::MONO_FONT)
+        .text_size(px(10.5))
+        .text_color(text)
+        .when(r.is_head, |d| d.bg(theme::accent()).border_color(theme::accent()).font_weight(FontWeight::SEMIBOLD))
+        .when(!r.is_head, |d| d.border_color(color.opacity(0.5)))
+        .child(small_icon(icon, text).size(px(h - 7.)))
+        .child(r.name.clone())
+        .when(cloud, |d| d.child(small_icon("cloud", text).size(px(10.))))
+}
+
+#[cfg(test)]
+mod ref_label_tests {
+    use super::ref_labels;
+    use crate::git::{Ref, RefKind};
+
+    #[test]
+    fn a_branch_and_its_remote_twin_show_once_with_a_cloud() {
+        let r = |name: &str, kind| Ref { name: name.into(), kind, is_head: false };
+        let refs = [r("main", RefKind::Local), r("origin/main", RefKind::Remote), r("origin/dev", RefKind::Remote), r("v1", RefKind::Tag)];
+        let shown: Vec<_> = ref_labels(&refs).into_iter().map(|(r, cloud, _)| (r.name.as_str(), cloud)).collect();
+        assert_eq!(shown, [("main", true), ("origin/dev", false), ("v1", false)]);
     }
 }

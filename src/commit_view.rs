@@ -1,6 +1,6 @@
 //! Commit details: hash, author, message and the files it changed.
 
-use crate::git::{self, CommitDetails, FileStatus, RefKind, Rev};
+use crate::git::{self, CommitDetails, FileStatus, Rev};
 use crate::request::{Back, DiffSpec, Request};
 use crate::{theme, ui, util};
 use gpui::prelude::*;
@@ -16,7 +16,7 @@ static AS_TREE: AtomicBool = AtomicBool::new(false);
 
 /// A row of the files: a folder (tree view only) or a file by its index in `details.files`.
 #[derive(Clone, Debug, PartialEq)]
-enum FileRow {
+pub(crate) enum FileRow {
     /// `label` is the folder, or a chain of single folders like "src / lib".
     Folder { key: String, label: String, depth: usize, open: bool },
     File { ix: usize, depth: usize },
@@ -24,7 +24,7 @@ enum FileRow {
 
 /// The files in display order: as they are (list), or folders first then files, like the
 /// explorer (tree). Folders whose key is in `collapsed` hide what's inside.
-fn file_rows(files: &[git::Change], tree: bool, collapsed: &HashSet<String>) -> Vec<FileRow> {
+pub(crate) fn file_rows(files: &[git::Change], tree: bool, collapsed: &HashSet<String>) -> Vec<FileRow> {
     if !tree {
         return (0..files.len()).map(|ix| FileRow::File { ix, depth: 0 }).collect();
     }
@@ -99,6 +99,8 @@ pub struct CommitView {
     picker: Option<bool>,
     /// Collapsed folders of the tree view.
     collapsed: HashSet<String>,
+    /// Shown beside the history in the Git tab: a smaller title and less padding.
+    pub compact: bool,
     _task: Task<()>,
 }
 
@@ -136,6 +138,7 @@ impl CommitView {
             branches: Vec::new(),
             picker: None,
             collapsed: HashSet::new(),
+            compact: false,
             _task: task,
         }
     }
@@ -404,7 +407,7 @@ fn meta_row(label: &str, value: impl IntoElement) -> Div {
     div()
         .flex()
         .gap(px(12.))
-        .child(div().w(px(80.)).flex_none().text_color(theme::fg_muted()).child(label.to_string()))
+        .child(div().w(px(72.)).flex_none().text_color(theme::fg_muted()).child(label.to_string()))
         .child(value)
 }
 
@@ -442,25 +445,7 @@ impl Render for CommitView {
         };
 
         let sha = d.sha.clone();
-        let refs = div().flex().gap(px(6.)).children(d.refs.iter().map(|r| {
-            let (color, icon) = match r.kind {
-                RefKind::Local => (theme::ref_local(), "target"),
-                RefKind::Remote => (theme::ref_remote(), "cloud"),
-                RefKind::Tag => (theme::ref_tag(), "tag"),
-            };
-            div()
-                .flex()
-                .items_center()
-                .gap(px(4.))
-                .px(px(6.))
-                .h(px(18.))
-                .rounded(px(9.))
-                .bg(color)
-                .text_color(theme::on(color))
-                .text_size(px(10.5))
-                .child(ui::small_icon(icon, theme::on(color)))
-                .child(r.name.clone())
-        }));
+        let refs = div().flex().gap(px(6.)).children(ui::ref_labels(&d.refs).into_iter().map(|(r, cloud, _)| ui::ref_chip(r, cloud, 18.)));
 
         let parents = div().flex().gap(px(8.)).children(d.parents.iter().map(|p| {
             let p2 = p.clone();
@@ -476,6 +461,7 @@ impl Render for CommitView {
 
         let compare_bar = self.compare.is_some().then(|| self.render_compare_bar(cx).into_any_element());
         let tree = AS_TREE.load(Ordering::Relaxed);
+        let compact = self.compact;
         const INDENT: f32 = 12.;
         let files = self.rows().into_iter().enumerate().map(|(row_ix, row)| match row {
             FileRow::Folder { key, label, depth, open } => {
@@ -532,7 +518,8 @@ impl Render for CommitView {
                         view.open(ix, ev.click_count() < 2, cx);
                         cx.notify();
                     }))
-                    .child(ui::file_icon(&name))
+                    .when(!tree, |d| d.child(div().flex_none().w(px(14.)).text_center().text_size(px(11.)).font_family(theme::MONO_FONT).font_weight(FontWeight::SEMIBOLD).text_color(ui::status_color(f.status)).child(f.status.letter())))
+                    .when(tree, |d| d.child(ui::file_icon(&name)))
                     .child(div().text_color(ui::status_color(f.status)).child(name))
                     .child(
                         div()
@@ -548,7 +535,7 @@ impl Render for CommitView {
                                 (None, false) => dir,
                             }),
                     )
-                    .child(div().w(px(16.)).text_color(ui::status_color(f.status)).child(f.status.letter()))
+                    .when(tree, |d| d.child(div().w(px(16.)).text_color(ui::status_color(f.status)).child(f.status.letter())))
             }
         });
 
@@ -558,11 +545,11 @@ impl Render for CommitView {
                 .size_full()
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll)
-                .p(px(24.))
+                .p(px(if compact { 14. } else { 24. }))
                 .flex()
                 .flex_col()
-                .gap(px(14.))
-                .when(self.compare.is_none(), |el| el.child(div().text_size(px(20.)).text_color(theme::fg_bright()).child(d.subject().to_string())).child(refs))
+                .gap(px(if compact { 8. } else { 14. }))
+                .when(self.compare.is_none(), |el| el.child(div().text_size(px(if compact { 15. } else { 20. })).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(d.subject().to_string())).child(refs))
                 .when_some(self.compare.clone(), |el, (a, b)| {
                     let split = d.parents.first().map(|p| p[..p.len().min(7)].to_string()).unwrap_or_default();
                     el.children(compare_bar).child(
@@ -596,6 +583,17 @@ impl Render for CommitView {
                         .child(meta_row("Author", div().child(format!("{} <{}>", d.author, d.email))))
                         .child(meta_row("Date", div().child(format!("{}  ({})", d.date, util::relative_time(d.time)))))
                         .when(d.committer != d.author, |el| el.child(meta_row("Committer", div().child(d.committer.clone()))))
+                        .when(d.signature != 'N', |el| {
+                            let (text, good) = match d.signature {
+                                'G' => ("Signed, verified", true),
+                                'U' => ("Signed, by a key you haven't marked as trusted", true),
+                                'B' => ("Bad signature", false),
+                                'X' | 'Y' => ("Signed, but the signature or key has expired", false),
+                                'R' => ("Signed with a revoked key", false),
+                                _ => ("Signed (can't check it here: is gpg or ssh signing set up?)", false),
+                            };
+                            el.child(meta_row("Signature", div().id("commit-signature").debug_selector(|| "commit-signature".into()).text_color(if good { theme::git_added() } else { theme::git_modified() }).child(text)))
+                        })
                         .when(!d.parents.is_empty(), |el| el.child(meta_row("Parents", parents))),
                 ))
                 .when(!d.body().is_empty(), |el| {
@@ -617,7 +615,7 @@ impl Render for CommitView {
                         .pt(px(6.))
                         .border_t_1()
                         .border_color(theme::border())
-                        .child(div().font_weight(FontWeight::BOLD).child(format!("{} files changed", d.files.len())))
+                        .child(div().font_weight(FontWeight::BOLD).child(format!("{} file{} changed", d.files.len(), if d.files.len() == 1 { "" } else { "s" })))
                         .child(div().text_color(theme::fg_muted()).text_size(px(11.)).child({
                             let d: Vec<char> = crate::keybindings::direction_letters().chars().collect();
                             let (down, up) = (d.get(1).copied().unwrap_or('k'), d.get(2).copied().unwrap_or('i'));

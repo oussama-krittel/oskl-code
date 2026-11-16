@@ -930,8 +930,6 @@ impl Render for SearchPanel {
             e.clone()
         } else if self.searching {
             "Searching…".into()
-        } else if self.last_search.is_some() && matches == 0 {
-            "No results found.".into()
         } else if matches > 0 {
             format!("{matches} result{} in {files} file{}{}", if matches == 1 { "" } else { "s" }, if files == 1 { "" } else { "s" }, if self.truncated { " (truncated)" } else { "" })
         } else {
@@ -955,8 +953,10 @@ impl Render for SearchPanel {
                     .items_center()
                     .h(px(35.))
                     .px(px(20.))
-                    .text_size(px(10.5))
-                    .child(div().flex_1().child("SEARCH"))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::fg_bright())
+                    .child(div().flex_1().child("Search"))
                     .child(
                         ui::icon_button("search-tree", if self.tree { "list-flat" } else { "list-tree" })
                             .tooltip(ui::tooltip(if self.tree { "View as List" } else { "View as Tree" }))
@@ -1111,7 +1111,29 @@ impl Render for SearchPanel {
                     .on_action(cx.listener(|p, _: &FocusQuery, window, cx| p.focus_query(window, cx)))
                     .flex_1()
                     .min_h_0()
-                    .child(
+                    .child(if rows_count == 0 && !self.searching && self.error.is_none() {
+                        // Nothing to list: say what to do next.
+                        let (title, hint) = match &self.last_search {
+                            Some((q, ..)) => (format!("No results for “{q}”"), "Check the include and exclude filters, or turn off match case."),
+                            None => ("Search every file".to_string(), "Type above. Results update as you type."),
+                        };
+                        div()
+                            .id("search-empty")
+                            .debug_selector(|| "search-empty".into())
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(8.))
+                            .px(px(20.))
+                            .text_center()
+                            .text_size(px(12.))
+                            .text_color(theme::fg_dim())
+                            .child(div().text_size(px(14.)).text_color(theme::fg_bright()).child(title))
+                            .child(hint)
+                            .into_any_element()
+                    } else {
                         uniform_list(
                             "search-results",
                             rows_count,
@@ -1120,8 +1142,9 @@ impl Render for SearchPanel {
                             }),
                         )
                         .track_scroll(&self.scroll)
-                        .size_full(),
-                    ),
+                        .size_full()
+                        .into_any_element()
+                    }),
             )
     }
 }

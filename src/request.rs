@@ -42,12 +42,22 @@ pub enum Request {
     OpenCommit(String),
     /// Blame was switched on or off in a diff: new diffs open the same way.
     BlameShown(bool),
+    /// "Show only the changes" was switched in a diff: every diff, open or opened later, follows.
+    ChangesOnlyShown(bool),
     /// What `other` changed since it split from `base` (the current branch when None).
     Compare { base: Option<String>, other: String },
     /// Show a file (repo-relative) rendered as it is in a revision.
     PreviewRev { rev: Rev, path: String },
     /// Ask which branch to compare this one to, then compare.
     CompareTo(String),
+    /// Show this file's history in the Source Control graph.
+    FileHistory(PathBuf),
+    /// The Git tab of the repository at this root.
+    OpenGitTab(PathBuf),
+    /// Review pull request n of the repository at this root, in its own tab.
+    OpenPr(PathBuf, u64),
+    /// A conflicted file, in the merge editor.
+    OpenMergeEditor(PathBuf),
     /// A conflicted file (repo-relative) was resolved in the merge editor: stage it.
     MarkResolved(String),
     /// Opens the command line pre-filled with this text.
@@ -62,8 +72,6 @@ pub enum Request {
     OpenTerminal(PathBuf),
     /// A terminal in this folder running a command.
     RunInTerminal { dir: PathBuf, command: String },
-    /// A Claude chat forked into a new tab: the session, continued from before the message `uuid`.
-    ForkChat { session: String, uuid: String },
     /// A Claude chat on this saved session (its tab if open), or a new chat.
     OpenChat(Option<String>),
     /// Show this repository in the Source Control panel.

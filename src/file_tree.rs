@@ -690,6 +690,14 @@ impl FileTree {
         // A terminal opens in a folder, so only folders offer it.
         if path.is_dir() {
             items.push(Some(("Open in Integrated Terminal", "", true, |t, _, cx| t.open_in_terminal(cx))));
+        } else {
+            items.push(Some(("File History", "", true, |t, _, cx| {
+                t.menu = None;
+                if let Some(p) = t.selected.clone() {
+                    cx.emit(Request::FileHistory(p));
+                }
+                cx.notify();
+            })));
         }
         items.push(None);
         if !is_root {
@@ -853,8 +861,8 @@ impl FileTree {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_color(name_color)
-                    .when(is_root, |d| d.font_weight(FontWeight::BOLD).text_size(px(10.5)))
-                    .child(if is_root { row.entry.name.to_uppercase() } else { row.entry.name.clone() })
+                    .when(is_root, |d| d.font_weight(FontWeight::SEMIBOLD))
+                    .child(row.entry.name.clone())
                     .into_any_element(),
             })
             .when_some(status, |d, s| d.child(div().text_size(px(11.)).text_color(ui::status_color(s)).child(s.letter())))
@@ -944,8 +952,10 @@ impl Render for FileTree {
                     .pl(px(20.))
                     .pr(px(6.))
                     .gap(px(1.))
-                    .text_size(px(10.5))
-                    .child(div().flex_1().child("EXPLORER"))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::fg_bright())
+                    .child(div().flex_1().child("Explorer"))
                     .child(head_button("tree-new-file", "new-file", "New File… (A)").debug_selector(|| "tree-new-file".into()).on_click(cx.listener(|t, _, w, cx| t.new_file(&NewFile, w, cx))))
                     .child(head_button("tree-new-folder", "new-folder", "New Folder… (⇧A)").debug_selector(|| "tree-new-folder".into()).on_click(cx.listener(|t, _, w, cx| t.new_folder(&NewFolder, w, cx))))
                     .child(head_button("tree-refresh", "refresh", "Refresh").on_click(cx.listener(|t, _, _, cx| {

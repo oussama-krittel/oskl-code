@@ -46,6 +46,7 @@ impl DiffEditView {
         let right = cx.new(|cx| {
             let mut ed = Editor::new(EditorMode::Full, cx);
             ed.diff_role = DiffRole::Right { inline: false };
+            ed.changes_only = crate::editor::diff_changes_only();
             ed.scroll_link = Some(link.clone());
             ed.font_size = font_size;
             ed.blame_gutter = blame;
@@ -127,11 +128,66 @@ impl DiffEditView {
         }
     }
 
+    /// Only the changes (and a few lines around each) instead of the whole file, on both sides;
+    /// every other diff follows, and the choice is saved.
+    pub fn toggle_changes_only(&mut self, cx: &mut Context<Self>) {
+        let on = !self.right.read(cx).changes_only;
+        self.right.update(cx, |r, cx| r.set_changes_only(on, cx));
+        cx.emit(Request::ChangesOnlyShown(on));
+        cx.notify();
+    }
+
     pub fn toggle_inline(&mut self, cx: &mut Context<Self>) {
         self.inline = !self.inline;
         let inline = self.inline;
         self.right.update(cx, |r, cx| r.set_inline_diff(inline, cx));
         cx.notify();
+    }
+
+    /// Working-tree lines the selection covers, and whether it's just a cursor (the whole change
+    /// there is meant) rather than chosen lines.
+    fn picked_rows(&self, cx: &App) -> (std::ops::Range<usize>, bool) {
+        let buf = &self.right.read(cx).buf;
+        let r = buf.sel.range();
+        let ((a, _), (b, bcol)) = (buf.pos_to_rc(r.start), buf.pos_to_rc(r.end));
+        let end = if bcol == 0 && b > a { b } else { b + 1 };
+        (a..end, r.is_empty())
+    }
+
+    /// Stages the change at the cursor, or only the selected lines.
+    pub fn stage_part(&mut self, cx: &mut Context<Self>) {
+        let (rows, whole) = self.picked_rows(cx);
+        let work = self.right.read(cx).text();
+        let index = git::read_rev(&self.root, &Rev::Index, &self.spec.path).unwrap_or_default();
+        let staged = git::mix(&index, &work, rows, true, whole);
+        if staged == index {
+            return cx.emit(Request::Error("No change here to stage".into()));
+        }
+        match git::write_index(&self.root, &self.spec.path, &staged) {
+            Ok(()) => cx.emit(Request::Message(if whole { "Staged this change".into() } else { "Staged the selected lines".into() })),
+            Err(e) => cx.emit(Request::Error(format!("Stage failed: {e}"))),
+        }
+        self.refresh(cx);
+    }
+
+    /// Puts the change at the cursor (or the selected lines) back as staged, as an edit you can
+    /// undo, and saves.
+    pub fn discard_part(&mut self, cx: &mut Context<Self>) {
+        let (rows, whole) = self.picked_rows(cx);
+        let work = self.right.read(cx).text();
+        let index = git::read_rev(&self.root, &Rev::Index, &self.spec.path).unwrap_or_default();
+        let kept = git::mix(&work, &index, rows, false, whole);
+        if kept == work {
+            return cx.emit(Request::Error("No change here to discard".into()));
+        }
+        let saved = self.right.update(cx, |r, cx| {
+            r.apply_format(&kept, cx);
+            r.save(cx)
+        });
+        match saved {
+            Ok(()) => cx.emit(Request::Message("Discarded (⌘Z in the diff brings it back)".into())),
+            Err(e) => cx.emit(Request::Error(format!("Discard failed: {e}"))),
+        }
     }
 
     fn step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -163,6 +219,7 @@ impl Render for DiffEditView {
         let dirty = self.right.read(cx).buf.is_dirty();
         let path = self.root.join(&self.spec.path);
         let blame_on = self.right.read(cx).blame_gutter;
+        let changes_only = self.right.read(cx).changes_only;
         let header = div()
             .flex()
             .flex_none()
@@ -172,15 +229,25 @@ impl Render for DiffEditView {
             .gap(px(8.))
             .border_b_1()
             .border_color(theme::border())
-            .child(ui::file_icon(&self.spec.path))
-            .child(div().text_color(theme::fg_bright()).child(self.spec.path.clone()))
-            .child(div().text_color(theme::fg_muted()).child("Index ↔ Working Tree"))
-            .child(div().text_size(px(10.5)).px(px(6.)).rounded(px(3.)).bg(theme::selected()).child(if dirty { "editing • unsaved" } else { "editable" }))
-            .child(div().text_color(theme::git_added()).child(format!("+{added}")))
-            .child(div().text_color(theme::git_deleted()).child(format!("-{removed}")))
+            // One line at any width: the path and labels shorten, the buttons stay.
+            .child(ui::file_icon(&self.spec.path).flex_none())
+            .child(div().min_w(px(40.)).overflow_hidden().text_ellipsis().whitespace_nowrap().font_family(theme::MONO_FONT).text_color(theme::fg_bright()).child(self.spec.path.clone()))
+            .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_muted()).child("Index ↔ Working Tree"))
+            .child(div().min_w_0().overflow_hidden().whitespace_nowrap().text_size(px(10.5)).px(px(6.)).rounded(px(3.)).bg(theme::selected()).child(if dirty { "editing • unsaved" } else { "editable" }))
+            .child(div().flex_none().text_color(theme::git_added()).child(format!("+{added}")))
+            .child(div().flex_none().text_color(theme::git_deleted()).child(format!("-{removed}")))
             .child(div().flex_1())
+            .child(ui::icon_button("de-stage", "plus").debug_selector(|| "de-stage".into()).tooltip(ui::tooltip("Stage the change at the cursor, or the selected lines")).on_click(cx.listener(|v, _, _, cx| v.stage_part(cx))))
+            .child(ui::icon_button("de-discard", "discard").debug_selector(|| "de-discard".into()).tooltip(ui::tooltip("Discard the change at the cursor, or the selected lines (⌘Z undoes)")).on_click(cx.listener(|v, _, _, cx| v.discard_part(cx))))
             .child(ui::icon_button("de-prev", "arrow-up").on_click(cx.listener(|v, _, w, cx| v.step(false, w, cx))))
             .child(ui::icon_button("de-next", "arrow-down").on_click(cx.listener(|v, _, w, cx| v.step(true, w, cx))))
+            .child(
+                ui::icon_button("de-changes-only", if changes_only { "unfold-changes" } else { "fold-changes" })
+                    .debug_selector(|| "de-changes-only".into())
+                    .tooltip(ui::tooltip(if changes_only { "Show the whole file" } else { "Show only the changes" }))
+                    .when(changes_only, |b| b.bg(theme::selected()))
+                    .on_click(cx.listener(|v, _, _, cx| v.toggle_changes_only(cx))),
+            )
             .when(!one_sided, |d| d.child(ui::icon_button("de-inline", if self.inline { "split" } else { "inline" }).on_click(cx.listener(|v, _, _, cx| v.toggle_inline(cx)))))
             .child(
                 ui::icon_button("de-blame", "blame")
@@ -192,6 +259,7 @@ impl Render for DiffEditView {
                         cx.emit(Request::BlameShown(on));
                     })),
             )
+            .child(ui::icon_button("de-history", "history").debug_selector(|| "de-history".into()).tooltip(ui::tooltip("This file's history")).on_click(cx.listener(|v, _, _, cx| cx.emit(Request::FileHistory(v.root.join(&v.spec.path))))))
             .child(ui::icon_button("de-open", "open").on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(Request::OpenFile { path: path.clone(), line: None, preview: false });
             })));
