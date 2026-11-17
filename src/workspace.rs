@@ -313,6 +313,22 @@ impl Layout {
         }
     }
 
+    /// Which sides of pane `id` lie on the edge of the whole area (top, right, bottom, left),
+    /// splits laid out as drawn (`stack`: side-by-side splits stacked in a narrow window).
+    fn outer_sides(&self, id: usize, stack: bool) -> Option<[bool; 4]> {
+        fn walk(l: &Layout, id: usize, stack: bool, out: [bool; 4]) -> Option<[bool; 4]> {
+            match l {
+                Layout::Pane(p) => (*p == id).then_some(out),
+                Layout::Split { vertical, a, b, .. } => {
+                    let [t, r, bt, lf] = out;
+                    let (oa, ob) = if *vertical && !stack { ([t, false, bt, lf], [t, r, bt, false]) } else { ([t, r, false, lf], [false, r, bt, lf]) };
+                    walk(a, id, stack, oa).or_else(|| walk(b, id, stack, ob))
+                }
+            }
+        }
+        walk(self, id, stack, [true; 4])
+    }
+
     /// Removes a pane; its sibling takes the parent's place.
     fn remove_pane(&mut self, id: usize) -> bool {
         let Layout::Split { a, b, .. } = self else { return false };
@@ -5753,19 +5769,32 @@ impl Workspace {
             .left_0()
             .size_full()
         });
+        // Against the window's edges (the sidebar, title bar, status bar) the card has no gap,
+        // outline or rounding: their own line is the edge. Between splits it keeps all three.
+        // With the window buttons over it, the outline is drawn (over it) instead.
+        let [ot, or, ob, ol] = if notch.is_some() { [false; 4] } else { self.layout.outer_sides(id, self.shell.stack).unwrap_or([false; 4]) };
+        let gap = |outer: bool| if outer { px(0.) } else { px(2.) };
+        let round = |a: bool, b: bool| if a || b { px(0.) } else { px(6.) };
         div()
             .relative()
             .size_full()
-            .p(px(2.))
+            .pt(gap(ot))
+            .pr(gap(or))
+            .pb(gap(ob))
+            .pl(gap(ol))
             .child(
                 div()
                     .relative()
                     .size_full()
                     .flex()
                     .flex_col()
-                    .rounded(px(6.))
-                    // With the buttons over it, the outline is drawn (over it) instead.
-                    .when(notch.is_none(), |d| d.border_1())
+                    .rounded_tl(round(ot, ol))
+                    .rounded_tr(round(ot, or))
+                    .rounded_br(round(ob, or))
+                    .rounded_bl(round(ob, ol))
+                    .when(notch.is_none(), |d| {
+                        d.when(!ot, |d| d.border_t_1()).when(!or, |d| d.border_r_1()).when(!ob, |d| d.border_b_1()).when(!ol, |d| d.border_l_1())
+                    })
                     .border_color(frame)
                     .bg(theme::bg_editor())
                     .overflow_hidden()
@@ -6979,6 +7008,20 @@ mod ui_tests {
 
     pub(super) fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&std::process::Command::new("git").args(args).current_dir(dir).output().unwrap().stdout).trim().to_string()
+    }
+
+    #[test]
+    fn panes_know_which_sides_meet_the_window() {
+        use super::Layout;
+        let l = Layout::Split { vertical: true, ratio: 0.5, a: Box::new(Layout::Pane(1)), b: Box::new(Layout::Split { vertical: false, ratio: 0.5, a: Box::new(Layout::Pane(2)), b: Box::new(Layout::Pane(3)) }) };
+        // top, right, bottom, left
+        assert_eq!(l.outer_sides(1, false), Some([true, false, true, true]));
+        assert_eq!(l.outer_sides(2, false), Some([true, true, false, false]));
+        assert_eq!(l.outer_sides(3, false), Some([false, true, true, false]));
+        // Stacked in a narrow window, side by side becomes one above the other.
+        assert_eq!(l.outer_sides(1, true), Some([true, true, false, true]));
+        assert_eq!(Layout::Pane(4).outer_sides(4, false), Some([true; 4]));
+        assert_eq!(l.outer_sides(9, false), None);
     }
 
     #[gpui::test]
