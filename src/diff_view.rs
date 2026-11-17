@@ -15,7 +15,8 @@ use std::time::Duration;
 actions!(diff_view, [NextRow, PrevRow, NextHunk, PrevHunk, ToggleBlame, ToggleInline, OpenFile, CopyRow, SelectAllNew, Top, Bottom, PageDownRows, PageUpRows]);
 
 pub fn bind_keys() {
-    let c = Some("DiffView");
+    // Not while typing a comment on a line: n, p, b and v are letters there.
+    let c = Some("DiffView && !typing");
     crate::keybindings::collect([
         crate::keybindings::kb("{down}", NextRow, c),
         crate::keybindings::kb("down", NextRow, c),
@@ -93,7 +94,10 @@ pub struct DiffView {
     dragging_split: bool,
     body_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     selected: Option<usize>,
-    scroll: UniformListScrollHandle,
+    /// The rows as drawn: each its own height, a line with comments under it being taller.
+    list: ListState,
+    /// What the list was last laid out for: (rows, inline, changes only).
+    list_key: (usize, bool, bool),
     scroll_x: f32,
     user_email: Option<String>,
     /// The find bar's query, and its matches: (row, left side?, byte range in that line).
@@ -105,10 +109,20 @@ pub struct DiffView {
     sel_new: crate::sel::Selection,
     /// Code text size, as in the editors (the zoom changes it).
     pub font_size: f32,
+    /// A + on each line's number, to comment on it (a pull request's review).
+    pub commentable: bool,
+    /// What shows under a row: (old line, new line), 1-based, as the row shows them.
+    pub annotate: Option<Annotate>,
     _tasks: Vec<Task<()>>,
 }
 
+pub type Annotate = std::rc::Rc<dyn Fn(Option<usize>, Option<usize>, &mut Window, &mut App) -> Option<AnyElement>>;
+
+/// The + on a line's number was clicked: (new side, 1-based line).
+pub struct CommentOn(pub bool, pub usize);
+
 impl EventEmitter<Request> for DiffView {}
+impl EventEmitter<CommentOn> for DiffView {}
 
 impl DiffView {
     pub fn new(root: PathBuf, spec: DiffSpec, user_email: Option<String>, show_blame: bool, font_size: f32, cx: &mut Context<Self>) -> Self {
@@ -127,7 +141,8 @@ impl DiffView {
             dragging_split: false,
             body_bounds: Default::default(),
             selected: None,
-            scroll: UniformListScrollHandle::new(),
+            list: ListState::new(0, ListAlignment::Top, gpui::px(600.)),
+            list_key: (0, false, false),
             scroll_x: 0.,
             user_email,
             find: None,
@@ -136,10 +151,28 @@ impl DiffView {
             sel_old: Default::default(),
             sel_new: Default::default(),
             font_size,
+            commentable: false,
+            annotate: None,
             _tasks: Vec::new(),
         };
         view.reload(cx);
         view
+    }
+
+    /// The list laid out again when the rows changed (loaded, folded, inline or side by side).
+    fn sync_list(&mut self) {
+        let Some(data) = self.data.clone() else { return };
+        let key = (Arc::as_ptr(&data) as usize ^ self.rows_of(&data).len(), self.show_inline(), self.changes_only);
+        if key != self.list_key {
+            self.list_key = key;
+            self.list.reset_with_uniform_height(self.rows_of(&data).len(), gpui::px(self.row_h()));
+        }
+    }
+
+    /// Measures the rows again: what shows under them changed (comments added or opened).
+    pub fn remeasure(&mut self, cx: &mut Context<Self>) {
+        self.list.remeasure();
+        cx.notify();
     }
 
     fn row_h(&self) -> f32 {
@@ -180,7 +213,8 @@ impl DiffView {
                             && let Some(ix) = first_hunk
                         {
                             view.selected = Some(ix);
-                            view.scroll.scroll_to_item(ix.saturating_sub(5), ScrollStrategy::Top);
+                            view.sync_list();
+                            view.list.scroll_to(ListOffset { item_ix: ix.saturating_sub(5), offset_in_item: gpui::px(0.) });
                         }
                     }
                     Err(e) => view.error = Some(e),
@@ -332,7 +366,8 @@ impl DiffView {
         }
         let ix = ix.min(n - 1);
         self.selected = Some(ix);
-        self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        self.sync_list();
+        self.list.scroll_to_reveal_item(ix);
         cx.notify();
     }
 
@@ -408,12 +443,6 @@ impl DiffView {
             self.select(ix, cx);
         }
         cx.notify();
-    }
-
-    /// The selected row's line, 1-based: (on the new side, line), or the old side for a removed line.
-    pub fn selected_line(&self) -> Option<(bool, usize)> {
-        let row = self.rows().get(self.selected?)?;
-        row.r.map(|r| (true, r + 1)).or(row.l.map(|l| (false, l + 1)))
     }
 
     /// A staged diff (HEAD ↔ Index): its changes can be taken back out of the index one by one.
@@ -819,15 +848,44 @@ impl DiffView {
                 });
             side = side.child(cell);
         }
+        let plus = line.filter(|_| self.commentable).map(|i| {
+            let new_side = !left || (self.show_inline() && row.r.is_some());
+            div()
+                .id(("diff-comment", row_ix * 2 + left as usize))
+                .debug_selector(move || format!("diff-comment-{}-{}", if new_side { "new" } else { "old" }, i + 1))
+                .absolute()
+                .left(px(2.))
+                .top(px(1.))
+                .size(px(self.row_h() - 2.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .bg(theme::accent())
+                .text_color(theme::on(theme::accent()))
+                .font_weight(FontWeight::BOLD)
+                .cursor_pointer()
+                .opacity(0.)
+                .group_hover("diff-row", |s| s.opacity(1.))
+                .tooltip(ui::tooltip("Comment on this line"))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(CommentOn(new_side, i + 1));
+                }))
+                .child("+")
+        });
         side.child(
             div()
+                .relative()
                 .flex_none()
                 .w(px(NUM_W))
                 .pr(px(8.))
                 .flex()
                 .justify_end()
                 .text_color(theme::line_number())
-                .child(line.map(|i| (i + 1).to_string()).unwrap_or_default()),
+                .child(line.map(|i| (i + 1).to_string()).unwrap_or_default())
+                .children(plus),
         )
         .child(div().flex_none().w(px(16.)).text_color(theme::fg_muted()).child(sign))
         .child(
@@ -864,7 +922,8 @@ impl Focusable for DiffView {
 }
 
 impl Render for DiffView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let typing = self.focus.contains_focused(window, cx) && !self.focus.is_focused(window);
         self.sel_old.begin_frame();
         self.sel_new.begin_frame();
         let body: AnyElement = if let Some(err) = &self.error {
@@ -874,19 +933,20 @@ impl Render for DiffView {
             if count == 0 || (count == 1 && data.side.iter().all(|r| r.kind == Kind::Equal) && data.left == data.right) {
                 div().p(px(20.)).text_color(theme::fg_muted()).child("No changes.").into_any_element()
             } else {
-                uniform_list(
-                    "diff-rows",
-                    count,
-                    cx.processor(move |view, range: Range<usize>, _window, cx| {
+                self.sync_list();
+                let first = self.list.logical_scroll_top().item_ix;
+                list(
+                    self.list.clone(),
+                    cx.processor(move |view, ix: usize, window, cx| {
                         let rows = view.rows_of(&data);
-                        let first = range.start;
-                        range
-                            .map(|ix| {
+                        {
+                            {
                                 let top = ix == first;
-                                let row = rows[ix].clone();
+                                let Some(row) = rows.get(ix).cloned() else { return div().into_any_element() };
                                 let selected = view.selected == Some(ix);
                                 let base = div()
                                     .id(("diff-row", ix))
+                                    .group("diff-row")
                                     .flex()
                                     .h(px(view.row_h()))
                                     .w_full()
@@ -902,7 +962,11 @@ impl Render for DiffView {
                                         }
                                         cx.notify();
                                     }));
-                                if row.kind == Kind::Gap {
+                                let note = match (&view.annotate, row.kind) {
+                                    (Some(f), k) if k != Kind::Gap => f(row.l.map(|l| l + 1), row.r.map(|r| r + 1), window, cx),
+                                    _ => None,
+                                };
+                                let line = if row.kind == Kind::Gap {
                                     let n = row.hidden;
                                     base.bg(theme::diff_filler()).items_center().px(px(10.)).text_color(theme::fg_muted()).child(format!("⋯ {n} unchanged {}", if n == 1 { "line" } else { "lines" }))
                                 } else if view.show_inline() {
@@ -929,12 +993,15 @@ impl Render for DiffView {
                                                 .child(div().w(px(1.)).h_full().bg(theme::border())),
                                         )
                                         .child(view.render_side(&row, false, &data, ix, top, cx))
+                                };
+                                match note {
+                                    Some(note) => div().flex().flex_col().w_full().child(line).child(note).into_any_element(),
+                                    None => line.into_any_element(),
                                 }
-                            })
-                            .collect::<Vec<_>>()
+                            }
+                        }
                     }),
                 )
-                .track_scroll(&self.scroll)
                 .flex_1()
                 .into_any_element()
             }
@@ -943,7 +1010,7 @@ impl Render for DiffView {
         };
 
         div()
-            .key_context("DiffView")
+            .key_context(if typing { "DiffView typing" } else { "DiffView" })
             .track_focus(&self.focus)
             .size_full()
             .flex()

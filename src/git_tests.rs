@@ -751,9 +751,9 @@ const FAKE_GH: &str = r#"#!/bin/sh
 echo "$*" >> "$(dirname "$0")/gh.log"
 case "$1 $2" in
   "pr list") case "$*" in *"--head newwork"*) echo '[]' ; exit 0 ;; esac; echo '[{"number":7,"title":"Login page","author":{"login":"ann"},"headRefName":"login","baseRefName":"main","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS"}],"updatedAt":"2026-11-14T10:00:00Z"}]' ;;
-  "pr view") echo '{"number":7,"title":"Login page","body":"Adds the login page.","author":{"login":"ann"},"state":"OPEN","url":"https://example.invalid/pr/7","headRefName":"login","baseRefName":"main","headRefOid":"'"$(git rev-parse refs/oskl/pr/7 2>/dev/null)"'","additions":1,"deletions":0,"isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeable":"MERGEABLE","comments":[{"author":{"login":"bob"},"body":"Thanks!","createdAt":"2026-11-14T11:00:00Z"}],"reviews":[],"statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS"}],"commits":[{"oid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/7/head)"'","messageHeadline":"Login page","authors":[{"login":"ann"}],"committedDate":"2026-11-14T10:00:00Z"}]}' ;;
+  "pr view") echo '{"number":7,"title":"Login page","body":"Adds the login page.","author":{"login":"ann"},"state":"OPEN","url":"https://example.invalid/pr/7","headRefName":"login","baseRefName":"main","headRefOid":"'"$(git rev-parse refs/oskl/pr/7 2>/dev/null)"'","additions":1,"deletions":0,"isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeable":"MERGEABLE","comments":[{"author":{"login":"bob"},"body":"Thanks!","createdAt":"2026-11-14T11:00:00Z"}],"reviews":[],"statusCheckRollup":[{"name":"build","workflowName":"CI","conclusion":"SUCCESS","status":"COMPLETED","detailsUrl":"https://example.invalid/run/1"},{"name":"lint","workflowName":"CI","conclusion":"","status":"IN_PROGRESS","detailsUrl":"https://example.invalid/run/2"}],"commits":[{"oid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/7/head)"'","messageHeadline":"Login page","authors":[{"login":"ann"}],"committedDate":"2026-11-14T10:00:00Z"}]}' ;;
   "api repos/{owner}/{repo}/pulls/7/comments") echo '[{"path":"login.txt","line":1,"body":"Nice","user":{"login":"bob"}}]' ;;
-  "api --method") echo '{}' ;;
+  "api --method") case "$*" in *--input*) for a; do last=$a; done; cat "$last" >> "$(dirname "$0")/gh.log"; echo >> "$(dirname "$0")/gh.log" ;; esac; echo '{}' ;;
   "pr review"|"pr comment") echo ok ;;
   "pr create") echo "https://example.invalid/pr/8" ;;
   "pr checkout") git switch -q -c login refs/oskl/pr/7 ;;
@@ -840,6 +840,8 @@ fn a_pull_request_is_opened_from_the_sidebar_or_source_control(cx: &mut gpui::Te
     // One commit: its subject and body to start from.
     let title = cx.debug_bounds("pr-new-title").expect("the title box");
     let _ = title;
+    // The description reads beside its box as it will on GitHub.
+    let _ = at(cx, "md-preview");
     assert_eq!(view.read_with(cx, |v, cx| v.form_text(cx)), Some(("Add the b file".into(), "Because b matters.".into())));
     // The sidebar's + opens the same form, not a second one.
     click(cx, "act-prs");
@@ -923,17 +925,51 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     click(cx, "pr-file-login.txt");
     settle(&ws, cx);
 
-    // A comment on the diff's line, then an approval, from the Review dropdown.
-    click(cx, "pr-review");
-    click(cx, "pr-input");
+    // The + on a line opens a box under it, below the comment already there: a single
+    // comment goes at once.
+    let _ = at(cx, "pr-thread-login.txt-1");
+    click(cx, "diff-comment-new-1");
+    settle(&ws, cx);
+    click(cx, "pr-line-input");
     cx.simulate_input("Looks right");
-    click(cx, "pr-comment-line");
+    click(cx, "pr-line-single");
     settle(&ws, cx);
     assert!(log().contains("path=login.txt") && log().contains("line=1") && log().contains("body=Looks right"), "{}", log());
-    click(cx, "pr-review");
-    click(cx, "pr-approve");
+    // Start a review: the comment waits (shown under its line, and kept on disk) ...
+    click(cx, "diff-comment-new-1");
     settle(&ws, cx);
-    assert!(log().contains("pr review 7 --approve"), "{}", log());
+    click(cx, "pr-line-input");
+    cx.simulate_input("Rename this");
+    click(cx, "pr-line-review");
+    settle(&ws, cx);
+    assert_eq!(pr.read_with(cx, |p, _| p.pending.len()), 1);
+    let _ = at(cx, "pr-pending-del-0");
+    let kept = git_out(&dir, &["rev-parse", "--git-path", "oskl/review-7.json"]);
+    assert!(std::fs::read_to_string(dir.join(&kept)).unwrap().contains("Rename this"));
+    // ... until Finish your review sends it with the approval.
+    click(cx, "pr-review");
+    let _ = at(cx, "pr-pending-0");
+    click(cx, "pr-kind-approve");
+    click(cx, "pr-submit-review");
+    settle(&ws, cx);
+    assert!(log().contains("pulls/7/reviews --input"), "{}", log());
+    assert!(log().contains(r#""event":"APPROVE""#) && log().contains(r#""body":"Rename this""#) && log().contains(r#""side":"RIGHT""#), "{}", log());
+    assert_eq!(pr.read_with(cx, |p, _| p.pending.len()), 0);
+    assert!(!dir.join(&kept).exists(), "nothing pending left");
+
+    // The conversation: its checks (each a link to its run), whether it merges, a comment box
+    // with its preview.
+    click(cx, "pr-tab-conversation");
+    settle(&ws, cx);
+    let _ = at(cx, "pr-check-CI / build");
+    let _ = at(cx, "pr-check-CI / lint");
+    let _ = at(cx, "pr-merge-state");
+    click(cx, "pr-comment-input");
+    cx.simulate_input("Ship it");
+    let _ = at(cx, "md-preview");
+    click(cx, "pr-comment-post");
+    settle(&ws, cx);
+    assert!(log().contains("pr comment 7 --body Ship it"), "{}", log());
 
     // Checked out, the Git tab shows its chip, which comes back to this review's tab.
     click(cx, "pr-checkout");

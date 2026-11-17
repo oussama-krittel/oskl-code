@@ -44,6 +44,52 @@ pub struct Check {
     pub status: Option<String>,
     #[serde(default)]
     pub state: Option<String>,
+    /// The workflow a check run belongs to ("CI" in "CI / build").
+    #[serde(default, rename = "workflowName")]
+    pub workflow_name: String,
+    /// Where a check run's log is (a commit status names its `targetUrl`).
+    #[serde(default, rename = "detailsUrl")]
+    pub details_url: String,
+    #[serde(default, rename = "targetUrl")]
+    pub target_url: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Where one check stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CheckState {
+    Failing,
+    Running,
+    Queued,
+    Passed,
+    Skipped,
+}
+
+impl Check {
+    pub fn name(&self) -> String {
+        let name = if self.name.is_empty() { &self.context } else { &self.name };
+        if self.workflow_name.is_empty() { name.clone() } else { format!("{} / {name}", self.workflow_name) }
+    }
+
+    /// Its page on GitHub (the run's log), if it has one.
+    pub fn url(&self) -> Option<&str> {
+        [&self.details_url, &self.target_url].into_iter().find(|u| !u.is_empty()).map(String::as_str)
+    }
+
+    pub fn state(&self) -> CheckState {
+        let outcome = self.conclusion.clone().filter(|c| !c.is_empty()).or(self.state.clone()).unwrap_or_default().to_uppercase();
+        match outcome.as_str() {
+            "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => CheckState::Failing,
+            "SUCCESS" => CheckState::Passed,
+            "NEUTRAL" | "SKIPPED" | "STALE" => CheckState::Skipped,
+            "EXPECTED" | "PENDING" => CheckState::Queued,
+            _ => match self.status.as_deref().unwrap_or("").to_uppercase().as_str() {
+                "IN_PROGRESS" => CheckState::Running,
+                _ => CheckState::Queued,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -58,10 +104,9 @@ pub fn checks(list: &[Check]) -> Checks {
     if list.is_empty() {
         return Checks::None;
     }
-    let outcome = |c: &Check| c.conclusion.clone().or(c.state.clone()).unwrap_or_default().to_uppercase();
-    if list.iter().any(|c| matches!(outcome(c).as_str(), "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED")) {
+    if list.iter().any(|c| c.state() == CheckState::Failing) {
         Checks::Failing
-    } else if list.iter().all(|c| matches!(outcome(c).as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED")) {
+    } else if list.iter().all(|c| matches!(c.state(), CheckState::Passed | CheckState::Skipped)) {
         Checks::Passing
     } else {
         Checks::Pending
@@ -118,6 +163,8 @@ pub struct PrDetail {
     pub is_draft: bool,
     pub review_decision: Option<String>,
     pub mergeable: String,
+    /// CLEAN, BLOCKED, BEHIND, DIRTY, DRAFT, UNSTABLE, HAS_HOOKS or UNKNOWN (still working it out).
+    pub merge_state_status: String,
     pub comments: Vec<Comment>,
     pub reviews: Vec<Review>,
     pub status_check_rollup: Vec<Check>,
@@ -138,6 +185,10 @@ pub struct PrCommit {
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct LineComment {
+    pub id: u64,
+    /// The thread's first comment, for a reply.
+    pub in_reply_to_id: Option<u64>,
+    pub created_at: String,
     pub path: String,
     pub line: Option<u64>,
     pub original_line: Option<u64>,
@@ -158,7 +209,7 @@ pub fn list(root: &Path, state: &str) -> Result<Vec<Pr>> {
 }
 
 pub fn view(root: &Path, n: u64) -> Result<(PrDetail, Vec<LineComment>)> {
-    let fields = "number,title,body,author,state,url,headRefName,baseRefName,headRefOid,additions,deletions,isDraft,reviewDecision,mergeable,comments,reviews,statusCheckRollup,commits";
+    let fields = "number,title,body,author,state,url,headRefName,baseRefName,headRefOid,additions,deletions,isDraft,reviewDecision,mergeable,mergeStateStatus,comments,reviews,statusCheckRollup,commits";
     let detail: PrDetail = serde_json::from_str(&gh(root, &["pr", "view", &n.to_string(), "--json", fields])?)?;
     // Line comments aren't in `pr view`; without them the review still works.
     let lines = gh(root, &["api", &format!("repos/{{owner}}/{{repo}}/pulls/{n}/comments")]).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
@@ -277,6 +328,38 @@ pub fn line_comment(root: &Path, n: u64, commit: &str, path: &str, line: usize, 
             if new_side { "side=RIGHT" } else { "side=LEFT" },
         ],
     )
+}
+
+/// A comment of a review not sent yet: on `line` of `path`, new side or (a removed line) the old one.
+#[derive(serde::Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DraftComment {
+    pub path: String,
+    pub line: usize,
+    pub new_side: bool,
+    pub body: String,
+}
+
+/// Sends a review: its comments on lines and `body`, as `event` (COMMENT, APPROVE or
+/// REQUEST_CHANGES), on the pull request at `commit`.
+pub fn submit_review(root: &Path, n: u64, commit: &str, event: &str, body: &str, comments: &[DraftComment]) -> Result<String> {
+    let comments: Vec<serde_json::Value> = comments
+        .iter()
+        .map(|c| serde_json::json!({"path": c.path, "line": c.line, "side": if c.new_side { "RIGHT" } else { "LEFT" }, "body": c.body}))
+        .collect();
+    let mut review = serde_json::json!({"commit_id": commit, "event": event, "comments": comments});
+    if !body.trim().is_empty() {
+        review["body"] = body.into();
+    }
+    let file = std::env::temp_dir().join(format!("oskl-review-{}-{n}.json", std::process::id()));
+    std::fs::write(&file, review.to_string())?;
+    let out = gh(root, &["api", "--method", "POST", &format!("repos/{{owner}}/{{repo}}/pulls/{n}/reviews"), "--input", &file.to_string_lossy()]);
+    let _ = std::fs::remove_file(&file);
+    out
+}
+
+/// An answer in the thread that comment `to` starts.
+pub fn reply(root: &Path, n: u64, to: u64, body: &str) -> Result<String> {
+    gh(root, &["api", "--method", "POST", &format!("repos/{{owner}}/{{repo}}/pulls/{n}/comments/{to}/replies"), "-f", &format!("body={body}")])
 }
 
 pub fn checkout(root: &Path, n: u64) -> Result<String> {
