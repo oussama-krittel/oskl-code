@@ -793,6 +793,9 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     settle(&ws, cx);
     assert!(log().contains("pr list --state merged"), "{}", log());
     click(cx, "pr-filter-open");
+    // Back to a state already read: its list shows at once while gh reads it again.
+    cx.run_until_parked();
+    let _ = at(cx, "pr-row-7");
     settle(&ws, cx);
 
     click(cx, "pr-row-7");

@@ -146,10 +146,15 @@ pub struct LineComment {
     pub user: Author,
 }
 
-/// The pull requests in `state`: open, merged, closed or all.
+/// The pull requests in `state`: open, merged, closed (without merging) or all.
 pub fn list(root: &Path, state: &str) -> Result<Vec<Pr>> {
     let out = gh(root, &["pr", "list", "--state", state, "--limit", "50", "--json", "number,title,author,headRefName,baseRefName,isDraft,reviewDecision,statusCheckRollup,updatedAt,state"])?;
-    Ok(serde_json::from_str(&out)?)
+    let mut prs: Vec<Pr> = serde_json::from_str(&out)?;
+    // gh counts a merged pull request as closed too.
+    if state == "closed" {
+        prs.retain(|p| p.state != "MERGED");
+    }
+    Ok(prs)
 }
 
 pub fn view(root: &Path, n: u64) -> Result<(PrDetail, Vec<LineComment>)> {
