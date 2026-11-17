@@ -15,7 +15,8 @@ use std::time::Duration;
 actions!(diff_view, [NextRow, PrevRow, NextHunk, PrevHunk, ToggleBlame, ToggleInline, OpenFile, CopyRow, SelectAllNew, Top, Bottom, PageDownRows, PageUpRows]);
 
 pub fn bind_keys() {
-    let c = Some("DiffView");
+    // Not while typing a comment on a line: n, p, b and v are letters there.
+    let c = Some("DiffView && !typing");
     crate::keybindings::collect([
         crate::keybindings::kb("{down}", NextRow, c),
         crate::keybindings::kb("down", NextRow, c),
@@ -93,7 +94,10 @@ pub struct DiffView {
     dragging_split: bool,
     body_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     selected: Option<usize>,
-    scroll: UniformListScrollHandle,
+    /// The rows as drawn: each its own height, a line with comments under it being taller.
+    list: ListState,
+    /// What the list was last laid out for: (rows, inline, changes only).
+    list_key: (usize, bool, bool),
     scroll_x: f32,
     user_email: Option<String>,
     /// The find bar's query, and its matches: (row, left side?, byte range in that line).
@@ -105,10 +109,30 @@ pub struct DiffView {
     sel_new: crate::sel::Selection,
     /// Code text size, as in the editors (the zoom changes it).
     pub font_size: f32,
+    /// A + on each line's number, to comment on it (a pull request's review).
+    pub commentable: bool,
+    /// What shows under a row: (old line, new line), 1-based, as the row shows them.
+    pub annotate: Option<Annotate>,
+    /// Lines picked for a comment, tinted: (new side, first, last), 1-based.
+    pub marked: Option<(bool, usize, usize)>,
+    /// A press on a line's +, being dragged over more lines: (new side, the line pressed).
+    comment_drag: Option<(bool, usize)>,
+    /// Each row's part of the diff as GitHub cuts it (a change and 3 lines around it), 0 for
+    /// none: only those lines take comments, and a comment on several stays in one part.
+    hunks: std::rc::Rc<Vec<u32>>,
+    /// The parts as git cuts them (what GitHub goes by), once read: they decide over `hunks`.
+    pub git_hunks: Option<Vec<crate::git::gh::Hunk>>,
     _tasks: Vec<Task<()>>,
 }
 
+pub type Annotate = std::rc::Rc<dyn Fn(Option<usize>, Option<usize>, &mut Window, &mut App) -> Option<AnyElement>>;
+
+/// The + on a line's number was clicked: (new side, 1-based line, with shift: to the lines
+/// already picked, dragged from: the first of the lines picked).
+pub struct CommentOn(pub bool, pub usize, pub bool, pub Option<usize>);
+
 impl EventEmitter<Request> for DiffView {}
+impl EventEmitter<CommentOn> for DiffView {}
 
 impl DiffView {
     pub fn new(root: PathBuf, spec: DiffSpec, user_email: Option<String>, show_blame: bool, font_size: f32, cx: &mut Context<Self>) -> Self {
@@ -127,7 +151,8 @@ impl DiffView {
             dragging_split: false,
             body_bounds: Default::default(),
             selected: None,
-            scroll: UniformListScrollHandle::new(),
+            list: ListState::new(0, ListAlignment::Top, gpui::px(600.)),
+            list_key: (0, false, false),
             scroll_x: 0.,
             user_email,
             find: None,
@@ -136,10 +161,48 @@ impl DiffView {
             sel_old: Default::default(),
             sel_new: Default::default(),
             font_size,
+            commentable: false,
+            annotate: None,
+            marked: None,
+            comment_drag: None,
+            hunks: Default::default(),
+            git_hunks: None,
             _tasks: Vec::new(),
         };
         view.reload(cx);
         view
+    }
+
+    /// The list laid out again when the rows changed (loaded, folded, inline or side by side).
+    fn sync_list(&mut self) {
+        let Some(data) = self.data.clone() else { return };
+        let key = (Arc::as_ptr(&data) as usize ^ self.rows_of(&data).len(), self.show_inline(), self.changes_only);
+        if key != self.list_key {
+            self.list_key = key;
+            self.list.reset_with_uniform_height(self.rows_of(&data).len(), gpui::px(self.row_h()));
+            self.hunks = std::rc::Rc::new(hunk_ids(self.rows_of(&data)));
+        }
+    }
+
+    /// The part of the diff (as GitHub cuts it) that `line` of a side is in, if any.
+    fn hunk_of(&self, new_side: bool, line: usize) -> Option<u32> {
+        if let Some(h) = &self.git_hunks {
+            return crate::git::gh::hunk_index(h, new_side, line).map(|i| i as u32 + 1);
+        }
+        let i = line.checked_sub(1)?;
+        let ix = self.rows().iter().position(|r| if new_side { r.r == Some(i) } else { r.l == Some(i) && (r.r.is_none() || !self.show_inline()) })?;
+        self.hunks.get(ix).copied().filter(|h| *h != 0)
+    }
+
+    /// Lines `a` to `b` of a side are in one part of the diff: GitHub takes a comment on them.
+    pub fn same_hunk(&self, new_side: bool, a: usize, b: usize) -> bool {
+        self.hunk_of(new_side, a).is_some_and(|h| self.hunk_of(new_side, b) == Some(h))
+    }
+
+    /// Measures the rows again: what shows under them changed (comments added or opened).
+    pub fn remeasure(&mut self, cx: &mut Context<Self>) {
+        self.list.remeasure();
+        cx.notify();
     }
 
     fn row_h(&self) -> f32 {
@@ -180,7 +243,8 @@ impl DiffView {
                             && let Some(ix) = first_hunk
                         {
                             view.selected = Some(ix);
-                            view.scroll.scroll_to_item(ix.saturating_sub(5), ScrollStrategy::Top);
+                            view.sync_list();
+                            view.list.scroll_to(ListOffset { item_ix: ix.saturating_sub(5), offset_in_item: gpui::px(0.) });
                         }
                     }
                     Err(e) => view.error = Some(e),
@@ -332,7 +396,8 @@ impl DiffView {
         }
         let ix = ix.min(n - 1);
         self.selected = Some(ix);
-        self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        self.sync_list();
+        self.list.scroll_to_reveal_item(ix);
         cx.notify();
     }
 
@@ -408,12 +473,6 @@ impl DiffView {
             self.select(ix, cx);
         }
         cx.notify();
-    }
-
-    /// The selected row's line, 1-based: (on the new side, line), or the old side for a removed line.
-    pub fn selected_line(&self) -> Option<(bool, usize)> {
-        let row = self.rows().get(self.selected?)?;
-        row.r.map(|r| (true, r + 1)).or(row.l.map(|l| (false, l + 1)))
     }
 
     /// A staged diff (HEAD ↔ Index): its changes can be taken back out of the index one by one.
@@ -748,6 +807,43 @@ pub(crate) fn styled_line(text: &str, syntax: &[(Range<usize>, u8)], highlights:
 }
 
 const NUM_W: f32 = 44.;
+
+/// Which part of the diff each row is in, as GitHub cuts it: a change with up to 3 lines on
+/// either side (parts that touch are one); 0 for rows in none.
+fn hunk_ids(rows: &[Row]) -> Vec<u32> {
+    let n = rows.len();
+    let changed = |r: &Row| !matches!(r.kind, Kind::Equal | Kind::Gap);
+    let mut near = vec![false; n];
+    for order in [false, true] {
+        let mut last: Option<usize> = None;
+        for k in 0..n {
+            let i = if order { n - 1 - k } else { k };
+            if rows[i].kind == Kind::Gap {
+                last = None;
+                continue;
+            }
+            if changed(&rows[i]) {
+                last = Some(k);
+            }
+            if last.is_some_and(|j| k - j <= 3) {
+                near[i] = true;
+            }
+        }
+    }
+    let mut id = 0;
+    near.iter()
+        .enumerate()
+        .map(|(i, &on)| {
+            if !on {
+                return 0;
+            }
+            if i == 0 || !near[i - 1] {
+                id += 1;
+            }
+            id
+        })
+        .collect()
+}
 const BLAME_W: f32 = 190.;
 
 impl DiffView {
@@ -780,6 +876,28 @@ impl DiffView {
         let mut side = div().flex().flex_1().min_w_0().h_full().overflow_hidden();
         if let Some(bg) = bg {
             side = side.bg(bg);
+        }
+        // Picked for a comment: tinted like GitHub's.
+        let cell_new = !left || (self.show_inline() && row.r.is_some());
+        if let Some(i) = line.filter(|_| self.comment_drag.is_some_and(|(s, _)| s == cell_new)) {
+            side = side.on_mouse_move(cx.listener(move |view, ev: &MouseMoveEvent, _, cx| {
+                if let Some((s, a)) = view.comment_drag
+                    && ev.dragging()
+                    && view.same_hunk(s, a, i + 1)
+                {
+                    let picked = Some((s, a.min(i + 1), a.max(i + 1)));
+                    if view.marked != picked {
+                        view.marked = picked;
+                        cx.notify();
+                    }
+                }
+            }));
+        }
+        if let (Some((new_side, a, b)), Some(i)) = (self.marked, line)
+            && new_side == cell_new
+            && (a..=b).contains(&(i + 1))
+        {
+            side = side.bg(theme::git_modified().opacity(0.22));
         }
         if self.show_blame {
             let starts = match (line, &commit) {
@@ -819,15 +937,53 @@ impl DiffView {
                 });
             side = side.child(cell);
         }
+        let in_hunk = match (&self.git_hunks, line) {
+            (Some(h), Some(i)) => crate::git::gh::hunk_index(h, cell_new, i + 1).is_some(),
+            _ => self.hunks.get(row_ix).is_some_and(|h| *h != 0),
+        };
+        let plus = line.filter(|_| self.commentable && in_hunk).map(|i| {
+            let new_side = !left || (self.show_inline() && row.r.is_some());
+            div()
+                .id(("diff-comment", row_ix * 2 + left as usize))
+                .debug_selector(move || format!("diff-comment-{}-{}", if new_side { "new" } else { "old" }, i + 1))
+                .absolute()
+                .left(px(2.))
+                .top(px(1.))
+                .size(px(self.row_h() - 2.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .bg(theme::accent())
+                .text_color(theme::on(theme::accent()))
+                .font_weight(FontWeight::BOLD)
+                .cursor_pointer()
+                .opacity(0.)
+                .group_hover("diff-row", |s| s.opacity(1.))
+                .tooltip(ui::tooltip("Comment on this line"))
+                // Press, then drag over more lines to pick them all (Shift-click adds to a box open).
+                .on_mouse_down(MouseButton::Left, cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if ev.modifiers.shift {
+                        return cx.emit(CommentOn(new_side, i + 1, true, None));
+                    }
+                    view.comment_drag = Some((new_side, i + 1));
+                    view.marked = Some((new_side, i + 1, i + 1));
+                    cx.notify();
+                }))
+                .child("+")
+        });
         side.child(
             div()
+                .relative()
                 .flex_none()
                 .w(px(NUM_W))
                 .pr(px(8.))
                 .flex()
                 .justify_end()
                 .text_color(theme::line_number())
-                .child(line.map(|i| (i + 1).to_string()).unwrap_or_default()),
+                .child(line.map(|i| (i + 1).to_string()).unwrap_or_default())
+                .children(plus),
         )
         .child(div().flex_none().w(px(16.)).text_color(theme::fg_muted()).child(sign))
         .child(
@@ -864,7 +1020,8 @@ impl Focusable for DiffView {
 }
 
 impl Render for DiffView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let typing = self.focus.contains_focused(window, cx) && !self.focus.is_focused(window);
         self.sel_old.begin_frame();
         self.sel_new.begin_frame();
         let body: AnyElement = if let Some(err) = &self.error {
@@ -874,19 +1031,20 @@ impl Render for DiffView {
             if count == 0 || (count == 1 && data.side.iter().all(|r| r.kind == Kind::Equal) && data.left == data.right) {
                 div().p(px(20.)).text_color(theme::fg_muted()).child("No changes.").into_any_element()
             } else {
-                uniform_list(
-                    "diff-rows",
-                    count,
-                    cx.processor(move |view, range: Range<usize>, _window, cx| {
+                self.sync_list();
+                let first = self.list.logical_scroll_top().item_ix;
+                list(
+                    self.list.clone(),
+                    cx.processor(move |view, ix: usize, window, cx| {
                         let rows = view.rows_of(&data);
-                        let first = range.start;
-                        range
-                            .map(|ix| {
+                        {
+                            {
                                 let top = ix == first;
-                                let row = rows[ix].clone();
+                                let Some(row) = rows.get(ix).cloned() else { return div().into_any_element() };
                                 let selected = view.selected == Some(ix);
                                 let base = div()
                                     .id(("diff-row", ix))
+                                    .group("diff-row")
                                     .flex()
                                     .h(px(view.row_h()))
                                     .w_full()
@@ -902,7 +1060,11 @@ impl Render for DiffView {
                                         }
                                         cx.notify();
                                     }));
-                                if row.kind == Kind::Gap {
+                                let note = match (&view.annotate, row.kind) {
+                                    (Some(f), k) if k != Kind::Gap => f(row.l.map(|l| l + 1), row.r.map(|r| r + 1), window, cx),
+                                    _ => None,
+                                };
+                                let line = if row.kind == Kind::Gap {
                                     let n = row.hidden;
                                     base.bg(theme::diff_filler()).items_center().px(px(10.)).text_color(theme::fg_muted()).child(format!("⋯ {n} unchanged {}", if n == 1 { "line" } else { "lines" }))
                                 } else if view.show_inline() {
@@ -929,12 +1091,15 @@ impl Render for DiffView {
                                                 .child(div().w(px(1.)).h_full().bg(theme::border())),
                                         )
                                         .child(view.render_side(&row, false, &data, ix, top, cx))
+                                };
+                                match note {
+                                    Some(note) => div().flex().flex_col().w_full().child(line).child(note).into_any_element(),
+                                    None => line.into_any_element(),
                                 }
-                            })
-                            .collect::<Vec<_>>()
+                            }
+                        }
                     }),
                 )
-                .track_scroll(&self.scroll)
                 .flex_1()
                 .into_any_element()
             }
@@ -943,7 +1108,7 @@ impl Render for DiffView {
         };
 
         div()
-            .key_context("DiffView")
+            .key_context(if typing { "DiffView typing" } else { "DiffView" })
             .track_focus(&self.focus)
             .size_full()
             .flex()
@@ -985,7 +1150,17 @@ impl Render for DiffView {
                     cx.notify();
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, _| view.dragging_split = false))
+            .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, cx| {
+                view.dragging_split = false;
+                // The + let go: comment on the lines dragged over.
+                if let Some((s, a)) = view.comment_drag.take() {
+                    let (lo, hi) = match view.marked {
+                        Some((ms, lo, hi)) if ms == s => (lo, hi),
+                        _ => (a, a),
+                    };
+                    cx.emit(CommentOn(s, hi, false, Some(lo)));
+                }
+            }))
             .on_scroll(cx.listener(|view, ev: &ScrollEvent, _, cx| {
                 let d = ev.delta.pixel_delta(px(view.row_h()));
                 let dx = d.x / px(1.);
@@ -1012,6 +1187,19 @@ impl Render for DiffView {
 #[cfg(test)]
 mod tests {
     use super::prepare;
+
+    #[test]
+    fn only_lines_near_a_change_take_comments_and_far_changes_are_apart() {
+        let old: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        let new = old.replace("line 10\n", "ten\n").replace("line 25\n", "twenty-five\n");
+        let d = prepare(&old, &new, "a.txt");
+        let ids = super::hunk_ids(&d.side);
+        let at = |line: usize| ids[d.side.iter().position(|r| r.r == Some(line - 1)).unwrap()];
+        assert_eq!(at(1), 0, "far from any change");
+        assert!(at(7) != 0 && at(10) == at(7) && at(13) == at(7), "3 lines either side");
+        assert_eq!(at(14), 0);
+        assert!(at(25) != 0 && at(25) != at(10), "another part");
+    }
 
     #[test]
     fn both_sides_get_syntax_colours() {

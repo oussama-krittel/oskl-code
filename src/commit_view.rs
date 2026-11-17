@@ -112,6 +112,8 @@ pub struct CommitView {
 pub struct PrForm {
     title: Entity<Editor>,
     body: Entity<Editor>,
+    /// The description as it will read, beside it while it's typed.
+    preview: Entity<crate::md_preview::MdPreview>,
     draft: bool,
     busy: bool,
     error: Option<String>,
@@ -193,7 +195,11 @@ impl CommitView {
             }
         };
         let subs = vec![cx.subscribe(&title, changed), cx.subscribe(&body, changed)];
-        view.create = Some(PrForm { title, body, draft: false, busy: false, error: None, existing: None, suggested: Default::default(), _subs: subs, _task: None });
+        let preview = {
+            let (body, root) = (body.clone(), view.root.clone());
+            cx.new(|cx| crate::md_preview::MdPreview::new(body, root, 320., "pr-new-body", cx))
+        };
+        view.create = Some(PrForm { title, body, preview, draft: false, busy: false, error: None, existing: None, suggested: Default::default(), _subs: subs, _task: None });
         let (r, h) = (view.root.clone(), head.clone());
         let check = cx.background_executor().spawn(async move { git::gh::open_from(&r, &h) });
         cx.spawn(async move |this, cx| {
@@ -324,11 +330,11 @@ impl CommitView {
                 .flex()
                 .flex_col()
                 .gap(px(8.))
-                .max_w(px(760.))
+                .max_w(px(900.))
                 // Clicks in the form stay in its boxes (the page would take the keyboard).
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(field(f.title.clone(), "pr-new-title"))
-                .child(field(f.body.clone(), "pr-new-body").min_h(px(90.)))
+                .child(f.preview.clone())
                 .child(
                     div()
                         .flex()

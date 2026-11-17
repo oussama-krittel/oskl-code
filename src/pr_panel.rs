@@ -1,9 +1,6 @@
 //! The Pull requests sidebar: the repository's pull requests (read with `gh`), filtered by
-//! state; a click reviews one in its own tab. While a review tab is in front, the sidebar is
-//! that pull request's files as a tree (like GitHub's), and a file picked shows its diff.
+//! state; a click reviews one in its own tab (its files' tree is in the tab, beside the diff).
 
-use crate::commit_view::FileRow;
-use crate::editor::{Editor, EditorEvent, EditorMode};
 use crate::git::gh;
 use crate::git_panel::pr::PrView;
 use crate::request::Request;
@@ -12,12 +9,8 @@ use crate::ui::{self, px};
 use gpui::prelude::*;
 use gpui::*;
 use std::path::PathBuf;
-use std::rc::Rc;
 
 const STATES: [(&str, &str); 4] = [("open", "Open"), ("merged", "Merged"), ("closed", "Closed"), ("all", "All")];
-/// Rows of the file tree (it draws only what's on screen, so 30 000 files scroll freely).
-const ROW_H: f32 = 22.;
-const INDENT: f32 = 12.;
 
 pub struct PrPanel {
     focus: FocusHandle,
@@ -30,15 +23,6 @@ pub struct PrPanel {
     loading: Option<&'static str>,
     selected: Option<u64>,
     _load: Option<Task<()>>,
-    /// The review tab in front: its files are the tree.
-    pr: Option<Entity<PrView>>,
-    _pr_sub: Option<Subscription>,
-    /// The list asked for while a review is in front.
-    pub show_list: bool,
-    filter: Entity<Editor>,
-    /// Files whose path holds the filter's text (by index), for (text, files shown, how many).
-    matches: Option<(String, usize, usize, Rc<Vec<usize>>)>,
-    scroll: UniformListScrollHandle,
     _subs: Vec<Subscription>,
 }
 
@@ -46,18 +30,6 @@ impl EventEmitter<Request> for PrPanel {}
 
 impl PrPanel {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let filter = cx.new(|cx| {
-            let mut ed = Editor::new(EditorMode::SingleLine, cx);
-            ed.font_size = 12.;
-            ed.placeholder = "Filter files".into();
-            ed
-        });
-        let subs = vec![cx.subscribe(&filter, |p, _, ev: &EditorEvent, cx| {
-            if matches!(ev, EditorEvent::Changed) {
-                p.scroll.scroll_to_item(0, ScrollStrategy::Top);
-                cx.notify();
-            }
-        })];
         Self {
             focus: cx.focus_handle(),
             root: None,
@@ -66,13 +38,7 @@ impl PrPanel {
             loading: None,
             selected: None,
             _load: None,
-            pr: None,
-            _pr_sub: None,
-            show_list: false,
-            filter,
-            matches: None,
-            scroll: UniformListScrollHandle::new(),
-            _subs: subs,
+            _subs: Vec::new(),
         }
     }
 
@@ -90,20 +56,15 @@ impl PrPanel {
         }
     }
 
-    /// The review tab in front (None: another tab): the sidebar shows its files.
+    /// The review tab in front (None: another tab): its row is marked in the list.
     pub fn set_pr(&mut self, pr: Option<Entity<PrView>>, cx: &mut Context<Self>) {
-        if self.pr.as_ref().map(|p| p.entity_id()) == pr.as_ref().map(|p| p.entity_id()) {
-            return;
-        }
-        self._pr_sub = pr.as_ref().map(|p| cx.observe(p, |_, _, cx| cx.notify()));
         if let Some(p) = &pr {
-            self.selected = Some(p.read(cx).number);
+            let n = p.read(cx).number;
+            if self.selected != Some(n) {
+                self.selected = Some(n);
+                cx.notify();
+            }
         }
-        self.pr = pr;
-        self.show_list = false;
-        self.matches = None;
-        self.filter.update(cx, |e, cx| e.set_text("", cx));
-        cx.notify();
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
@@ -220,8 +181,11 @@ impl PrPanel {
                 .flex()
                 .items_center()
                 .justify_center()
+                .flex_col()
+                .gap(px(10.))
                 .debug_selector(|| "pr-loading".into())
-                .child(spinner("pr-loading-spin", 20.))
+                .child(fetching("pr-loading", false))
+                .child(div().text_color(theme::fg_muted()).child("Fetching pull requests from GitHub…"))
                 .into_any_element(),
             Some(Err(e)) if e.contains("No such file") || e.contains("not found") => {
                 ui::empty_state("pull-request", "GitHub CLI not found", "Install it (brew install gh), then sign in with gh auth login.").into_any_element()
@@ -241,7 +205,6 @@ impl PrPanel {
                 .children(list.clone().iter().map(|p| self.render_row(p, cx).into_any_element()).collect::<Vec<_>>())
                 .into_any_element(),
         };
-        let back = self.pr.as_ref().map(|p| p.read(cx).number);
         div()
             .size_full()
             .flex()
@@ -260,16 +223,11 @@ impl PrPanel {
                     .child("Pull requests")
                     .when_some(count.filter(|c| *c > 0), |d, c| d.child(div().text_color(theme::fg_muted()).font_weight(FontWeight::NORMAL).child(c.to_string())))
                     .child(div().flex_1())
-                    .when_some(back, |d, n| {
-                        d.child(ui::icon_button("pr-to-files", "files").debug_selector(|| "pr-to-files".into()).tooltip(ui::tooltip_text(format!("Files of #{n}"))).on_click(cx.listener(|p, _, _, cx| {
-                            p.show_list = false;
-                            cx.notify();
-                        })))
-                    })
                     .child(ui::icon_button("pr-new", "plus").debug_selector(|| "pr-new".into()).tooltip(ui::tooltip("Open a pull request from the current branch")).on_click(cx.listener(|_, _, _, cx| cx.emit(Request::NewPr))))
-                    .when(loading, |d| d.child(div().size(px(22.)).flex().flex_none().items_center().justify_center().debug_selector(|| "pr-refreshing".into()).child(spinner("pr-refresh-spin", 14.))))
-                    .when(!loading, |d| d.child(ui::icon_button("pr-refresh", "refresh").debug_selector(|| "pr-refresh".into()).tooltip(ui::tooltip("Read them again")).on_click(cx.listener(|p, _, _, cx| p.reload(cx))))),
+                    .child(ui::icon_button("pr-refresh", "refresh").debug_selector(|| "pr-refresh".into()).tooltip(ui::tooltip("Read them again")).when(!loading, |b| b.on_click(cx.listener(|p, _, _, cx| p.reload(cx))))),
             )
+            // Read again with a list shown: a thin bar running under the header.
+            .child(div().flex_none().h(px(2.)).w_full().when(loading && count.is_some(), |d| d.debug_selector(|| "pr-refreshing".into()).child(progress_bar("pr-refresh-bar", None))))
             .child(
                 div()
                     .flex()
@@ -290,162 +248,11 @@ impl PrPanel {
             .child(body)
             .into_any_element()
     }
-
-    /// The files whose path holds `q` (any case), by index; kept until the text or files change.
-    fn matching(&mut self, q: &str, pr: &PrView) -> Option<Rc<Vec<usize>>> {
-        let Some(Ok(f)) = pr.shown_files() else { return None };
-        let key = (q.to_string(), f.list.as_ptr() as usize, f.list.len());
-        if let Some((t, ptr, len, m)) = &self.matches
-            && (t, ptr, len) == (&key.0, &key.1, &key.2)
-        {
-            return Some(m.clone());
-        }
-        let q = q.to_lowercase();
-        let m: Rc<Vec<usize>> = Rc::new(f.list.iter().enumerate().filter(|(_, c)| c.path.to_lowercase().contains(&q)).map(|(i, _)| i).collect());
-        self.matches = Some((key.0, key.1, key.2, m.clone()));
-        Some(m)
-    }
-
-    fn render_files(&mut self, pr: Entity<PrView>, cx: &mut Context<Self>) -> AnyElement {
-        let q = self.filter.read(cx).text();
-        let matched = if q.trim().is_empty() { None } else { self.matching(q.trim(), pr.read(cx)) };
-        let v = pr.read(cx);
-        let (n, title) = (v.number, v.detail.as_ref().and_then(|d| d.as_ref().ok()).map(|(d, _)| d.title.clone()).unwrap_or_default());
-        let scope = v.commit_label();
-        let (count, body): (usize, Option<AnyElement>) = match v.shown_files() {
-            None => (0, Some(div().px(px(20.)).py(px(8.)).text_color(theme::fg_muted()).child("Bringing its commits here…").into_any_element())),
-            Some(Err(e)) => (0, Some(div().px(px(20.)).py(px(8.)).text_color(theme::git_deleted()).child(e.clone()).into_any_element())),
-            Some(Ok(f)) => (matched.as_ref().map_or(f.rows.len(), |m| m.len()), None),
-        };
-        let files_n = match v.shown_files() {
-            Some(Ok(f)) => f.list.len(),
-            _ => 0,
-        };
-        let body = body.unwrap_or_else(|| {
-            let pr2 = pr.clone();
-            let matched = matched.clone();
-            uniform_list("pr-tree", count, move |range: std::ops::Range<usize>, _, cx: &mut App| {
-                let v = pr2.read(cx);
-                let Some(Ok(f)) = v.shown_files() else { return Vec::new() };
-                let current = v.file.clone();
-                range
-                    .map(|i| {
-                        let row = match &matched {
-                            Some(m) => FileRow::File { ix: m[i], depth: 0 },
-                            None => f.rows[i].clone(),
-                        };
-                        match row {
-                            FileRow::Folder { key, label, depth, open } => {
-                                let (pr3, k) = (pr2.clone(), key.clone());
-                                div()
-                                    .id(SharedString::from(format!("pr-dir-{key}")))
-                                    .debug_selector(move || format!("pr-dir-{key}"))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.))
-                                    .h(px(ROW_H))
-                                    .pl(px(10. + depth as f32 * INDENT))
-                                    .pr(px(8.))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::hover()))
-                                    .whitespace_nowrap()
-                                    .on_click(move |_, _, cx| pr3.update(cx, |v, cx| v.toggle_folder(&k, cx)))
-                                    .child(ui::small_icon(if open { "chevron-down" } else { "chevron-right" }, theme::fg_muted()))
-                                    .child(ui::folder_icon(&label, open).size(px(14.)).flex_none())
-                                    .child(div().min_w_0().overflow_hidden().text_ellipsis().text_color(theme::fg()).child(label))
-                                    .into_any_element()
-                            }
-                            FileRow::File { ix, depth } => {
-                                let c = &f.list[ix];
-                                let on = current.as_deref() == Some(c.path.as_str());
-                                let notes = v.comments_on(&c.path);
-                                let color = ui::status_color(c.status);
-                                let pr3 = pr2.clone();
-                                let sel = format!("pr-file-{}", c.path);
-                                let flat = matched.is_some();
-                                div()
-                                    .id(SharedString::from(sel.clone()))
-                                    .debug_selector(move || sel)
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(5.))
-                                    .h(px(ROW_H))
-                                    .pl(px(10. + depth as f32 * INDENT + if flat { 0. } else { 16. }))
-                                    .pr(px(8.))
-                                    .cursor_pointer()
-                                    .when(on, |d| d.bg(theme::selected()))
-                                    .when(!on, |d| d.hover(|s| s.bg(theme::hover())))
-                                    .whitespace_nowrap()
-                                    .tooltip(ui::tooltip_text(c.path.clone()))
-                                    .on_click(move |_, _, cx| pr3.update(cx, |v, cx| v.open_ix(ix, cx)))
-                                    .child(ui::file_icon(ui::file_name(&c.path)).size(px(14.)).flex_none())
-                                    .child(div().flex_none().max_w(relative(0.75)).overflow_hidden().text_ellipsis().text_color(color).when(c.status == crate::git::FileStatus::Deleted, |d| d.line_through()).child(ui::file_name(&c.path).to_string()))
-                                    .when(flat, |d| d.child(div().min_w_0().overflow_hidden().text_ellipsis().text_size(px(10.5)).text_color(theme::fg_muted()).child(ui::file_dir(&c.path).to_string())))
-                                    .child(div().flex_1())
-                                    .when(notes > 0, |d| d.child(div().flex_none().text_size(px(10.)).text_color(theme::accent()).child(format!("💬{notes}"))))
-                                    .child(div().flex_none().w(px(12.)).text_center().text_size(px(10.5)).font_family(theme::MONO_FONT).font_weight(FontWeight::SEMIBOLD).text_color(color).child(c.status.letter()))
-                                    .into_any_element()
-                            }
-                        }
-                    })
-                    .collect()
-            })
-            .track_scroll(&self.scroll)
-            .flex_1()
-            .into_any_element()
-        });
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(4.))
-                    .h(px(35.))
-                    .pl(px(8.))
-                    .pr(px(6.))
-                    .child(ui::icon_button("pr-back-to-list", "chevron-left").debug_selector(|| "pr-back-to-list".into()).tooltip(ui::tooltip("All pull requests")).on_click(cx.listener(|p, _, _, cx| {
-                        p.show_list = true;
-                        cx.notify();
-                    })))
-                    .child(div().flex_none().text_color(theme::fg_muted()).child(format!("#{n}")))
-                    .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(title)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(6.))
-                    .px(px(12.))
-                    .pb(px(6.))
-                    .text_size(px(11.))
-                    .text_color(theme::fg_muted())
-                    .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(match &scope {
-                        Some(c) => format!("{files_n} files in {c}"),
-                        None => format!("{files_n} files changed"),
-                    }))
-                    .when(scope.is_some(), |d| {
-                        let pr = pr.clone();
-                        d.child(div().id("pr-all-commits").debug_selector(|| "pr-all-commits".into()).flex_none().cursor_pointer().text_color(theme::accent()).child("Show all").on_click(move |_, _, cx| pr.update(cx, |v, cx| v.pick_commit(None, cx))))
-                    }),
-            )
-            .child(div().id("pr-files-filter").debug_selector(|| "pr-files-filter".into()).flex_none().mx(px(12.)).mb(px(6.)).h(px(24.)).px(px(6.)).flex().items_center().rounded(px(4.)).bg(theme::bg_input()).border_1().border_color(theme::border_input()).overflow_hidden().child(self.filter.clone()))
-            .child(div().flex_none().h(px(1.)).bg(theme::border()))
-            .child(div().flex().flex_col().flex_1().min_h_0().pt(px(4.)).child(body))
-            .into_any_element()
-    }
 }
 
 impl Render for PrPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = match self.pr.clone().filter(|_| !self.show_list) {
-            Some(pr) => self.render_files(pr, cx),
-            None => self.render_list(cx),
-        };
+        let body = self.render_list(cx);
         div().key_context("PrPanel").track_focus(&self.focus).size_full().text_size(px(12.)).child(body)
     }
 }
@@ -476,7 +283,60 @@ mod tests {
 }
 
 /// A turning arrow while something is read.
-fn spinner(id: &'static str, size: f32) -> impl IntoElement {
+/// Bringing something down from GitHub: an arrow dropping into its tray, over a running bar
+/// (`big` for a whole page; small for a list).
+pub(crate) fn fetching(id: &'static str, big: bool) -> Div {
+    let (icon, bar) = if big { (30., 200.) } else { (18., 110.) };
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(if big { 12. } else { 8. }))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .size(px(icon + 8.))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .relative()
+                        .child(ui::icon("arrow-down", theme::accent()).size(px(icon)))
+                        .with_animation(SharedString::from(format!("{id}-arrow")), Animation::new(std::time::Duration::from_millis(1100)).repeat(), move |d, t| {
+                            // Drops in, settles, fades into the tray.
+                            let y = -icon * 0.6 + icon * 0.75 * t.min(0.7) / 0.7;
+                            d.top(px(y)).opacity(if t > 0.75 { (1. - t) * 4. } else { 1. })
+                        }),
+                )
+                .child(div().flex_none().w(px(icon * 0.9)).h(px(2.)).rounded(px(1.)).bg(theme::fg_muted())),
+        )
+        .child(progress_bar(id, Some(bar)))
+}
+
+/// A bar with a piece running along it (how long is unknown): `width`, else all there is.
+pub(crate) fn progress_bar(id: &'static str, width: Option<f32>) -> Div {
+    div()
+        .relative()
+        .h(px(if width.is_some() { 3. } else { 2. }))
+        .when_some(width, |d, w| d.w(px(w)))
+        .when(width.is_none(), |d| d.w_full())
+        .rounded(px(2.))
+        .overflow_hidden()
+        .bg(theme::border())
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .h_full()
+                .w(relative(0.35))
+                .rounded(px(2.))
+                .bg(theme::accent())
+                .with_animation(SharedString::from(format!("{id}-run")), Animation::new(std::time::Duration::from_millis(1200)).repeat().with_easing(ease_in_out), |d, t| d.left(relative(-0.35 + 1.35 * t))),
+        )
+}
+
+pub(crate) fn spinner(id: impl Into<ElementId>, size: f32) -> impl IntoElement {
     ui::icon("refresh", theme::fg_muted())
         .size(px(size))
         .with_animation(id, Animation::new(std::time::Duration::from_millis(900)).repeat(), |icon, t| icon.with_transformation(Transformation::rotate(percentage(t))))

@@ -751,9 +751,15 @@ const FAKE_GH: &str = r#"#!/bin/sh
 echo "$*" >> "$(dirname "$0")/gh.log"
 case "$1 $2" in
   "pr list") case "$*" in *"--head newwork"*) echo '[]' ; exit 0 ;; esac; echo '[{"number":7,"title":"Login page","author":{"login":"ann"},"headRefName":"login","baseRefName":"main","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS"}],"updatedAt":"2026-11-14T10:00:00Z"}]' ;;
-  "pr view") echo '{"number":7,"title":"Login page","body":"Adds the login page.","author":{"login":"ann"},"state":"OPEN","url":"https://example.invalid/pr/7","headRefName":"login","baseRefName":"main","headRefOid":"'"$(git rev-parse refs/oskl/pr/7 2>/dev/null)"'","additions":1,"deletions":0,"isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeable":"MERGEABLE","comments":[{"author":{"login":"bob"},"body":"Thanks!","createdAt":"2026-11-14T11:00:00Z"}],"reviews":[],"statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS"}],"commits":[{"oid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/7/head)"'","messageHeadline":"Login page","authors":[{"login":"ann"}],"committedDate":"2026-11-14T10:00:00Z"}]}' ;;
-  "api repos/{owner}/{repo}/pulls/7/comments") echo '[{"path":"login.txt","line":1,"body":"Nice","user":{"login":"bob"}}]' ;;
-  "api --method") echo '{}' ;;
+  "pr view") echo '{"number":7,"title":"Login page","body":"Adds the login page.","author":{"login":"ann"},"state":"OPEN","url":"https://example.invalid/pr/7","headRefName":"login","baseRefName":"main","headRepositoryOwner":{"login":"ann"},"headRefOid":"'"$(git rev-parse refs/oskl/pr/7 2>/dev/null)"'","additions":1,"deletions":0,"isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeable":"MERGEABLE","comments":[{"id":"IC_1","author":{"login":"bob"},"body":"Thanks!","createdAt":"2026-11-14T11:00:00Z"},{"id":"IC_2","author":{"login":"me"},"body":"Mine","createdAt":"2026-11-14T11:30:00Z"}],"reviews":[{"id":"R_1","author":{"login":"bob"},"state":"CHANGES_REQUESTED","body":"Needs work","submittedAt":"2026-11-14T12:00:00Z"}],"statusCheckRollup":[{"name":"build","workflowName":"CI","conclusion":"SUCCESS","status":"COMPLETED","detailsUrl":"https://example.invalid/run/1"},{"name":"lint","workflowName":"CI","conclusion":"","status":"IN_PROGRESS","detailsUrl":"https://example.invalid/run/2"}],"commits":[{"oid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/7/head)"'","messageHeadline":"Login page","authors":[{"login":"ann"}],"committedDate":"2026-11-14T10:00:00Z"}]}' ;;
+  "api repos/{owner}/{repo}/pulls/7/comments?per_page=100") echo '[{"id":101,"pull_request_review_id":55,"path":"login.txt","line":1,"body":"Nice","user":{"login":"bob"},"created_at":"2026-11-14T12:00:00Z","diff_hunk":"@@ -0,0 +1,3 @@\\n+login"}]' ;;
+  "api repos/{owner}/{repo}/pulls/7/reviews?per_page=100") echo '[{"id":55,"node_id":"R_1"}]' ;;
+  "api graphql") case "$*" in *reviewThreads*) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"T_1","isResolved":false,"comments":{"nodes":[{"databaseId":101}]}}]},"timelineItems":{"nodes":[{"actor":{"login":"ann"},"beforeCommit":{"abbreviatedOid":"aaaaaaa"},"afterCommit":{"abbreviatedOid":"bbbbbbb"},"createdAt":"2026-11-14T13:00:00Z"}]}}}}}' ;; *) echo '{}' ;; esac ;;
+  "api user") echo me ;;
+  "pr edit") echo ok ;;
+  "pr close"|"pr reopen"|"pr merge") echo ok ;;
+  "repo view") echo '{"mergeCommitAllowed":true,"squashMergeAllowed":true,"rebaseMergeAllowed":false}' ;;
+  "api --method") case "$*" in *--input*) for a; do last=$a; done; cat "$last" >> "$(dirname "$0")/gh.log"; echo >> "$(dirname "$0")/gh.log" ;; esac; echo '{}' ;;
   "pr review"|"pr comment") echo ok ;;
   "pr create") echo "https://example.invalid/pr/8" ;;
   "pr checkout") git switch -q -c login refs/oskl/pr/7 ;;
@@ -840,6 +846,12 @@ fn a_pull_request_is_opened_from_the_sidebar_or_source_control(cx: &mut gpui::Te
     // One commit: its subject and body to start from.
     let title = cx.debug_bounds("pr-new-title").expect("the title box");
     let _ = title;
+    // Preview shows the description as it will read on GitHub, Write the box again.
+    click(cx, "md-tab-preview");
+    let _ = at(cx, "md-preview");
+    assert!(cx.debug_bounds("pr-new-body").is_none());
+    click(cx, "md-tab-write");
+    let _ = at(cx, "pr-new-body");
     assert_eq!(view.read_with(cx, |v, cx| v.form_text(cx)), Some(("Add the b file".into(), "Because b matters.".into())));
     // The sidebar's + opens the same form, not a second one.
     click(cx, "act-prs");
@@ -866,7 +878,7 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
         sh(dir, "git init -q --bare ../$(basename $PWD)-remote.git");
         sh(dir, INIT);
         sh(dir, "echo a > a.txt && git add . && git commit -qm one && git remote add origin ../$(basename $PWD)-remote.git && git push -q -u origin main");
-        sh(dir, "git switch -qc login && echo login > login.txt && git add . && git commit -qm 'Login page' && git push -q origin login:refs/pull/7/head && git switch -q main && git branch -qD login");
+        sh(dir, "git switch -qc login && printf 'login\\nform\\nbutton\\n' > login.txt && git add . && git commit -qm 'Login page' && git push -q origin login:refs/pull/7/head && git switch -q main && git branch -qD login");
         fake_gh();
     });
     let dir = root(&ws, cx);
@@ -906,15 +918,19 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     settle(&ws, cx);
     assert!(pr.read_with(cx, |p, _| p.diff.is_some()));
 
-    // A commit picked in Commits: the tree shows only its files, until "Show all".
+    // A commit picked in Commits opens there: its files and their diff, until Back.
     click(cx, "pr-tab-commits");
     let sha = git_out(&dir, &["rev-parse", "--short=7", "refs/oskl/pr/7"]);
     click(cx, &format!("pr-commit-{sha}"));
     settle(&ws, cx);
-    assert!(pr.read_with(cx, |p, _| p.commit.is_some() && matches!(p.shown_files(), Some(Ok(f)) if f.list.len() == 1)));
-    let _ = at(cx, "pr-commit-chip");
-    click(cx, "pr-all-commits");
-    assert!(pr.read_with(cx, |p, _| p.commit.is_none()));
+    assert!(pr.read_with(cx, |p, _| p.commit.is_some() && p.tab == crate::git_panel::pr::Tab::Commits && matches!(p.shown_files(), Some(Ok(f)) if f.list.len() == 1)));
+    click(cx, "pr-file-login.txt");
+    settle(&ws, cx);
+    assert!(pr.read_with(cx, |p, _| p.diff.is_some()));
+    click(cx, "pr-commit-back");
+    assert!(pr.read_with(cx, |p, _| p.commit.is_none() && p.diff.is_none()));
+    let _ = at(cx, &format!("pr-commit-{sha}"));
+    click(cx, "pr-tab-files");
 
     // The filter lists matching files flat.
     click(cx, "pr-files-filter");
@@ -923,17 +939,123 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     click(cx, "pr-file-login.txt");
     settle(&ws, cx);
 
-    // A comment on the diff's line, then an approval, from the Review dropdown.
-    click(cx, "pr-review");
-    click(cx, "pr-input");
+    // The + on a line opens a box under it, below the comment already there: a single
+    // comment goes at once.
+    let _ = at(cx, "pr-thread-login.txt-1");
+    click(cx, "diff-comment-new-1");
+    settle(&ws, cx);
+    click(cx, "pr-line-input");
     cx.simulate_input("Looks right");
-    click(cx, "pr-comment-line");
+    click(cx, "pr-line-single");
     settle(&ws, cx);
     assert!(log().contains("path=login.txt") && log().contains("line=1") && log().contains("body=Looks right"), "{}", log());
-    click(cx, "pr-review");
-    click(cx, "pr-approve");
+    // Start a review on lines 1 to 3 (Shift-click a second +): the comment waits, shown under
+    // them, and kept on disk ...
+    click(cx, "diff-comment-new-1");
     settle(&ws, cx);
-    assert!(log().contains("pr review 7 --approve"), "{}", log());
+    // Shift-click a second + ...
+    let third = at(cx, "diff-comment-new-3");
+    cx.simulate_click(third, gpui::Modifiers::shift());
+    settle(&ws, cx);
+    assert_eq!(pr.read_with(cx, |p, _| p.line_box.as_ref().map(|b| (b.start, b.line))), Some((Some(1), 3)));
+    // ... or press one + and drag down over the others.
+    click(cx, "pr-line-cancel");
+    let (first, third) = (at(cx, "diff-comment-new-1"), at(cx, "diff-comment-new-3"));
+    cx.simulate_mouse_down(first, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.simulate_mouse_move(third, Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+    cx.simulate_mouse_up(third, gpui::MouseButton::Left, gpui::Modifiers::none());
+    settle(&ws, cx);
+    assert_eq!(pr.read_with(cx, |p, _| p.line_box.as_ref().map(|b| (b.start, b.line))), Some((Some(1), 3)));
+    assert_eq!(pr.read_with(cx, |p, cx| p.diff.as_ref().and_then(|d| d.read(cx).marked)), Some((true, 1, 3)), "the lines are tinted");
+    click(cx, "pr-line-input");
+    cx.simulate_input("Rename this");
+    click(cx, "pr-line-review");
+    settle(&ws, cx);
+    assert_eq!(pr.read_with(cx, |p, _| p.pending.len()), 1);
+    let _ = at(cx, "pr-pending-del-0");
+    let kept = git_out(&dir, &["rev-parse", "--git-path", "oskl/review-7.json"]);
+    assert!(std::fs::read_to_string(dir.join(&kept)).unwrap().contains("Rename this"));
+    // One left from before on a line GitHub wouldn't take: it goes into the review's text.
+    pr.update(cx, |p, _| p.pending.push(crate::git::gh::DraftComment { path: "login.txt".into(), line: 50, new_side: true, body: "Far away".into(), start_line: None }));
+    // ... until Finish your review sends it with the approval.
+    click(cx, "pr-review");
+    let _ = at(cx, "pr-pending-0");
+    click(cx, "pr-kind-approve");
+    click(cx, "pr-submit-review");
+    settle(&ws, cx);
+    assert!(log().contains("pulls/7/reviews --input"), "{}", log());
+    assert!(log().contains(r#""event":"APPROVE""#) && log().contains(r#""body":"Rename this""#) && log().contains(r#""side":"RIGHT""#), "{}", log());
+    assert!(log().contains(r#""start_line":1"#) && log().contains(r#""line":3"#), "{}", log());
+    assert!(log().contains("`login.txt:50`: Far away") && !log().contains(r#""line":50"#), "{}", log());
+    assert_eq!(pr.read_with(cx, |p, _| p.pending.len()), 0);
+    assert!(!dir.join(&kept).exists(), "nothing pending left");
+
+    // The conversation: its checks (each a link to its run), whether it merges, a comment box
+    // with its preview.
+    click(cx, "pr-tab-conversation");
+    settle(&ws, cx);
+    let _ = at(cx, "pr-check-CI / build");
+    let _ = at(cx, "pr-check-CI / lint");
+    let _ = at(cx, "pr-merge-state");
+    // (scrolled down to the box first)
+    let page = at(cx, "pr-conversation");
+    cx.simulate_event(gpui::ScrollEvent { position: page, delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-5000.))), ..Default::default() });
+    cx.run_until_parked();
+    click(cx, "pr-comment-input");
+    cx.simulate_input("Ship it");
+    click(cx, "md-tab-preview");
+    let _ = at(cx, "md-preview");
+    // ⌘Enter twice (or two clicks) sends it once.
+    pr.update(cx, |p, cx| {
+        p.post_comment(cx);
+        p.post_comment(cx);
+    });
+    settle(&ws, cx);
+    assert_eq!(log().matches("pr comment 7 --body Ship it").count(), 1, "{}", log());
+
+    // Commits grouped, the force push, bob's review with his thread under it (back up top).
+    cx.simulate_event(gpui::ScrollEvent { position: page, delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(5000.))), ..Default::default() });
+    cx.run_until_parked();
+    let _ = at(cx, &format!("pr-timeline-commit-{sha}"));
+    let _ = at(cx, "pr-force-push-0");
+    // Resolve the thread; edit my own comment (Cancel leaves it, Update comment sends it).
+    click(cx, "pr-resolve-101");
+    settle(&ws, cx);
+    assert!(log().contains("resolveReviewThread") && log().contains("id=T_1"), "{}", log());
+    assert!(cx.debug_bounds("pr-edit-IC_1").is_none(), "not mine");
+    click(cx, "pr-edit-IC_2");
+    let _ = at(cx, "pr-edit-input");
+    click(cx, "pr-edit-cancel");
+    assert!(pr.read_with(cx, |p, _| p.editing.is_none()));
+    click(cx, "pr-edit-IC_2");
+    click(cx, "pr-edit-save");
+    settle(&ws, cx);
+    assert!(log().contains("updateIssueComment") && log().contains("id=IC_2"), "{}", log());
+
+    // Merge: the arrow offers the ways the repository allows; Squash and merge asks for the
+    // commit's message, as GitHub suggests it.
+    let page = at(cx, "pr-conversation");
+    cx.simulate_event(gpui::ScrollEvent { position: page, delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-5000.))), ..Default::default() });
+    cx.run_until_parked();
+    click(cx, "pr-merge-choose");
+    let _ = at(cx, "pr-merge-how-merge");
+    assert!(cx.debug_bounds("pr-merge-how-rebase").is_none(), "not allowed here");
+    click(cx, "pr-merge-how-squash");
+    click(cx, "pr-merge");
+    let _ = at(cx, "pr-merge-subject");
+    click(cx, "pr-merge-cancel");
+    assert!(pr.read_with(cx, |p, _| !p.merging && p.merge_how == "squash"));
+    click(cx, "pr-merge");
+    click(cx, "pr-merge-confirm");
+    settle(&ws, cx);
+    assert!(log().contains("pr merge 7 --squash --subject Login page (#7) --body * Login page"), "{}", log());
+    cx.simulate_event(gpui::ScrollEvent { position: page, delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-5000.))), ..Default::default() });
+    cx.run_until_parked();
+
+    // Close pull request, beside Comment.
+    click(cx, "pr-close");
+    settle(&ws, cx);
+    assert!(log().contains("pr close 7"), "{}", log());
 
     // Checked out, the Git tab shows its chip, which comes back to this review's tab.
     click(cx, "pr-checkout");
