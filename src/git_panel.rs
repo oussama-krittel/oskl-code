@@ -1948,11 +1948,16 @@ struct CommitCard {
 
 impl Render for CommitCard {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // A set width (from the longest line, up to 420): with only a maximum, the height is
+        // measured for the text on one line and the wrapped lines run out below the card.
+        let longest = self.subject.chars().count().max(self.body.lines().map(|l| l.chars().count()).max().unwrap_or(0)).max(self.author.chars().count() + self.when.chars().count() + 12);
+        let width = (longest as f32 * 7. + 24.).clamp(200., 420.);
         div()
+            .debug_selector(|| "commit-card".into())
             .flex()
             .flex_col()
             .gap(px(6.))
-            .max_w(px(420.))
+            .w(px(width))
             .px(px(10.))
             .py(px(8.))
             .bg(theme::bg_popup())
@@ -1972,8 +1977,8 @@ impl Render for CommitCard {
                     .child(self.when.clone())
                     .child(div().font_family(theme::MONO_FONT).child(self.short.clone())),
             )
-            .child(div().text_color(theme::fg_bright()).child(self.subject.clone()))
-            .when(!self.body.is_empty(), |d| d.child(div().text_color(theme::fg_dim()).child(self.body.clone())))
+            .child(div().w_full().text_color(theme::fg_bright()).debug_selector(|| "commit-card-subject".into()).child(self.subject.clone()))
+            .when(!self.body.is_empty(), |d| d.child(div().w_full().text_color(theme::fg_dim()).debug_selector(|| "commit-card-body".into()).child(self.body.clone())))
             .with_animation("commit-card", Animation::new(std::time::Duration::from_millis(120)).with_easing(ease_out_quint()), |d, t| d.opacity(t))
     }
 }

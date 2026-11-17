@@ -7554,6 +7554,36 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn a_long_commit_message_stays_inside_its_hover_card(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            let long = "word ".repeat(40);
+            sh(&format!("echo a > a.txt && git add . && git commit -qm 'A subject long enough to need more than one line in the card, {long}' -m 'And a body: {long}'"));
+        });
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
+        cx.run_until_parked();
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let row: &'static str = Box::leak(format!("commit-row-{}", git_out(&root, &["rev-parse", "--short", "HEAD"])).into_boxed_str());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let at = cx.debug_bounds(row).expect("the commit's row").center();
+        cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+        cx.executor().advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let card = cx.debug_bounds("commit-card").expect("the hover card");
+        for part in ["commit-card-subject", "commit-card-body"] {
+            let b = cx.debug_bounds(part).expect(part);
+            assert!(b.right() <= card.right() && b.bottom() <= card.bottom(), "{part} {b:?} inside {card:?}");
+        }
+        assert!(cx.debug_bounds("commit-card-body").unwrap().size.height > gpui::px(30.), "the body wraps onto lines of its own");
+    }
+
+    #[gpui::test]
     fn graph_commits_expand_to_their_files_and_open_on_double_click(cx: &mut TestAppContext) {
         let (ws, cx) = setup_with(cx, |dir| {
             let sh = |cmd: &str| {
