@@ -197,7 +197,7 @@ impl CommitView {
         let subs = vec![cx.subscribe(&title, changed), cx.subscribe(&body, changed)];
         let preview = {
             let (body, root) = (body.clone(), view.root.clone());
-            cx.new(|cx| crate::md_preview::MdPreview::new(body, root, cx))
+            cx.new(|cx| crate::md_preview::MdPreview::new(body, root, 320., "pr-new-body", cx))
         };
         view.create = Some(PrForm { title, body, preview, draft: false, busy: false, error: None, existing: None, suggested: Default::default(), _subs: subs, _task: None });
         let (r, h) = (view.root.clone(), head.clone());
@@ -330,15 +330,11 @@ impl CommitView {
                 .flex()
                 .flex_col()
                 .gap(px(8.))
-                .max_w(px(1100.))
+                .max_w(px(900.))
                 // Clicks in the form stay in its boxes (the page would take the keyboard).
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(field(f.title.clone(), "pr-new-title"))
-                .child(crate::md_preview::side_by_side(
-                    div().debug_selector(|| "pr-new-body".into()).size_full().p(px(6.)).bg(theme::bg_input()).child(f.body.clone()).into_any_element(),
-                    f.preview.clone(),
-                    200.,
-                ))
+                .child(f.preview.clone())
                 .child(
                     div()
                         .flex()

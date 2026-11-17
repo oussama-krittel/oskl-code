@@ -1352,19 +1352,6 @@ impl GitPanel {
                             panel.stage(p.clone(), cx);
                         })))
                 };
-                let tree = self.as_tree;
-                let actions = actions.when(!staged && !*conflicts, |d| {
-                    d.child(
-                        ui::icon_button("changes-view", if tree { "list-flat" } else { "list-tree" })
-                            .debug_selector(|| "changes-view".into())
-                            .tooltip(ui::tooltip(if tree { "View as list" } else { "View as tree" }))
-                            .on_click(cx.listener(|panel, _, _, cx| {
-                                cx.stop_propagation();
-                                panel.as_tree = !panel.as_tree;
-                                cx.notify();
-                            })),
-                    )
-                });
                 let section_sel = format!("changes-section-{ix}");
                 div()
                     .id(("section", ix))
@@ -2008,11 +1995,18 @@ impl Render for GitPanel {
                 div()
                     .flex()
                     .gap(px(1.))
-                    .child(ui::icon_button("hdr-commit", "check").on_click(cx.listener(|p, _, w, cx| {
-                        cx.stop_propagation();
-                        let amend = p.amend;
-                        p.commit(None, false, amend, w, cx);
-                    })))
+                    // Staged and unstaged changes alike, as a tree or a list.
+                    .child({
+                        let tree = self.as_tree;
+                        ui::icon_button("changes-view", if tree { "list-flat" } else { "list-tree" })
+                            .debug_selector(|| "changes-view".into())
+                            .tooltip(ui::tooltip(if tree { "View as list" } else { "View as tree" }))
+                            .on_click(cx.listener(|panel, _, _, cx| {
+                                cx.stop_propagation();
+                                panel.as_tree = !panel.as_tree;
+                                cx.notify();
+                            }))
+                    })
                     .child(ui::icon_button("hdr-refresh", "refresh").on_click(cx.listener(|p, _, _, cx| {
                         cx.stop_propagation();
                         p.repo.update(cx, |r, cx| r.refresh_all(cx));
