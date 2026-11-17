@@ -1585,12 +1585,17 @@ impl GitPanel {
                             .bg(theme::bg_input())
                             .border_1()
                             .border_color(if input_focused { theme::focus_border() } else { theme::border_input() })
-                            .child(self.commit_input.clone()),
+                            // Draft sits inside the box, top right, beside the message.
+                            .debug_selector(|| "commit-box".into())
+                            .flex()
+                            .items_start()
+                            .gap(px(4.))
+                            .child(div().flex_1().min_w_0().child(self.commit_input.clone()))
+                            .child(git::draft::button("commit-draft", self.drafter.running()).border_0().h(px(20.)).px(px(6.)).on_click(cx.listener(|panel, _, _, cx| {
+                                let root = panel.repo.read(cx).root.clone();
+                                panel.drafter.toggle(root, &panel.commit_input, cx);
+                            }))),
                     )
-                    .child(div().flex().justify_end().child(git::draft::button("commit-draft", self.drafter.running()).on_click(cx.listener(|panel, _, _, cx| {
-                        let root = panel.repo.read(cx).root.clone();
-                        panel.drafter.toggle(root, &panel.commit_input, cx);
-                    }))))
                     .child(
                         div()
                             .flex()

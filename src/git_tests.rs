@@ -1321,6 +1321,10 @@ fn claude_drafts_the_commit_message_and_can_be_stopped(cx: &mut gpui::TestAppCon
     let draft = cx.debug_bounds("commit-draft").expect("the button");
     let edge = gpui::px((super::ACTIVITY_W + 180.) * crate::ui::scale());
     assert!(draft.right() <= edge && draft.left() >= gpui::px(0.), "{draft:?} inside {edge:?}");
+    // Inside the message box, on its right, beside the message rather than under it.
+    let bx = cx.debug_bounds("commit-box").expect("the message box");
+    assert!(draft.left() > bx.left() && draft.right() <= bx.right() && draft.top() >= bx.top() && draft.bottom() <= bx.bottom(), "{draft:?} in {bx:?}");
+    assert!(draft.right() > bx.right() - gpui::px(12.), "at the right edge: {draft:?} in {bx:?}");
 }
 
 #[gpui::test]
