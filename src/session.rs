@@ -15,8 +15,12 @@ pub enum LayoutState {
 pub enum ItemState {
     File { path: PathBuf, row: usize, col: usize },
     Terminal { cwd: PathBuf },
-    /// A Claude chat, and its Claude Code session.
-    Agent { session: Option<String> },
+    /// An agent chat: its session, and the agent (an `acp::AGENTS` id; empty in older saves: Claude).
+    Agent {
+        session: Option<String>,
+        #[serde(default)]
+        agent: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -50,6 +54,9 @@ pub struct Session {
     pub space: usize,
     #[serde(default)]
     pub first_space_name: Option<String>,
+    /// The title bar's tint (0xRRGGBB), to tell this project's window apart.
+    #[serde(default)]
+    pub window_color: Option<u32>,
 }
 
 /// A space besides the first: its name and color, its splits and their items, its sidebar.
@@ -176,6 +183,7 @@ mod tests {
             spaces: vec![super::SpaceSession { name: "DB".into(), color: 2, layout: LayoutState::Pane(0), panes: vec![PaneState::default()], focused: 0, side: "databases".into(), side_visible: true }],
             space: 1,
             first_space_name: Some("Code".into()),
+            window_color: Some(0x3f8f8a),
         };
         let text = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<Session>(&text).unwrap(), s);

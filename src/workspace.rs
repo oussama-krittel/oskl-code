@@ -32,6 +32,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+// Go to symbol, the problems panel and the change peek's diff: new code kept out of this file.
+#[path = "code_nav.rs"]
+mod code_nav;
+
+// The window's shell: title bar, breadcrumb, start screens, zen mode, the ⌘K hints.
+#[path = "shell.rs"]
+mod shell;
+
 actions!(
     workspace,
     [
@@ -48,7 +56,7 @@ actions!(
         Buffer1, Buffer2, Buffer3, Buffer4, Buffer5, Buffer6, Buffer7, Buffer8, Buffer9,
         Space1, Space2, Space3, Space4, Space5, Space6, Space7, Space8, Space9,
         ToSpace1, ToSpace2, ToSpace3, ToSpace4, ToSpace5, ToSpace6, ToSpace7, ToSpace8, ToSpace9,
-        LastSpace, NextSpace, PrevSpace, NewSpace, CloseSpace, SpaceOverview,
+        LastSpace, NextSpace, PrevSpace, NewSpace, CloseSpace, SpaceOverview, ToggleZen, ExitZen, GoToSymbol,
     ]
 );
 
@@ -57,6 +65,7 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-p", FindFile, None),
         crate::keybindings::kb("cmd-;", CommandPalette, None),
         crate::keybindings::kb("cmd-shift-p", CommandPalette, None),
+        crate::keybindings::kb("cmd-shift-o", GoToSymbol, None),
         crate::keybindings::kb("cmd-f", FindInFile, None),
         crate::keybindings::kb("alt-cmd-f", FindReplaceInFile, None),
         crate::keybindings::kb("alt-z", ToggleWordWrap, None),
@@ -101,6 +110,8 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-k n", NewSpace, None),
         crate::keybindings::kb("cmd-k w", CloseSpace, None),
         crate::keybindings::kb("cmd-k o", SpaceOverview, None),
+        crate::keybindings::kb("cmd-k z", ToggleZen, None),
+        crate::keybindings::kb("escape", ExitZen, Some("Workspace && zen")),
         crate::keybindings::kb("cmd-alt-enter", ZoomPane, None),
         crate::keybindings::kb("cmd-0", FocusSidebar, None),
         // Directions: arrows, or j ← · k ↓ · l ↑ · ; → (home row).
@@ -194,8 +205,6 @@ pub fn bind_keys() {
 
 const ACTIVITY_W: f32 = 40.;
 const STATUS_H: f32 = 22.;
-/// Height kept clear for the macOS window buttons (close / minimize / zoom) at the top-left.
-const LIGHTS_H: f32 = 30.;
 /// How wide the sidebar's resize edge is to grab (real pixels, centered on its line).
 const GRAB_W: f32 = 12.;
 /// Width the window buttons take from the left edge.
@@ -216,6 +225,8 @@ enum Side {
     Api,
     /// Claude Code: sessions, usage, skills, MCP servers…
     Claude,
+    /// The repository's pull requests (`gh`), reviewed in their own tab.
+    Prs,
     /// Settings, and its Shortcuts tab (the shortcuts list).
     Settings,
     Keys,
@@ -227,6 +238,8 @@ enum CmdMode {
     Search,
     Files,
     Buffers,
+    /// The symbols (functions, types…) of the file in the active pane.
+    Symbols,
     /// Picking the branch to compare `compare_from` to.
     CompareTo,
 }
@@ -250,6 +263,9 @@ enum TabKind {
     Db(Entity<crate::db_view::DbView>),
     Api(Entity<crate::api_view::ApiView>),
     Agent(Entity<crate::agent_view::AgentView>),
+    Git(Entity<crate::git_panel::view::GitView>),
+    /// A pull request's review.
+    Pr(Entity<crate::git_panel::pr::PrView>),
 }
 
 /// What the find bar (⌘F) searches: a text editor, or a read-only diff.
@@ -405,6 +421,7 @@ fn side_name(s: Side) -> &'static str {
         Side::Databases => "databases",
         Side::Api => "api",
         Side::Claude => "claude",
+        Side::Prs => "prs",
         Side::Settings => "settings",
         Side::Keys => "keys",
     }
@@ -417,6 +434,7 @@ fn side_of(name: &str) -> Side {
         "databases" => Side::Databases,
         "api" => Side::Api,
         "claude" => Side::Claude,
+        "prs" => Side::Prs,
         "keys" => Side::Keys,
         "settings" => Side::Settings,
         _ => Side::Files,
@@ -505,6 +523,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("sync", "Pull then push: sync (rebase) | sync merge", true),
     ("compare", "Compare branches: compare <branch> (with the current one) or compare <base> <branch>", true),
     ("abort", "Abort the merge / rebase / cherry-pick in progress", false),
+    ("undo-git", "Undo the last git action: commit, amend, reset, merge, rebase, stash, branch delete, discard, fix up", false),
     ("stash", "git stash (stash pop to restore)", false),
     ("graph", "Graph scope: graph all | graph auto", true),
     ("open", "Open a folder in this window: open <dir> (⌘O for a picker)", true),
@@ -529,6 +548,8 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("space", "Spaces: space new [name] · rename <name> · close · move <n> · <n> (⌃1–9 go, ⌃⌥1–9 move, ⌘K O overview)", true),
     ("only", "Close all other panes", false),
     ("max", "Maximize / restore this pane (⌘⌥Enter)", false),
+    ("window-color", "Tint this window's title bar: window-color <#rrggbb or a name: blue, teal, green, amber, clay, rose, violet, gray> · off", true),
+    ("zen", "Zen mode: hide everything but the editor (⌘K Z); again, or Esc, brings it back", false),
     ("buffers", "Files open in this pane (⌘E)", false),
     ("git", "Run any git command: git <args>", true),
     ("!", "Run a shell command: !<command>", true),
@@ -555,6 +576,7 @@ pub struct Workspace {
     db_panel: Entity<crate::db_panel::DbPanel>,
     api_panel: Entity<crate::api_panel::ApiPanel>,
     claude_panel: Entity<crate::claude_panel::ClaudePanel>,
+    pr_panel: Entity<crate::pr_panel::PrPanel>,
     search: Entity<SearchPanel>,
     keys: Entity<KeysPanel>,
     settings: Settings,
@@ -594,6 +616,9 @@ pub struct Workspace {
     find_on: Option<(usize, FindOn)>,
     message: Option<(String, bool)>,
     message_task: Option<Task<()>>,
+    /// The toast offering Undo for the last git action: its repository and what happened.
+    undo_toast: Option<(Entity<Repo>, String)>,
+    undo_toast_task: Option<Task<()>>,
     recent: Vec<PathBuf>,
     font_size: f32,
     blame_default: bool,
@@ -643,6 +668,7 @@ pub struct Workspace {
     zoomed: bool,
     /// Extra left padding for the top-left pane's header so the window buttons don't cover it.
     lights_pad: f32,
+    shell: shell::Shell,
     pane_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
     split_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     dragging_split: Option<String>,
@@ -671,6 +697,7 @@ impl Workspace {
         let db_panel = cx.new(|cx| crate::db_panel::DbPanel::new(vec![db_root.clone()], cx));
         let api_panel = cx.new(|cx| crate::api_panel::ApiPanel::new(if root_is_project(&db_root) { vec![db_root] } else { Vec::new() }, cx));
         let claude_panel = cx.new(|cx| crate::claude_panel::ClaudePanel::new(repo.read(cx).root.clone(), window, cx));
+        let pr_panel = cx.new(crate::pr_panel::PrPanel::new);
         let cmd = cx.new(|cx| Editor::new(EditorMode::SingleLine, cx));
         let search = cx.new(|cx| SearchPanel::new(repo.clone(), window, cx));
         let keys = cx.new(|cx| KeysPanel::new(window, cx));
@@ -684,6 +711,7 @@ impl Workspace {
         let mut settings = Settings::load();
         crate::editor::set_word_wrap(settings.word_wrap);
         crate::editor::set_minimap(settings.minimap);
+        crate::editor::set_diff_changes_only(settings.diff_changes_only);
         if has_project {
             settings.add_recent(repo.read(cx).root.clone());
             settings.save();
@@ -695,9 +723,11 @@ impl Workspace {
             }),
             cx.subscribe_in(&tree, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&git_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
+            cx.subscribe_in(&git_panel.read(cx).refs.clone(), window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&db_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&api_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&claude_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
+            cx.subscribe_in(&pr_panel, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
             cx.subscribe_in(&cmd, window, |ws, _, ev: &EditorEvent, window, cx| ws.on_cmd_event(ev, window, cx)),
         ];
         let project = repo.read(cx).root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -714,6 +744,7 @@ impl Workspace {
             db_panel,
             api_panel,
             claude_panel,
+            pr_panel,
             search,
             keys,
             tabs: Vec::new(),
@@ -748,6 +779,8 @@ impl Workspace {
             find_on: None,
             message: None,
             message_task: None,
+            undo_toast: None,
+            undo_toast_task: None,
             recent: Vec::new(),
             font_size: settings.font_size,
             blame_default: settings.blame_default,
@@ -791,6 +824,7 @@ impl Workspace {
             next_id: 1,
             zoomed: false,
             lights_pad: 0.,
+            shell: Default::default(),
             pane_bounds: Default::default(),
             split_bounds: Default::default(),
             dragging_split: None,
@@ -828,6 +862,7 @@ impl Workspace {
         // Full screen on or off: the window buttons come or go, and what's beside them makes room
         // (or takes it back) at once, not on the next click.
         ws.extra_subs.push(cx.observe_window_bounds(window, |_, _, cx| cx.notify()));
+        ws.extra_subs.push(cx.observe_pending_input(window, |ws, window, cx| ws.chord_changed(window, cx)));
         register_workspace(cx.entity().downgrade());
         window.focus(&ws.tree.read(cx).focus_target(cx), cx);
         ws
@@ -916,13 +951,14 @@ impl Workspace {
 
     fn subscribe_repo(&self, repo: &Entity<Repo>, window: &mut Window, cx: &mut Context<Self>) -> [Subscription; 2] {
         [
-            cx.subscribe_in(repo, window, |ws, _, ev: &RepoEvent, window, cx| match ev {
+            cx.subscribe_in(repo, window, |ws, repo, ev: &RepoEvent, window, cx| match ev {
                 RepoEvent::PushRejected => {
                     // The remote moved on: Enter pulls (rebase) then pushes; "sync merge" merges instead.
                     ws.open_cmd(CmdMode::Command, "sync", window, cx);
                     ws.flash("Push rejected: the remote has new commits. Enter = pull --rebase then push · sync merge = merge instead".into(), true, cx);
                 }
                 RepoEvent::Message(m) => ws.flash(m.clone(), false, cx),
+                RepoEvent::Undoable(m) => ws.offer_undo(repo.clone(), m.clone(), cx),
                 RepoEvent::Error(e) => ws.flash(e.clone(), true, cx),
                 RepoEvent::Output { title, text, ok } => {
                     ws.show_output(title.clone(), text, !*ok, cx);
@@ -1013,6 +1049,92 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A toast with Undo for the last git action (it stays a few seconds; `:undo-git` still works after).
+    fn offer_undo(&mut self, repo: Entity<Repo>, msg: String, cx: &mut Context<Self>) {
+        self.undo_toast = Some((repo, msg));
+        self.undo_toast_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(7)).await;
+            this.update(cx, |ws, cx| {
+                ws.undo_toast = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Takes back the last git action of the repository the toast is about (else the current one).
+    fn undo_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repo = self.undo_toast.take().map(|t| t.0).unwrap_or_else(|| self.git.clone());
+        self.undo_toast_task = None;
+        cx.notify();
+        let Some((label, ask_first)) = repo.read(cx).undo_state() else {
+            return self.flash("Nothing to undo yet: commit, discard or stash something first".into(), false, cx);
+        };
+        if !ask_first {
+            return repo.update(cx, |r, cx| r.undo_last(false, cx));
+        }
+        self.open_ask(
+            crate::dialog::Ask {
+                title: format!("Undo \"{label}\"?"),
+                detail: "You have uncommitted changes, and undoing replaces the files. They go into a stash first, so nothing is lost.".into(),
+                buttons: vec!["Stash and Undo".into()],
+                danger: false,
+                cancel_default: false,
+                cancel_label: None,
+                on_answer: std::rc::Rc::new(move |_, _, cx| {
+                    repo.update(cx, |r, cx| r.undo_last(true, cx));
+                }),
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn render_undo_toast(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, msg) = self.undo_toast.as_ref()?;
+        Some(
+            div()
+                .absolute()
+                .bottom(px(STATUS_H + 12.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .px(px(10.))
+                .child(
+                    div()
+                        .id("undo-toast")
+                        .debug_selector(|| "undo-toast".into())
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .max_w_full()
+                        .px(px(12.))
+                        .py(px(6.))
+                        .rounded(px(8.))
+                        .bg(theme::bg_popup())
+                        .border_1()
+                        .border_color(theme::border_input())
+                        .shadow_lg()
+                        .text_color(theme::fg_bright())
+                        .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(msg.clone()))
+                        .child(
+                            div()
+                                .id("undo-button")
+                                .debug_selector(|| "undo-button".into())
+                                .flex_none()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::accent())
+                                .cursor_pointer()
+                                .child("Undo")
+                                .on_click(cx.listener(|ws, _, window, cx| ws.undo_git(window, cx))),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The lines of the output shown.
     fn output(&self) -> &[OutputLine] {
         self.outputs.get(self.output_shown).map(|e| e.lines.as_slice()).unwrap_or(&[])
@@ -1054,6 +1176,7 @@ impl Workspace {
         }
         self.output_shown = self.outputs.len() - 1;
         self.output_visible = true;
+        self.shell.problems = false;
         self.output_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.output_sel = 0;
         cx.notify();
@@ -1111,6 +1234,19 @@ impl Workspace {
                 let base = base.clone().unwrap_or_else(|| self.git.read(cx).branch_label());
                 self.open_compare(base, other.clone(), window, cx);
             }
+            Request::OpenGitTab(root) => self.open_git_tab(root.clone(), window, cx),
+            Request::OpenPr(root, n) => self.open_pr_tab(root.clone(), *n, window, cx),
+            Request::OpenMergeEditor(path) => self.open_merge_editor(path.clone(), window, cx),
+            Request::FileHistory(path) => {
+                let root = self.repo_for(path, cx).read(cx).root.clone();
+                if self.git.read(cx).root != root {
+                    self.select_repo(&root, window, cx);
+                }
+                let rel = path.strip_prefix(&root).ok().map(|p| p.to_string_lossy().to_string());
+                self.git_panel.update(cx, |p, cx| p.show_history(rel, cx));
+                self.side_visible = true;
+                self.show_git(&ShowGit, window, cx);
+            }
             Request::OpenFile { path, line, preview } => self.open_file(path.clone(), *line, *preview, window, cx),
             Request::ShowFile(path) => {
                 self.keep_focus = true;
@@ -1142,21 +1278,29 @@ impl Workspace {
                 self.settings.blame_default = *on;
                 self.settings.save();
             }
+            Request::ChangesOnlyShown(on) => {
+                let on = *on;
+                crate::editor::set_diff_changes_only(on);
+                self.settings.diff_changes_only = on;
+                self.settings.save();
+                // Every open diff, in every window, follows (this one included).
+                cx.defer(move |cx| {
+                    for w in cx.windows() {
+                        if let Some(ws) = w.downcast::<Workspace>() {
+                            ws.update(cx, |ws, _, cx| ws.set_diffs_changes_only(on, cx)).ok();
+                        }
+                    }
+                });
+            }
             Request::CommandLine(text) => self.open_cmd(CmdMode::Command, text, window, cx),
             Request::Moved { from, to } => self.path_moved(from, to, cx),
             Request::Deleted(paths) => self.paths_deleted(paths, window, cx),
             Request::Ask(ask) => self.open_ask(ask.clone(), window, cx),
             Request::OpenTerminal(dir) => self.open_terminal_in(dir.clone(), None, window, cx),
             Request::RunInTerminal { dir, command } => self.open_terminal_in(dir.clone(), Some(command.clone()), window, cx),
-            Request::ForkChat { session, uuid } => {
-                self.open_agent(true, Some(session.clone()), window, cx);
-                if let Some(TabKind::Agent(v)) = self.active.map(|a| &self.tabs[a].kind) {
-                    v.update(cx, |v, _| v.fork_from(uuid.clone()));
-                }
-            }
             Request::OpenChat(session) => match session.as_ref().and_then(|id| self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Agent(v) if v.read(cx).session().as_ref() == Some(id)))) {
                 Some(ix) => self.activate(ix, window, cx),
-                None => self.open_agent(true, session.clone(), window, cx),
+                None => self.open_agent(true, session.as_ref().map(|_| "claude"), session.clone(), window, cx),
             },
             Request::SelectRepo(root) => self.select_repo(root, window, cx),
             Request::AddFolder => self.add_folder_prompt(window, cx),
@@ -1669,7 +1813,7 @@ impl Workspace {
                             e.path.clone().map(|path| ItemState::File { path, row, col })
                         }
                         TabKind::Terminal(t) => Some(ItemState::Terminal { cwd: t.read(cx).cwd.clone() }),
-                        TabKind::Agent(a) => Some(ItemState::Agent { session: a.read(cx).session() }),
+                        TabKind::Agent(a) => Some(ItemState::Agent { session: a.read(cx).session(), agent: a.read(cx).agent_id().into() }),
                         _ => None,
                     };
                     if let Some(item) = item {
@@ -1719,6 +1863,7 @@ impl Workspace {
             spaces,
             space: self.space,
             first_space_name: Some(self.spaces[0].name.clone()),
+            window_color: self.shell.color,
             side_w: self.side_w,
             folders: self.folders.iter().map(|f| f.read(cx).root.clone()).collect(),
             window: self.place.clone(),
@@ -1757,6 +1902,7 @@ impl Workspace {
             return;
         }
         let Some(saved) = crate::session::load(&self.root(cx)) else { return };
+        self.shell.color = saved.window_color;
         self.graph_scopes = saved.graph.clone();
         self.apply_graph_scopes(cx);
         for dir in saved.folders.iter().filter(|d| d.is_dir()) {
@@ -1831,8 +1977,8 @@ impl Workspace {
                         }
                         opened.push(self.active.map(|a| self.tabs[a].id));
                     }
-                    ItemState::Agent { session } => {
-                        self.open_agent(true, session.clone(), window, cx);
+                    ItemState::Agent { session, agent } => {
+                        self.open_agent(true, Some(agent.as_str()), session.clone(), window, cx);
                         opened.push(self.active.map(|a| self.tabs[a].id));
                     }
                     ItemState::Terminal { cwd } => {
@@ -2265,6 +2411,8 @@ impl Workspace {
             TabKind::Diff(d) => window.focus(&d.read(cx).focus_target(cx), cx),
             TabKind::DiffEdit(d) => window.focus(&d.read(cx).focus_target(cx), cx),
             TabKind::Commit(c) => window.focus(&c.read(cx).focus_target(cx), cx),
+            TabKind::Git(v) => window.focus(&v.read(cx).focus_target(cx), cx),
+            TabKind::Pr(v) => window.focus(&v.focus_handle(cx), cx),
             TabKind::Terminal(t) => window.focus(&t.read(cx).focus_target(cx), cx),
             TabKind::Merge(m) => window.focus(&m.read(cx).focus_target(cx), cx),
             TabKind::Preview(v) => window.focus(&v.read(cx).focus_target(cx), cx),
@@ -2349,6 +2497,8 @@ impl Workspace {
                 }
                 EditorEvent::OpenAt(t) => ws.open_definition(t.clone(), window, cx),
                 EditorEvent::Notice(msg) => ws.flash(msg.clone(), false, cx),
+                EditorEvent::OpenDiff => ws.open_changes_of(editor, window, cx),
+                EditorEvent::Cancel if ws.shell.zen => ws.set_zen(false, window, cx),
                 _ => {}
             });
             self.add_tab(TabKind::Editor(editor.clone()), sub, preview, window, cx);
@@ -2480,13 +2630,13 @@ impl Workspace {
     }
 
     /// ⌘Esc: the Claude chat (the one open, else a new one); `new` always starts another.
-    fn open_agent(&mut self, new: bool, session: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_agent(&mut self, new: bool, agent: Option<&str>, session: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         if !new && let Some(ix) = self.tabs.iter().rposition(|t| matches!(t.kind, TabKind::Agent(_))) {
             return self.activate(ix, window, cx);
         }
         let root = self.root(cx);
         let editor = self.agent_editor.clone();
-        let view = cx.new(|cx| crate::agent_view::AgentView::new(root, session, editor, window, cx));
+        let view = cx.new(|cx| crate::agent_view::AgentView::new(root, agent, session, editor, window, cx));
         let sub = cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx));
         self.add_tab(TabKind::Agent(view), sub, false, window, cx);
         cx.notify();
@@ -2502,7 +2652,7 @@ impl Workspace {
         let r = ed.buf.sel.range();
         let (a, b) = (ed.buf.pos_to_rc(r.start).0 + 1, ed.buf.pos_to_rc(r.end).0 + 1);
         let mention = if r.is_empty() { format!("@{rel} ") } else if a == b { format!("@{rel}#L{a} ") } else { format!("@{rel}#L{a}-{b} ") };
-        self.open_agent(false, None, window, cx);
+        self.open_agent(false, None, None, window, cx);
         if let Some(TabKind::Agent(v)) = self.active.map(|a| &self.tabs[a].kind) {
             v.clone().update(cx, |v, cx| v.insert(&mention, window, cx));
         }
@@ -2608,6 +2758,7 @@ impl Workspace {
                 }
                 EditorEvent::OpenAt(t) => ws.open_definition(t.clone(), window, cx),
                 EditorEvent::Notice(msg) => ws.flash(msg.clone(), false, cx),
+                EditorEvent::Cancel if ws.shell.zen => ws.set_zen(false, window, cx),
                 _ => {}
             });
             self.extra_subs.push(sub2);
@@ -2625,8 +2776,8 @@ impl Workspace {
         }
         let root = self.git_root(cx);
         let email = self.git.read(cx).user_email.clone();
-        let blame = self.blame_default;
-        let view = cx.new(|cx| DiffView::new(root, spec, email, blame, cx));
+        let (blame, font) = (self.blame_default, self.font_size);
+        let view = cx.new(|cx| DiffView::new(root, spec, email, blame, font, cx));
         let sub = cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx));
         self.add_tab(TabKind::Diff(view), sub, preview, window, cx);
     }
@@ -2648,6 +2799,42 @@ impl Workspace {
             ws.handle_request(req, window, cx)
         });
         self.add_tab(TabKind::Commit(view), sub, true, window, cx);
+    }
+
+    /// The Git tab of the repository at `root` (its tab if open).
+    fn open_git_tab(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Git(v) if v.read(cx).repo.read(cx).root == root)) {
+            return self.activate(ix, window, cx);
+        }
+        let repo = self.repos.iter().find(|r| r.read(cx).root == root).cloned().unwrap_or(self.git.clone());
+        let font = self.font_size;
+        let view = cx.new(|cx| crate::git_panel::view::GitView::new(repo, font, window, cx));
+        let refs = view.read(cx).refs.clone();
+        let sub = Subscription::join(
+            cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
+            cx.subscribe_in(&refs, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
+        );
+        self.add_tab(TabKind::Git(view), sub, false, window, cx);
+    }
+
+    /// Pull request `n` of the repository at `root`, reviewed in its own tab (its tab if open).
+    fn open_pr_tab(&mut self, root: PathBuf, n: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Pr(v) if v.read(cx).number == n && v.read(cx).repo.read(cx).root == root)) {
+            return self.activate(ix, window, cx);
+        }
+        let repo = self.repos.iter().find(|r| r.read(cx).root == root).cloned().unwrap_or(self.git.clone());
+        let font = self.font_size;
+        let view = cx.new(|cx| {
+            let mut v = crate::git_panel::pr::PrView::new(repo, n, cx);
+            v.font_size = font;
+            v
+        });
+        let sub = Subscription::join(
+            cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
+            // A review, a merge: the list shows it.
+            cx.subscribe(&view, |ws, _, _: &crate::git_panel::pr::PrEvent, cx| ws.pr_panel.update(cx, |p, cx| p.reload(cx))),
+        );
+        self.add_tab(TabKind::Pr(view), sub, false, window, cx);
     }
 
     /// "Resolve in Merge Editor" for a conflicted file.
@@ -2768,6 +2955,8 @@ impl Workspace {
                 (d.title(), d.spec.path.clone(), d.right.read(cx).buf.is_dirty())
             }
             TabKind::Commit(c) => (c.read(cx).title(), String::new(), false),
+            TabKind::Git(v) => (v.read(cx).title(cx), String::new(), false),
+            TabKind::Pr(v) => (format!("PR #{}", v.read(cx).number), String::new(), false),
             TabKind::Merge(m) => {
                 let m = m.read(cx);
                 (m.title(), m.rel.clone(), m.result.read(cx).buf.is_dirty())
@@ -2916,6 +3105,7 @@ impl Workspace {
             Side::Databases => window.focus(&self.db_panel.read(cx).focus_target(cx), cx),
             Side::Api => window.focus(&self.api_panel.read(cx).focus_target(cx), cx),
             Side::Claude => window.focus(&self.claude_panel.read(cx).focus_target(cx), cx),
+            Side::Prs => window.focus(&self.pr_panel.read(cx).focus_target(cx), cx),
             Side::Search => {
                 let query = self.search.read(cx).query.clone();
                 query.update(cx, |q, cx| {
@@ -2941,6 +3131,10 @@ impl Workspace {
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
+        // In zen mode it is the way back to the sidebar, not a second toggle.
+        if std::mem::take(&mut self.shell.zen) && self.side_visible {
+            return cx.notify();
+        }
         self.side_visible = !self.side_visible;
         if !self.side_visible {
             self.focus_active(window, cx);
@@ -2950,6 +3144,9 @@ impl Workspace {
 
     /// ⌘J: open the output panel and put keyboard focus in it; again to close it.
     fn toggle_output(&mut self, _: &ToggleOutput, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.shell.zen) && self.output_visible {
+            return cx.notify();
+        }
         self.output_visible = !self.output_visible;
         if self.output_visible {
             window.focus(&self.output_focus, cx);
@@ -2992,7 +3189,7 @@ impl Workspace {
     }
 
     fn output_move(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let n = self.output().len();
+        let n = if self.shell.problems { self.problem_rows().len() } else { self.output().len() };
         if n == 0 {
             return;
         }
@@ -3002,6 +3199,9 @@ impl Workspace {
     }
 
     fn output_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shell.problems {
+            return self.open_problem(self.output_sel, window, cx);
+        }
         let Some((file, row, _)) = self.output().get(self.output_sel).and_then(|l| l.loc.clone()) else { return };
         let root = self.root(cx);
         self.open_file(resolve(&root, &file), Some(row), false, window, cx);
@@ -3020,6 +3220,16 @@ impl Workspace {
         self.side_visible = true;
         self.git_panel.update(cx, |p, cx| p.focus_commit_input(window, cx));
         cx.notify();
+    }
+
+    fn set_diffs_changes_only(&mut self, on: bool, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            match &tab.kind {
+                TabKind::Diff(d) => d.update(cx, |d, cx| d.set_changes_only(on, cx)),
+                TabKind::DiffEdit(d) => d.update(cx, |d, cx| d.right.update(cx, |r, cx| r.set_changes_only(on, cx))),
+                _ => {}
+            }
+        }
     }
 
     fn toggle_blame(&mut self, _: &ToggleBlame, _: &mut Window, cx: &mut Context<Self>) {
@@ -3045,7 +3255,7 @@ impl Workspace {
                 d.update(cx, |d, cx| d.set_blame(on, cx));
                 self.blame_default = on;
             }
-            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Preview(_) | TabKind::Db(_) | TabKind::Api(_) | TabKind::Agent(_) => {}
+            TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Preview(_) | TabKind::Db(_) | TabKind::Api(_) | TabKind::Agent(_) | TabKind::Git(_) | TabKind::Pr(_) => {}
         }
         self.settings.blame_default = self.blame_default;
         self.settings.save();
@@ -3058,6 +3268,40 @@ impl Workspace {
             let eds: Vec<Entity<Editor>> = match &tab.kind {
                 TabKind::Editor(e) => vec![e.clone()],
                 TabKind::DiffEdit(d) => vec![d.read(cx).left.clone(), d.read(cx).right.clone()],
+                TabKind::Diff(d) => {
+                    d.update(cx, |d, cx| {
+                        d.font_size = size;
+                        cx.notify();
+                    });
+                    vec![]
+                }
+                TabKind::Pr(v) => {
+                    let diff = v.update(cx, |v, _| {
+                        v.font_size = size;
+                        v.diff.clone()
+                    });
+                    if let Some(d) = diff {
+                        d.update(cx, |d, cx| {
+                            d.font_size = size;
+                            cx.notify();
+                        });
+                    }
+                    vec![]
+                }
+                // The Git page's diff beside its lists, staged (read-only) or not (editable).
+                TabKind::Git(g) => {
+                    let (diff, edit) = g.update(cx, |g, _| {
+                        g.font_size = size;
+                        (g.diff.clone(), g.edit.clone())
+                    });
+                    if let Some(d) = diff {
+                        d.update(cx, |d, cx| {
+                            d.font_size = size;
+                            cx.notify();
+                        });
+                    }
+                    edit.map(|e| vec![e.read(cx).left.clone(), e.read(cx).right.clone()]).unwrap_or_default()
+                }
                 TabKind::Terminal(t) => {
                     t.update(cx, |t, cx| {
                         t.font_size = size;
@@ -3145,6 +3389,9 @@ impl Workspace {
     }
 
     fn select_side(&mut self, side: Side, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.shell.zen) && self.side_visible && self.side == side {
+            return cx.notify();
+        }
         if self.side == side && self.side_visible {
             self.side_visible = false;
             self.focus_active(window, cx);
@@ -3156,7 +3403,7 @@ impl Workspace {
         if side == Side::Claude {
             let root = self.root(cx);
             self.claude_panel.update(cx, |p, cx| p.refresh(root, cx));
-            self.open_agent(false, None, window, cx);
+            self.open_agent(false, None, None, window, cx);
         }
     }
 
@@ -3248,7 +3495,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .child(div().flex().items_center().h(px(35.)).px(px(15.)).text_size(px(10.5)).child("SETTINGS"))
+            .child(div().flex().items_center().h(px(35.)).px(px(15.)).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child("Settings"))
             .child(
                 div()
                     .flex()
@@ -3263,7 +3510,7 @@ impl Workspace {
 
     /// The Settings panel: theme, interface and code zoom, where the sidebar goes.
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let section = |title: &str| div().px(px(12.)).pt(px(14.)).pb(px(6.)).text_size(px(10.)).text_color(theme::fg_muted()).child(title.to_uppercase());
+        let section = |title: &str| div().px(px(12.)).pt(px(14.)).pb(px(6.)).text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_muted()).child(title.to_string());
         let current = theme::current();
         let themes = theme::Theme::ALL.into_iter().map(|t| {
             let on = t == current;
@@ -3701,34 +3948,6 @@ impl Workspace {
         })
     }
 
-    fn show_problems(&mut self, cx: &mut Context<Self>) {
-        let root = self.root(cx);
-        let mut rows: Vec<(PathBuf, Diag)> = self
-            .lint_diags
-            .iter()
-            .chain(self.ts_diags.iter())
-            .chain(self.data_diags.iter())
-            .flat_map(|(p, ds)| ds.iter().map(move |d| (p.clone(), d.clone())))
-            .collect();
-        rows.sort_by(|a, b| (a.1.severity, &a.0, a.1.row).cmp(&(b.1.severity, &b.0, b.1.row)));
-        let text = rows
-            .iter()
-            .map(|(p, d)| {
-                let rel = p.strip_prefix(&root).unwrap_or(p).to_string_lossy().to_string();
-                let sev = match d.severity {
-                    Severity::Error => "error",
-                    Severity::Warning => "warn ",
-                    Severity::Info => "info ",
-                };
-                format!("{rel}:{}:{}  {sev}  {}  ({})", d.row + 1, d.col + 1, crate::tserror::label(&d.message, d.source == "ts"), d.source)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let (e, w) = self.problem_counts();
-        let body = if text.is_empty() { "No problems found. (Lint runs on open/save, TypeScript checks on save of .ts/.tsx.)".to_string() } else { text };
-        self.show_output(format!("Problems — {e} errors, {w} warnings"), &body, false, cx);
-    }
-
     // ------------------------------------------------------------ command line
 
     fn command_palette(&mut self, _: &CommandPalette, window: &mut Window, cx: &mut Context<Self>) {
@@ -3851,8 +4070,9 @@ impl Workspace {
             c.placeholder = match mode {
                 CmdMode::Command => "command — try w, format, commit <msg>, checkout <branch>, !<shell>, 42 (go to line)".into(),
                 CmdMode::Search => "search in file".into(),
-                CmdMode::Files => "file name — append :line to jump".into(),
+                CmdMode::Files => "file name (append :line to jump), or start with : for a command".into(),
                 CmdMode::Buffers => "files open in this pane".into(),
+                CmdMode::Symbols => "symbol in this file (a function, class, type…)".into(),
                 CmdMode::CompareTo => format!("compare {} to which branch?", self.compare_from.clone().unwrap_or_default()).into(),
             };
             c.set_text(text, cx);
@@ -3877,6 +4097,17 @@ impl Workspace {
         let Some(mode) = self.cmd_mode else { return };
         match ev {
             EditorEvent::Changed => {
+                // The title bar's "Go to file or command" box: a leading ":" makes it the command line.
+                let typed = self.cmd.read(cx).text();
+                if mode == CmdMode::Files && let Some(rest) = typed.strip_prefix(':') {
+                    let rest = rest.to_string();
+                    return self.open_cmd(CmdMode::Command, &rest, window, cx);
+                }
+                // An "@" first asks for a symbol of this file instead.
+                if mode == CmdMode::Files && let Some(rest) = typed.strip_prefix('@') {
+                    let rest = rest.to_string();
+                    return self.open_cmd(CmdMode::Symbols, &rest, window, cx);
+                }
                 self.update_items(cx);
                 if mode == CmdMode::Search {
                     self.incremental_search(cx);
@@ -3914,7 +4145,7 @@ impl Workspace {
                     self.cmd.update(cx, |c, cx| c.set_text(&value, cx));
                 }
             }
-            EditorEvent::OpenCommit(_) | EditorEvent::Saved | EditorEvent::CompareConflict | EditorEvent::OpenMergeEditor | EditorEvent::OpenAt(_) | EditorEvent::Notice(_) | EditorEvent::Image(_) => {}
+            EditorEvent::OpenCommit(_) | EditorEvent::Saved | EditorEvent::CompareConflict | EditorEvent::OpenMergeEditor | EditorEvent::OpenAt(_) | EditorEvent::Notice(_) | EditorEvent::Image(_) | EditorEvent::OpenDiff => {}
         }
     }
 
@@ -3951,6 +4182,7 @@ impl Workspace {
         self.cmd_items = match self.cmd_mode {
             Some(CmdMode::Files) => self.file_items(&text, cx),
             Some(CmdMode::Buffers) => self.buffer_items(&text, cx),
+            Some(CmdMode::Symbols) => self.symbol_items(&text, cx),
             Some(CmdMode::Command) => self.command_items(&text, cx),
             Some(CmdMode::CompareTo) => self.compare_items(&text, cx),
             _ => Vec::new(),
@@ -4031,6 +4263,7 @@ impl Workspace {
         let Some((head, rest)) = text.split_once(' ') else {
             let mut items: Vec<(i64, CmdItem)> = COMMANDS
                 .iter()
+                .chain(crate::git_panel::COMMANDS)
                 .filter_map(|(name, detail, takes_arg)| {
                     let (score, positions) = util::fuzzy(text, name)?;
                     let bonus = if name.starts_with(text) { 100 } else { 0 };
@@ -4097,6 +4330,16 @@ impl Workspace {
                 .iter()
                 .map(|s| CmdItem { label: s.to_string(), detail: String::new(), value: format!("zoom {s}"), positions: vec![], exec: true })
                 .collect(),
+            h if crate::git_panel::COMMANDS.iter().any(|g| g.0 == h) => {
+                let typed = rest.rsplit(' ').next().unwrap_or("");
+                self.git_panel
+                    .read(cx)
+                    .command_items(h, rest, cx)
+                    .into_iter()
+                    .filter_map(|(label, value, exec)| Some(CmdItem { positions: util::fuzzy(typed, &label)?.1, label, detail: String::new(), value, exec }))
+                    .take(12)
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -4112,6 +4355,7 @@ impl Workspace {
                     self.activate(ix, window, cx);
                 }
             }
+            CmdMode::Symbols => self.go_to_symbol_item(window, cx),
             CmdMode::CompareTo => {
                 let base = self.cmd_items.get(self.cmd_sel).map(|i| i.value.clone());
                 let other = self.compare_from.take();
@@ -4148,7 +4392,7 @@ impl Workspace {
                     line = item.value.clone();
                 } else if !line.contains(' ')
                     && !line.starts_with('!')
-                    && !COMMANDS.iter().any(|(n, _, _)| *n == line.trim_end_matches('!'))
+                    && !COMMANDS.iter().chain(crate::git_panel::COMMANDS).any(|(n, _, _)| *n == line.trim_end_matches('!'))
                     && line.parse::<usize>().is_err()
                     && let Some(item) = self.cmd_items.first()
                 {
@@ -4332,7 +4576,7 @@ impl Workspace {
             }
             "claude" => {
                 self.close_cmd(window, cx);
-                self.open_agent(false, None, window, cx);
+                self.open_agent(false, None, None, window, cx);
                 if !rest.is_empty()
                     && let Some(TabKind::Agent(v)) = self.active.map(|a| &self.tabs[a].kind)
                 {
@@ -4505,6 +4749,7 @@ impl Workspace {
                 };
                 self.open_compare(base, other.to_string(), window, cx);
             }
+            "undo-git" => self.undo_git(window, cx),
             "abort" => match self.git.read(cx).status.op.clone() {
                 Some(op) => self.git.update(cx, |r, cx| r.run_op("Abort", cx, move |root| git::abort_op(root, op.kind))),
                 None => self.flash("Nothing in progress to abort".into(), true, cx),
@@ -4533,6 +4778,8 @@ impl Workspace {
             "files" | "explorer" => self.show_files(&ShowFiles, window, cx),
             "scm" | "sc" => self.show_git(&ShowGit, window, cx),
             "output" => self.toggle_output(&ToggleOutput, window, cx),
+            "zen" => self.toggle_zen(window, cx),
+            "window-color" => self.set_window_color_from(rest, cx),
             "zoom" => match rest {
                 "in" | "+" => self.zoom(1., cx),
                 "out" | "-" => self.zoom(-1., cx),
@@ -4543,6 +4790,13 @@ impl Workspace {
                 self.side = Side::Keys;
                 self.side_visible = true;
                 cx.notify();
+            }
+            c if crate::git_panel::COMMANDS.iter().any(|g| g.0 == c) => {
+                let active = self.active_editor().and_then(|e| e.read(cx).path.clone());
+                if self.git_panel.update(cx, |p, cx| p.run_command(c, rest, active, window, cx)) {
+                    self.side_visible = true;
+                    self.show_git(&ShowGit, window, cx);
+                }
             }
             _ => self.flash(format!("Unknown command: {cmd} (try :keys)"), true, cx),
         }
@@ -4670,7 +4924,7 @@ impl Workspace {
                         v.update(cx, |v, cx| v.mark_stale(cx));
                     }
                 }
-                TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Db(_) | TabKind::Api(_) | TabKind::Agent(_) => {}
+                TabKind::Commit(_) | TabKind::Terminal(_) | TabKind::Merge(_) | TabKind::Db(_) | TabKind::Api(_) | TabKind::Agent(_) | TabKind::Git(_) | TabKind::Pr(_) => {}
             }
         }
         for r in &meta_repos {
@@ -4693,7 +4947,7 @@ impl Workspace {
 
     // ------------------------------------------------------------ rendering
 
-    fn render_activity_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_activity_bar(&self, _: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let changes: usize = self.repos.iter().map(|r| r.read(cx).status.change_count()).sum();
         let right = self.settings.sidebar_right;
         // A plain button in the activity bar (no selected state).
@@ -4714,6 +4968,7 @@ impl Workspace {
             let active = ws.side_visible && (ws.side == side || (side == Side::Settings && ws.side == Side::Keys));
             div()
                 .id(id)
+                .debug_selector(move || id.to_string())
                 .relative()
                 .flex()
                 .items_center()
@@ -4740,7 +4995,6 @@ impl Workspace {
             .when(!right && self.lights_pad > 0., |d| d.relative().child(div().absolute().right_0().top(px(24.) + gpui::px(2. + NOTCH_R)).bottom_0().w(gpui::px(1.)).bg(theme::border())))
             .when(right, |d| d.border_l_1())
             .border_color(theme::border())
-            .when(!right && !window.is_fullscreen(), |d| d.pt(gpui::px(LIGHTS_H)))
             .child(tool("act-go-to-file", "go-to-file", "Go to File (⌘P)", 19.).on_click(cx.listener(|ws, _, w, cx| ws.find_file(&FindFile, w, cx))))
             .child(div().mx(px(10.)).my(px(2.)).h(px(1.)).bg(theme::border()))
             .child(item("act-files", "files", Side::Files, "Explorer (⇧⌘E)", self, cx))
@@ -4748,6 +5002,7 @@ impl Workspace {
             .child(item("act-git", "git", Side::Git, "Source Control (⌃⇧G)", self, cx).when(changes > 0, |d| {
                 d.child(div().absolute().bottom(px(8.)).right(px(6.)).child(ui::badge(changes.to_string(), theme::accent()).text_size(px(10.)).h(px(16.)).min_w(px(16.))))
             }))
+            .child(item("act-prs", "pull-request", Side::Prs, "Pull requests: list and review them (GitHub, with gh)", self, cx))
             .child(item("act-databases", "database", Side::Databases, "Databases", self, cx))
             .child(item("act-api", "api", Side::Api, "API: requests, collections, environments", self, cx))
             .child(item("act-claude", "sparkle", Side::Claude, "Claude: sessions, usage, skills, MCP (⌘Esc chat; ⌘⇧Esc a new one)", self, cx))
@@ -4762,7 +5017,7 @@ impl Workspace {
 
     /// The pane drawn in the main area's top-left corner (the first child all the way down).
     fn top_left_pane(&self) -> usize {
-        if self.zoomed {
+        if self.zoomed || self.shell.zen {
             return self.focused_pane;
         }
         let mut node = &self.layout;
@@ -4971,7 +5226,7 @@ impl Workspace {
                             .hover(|s| s.text_color(theme::fg_bright()))
                             .tooltip(ui::tooltip("Overview of all spaces (⌘K O)"))
                             .flex_col()
-                            .child(div().flex().items_center().gap(px(2.)).child("SPACES").child(ui::icon("chevron-right", theme::fg_muted()).size(px(9.))))
+                            .child(div().flex().items_center().gap(px(2.)).child("Spaces").child(ui::icon("chevron-right", theme::fg_muted()).size(px(9.))))
                             .child(keys("⌘K O"))
                             .on_click(cx.listener(|ws, _, w, cx| {
                                 ws.rail_open = false;
@@ -5159,7 +5414,8 @@ impl Workspace {
         match node {
             Layout::Pane(id) => self.render_pane(*id, focused_area, cx),
             Layout::Split { vertical, ratio, a, b } => {
-                let vertical = *vertical;
+                // In a narrow window side-by-side splits stack.
+                let vertical = *vertical && !self.shell.stack;
                 let cell = self.split_bounds.clone();
                 let key = path.clone();
                 let first = div()
@@ -5202,8 +5458,8 @@ impl Workspace {
         let active_ix = pane.active.and_then(|t| self.tab_ix(t));
         let count = pane.items.len();
         let is_editor = active_ix.is_some_and(|ix| matches!(self.tabs[ix].kind, TabKind::Editor(_) | TabKind::Merge(_)));
-        let can_preview = active_ix.is_some_and(|ix| matches!(&self.tabs[ix].kind, TabKind::Editor(e) if e.read(cx).path.as_deref().is_some_and(preview::has_preview)));
-        let frame = if focused { theme::frame_focused() } else { theme::frame() };
+        // Focus shows as a line on the active tab, not as a colored border around the pane.
+        let frame = theme::frame();
         let cell = self.pane_bounds.clone();
         let content: AnyElement = match active_ix.map(|ix| &self.tabs[ix].kind) {
             Some(TabKind::Editor(e)) => e.clone().into_any_element(),
@@ -5216,8 +5472,10 @@ impl Workspace {
             Some(TabKind::Db(v)) => v.clone().into_any_element(),
             Some(TabKind::Api(v)) => v.clone().into_any_element(),
             Some(TabKind::Agent(v)) => v.clone().into_any_element(),
+            Some(TabKind::Git(v)) => v.clone().into_any_element(),
+            Some(TabKind::Pr(v)) => v.clone().into_any_element(),
             None if self.panes.len() == 1 => self.render_welcome(cx),
-            None => self.render_empty_pane(),
+            None => self.render_start(id, cx),
         };
         let (can_back, can_fwd) = self.pane(id).map(|p| (!p.back.is_empty(), !p.fwd.is_empty())).unwrap_or_default();
         let glyph = |gid: &'static str, icon: &'static str, tip: &'static str| {
@@ -5254,10 +5512,10 @@ impl Workspace {
             .pl(gpui::px(8. * ui::scale() + if id == self.top_left_pane() && self.lights_pad > 0. { self.lights_pad + NOTCH_GAP + NOTCH_R * ui::scale() } else { 0. }))
             .pr(px(4.))
             .gap(px(6.))
-            .text_size(px(11.))
+            .text_size(px(12.))
+            .bg(theme::bg_side())
             .border_b_1()
             .border_color(frame)
-            .when(!(id == self.top_left_pane() && self.lights_pad > 0.), |d| d.child(div().text_color(frame).child("─")))
             .child(
                 // tmux-style list of what's open in this pane: "1 app.ts  2 $ zsh" (⌘1…⌘9 or click).
                 // It scrolls sideways (trackpad, or the wheel), and the selected tab is kept in view.
@@ -5276,6 +5534,7 @@ impl Workspace {
                         .debug_selector(move || format!("tab-row-{id}"))
                         .flex()
                         .items_center()
+                        .h_full()
                         .gap(px(2.))
                         .min_w_0()
                         .overflow_x_scroll()
@@ -5308,12 +5567,13 @@ impl Workspace {
                             .flex()
                             .flex_none()
                             .items_center()
+                            .relative()
                             .gap(px(4.))
-                            .px(px(6.))
-                            .h(px(18.))
-                            .rounded(px(3.))
+                            .px(px(8.))
+                            .h_full()
                             .cursor_pointer()
-                            .when(active, |d| d.bg(frame.opacity(0.22)).text_color(if focused { theme::fg_bright() } else { theme::fg() }))
+                            .when(active, |d| d.bg(theme::bg_editor()).text_color(if focused { theme::fg_bright() } else { theme::fg() }))
+                            .when(active && focused, |d| d.child(div().absolute().top_0().left_0().right_0().h(gpui::px(2.)).bg(theme::frame_focused())))
                             .when(!active, |d| d.text_color(theme::fg_muted()).hover(|s| s.bg(theme::hover()).text_color(theme::fg())))
                             .on_click(cx.listener({
                                 let tid = *tid;
@@ -5330,7 +5590,7 @@ impl Workspace {
                                     }
                                 }
                             }))
-                            .child(div().text_color(if active { theme::frame_focused() } else { theme::fg_muted() }).child(if i < 9 { format!("{}", i + 1) } else { "·".into() }))
+                            .child(div().text_color(if active && focused { theme::frame_focused() } else { theme::fg_muted() }).child(if i < 9 { format!("{}", i + 1) } else { "·".into() }))
                             .child(if term { ui::small_icon("terminal", theme::frame_focused()).size(px(12.)) } else if icon_name == "agent:" { ui::small_icon("sparkle", theme::accent()).size(px(12.)) } else if let Some(m) = icon_name.strip_prefix("api:") {
                                 ui::icon("api", if m.is_empty() { theme::accent() } else { theme::c(crate::api::method_color(m)) }).size(px(13.))
                             } else { match icon_name.strip_prefix("db:") {
@@ -5367,7 +5627,7 @@ impl Workspace {
                     )
                 })),
             )
-            .child(div().flex_1().min_w(px(4.)).h(px(1.)).bg(frame.opacity(0.5)))
+            .child(div().flex_1().min_w(px(4.)))
             .when(count > 1 && roomy, |d| {
                 d.child(glyph("prev", "chevron-left", "Previous file in pane (⌃⇧Tab)").on_click(cx.listener(move |ws, _, w, cx| {
                     ws.set_focused_pane(id);
@@ -5396,12 +5656,6 @@ impl Workspace {
                             ws.navigate(false, window, cx);
                         })),
                 )
-            })
-            .when(can_preview && !tight, |d| {
-                d.child(glyph("preview", "eye", "Open preview to the side (⌘K V · ⇧⌘V here)").on_click(cx.listener(move |ws, _, w, cx| {
-                    ws.set_focused_pane(id);
-                    ws.preview_to_side(&PreviewToSide, w, cx);
-                })))
             })
             .when(is_editor && roomy, |d| {
                 // Word wrap toggle (same as ⌥Z / the status bar): lit while wrapping.
@@ -5542,6 +5796,7 @@ impl Workspace {
                         ws.drop_paths(d.paths().to_vec(), id, zone, w, cx);
                     }))
                     .child(header)
+                    .children(self.render_breadcrumb(id, cx))
                     .child(
                         div()
                             .relative()
@@ -5584,30 +5839,6 @@ impl Workspace {
         }
     }
 
-    fn render_empty_pane(&self) -> AnyElement {
-        let row = |keys: &str, label: &str| {
-            div()
-                .flex()
-                .gap(px(12.))
-                .child(div().w(px(70.)).flex().justify_end().text_color(theme::frame_focused()).child(keys.to_string()))
-                .child(div().child(label.to_string()))
-        };
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(6.))
-            .text_color(theme::fg_muted())
-            .child(row("⌘P", "open a file here"))
-            .child(row("⌘T", "terminal here"))
-            .child(row("⌘\\ ⌘⇧\\", "split again"))
-            .child(row(":e", "open by path"))
-            .child(row("⌘⇧W", "close this pane"))
-            .into_any_element()
-    }
-
     fn render_welcome(&self, cx: &mut Context<Self>) -> AnyElement {
         let screen = div()
             .size_full()
@@ -5620,24 +5851,7 @@ impl Workspace {
             .text_color(theme::fg_muted());
 
         if self.has_project {
-            // A project is open: just the keys to get going.
-            let row = |label: &str, keys: &str| {
-                div()
-                    .flex()
-                    .gap(px(16.))
-                    .child(div().w(px(160.)).flex().justify_end().child(label.to_string()))
-                    .child(div().w(px(130.)).text_color(theme::fg()).child(keys.to_string()))
-            };
-            return screen
-                .child(row("Find File", "⌘ P"))
-                .child(row("Command Line", "⌘ ⇧ P  or  :"))
-                .child(row("Source Control", "⌃ ⇧ G"))
-                .child(row("Search in Files", "⌘ ⇧ F"))
-                .child(row("Terminal", "⌘ T  ·  ⌃ `"))
-                .child(row("Split Right / Down", "⌘ \\  ·  ⌘ ⇧ \\"))
-                .child(row("Toggle Blame", "⌥ ⌘ B"))
-                .child(row("All Shortcuts", "⌘K ⌘S"))
-                .into_any_element();
+            return self.render_start(self.focused_pane, cx);
         }
 
         // No project yet: the logo, Open Folder and Recent.
@@ -5665,7 +5879,7 @@ impl Workspace {
                     .on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx)))
                     .child("Open Folder…   ⌘O"),
             )
-            .when(!recent.is_empty(), |d| d.child(div().mt(px(22.)).mb(px(4.)).text_size(px(10.5)).child("RECENT")))
+            .when(!recent.is_empty(), |d| d.child(div().mt(px(22.)).mb(px(4.)).text_size(px(11.)).text_color(theme::fg_muted()).child("Recent")))
             .children(recent.into_iter().enumerate().map(|(i, f)| {
                 let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 let parent = f.parent().map(|p| p.to_string_lossy().replacen(&home, "~", 1)).unwrap_or_default();
@@ -5693,6 +5907,23 @@ impl Workspace {
         let page = ((self.output_h - 40.) / 18.).max(1.) as isize;
         let title = self.outputs.get(self.output_shown).map(|e| e.title.clone()).unwrap_or_default();
         let (shown, total) = (self.output_shown, self.outputs.len());
+        let problems = self.shell.problems;
+        let (errors, warnings) = self.problem_counts();
+        let tab = |id: &'static str, label: &'static str, on: bool| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .h(px(28.))
+                .cursor_pointer()
+                .border_b_1()
+                .border_color(if on { theme::fg() } else { gpui::transparent_black() })
+                .text_color(if on { theme::fg() } else { theme::fg_dim() })
+                .hover(|s| s.text_color(theme::fg()))
+                .child(label)
+        };
         div()
             .key_context("Output")
             .track_focus(&self.output_focus)
@@ -5744,10 +5975,19 @@ impl Workspace {
                     .px(px(12.))
                     .gap(px(8.))
                     .text_size(px(10.5))
-                    .child(div().border_b_1().border_color(theme::fg()).child("OUTPUT"))
-                    .child(div().flex_1().min_w_0().text_color(theme::fg_dim()).overflow_hidden().text_ellipsis().whitespace_nowrap().child(title))
+                    .child(tab("output-tab", "Output", !problems).on_click(cx.listener(|ws, _, _, cx| {
+                        ws.shell.problems = false;
+                        ws.output_sel = 0;
+                        cx.notify();
+                    })))
+                    .child(
+                        tab("problems-tab", "Problems", problems)
+                            .when(errors + warnings > 0, |t| t.child(ui::badge((errors + warnings).to_string(), if errors > 0 { Severity::Error.color() } else { Severity::Warning.color() }).text_size(px(10.)).h(px(15.)).min_w(px(15.))))
+                            .on_click(cx.listener(|ws, _, _, cx| ws.show_problems(cx))),
+                    )
+                    .child(div().flex_1().min_w_0().text_color(theme::fg_dim()).overflow_hidden().text_ellipsis().whitespace_nowrap().child(if problems { String::new() } else { title }))
                     // Earlier commands' output: older / newer, and the whole list.
-                    .when(total > 1, |d| {
+                    .when(total > 1 && !problems, |d| {
                         d.child(
                             ui::icon_button("output-older", "chevron-left")
                                 .tooltip(ui::tooltip("Older output"))
@@ -5762,7 +6002,7 @@ impl Workspace {
                                 .on_click(cx.listener(move |ws, _, _, cx| ws.show_output_entry(shown + 1, cx))),
                         )
                     })
-                    .when(total > 0, |d| {
+                    .when(total > 0 && !problems, |d| {
                         d.child(
                             ui::icon_button("output-history", "list-flat")
                                 .debug_selector(|| "output-history".into())
@@ -5779,8 +6019,8 @@ impl Workspace {
                         cx.notify();
                     }))),
             )
-            .when(self.output_history_open && total > 0, |d| d.child(deferred(self.render_output_history(cx)).with_priority(2)))
-            .child(
+            .when(self.output_history_open && total > 0 && !problems, |d| d.child(deferred(self.render_output_history(cx)).with_priority(2)))
+            .child(if problems { self.render_problems(cx) } else {
                 uniform_list(
                     "output",
                     count,
@@ -5811,8 +6051,9 @@ impl Workspace {
                     }),
                 )
                 .track_scroll(&self.output_scroll)
-                .flex_1(),
-            )
+                .flex_1()
+                .into_any_element()
+            })
     }
 
     /// The output history: newest first, each with when it ran and a ×; Clear all at the bottom.
@@ -5874,7 +6115,7 @@ impl Workspace {
                 ws.output_history_open = false;
                 cx.notify();
             }))
-            .child(div().px(px(14.)).py(px(4.)).text_size(px(10.)).text_color(theme::fg_muted()).child("OUTPUT HISTORY · THIS WINDOW"))
+            .child(div().px(px(14.)).py(px(4.)).text_size(px(10.)).text_color(theme::fg_muted()).child("Output history · this window"))
             .child(div().id("output-history-rows").flex_1().min_h_0().overflow_y_scroll().children(rows))
             .child(
                 div()
@@ -5902,9 +6143,9 @@ impl Workspace {
             .flex_none()
             .items_center()
             .h(px(STATUS_H))
-            .bg(theme::bg_side())
+            .bg(self.chrome_bg())
             .border_t_1()
-            .border_color(theme::border())
+            .border_color(self.chrome_border())
             .text_size(px(11.));
 
         if let Some(mode) = self.cmd_mode {
@@ -5913,6 +6154,7 @@ impl Workspace {
                 CmdMode::Search => "/",
                 CmdMode::Files => "›",
                 CmdMode::Buffers => "≡",
+                CmdMode::Symbols => "@",
                 CmdMode::CompareTo => "⇄",
             };
             let hint = match mode {
@@ -5920,6 +6162,7 @@ impl Workspace {
                 CmdMode::Search => "Enter keep · ⌘G next · Esc cancel",
                 CmdMode::Files => "↑↓ select · Enter open here · Esc cancel",
                 CmdMode::Buffers => "↑↓ select · Enter show · Esc cancel",
+                CmdMode::Symbols => "↑↓ select · Enter go there · Esc cancel",
                 CmdMode::CompareTo => "↑↓ select · Enter compare · Esc cancel",
             };
             return base
@@ -5963,7 +6206,6 @@ impl Workspace {
         // Nothing in the bar is squeezed: as the window narrows, the less needed items leave it.
         let room = window.viewport_size().width / gpui::px(1.) / ui::scale();
         let (show_hints, show_toggles, show_format) = (room >= 1380., room >= 1040., room >= 780.);
-        let chip = |label: String, bg: Hsla| div().flex().flex_none().whitespace_nowrap().items_center().h_full().px(px(8.)).bg(bg).text_color(theme::bg_app()).font_weight(FontWeight::BOLD).child(label);
         let hint = |key: &str, label: &str| {
             div()
                 .flex()
@@ -5976,7 +6218,15 @@ impl Workspace {
                 .child(div().text_color(theme::fg_muted()).child(label.to_string()))
         };
         let pane_count = self.panes.len();
-        base.child(chip(if self.zoomed { " oskl · MAX ".into() } else { " oskl ".into() }, theme::frame_focused()))
+        // When the window runs out of room the left side is cut at its end, never the right.
+        let left = div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .items_center()
+            .overflow_hidden()
+            .child(div().flex().flex_none().items_center().gap(px(5.)).px(px(8.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(div().size(px(8.)).rounded(px(2.)).bg(theme::accent())).when(self.zoomed, |d| d.child("Max")))
         .child(
             item("status-branch")
                 .when(!branch.is_empty(), |d| d.child(ui::small_icon("git", theme::fg())).child(div().max_w(px(180.)).overflow_hidden().text_ellipsis().whitespace_nowrap().child(branch.clone())))
@@ -6010,6 +6260,8 @@ impl Workspace {
                 .child(hint(&k("CommandPalette", "⌘;"), "cmd"))
                 .when(pane_count > 1, |d| d.child(hint(&format!("⌘⌥ {dirs}"), "move")))
         })
+        ;
+        let right = div().flex().flex_none().h_full().items_center()
         .child({
             let (e, w) = self.problem_counts();
             item("status-problems")
@@ -6019,7 +6271,7 @@ impl Workspace {
                 .child(ui::small_icon("warning", if w > 0 { Severity::Warning.color() } else { theme::fg_muted() }))
                 .child(w.to_string())
                 .when(self.tsc_running, |d| d.child(div().text_color(theme::fg_muted()).child("tsc…")))
-                .on_click(cx.listener(|ws, _, _, cx| ws.show_problems(cx)))
+                .on_click(cx.listener(|ws, _, _, cx| ws.toggle_problems(cx)))
         })
         .when_some(editor_info, |d, (pos, indent, eol, lang)| {
             d.child(item("status-pos").child(pos).on_click(cx.listener(|ws, _, w, cx| ws.go_to_line(&GoToLine, w, cx))))
@@ -6086,7 +6338,8 @@ impl Workspace {
             item("status-keys")
                 .child(ui::small_icon("terminal", theme::fg()))
                 .on_click(cx.listener(|ws, _, w, cx| ws.open_cmd(CmdMode::Command, "", w, cx))),
-        )
+        );
+        base.child(left).child(right)
     }
 
     fn render_cmd_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -6245,6 +6498,7 @@ impl Render for Workspace {
             *self.agent_editor.borrow_mut() = Some(ed.downgrade());
         }
         let bounds_cell = self.window_bounds.clone();
+        self.measure_shell(window);
         let sidebar: AnyElement = match self.side {
             Side::Files => self.tree.clone().into_any_element(),
             Side::Git => self.git_panel.clone().into_any_element(),
@@ -6259,6 +6513,18 @@ impl Render for Workspace {
                 self.api_panel.clone().into_any_element()
             }
             Side::Search => self.search.clone().into_any_element(),
+            Side::Prs => {
+                let root = self.git.read(cx).root.clone();
+                let pr = self.active.and_then(|i| match &self.tabs.get(i)?.kind {
+                    TabKind::Pr(v) => Some(v.clone()),
+                    _ => None,
+                });
+                self.pr_panel.update(cx, |p, cx| {
+                    p.set_root(root, cx);
+                    p.set_pr(pr, cx);
+                });
+                self.pr_panel.clone().into_any_element()
+            }
             Side::Claude => {
                 // Shown without a click (a restored window or space): read it the first time.
                 if !self.claude_panel.read(cx).loaded() {
@@ -6273,12 +6539,9 @@ impl Render for Workspace {
         let right = self.settings.sidebar_right;
         // The window buttons sit over the top-left corner: whatever is there makes room for them.
         let lights = !window.is_fullscreen();
-        self.lights_pad = match (lights, right, self.side_visible) {
-            (false, _, _) | (true, false, true) => 0.,
-            // In real pixels: the window buttons don't zoom, what's beside them does.
-            (true, false, false) => LIGHTS_W - ACTIVITY_W * ui::scale(),
-            (true, true, _) => LIGHTS_W - 8. * ui::scale(),
-        };
+        // The window buttons sit in the title bar; in zen mode, with it gone, they float over the editor.
+        self.lights_pad = if lights && self.shell.zen { LIGHTS_W } else { 0. };
+        let overlay = self.shell.overlay && self.side_visible;
         let side_block = self.side_visible.then(|| {
             // A wide grab area centered on the thin line, drawn over the editor beside it
             // (deferred), so the edge is easy to catch and always gets the mouse first.
@@ -6304,7 +6567,11 @@ impl Render for Workspace {
             let panel = div()
                 .flex_none()
                 // Its width is kept, but in a small window it leaves the editors their room.
-                .w(px(self.side_w.min((window.viewport_size().width / gpui::px(1.) / ui::scale() - ACTIVITY_W - 260.).max(170.))))
+                .w(px(if overlay {
+                    self.side_w.min(320.).min(window.viewport_size().width / gpui::px(1.) / ui::scale() - ACTIVITY_W - 16.)
+                } else {
+                    self.side_w.min((window.viewport_size().width / gpui::px(1.) / ui::scale() - ACTIVITY_W - 260.).max(170.))
+                }))
                 .h_full()
                 .min_w_0()
                 .overflow_hidden()
@@ -6312,11 +6579,32 @@ impl Render for Workspace {
                 .when(!right, |d| d.border_r_1())
                 .when(right, |d| d.border_l_1())
                 .border_color(theme::border())
-                .when(!right && lights, |d| d.pt(gpui::px(LIGHTS_H)))
                 .text_size(px(11.))
                 .bg(theme::bg_side())
+                .debug_selector(|| "side-panel".into())
                 .child(sidebar);
-            div().relative().flex().h_full().child(panel).child(deferred(handle))
+            if overlay {
+                // A narrow window: the sidebar lies over the editor, and a click outside closes it.
+                deferred(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .occlude()
+                        .flex()
+                        .when(!right, |d| d.left(px(ACTIVITY_W)).right_0())
+                        .when(right, |d| d.right(px(ACTIVITY_W)).left_0().justify_end())
+                        .on_mouse_down(MouseButton::Left, cx.listener(|ws, _, window, cx| {
+                            ws.side_visible = false;
+                            ws.focus_active(window, cx);
+                            cx.notify();
+                        }))
+                        .child(div().h_full().shadow_lg().occlude().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(panel)),
+                )
+                .into_any_element()
+            } else {
+                div().relative().flex().h_full().child(panel).child(deferred(handle)).into_any_element()
+            }
         });
         let main = div()
             .flex()
@@ -6324,21 +6612,26 @@ impl Render for Workspace {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(div().flex().flex_1().min_h_0().p(px(2.)).child(if self.zoomed {
+            .child(div().flex().flex_1().min_h_0().p(px(2.)).child(if self.zoomed || self.shell.zen {
                 self.render_pane(self.focused_pane, true, cx)
             } else {
                 let layout = self.layout.clone();
                 self.render_layout(&layout, String::new(), true, cx)
             }))
-            .when(self.output_visible, |d| d.child(self.render_output(cx)))
+            .when(self.output_visible && !self.shell.zen, |d| d.child(self.render_output(cx)))
             .into_any_element();
         let activity = self.render_activity_bar(window, cx).into_any_element();
-        // Beside the activity bar alone (no side panel), the rail is under the window's buttons.
-        let rail_top = if !right && !self.side_visible && !window.is_fullscreen() { LIGHTS_H } else { 0. };
-        let rail = self.render_space_rail(right, rail_top, cx);
+        let rail = self.render_space_rail(right, 0., cx);
         let overview = self.overview.then(|| self.render_overview(cx));
         div()
-            .key_context("Workspace")
+            .key_context({
+                let mut c = KeyContext::new_with_defaults(gpui::OperatingSystem::Mac);
+                c.add("Workspace");
+                if self.shell.zen {
+                    c.add("zen");
+                }
+                c
+            })
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(|ws, ev: &KeyDownEvent, window, cx| {
                 if ev.keystroke.key == "escape" && ws.cmd_mode.is_some() {
@@ -6348,6 +6641,14 @@ impl Render for Workspace {
                 }
                 if ev.keystroke.key == "escape" && ws.find_on.is_some() && !ev.keystroke.modifiers.modified() {
                     ws.close_find(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if ev.keystroke.key == "escape" && std::mem::take(&mut ws.shell.project_menu) {
+                    if ws.cancel_color_input(cx) {
+                        ws.focus_active(window, cx);
+                    }
+                    cx.notify();
                     cx.stop_propagation();
                     return;
                 }
@@ -6370,6 +6671,10 @@ impl Render for Workspace {
                 // Clicks inside the popup / command bar stop propagation; anything else dismisses it.
                 // Leave focus wherever the click put it.
                 let _ = window;
+                if std::mem::take(&mut ws.shell.project_menu) {
+                    ws.cancel_color_input(cx);
+                    cx.notify();
+                }
                 if ws.cmd_mode.take().is_some() {
                     ws.cmd_items.clear();
                     ws.return_focus = None;
@@ -6377,6 +6682,7 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(Self::find_file))
+            .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::find_replace_in_file))
@@ -6412,8 +6718,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &FocusUp, w, cx| ws.focus_dir(0, -1, w, cx)))
             .on_action(cx.listener(|ws, _: &FocusDown, w, cx| ws.focus_dir(0, 1, w, cx)))
             .on_action(cx.listener(|ws, _: &NewTerminal, w, cx| ws.new_terminal(w, cx)))
-            .on_action(cx.listener(|ws, _: &OpenClaude, w, cx| ws.open_agent(false, None, w, cx)))
-            .on_action(cx.listener(|ws, _: &NewClaude, w, cx| ws.open_agent(true, None, w, cx)))
+            .on_action(cx.listener(|ws, _: &OpenClaude, w, cx| ws.open_agent(false, None, None, w, cx)))
+            .on_action(cx.listener(|ws, _: &NewClaude, w, cx| ws.open_agent(true, None, None, w, cx)))
             .on_action(cx.listener(|ws, _: &MentionInClaude, w, cx| ws.mention_in_claude(w, cx)))
             .on_action(cx.listener(|ws, _: &ToggleTerminal, w, cx| ws.toggle_terminal(w, cx)))
             .on_action(cx.listener(|ws, _: &PaneBuffers, w, cx| ws.open_cmd(CmdMode::Buffers, "", w, cx)))
@@ -6452,6 +6758,8 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|ws, _: &CloseSpace, w, cx| ws.close_space(w, cx)))
             .on_action(cx.listener(|ws, _: &SpaceOverview, w, cx| ws.toggle_overview(w, cx)))
+            .on_action(cx.listener(|ws, _: &ToggleZen, w, cx| ws.toggle_zen(w, cx)))
+            .on_action(cx.listener(Self::exit_zen))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_output))
             .on_action(cx.listener(Self::on_focus_editor))
@@ -6481,7 +6789,9 @@ impl Render for Workspace {
                         return;
                     }
                     let Some(b) = ws.split_bounds.borrow().get(&path).copied() else { return };
+                    let stacked = ws.shell.stack;
                     if let Some(Layout::Split { vertical, ratio, .. }) = ws.layout.at_path(&path) {
+                        let vertical = &(*vertical && !stacked);
                         let r = if *vertical {
                             (ev.position.x - b.left()) / b.size.width
                         } else {
@@ -6529,14 +6839,22 @@ impl Render for Workspace {
             .font_family(theme::UI_FONT)
             .text_size(theme::ui_text())
             .child(canvas(move |b, _, _| bounds_cell.set(b), |_, _, _, _| {}).absolute().size_full())
-            .child(if right {
-                div().flex().flex_1().min_h_0().child(main).child(rail).children(side_block).child(activity)
+            .children(self.render_title_bar(window, cx))
+            .child(if self.shell.zen {
+                div().flex().flex_1().min_h_0().child(main)
+            } else if right {
+                div().relative().flex().flex_1().min_h_0().child(main).child(rail).children(side_block).child(activity)
             } else {
-                div().flex().flex_1().min_h_0().child(activity).children(side_block).child(rail).child(main)
+                div().relative().flex().flex_1().min_h_0().child(activity).children(side_block).child(rail).child(main)
             })
-            .child(self.render_status(window, cx))
+            // The command line lives in the status bar, so it stays while one is open.
+            .children((!self.shell.zen || self.cmd_mode.is_some()).then(|| self.render_status(window, cx)))
             .children(self.render_cmd_popup(cx))
+            .children(self.render_chord_hints(window))
+            .children(self.render_project_menu(window, cx))
+            .children(self.render_zen_note())
             .children(overview)
+            .children(self.render_undo_toast(cx))
             .children(self.render_ask(cx))
     }
 }
@@ -6604,6 +6922,10 @@ fn root_is_project(root: &Path) -> bool {
 }
 
 #[cfg(test)]
+#[path = "git_tests.rs"]
+mod git_tests;
+
+#[cfg(test)]
 mod ui_tests {
     use super::{CmdMode, TabKind, Workspace};
     use gpui::{TestAppContext, VisualTestContext};
@@ -6613,7 +6935,7 @@ mod ui_tests {
     }
 
     /// Like `setup`, letting the test fill the project folder before the window opens.
-    fn setup_with(cx: &mut TestAppContext, prepare: impl FnOnce(&std::path::Path)) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
+    pub(super) fn setup_with(cx: &mut TestAppContext, prepare: impl FnOnce(&std::path::Path)) -> (gpui::Entity<Workspace>, &mut VisualTestContext) {
         let home = std::env::temp_dir().join(format!("oskl-ui-test-{}", std::process::id()));
         // Each test gets its own project so saved sessions don't clash between parallel tests.
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -6646,7 +6968,7 @@ mod ui_tests {
     }
 
     /// `main` and `feature` both changed line 1 of a.txt, and `git merge feature` stopped on it.
-    fn merge_in_conflict(dir: &std::path::Path) {
+    pub(super) fn merge_in_conflict(dir: &std::path::Path) {
         let sh = |cmd: &str| {
             std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).env("GIT_EDITOR", "true").output().unwrap();
         };
@@ -6657,7 +6979,7 @@ mod ui_tests {
         sh("git merge feature");
     }
 
-    fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+    pub(super) fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&std::process::Command::new("git").args(args).current_dir(dir).output().unwrap().stdout).trim().to_string()
     }
 
@@ -7529,21 +7851,21 @@ mod ui_tests {
     }
 
     #[gpui::test]
-    fn change_names_use_the_buttons_room_until_hovered(cx: &mut TestAppContext) {
+    fn change_rows_keep_their_layout_when_hovered(cx: &mut TestAppContext) {
         let long = "sprint-new-features-and-mobile-screens-sync-with-backend-2026.md";
         let (ws, cx) = setup_with(cx, |dir| {
-            std::process::Command::new("sh").arg("-c").arg(format!("git init -q -b main && echo x > {long}")).current_dir(dir).output().unwrap();
+            std::process::Command::new("sh").arg("-c").arg(format!("git init -q -b main && echo x > {long} && echo y > b.md")).current_dir(dir).output().unwrap();
         });
         ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
         cx.run_until_parked();
         let name: &'static str = Box::leak(format!("change-name-{long}").into_boxed_str());
         let row: &'static str = Box::leak(format!("change-row-{long}").into_boxed_str());
-        let wide = cx.debug_bounds(name).expect("the file's name").size.width;
+        let (before, other) = (cx.debug_bounds(name).expect("the file's name"), cx.debug_bounds("change-name-b.md").expect("the other file's name"));
+        assert_eq!(before.left(), other.left(), "the names start in one column");
         let at = cx.debug_bounds(row).expect("its row").center();
         cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
         cx.run_until_parked();
-        let hovered = cx.debug_bounds(name).unwrap().size.width;
-        assert!(wide > hovered + gpui::px(30.), "not hovered, the name has the buttons' room: {wide:?} vs {hovered:?} hovered");
+        assert_eq!(cx.debug_bounds(name).unwrap(), before, "the buttons appear on top: the name doesn't move or shrink");
     }
 
     #[gpui::test]
@@ -7559,6 +7881,14 @@ mod ui_tests {
         ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
         cx.run_until_parked();
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        // The list is the default: the tree is one click on the Changes header away.
+        assert!(cx.debug_bounds("folder-row-src").is_none(), "a flat list has no folders");
+        let header = cx.debug_bounds("changes-section-0").expect("the Changes header").center();
+        cx.simulate_mouse_move(header, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let toggle = cx.debug_bounds("changes-view").expect("the list/tree switch").center();
+        cx.simulate_click(toggle, gpui::Modifiers::none());
+        cx.run_until_parked();
         let row = cx.debug_bounds("folder-row-src").expect("src folder in the tree").center();
         cx.simulate_mouse_move(row, None, gpui::Modifiers::none());
         cx.run_until_parked();
@@ -10186,7 +10516,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         cx.update(|w, _| w.refresh());
         cx.run_until_parked();
         let mark = cx.debug_bounds("space-mark-0").expect("a mark");
-        assert!(mark.origin.y >= gpui::px(super::LIGHTS_H), "below the window buttons: {:?}", mark.origin);
+        assert!(mark.origin.y >= gpui::px(super::shell::TITLE_H), "below the window buttons: {:?}", mark.origin);
         cx.simulate_keystrokes("cmd-b");
         // The overview: a card per space and one to make a new one.
         cx.simulate_keystrokes("cmd-k o");

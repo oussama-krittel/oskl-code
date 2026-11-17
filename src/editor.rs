@@ -15,6 +15,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+// The change peek: the card a click on a gutter change mark opens.
+#[path = "peek.rs"]
+mod peek;
+
 actions!(
     editor,
     [
@@ -178,6 +182,8 @@ pub enum EditorEvent {
     Notice(String),
     /// A picture pasted into a chat box.
     Image(Image),
+    /// "Open diff" on the change peek: this file's changes in the editable diff.
+    OpenDiff,
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -209,6 +215,8 @@ pub enum DRow {
     Phantom(usize),
     /// Continuation of a soft-wrapped line: (buffer row, segment ≥ 1).
     Cont(usize, usize),
+    /// Unchanged lines left out of a diff that shows only the changes: how many.
+    Gap(usize),
 }
 
 thread_local! {
@@ -393,6 +401,10 @@ pub struct Editor {
     base_text: Option<Arc<String>>,
     marks: Vec<u8>,
     marks_task: Option<Task<()>>,
+    /// The change card a click on a gutter mark opened.
+    peek: Option<peek::Peek>,
+    /// The file's functions and types for the buffer version they were read at.
+    pub symbol_cache: crate::symbols::Cache,
     pub search: Option<String>,
     find_matches: Arc<Vec<Range<usize>>>,
     /// Folded regions: (first row, last hidden row); rows after the first are hidden.
@@ -417,6 +429,8 @@ pub struct Editor {
     pub diagnostics: Vec<Diag>,
     pub decor: Option<Arc<DiffDecor>>,
     pub decors: Option<Arc<DiffDecors>>,
+    /// The diff shows only the changes and a few lines around them.
+    pub changes_only: bool,
     pub scroll_link: Option<Rc<Cell<(f32, u64)>>>,
     link_gen: u64,
     /// The problems card: the row it's for, where it hangs, and whether the keyboard opened it.
@@ -477,6 +491,8 @@ impl Editor {
             base_text: None,
             marks: Vec::new(),
             marks_task: None,
+            peek: None,
+            symbol_cache: Default::default(),
             search: None,
             find_matches: Arc::default(),
             folds: Vec::new(),
@@ -499,6 +515,7 @@ impl Editor {
             diagnostics: Vec::new(),
             decor: None,
             decors: None,
+            changes_only: false,
             scroll_link: None,
             link_gen: 0,
             hover_diag: None,
@@ -721,7 +738,8 @@ impl Editor {
     fn schedule_marks(&mut self, delay: Duration, cx: &mut Context<Self>) {
         if let DiffRole::Right { inline } = self.diff_role {
             let base = self.base_text.clone().unwrap_or_default();
-            let decors = Arc::new(compute_decors(base, &self.buf.text()));
+            let decors = compute_decors(base, &self.buf.text());
+            let decors = Arc::new(if self.changes_only { changes_only(decors, DIFF_CONTEXT) } else { decors });
             self.decor = Some(if inline { decors.inline.clone() } else { decors.right.clone() });
             self.decors = Some(decors);
             cx.notify();
@@ -759,6 +777,13 @@ impl Editor {
             self.buf = Buffer::new(text);
             self.schedule_highlight(Duration::ZERO, cx);
             cx.notify();
+        }
+    }
+
+    pub fn set_changes_only(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.changes_only != on {
+            self.changes_only = on;
+            self.schedule_marks(Duration::ZERO, cx);
         }
     }
 
@@ -1373,7 +1398,8 @@ impl Editor {
                 .cursor_pointer()
                 .when(i == c.sel, |d| d.bg(theme::selected_focused()).text_color(theme::fg_bright()))
                 .child(div().w(px(16.)).flex_none().text_color(color).child(it.kind.glyph()))
-                .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(it.label.clone()))
+                // A long path keeps its end (the file's name) in view.
+                .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().when(matches!(it.kind, Kind::File | Kind::Folder), |d| d.text_ellipsis_start()).child(it.label.clone()))
                 .child(div().flex_none().text_color(theme::fg_muted()).child(it.kind.label()))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1388,7 +1414,8 @@ impl Editor {
         });
         Some(
             deferred(
-                anchored().position(point(px(x), px(y))).snap_to_window().child(
+                // A chat box sits at the bottom of its tab: the list opens above the line typed on.
+                anchored().anchor(if self.chat { Anchor::BottomLeft } else { Anchor::TopLeft }).position(point(px(x), px(if self.chat { y - l.line_h } else { y }))).snap_to_window().child(
                     div()
                         .id("completion")
                         .w(px(320.))
@@ -1636,6 +1663,11 @@ impl Editor {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        // In a chat box, a suggestion already typed out in full (`/clear`) leaves Enter to send.
+        let typed_out = self.chat && self.completion.as_ref().is_some_and(|c| c.shown.get(c.sel).is_some_and(|&ix| c.items[ix].label == c.ctx.prefix()));
+        if typed_out {
+            self.completion = None;
+        }
         if self.completion.is_some() {
             if !self.enter_submits {
                 return self.accept_completion(cx);
@@ -1760,7 +1792,7 @@ impl Editor {
     }
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.completion.take().is_some() | self.hover_diag.take().is_some() | self.hover_info.take().is_some() {
+        if self.completion.take().is_some() | self.hover_diag.take().is_some() | self.hover_info.take().is_some() | self.peek.take().is_some() {
             return cx.notify();
         }
         if !self.buf.extra.is_empty() {
@@ -1841,11 +1873,12 @@ impl Editor {
         self.completion = None;
         self.hover_info = None;
         self.hover_wait = None;
+        let peek = self.peek.take();
         if let Some((_, ix, action)) = self.conflict_hits.iter().find(|(b, _, _)| b.contains(&ev.position)).cloned() {
             return self.resolve_conflict(ix, action, cx);
         }
         let Some(l) = &self.layout else { return };
-        let x = ev.position.x / px(1.);
+        let (x, text_left) = (ev.position.x / px(1.), l.text_left);
         if let Some(m) = l.minimap
             && m.bounds.contains(&ev.position)
         {
@@ -1875,14 +1908,17 @@ impl Editor {
             }
             return;
         }
-        if self.mode == EditorMode::Full && self.decor.is_none() && x >= l.text_left - 18. && x < l.text_left - 2. {
+        if self.mode == EditorMode::Full && self.decor.is_none() && !self.chat && x >= text_left - 28. && x < text_left - 18. && self.click_change_mark(ev.position.y, peek, cx) {
+            return;
+        }
+        if self.mode == EditorMode::Full && self.decor.is_none() && x >= text_left - 18. && x < text_left - 2. {
             // Fold chevron.
             let row = self.row_for_y(ev.position.y);
             if self.is_folded(row) || self.foldable_quick(row) {
                 return self.toggle_fold(row, cx);
             }
         }
-        let in_numbers = self.mode == EditorMode::Full && x < l.text_left;
+        let in_numbers = self.mode == EditorMode::Full && x < text_left;
         let pos = self.pos_for_point(ev.position);
         self.buf.goal_col = None;
         if !in_numbers && ev.modifiers.platform && ev.click_count <= 1 && self.mode == EditorMode::Full {
@@ -2065,6 +2101,7 @@ impl Editor {
         self.hover_diag = None;
         self.hover_info = None;
         self.hover_wait = None;
+        self.peek = None;
         if let Some(link) = &self.scroll_link {
             let (_, g) = link.get();
             self.link_gen = g + 1;
@@ -2163,9 +2200,10 @@ impl Editor {
         // Scrolling.
         let disp_count = self.disp_count();
         let content_h = if full { (disp_count.saturating_sub(1)) as f32 * line_h + height } else { disp_count as f32 * line_h };
-        // The box was sized by the wrap of the last frame: drawn again when it wraps to another row count.
+        // The box was sized at the last frame's width: when the new width wraps to another row
+        // count, it's sized again next frame (a refresh asked for while drawing is ignored).
         if self.chat && (disp_count.clamp(1, 10) as f32 * line_h - height).abs() > 0.5 {
-            window.refresh();
+            window.on_next_frame(|window, _| window.refresh());
         }
         let max_scroll = (content_h - height).max(0.);
         let (row, col) = self.buf.pos_to_rc(self.buf.sel.head);
@@ -2223,6 +2261,7 @@ impl Editor {
         let mut max_line_w: f32 = 0.;
         let mut fillers: Vec<f32> = Vec::new();
         let mut phantoms: Vec<(f32, usize, ShapedLine)> = Vec::new();
+        let mut gaps: Vec<(f32, ShapedLine)> = Vec::new();
         let mut tints: Vec<(f32, LineTint)> = Vec::new();
         for d in first..first + visible {
             let row = match decor.as_ref().map(|dec| dec.rows[d]) {
@@ -2245,6 +2284,11 @@ impl Editor {
                 Some(DRow::Phantom(i)) => {
                     let text = decor.as_ref().and_then(|dec| dec.phantom.get(i).cloned()).unwrap_or_default().replace('\t', "    ");
                     phantoms.push((y_disp(d), i, self.shape(window, text, theme::fg_dim())));
+                    continue;
+                }
+                Some(DRow::Gap(n)) => {
+                    let text = format!("⋯ {n} unchanged {}", if n == 1 { "line" } else { "lines" });
+                    gaps.push((y_disp(d), self.shape(window, text, theme::fg_muted())));
                     continue;
                 }
                 Some(_) => {
@@ -2331,6 +2375,10 @@ impl Editor {
         }
         for y in &fillers {
             p.quads_under.push(fill(Bounds::new(point(px(left), px(*y)), full_w), theme::diff_filler()));
+        }
+        for (y, shaped) in gaps {
+            p.quads_under.push(fill(Bounds::new(point(px(left), px(y)), full_w), theme::diff_filler()));
+            p.text.push((point(px(text_x), px(y)), shaped));
         }
         for (y, i, shaped) in phantoms {
             p.quads_under.push(fill(Bounds::new(point(px(left), px(y)), full_w), theme::diff_del_line()));
@@ -3014,6 +3062,80 @@ fn disp_of(d: &DiffDecor, row: usize) -> usize {
             last + row + 1 - d.disp_of_line.len()
         }
     }
+}
+
+/// Unchanged lines kept around each change when a diff shows only the changes.
+pub const DIFF_CONTEXT: usize = 3;
+
+thread_local! {
+    /// Diffs show only the changes: the last choice, so every diff opens that way. Per UI thread, like word wrap.
+    static DIFF_CHANGES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn diff_changes_only() -> bool {
+    DIFF_CHANGES_ONLY.with(|c| c.get())
+}
+
+pub fn set_diff_changes_only(on: bool) {
+    DIFF_CHANGES_ONLY.with(|c| c.set(on));
+}
+
+/// Which rows of a diff show when it shows only the changes: those within `context` of a
+/// changed one. A hidden run shorter than two rows isn't worth a gap row, so it shows.
+pub fn diff_keep_mask(n: usize, changed: impl Fn(usize) -> bool, context: usize) -> Vec<bool> {
+    let mut keep = vec![false; n];
+    for i in (0..n).filter(|&i| changed(i)) {
+        keep[i.saturating_sub(context)..(i + context + 1).min(n)].iter_mut().for_each(|k| *k = true);
+    }
+    let mut i = 0;
+    while i < n {
+        let start = i;
+        while i < n && !keep[i] {
+            i += 1;
+        }
+        if i - start < 2 {
+            keep[start..i].iter_mut().for_each(|k| *k = true);
+        }
+        i = i.max(start + 1);
+    }
+    keep
+}
+
+/// The same diff with long runs of unchanged lines folded into one `Gap` row each, `context`
+/// lines kept on both sides of every change. The two sides keep the same rows, so they stay aligned.
+pub fn changes_only(d: DiffDecors, context: usize) -> DiffDecors {
+    fn changed(d: &DiffDecor, i: usize) -> bool {
+        match d.rows[i] {
+            DRow::Line(r) => d.tint.get(r).is_some_and(|t| *t != LineTint::None),
+            _ => true,
+        }
+    }
+    fn trim(d: &DiffDecor, keep: &[bool]) -> DiffDecor {
+        let mut rows = Vec::new();
+        let mut new_of_old = vec![0; d.rows.len()];
+        let mut i = 0;
+        while i < d.rows.len() {
+            if keep[i] {
+                new_of_old[i] = rows.len();
+                rows.push(d.rows[i]);
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < d.rows.len() && !keep[i] {
+                new_of_old[i] = rows.len();
+                i += 1;
+            }
+            rows.push(DRow::Gap(i - start));
+        }
+        let disp_of_line = d.disp_of_line.iter().map(|&o| new_of_old.get(o).copied().unwrap_or(o)).collect();
+        DiffDecor { rows, disp_of_line, tint: d.tint.clone(), phantom: d.phantom.clone(), hunks: d.hunks.clone(), words: d.words.clone(), phantom_words: d.phantom_words.clone() }
+    }
+    let (left, right, inline) = (&*d.left, &*d.right, &*d.inline);
+    let n = left.rows.len().min(right.rows.len());
+    let side = diff_keep_mask(n, |i| changed(left, i) || changed(right, i), context);
+    let one = diff_keep_mask(inline.rows.len(), |i| changed(inline, i), context);
+    DiffDecors { left: Arc::new(trim(left, &side)), right: Arc::new(trim(right, &side)), inline: Arc::new(trim(inline, &one)), ..d }
 }
 
 /// Aligns `base` (left) against `current` (right) for side-by-side and inline diffs.
@@ -3706,19 +3828,21 @@ impl Element for EditorElement {
     }
 
     fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
-        let ed = self.editor.read(cx);
-        let lh = ed.line_height();
+        // Wrapped rows count (the chat box): a long line grows the box instead of hiding. The wrap
+        // is redone for the text as it is now (at the last width), so the box fits it this frame.
+        let (mode, lh, rows) = self.editor.update(cx, |ed, _| {
+            if let Some(cols) = ed.wrap_data.as_ref().map(|w| w.key.1).filter(|_| ed.mode == EditorMode::MultiLine && ed.wrap_active()) {
+                ed.ensure_wrap(cols);
+            }
+            (ed.mode, ed.line_height(), ed.disp_count().clamp(1, 10) as f32)
+        });
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        match ed.mode {
-            EditorMode::Full => style.size.height = relative(1.).into(),
-            EditorMode::SingleLine => style.size.height = px(lh + 6.).into(),
-            EditorMode::MultiLine => {
-                // Wrapped rows count (the chat box): a long line grows the box instead of hiding.
-                let rows = ed.disp_count().clamp(1, 10) as f32;
-                style.size.height = px(rows * lh).into();
-            }
-        }
+        style.size.height = match mode {
+            EditorMode::Full => relative(1.).into(),
+            EditorMode::SingleLine => px(lh + 6.).into(),
+            EditorMode::MultiLine => px(rows * lh).into(),
+        };
         (window.request_layout(style, [], cx), ())
     }
 
@@ -3849,6 +3973,7 @@ impl Render for Editor {
             .child(EditorElement { editor: cx.entity() })
             .children(self.completion_popup(cx))
             .children(self.hover_popup(cx))
+            .children(self.peek_popup(cx))
     }
 }
 
@@ -3878,6 +4003,19 @@ mod tests {
     }
 
     #[test]
+    fn changes_only_folds_unchanged_runs_and_keeps_context() {
+        let base = (1..=20).map(|n| n.to_string()).collect::<Vec<_>>().join("\n");
+        let now = base.replace("\n10\n", "\nten\n");
+        let d = super::changes_only(super::compute_decors(Arc::new(base), &now), 2);
+        let shape: Vec<String> = d.right.rows.iter().map(|r| match r { DRow::Line(l) => l.to_string(), DRow::Gap(n) => format!("gap{n}"), DRow::Filler => "-".into(), _ => "?".into() }).collect();
+        // Row 9 changed: rows 7–11 (two around it) show, 0–6 and 12–19 fold.
+        assert_eq!(shape, ["gap7", "7", "8", "9", "10", "11", "gap8"]);
+        assert_eq!(d.right.disp_of_line[0], 0, "a folded line maps to its gap row");
+        assert_eq!(d.left.rows.len(), d.right.rows.len());
+        assert!(d.inline.rows.iter().any(|r| matches!(r, DRow::Phantom(_))), "the removed line stays in the inline view");
+    }
+
+    #[test]
     fn wraps_after_spaces_and_indents_continuations() {
         let b = crate::buffer::Buffer::new("aaaa bbbb cccc\n    xxxxxxxx yyyyyyyy\nshort");
         assert_eq!(super::wrap_points(&b, 0, 10), (vec![0, 10], 0));
@@ -3888,5 +4026,45 @@ mod tests {
         assert_eq!(super::wrap_points(&b, 2, 10), (vec![0], 0));
         let b = crate::buffer::Buffer::new("abcdefghijklmnop");
         assert_eq!(super::wrap_points(&b, 0, 6).0, vec![0, 6, 12], "no space: cut mid-word");
+    }
+
+    /// The chat box: ⇧Enter adds a line and the box is one row taller in that same frame.
+    #[gpui::test]
+    fn chat_box_grows_with_its_lines(cx: &mut gpui::TestAppContext) {
+        use super::{Editor, EditorMode};
+        use gpui::{AppContext as _, Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, div};
+        struct Host(gpui::Entity<Editor>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div().w(gpui::px(400.)).child(div().debug_selector(|| "chat-box".into()).child(self.0.clone()))
+            }
+        }
+        cx.update(|cx| {
+            crate::keybindings::init_kit(cx);
+            super::bind_keys();
+            crate::keybindings::apply(cx);
+        });
+        let ed = cx.new(|cx| {
+            let mut ed = Editor::new(EditorMode::MultiLine, cx);
+            ed.chat = true;
+            ed
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Host(ed.clone()));
+        cx.update(|window, cx| window.focus(&ed.focus_handle(cx), cx));
+        let height = |cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            cx.debug_bounds("chat-box").expect("drawn").size.height
+        };
+        cx.simulate_input("one");
+        let one = height(cx);
+        // Shift held, as the keyboard reports it (Enter alone sends).
+        cx.simulate_modifiers_change(gpui::Modifiers::shift());
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_modifiers_change(gpui::Modifiers::none());
+        // The new, still empty line shows at once (not after the next key).
+        assert_eq!(ed.read_with(cx, |ed, _| ed.text()), "one\n");
+        let two = height(cx);
+        let lh = gpui::px(ed.read_with(cx, |ed, _| ed.line_height()));
+        assert_eq!((one, two), (lh, lh * 2.), "one row, then two");
     }
 }

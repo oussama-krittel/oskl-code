@@ -68,12 +68,13 @@ cargo run --release -- /path/to/project src/app.ts # a folder and a file
 
 ## Getting started
 
-1. **Open a folder:** ⌘O, drag a folder onto the Dock icon, or pick one from the recent list on the welcome screen. ⌘⇧N opens another project in a new window and ⌘\` switches between them.
-2. **Find a file:** ⌘P, type a few letters (fuzzy). Add `:42` to jump to a line: `app.ts:42`.
+1. **Open a folder:** ⌘O, drag a folder onto the Dock icon, or pick one from the recent list on the welcome screen. ⌘⇧N opens another project in a new window and ⌘\` switches between them. To tell the windows apart, give each project a color for its title and status bars: click the project's name at the top left and pick one, or Custom… to type a hex color there (the bars follow as you type; Enter keeps it, Esc goes back). From the command line: `:window-color #rrggbb`, `:window-color off`. The project keeps it.
+2. **Find a file:** ⌘P, type a few letters (fuzzy). Add `:42` to jump to a line: `app.ts:42`. ⌘⇧O (or `@` first in ⌘P) lists the file's functions, classes and types to jump to (for CSS, HTML, YAML, TOML and JSON: selectors and @media, elements with an id and headings, keys); the breadcrumb shows the one the cursor is in.
 3. **Split the screen:** ⌘\\ splits right, ⌘⇧\\ splits down. ⌘⌥ + arrows move between splits. Drag the gap to resize.
 4. **Open a terminal:** ⌘T in the focused split, or ⌃\` for one at the bottom.
 5. **Commit:** ⌃⇧G opens Source Control. Write a message, ⌘Enter commits.
-6. **See every shortcut:** ⌘K ⌘S (the keyboard icon at the bottom of the activity bar). The list is searchable.
+6. **See every shortcut:** ⌘K ⌘S (the keyboard icon at the bottom of the activity bar). The list is searchable. Pause after ⌘K and the keys that can follow it are listed.
+7. **Focus:** ⌘K Z (or `:zen`) hides everything but the editor; Esc or the same keys bring it back. In a narrow window the sidebar lies over the editor and splits stack.
 
 ## Usage guide
 
@@ -89,17 +90,60 @@ Works like VS Code's:
 ### Source Control (⌃⇧G)
 
 - Changes grouped by folder: stage / unstage / discard on hover or from the keyboard. Discard asks first.
-- Commit box: ⌘Enter commits, with an amend toggle.
+- Commit box: ⌘Enter commits, with an amend toggle. If git has a `commit.template`, the empty box starts from it.
 - Graph with branches, remotes and tags; filter which branches it shows. Fetch, pull and push buttons.
-- Click a commit to see its files and diffs; right-click it to create a branch there, cherry-pick, revert or copy its hash.
+- **Search the graph** (the magnifier, or `:find <text>`): commits on any branch whose message or author contains the text, or whose hash starts with it. Esc shows everything again.
+- Click a commit to see its files and diffs. Right-click it to:
+  - check it out, branch from it, or tag it;
+  - cherry-pick it (with or without committing) or revert it;
+  - reset the current branch there: keep the changes staged, keep them unstaged, or discard them (that last one asks first);
+  - start an **interactive rebase** from it: pick, reword (edit the message), squash, fix up, drop or move each commit;
+  - save it as a `.patch`;
+  - compare it with HEAD, or mark it and compare it with another commit.
+- **The Git tab** (`:repo`, or the ⤢ on the Repository section): a full git client in the editor area.
+  - **Toolbar:** fetch, pull and push (with how many commits each would bring), stash, pop, new branch, "All branches" for the history, apply a patch, and search.
+  - The history reads 800 commits at a time and loads more as you scroll to its end (the sidebar's graph too).
+  - While the tab is open it fetches every 10 minutes, quietly, so ahead/behind and remote branches stay current.
+  - Under the commit box, the subject's length (orange past 72).
+  - Click a branch, remote branch or tag in the tree to select its commit (the history widens to every branch if it has to). The sidebar's graph does the same.
+  - Right-click a changed file for open, file history, stage or unstage, discard, copy path. A conflicted one opens in the merge editor, or takes ours or theirs whole.
+  - **Left:** the branches tree (described below).
+  - **Middle:** the history as a table (graph, message, author, date, hash).
+  - **Bottom:** the picked commit's details and files, with the diff of the file you click beside them. ↑ / ↓ move through the history, Enter opens the commit.
+  - **Local changes** (the first row, when there are any): conflicted, unstaged and staged files, each staged, unstaged or discarded on hover, or all at once. Click a file for its diff; an unstaged one is editable, with its hunks and lines staged from there. Below, a commit box (⌘Enter) with Amend, which starts from the last commit's message.
+  - **A merge, rebase or cherry-pick that stopped** shows a banner: Continue once nothing is conflicted, Skip this commit, or Abort.
+  - **Undo** (the toast, or `:undo-git`) takes back the last commit, amend, cherry-pick, revert, merge, pull, rebase, reset, discard, stash, pop or branch delete. A commit or amend goes back to staged changes (the first commit of a branch too), a pull or merge goes back to where the branch was (it asks first when you have uncommitted changes), and undoing a pop puts the stash back and takes its changes out of the files, as long as you haven't edited them since. It never drops newer commits: if the branch moved on, it stops.
+  - Drag the edges to resize. On a narrow screen the table drops its author and date, the details stack, and the tree makes room.
+- **Pull request review** (GitHub, through the `gh` CLI and its sign-in): the Pull requests item of the sidebar (apart from Source Control) lists them with their checks (✓ ✗ •), filtered as Open, Merged, Closed or All; the current branch's shows as a chip in the Git tab's toolbar.
+  - Click one to review it in its own tab: Conversation (the description and comments drawn as Markdown, with Mermaid diagrams), Commits, and Files changed.
+  - While a review is in front, the sidebar is its files as a tree (like GitHub's), with a filter; a file picked shows its diff. Picking a commit narrows the tree to what it changed. The tree draws only what's on screen, so a pull request of 30 000 files lists at once.
+  - The page shows as soon as gh answers; the commits are fetched after, with gh's sign-in (never a keychain or Git Credential Manager prompt nobody sees).
+  - The review box comments, comments on the line selected in the diff, approves or requests changes.
+  - Check Out, Open on GitHub, and Merge (merge commit, squash or rebase, after asking). ← History goes back.
+- Names are typed in place: renaming a branch or remote, a new branch, a stash message. Things that need more ask in a small dialog: a branch from a commit (check it out or not), a tag (a message makes it annotated, and it can be pushed), a remote, an upstream, a worktree, a submodule, a patch.
+- **Repository** section (between Changes and Graph), like SourceGit's sidebar, and the left side of the Git tab. Right-click a row, or use its `…`, for its menu; double-click for the usual action; the + on a group adds to it.
+  - **Branches:** checkout, pull or fast-forward, push (and track), merge (normal, always a merge commit, or squash), rebase, compare, set or stop the upstream, rename, delete. Each shows ↑ ahead / ↓ behind.
+  - **Remotes:** fetch, prune, add, rename, change the URL, remove; their branches can be checked out, merged, compared, or deleted on the server.
+  - **Tags:** create (`:tag v1 message` makes an annotated tag), push, delete here or on the remote too.
+  - **Stashes:** stash with a message (or only the staged changes), see one, apply, pop, branch from it, drop, clear.
+  - **Worktrees and submodules:** add, open in a new window, lock, remove; set up and update submodules.
+  - **LFS** (when `.gitattributes` uses it): pull, fetch, push, prune, track files, locks. Needs `git-lfs` installed.
+  - **Git Flow** (the Branches menu, or `:flow`): set up, start and finish features, releases and hotfixes, with plain git (no extension needed).
+- **File history:** `:history` for the current file, the clock in a diff, or File History in the explorer's menu. The graph lists the commits that changed it, following renames; click one for that change. The ✕ goes back.
+- **Patches:** `:patch-save <commit> [folder]` and `:patch-apply <file>` (a `git format-patch` file becomes its commit; a plain diff only changes files).
+- **Signing:** `:sign on|off` signs commits and tags in this repository (gpg or ssh, as git is set up). A commit's page says whether its signature checks out.
 - **Several repositories:** if your folder (or an added folder) contains more than one git repository, a select at the top of the panel picks which one you see. Changes, graph, commit box and git commands follow it.
-- Merge conflicts open in a merge editor; files with no conflict markers left are staged when you save.
+- Merge conflicts open in a merge editor; files with no conflict markers left are staged when you save. `:take ours|theirs <file>` resolves a whole file with one side.
 - **Secrets check:** committing asks first when an env file or something shaped like an API key, token or private key is staged (the key itself is never shown in full). Enter cancels; Commit Anyway goes ahead.
+- Commands for the rest: `:branch-rename`, `:upstream`, `:tag-at`, `:remote-add`, `:remote-rename`, `:remote-url`, `:stash-save`, `:stash-branch`, `:rebase-i`, `:worktree-add`, `:submodule-add`, `:lfs-track`. The menus fill them in for you.
 
 ### Diffs and blame
 
 - Side by side or inline (⌘K I), with word-level highlights. F7 / ⇧F7 jump between changes.
-- Unstaged changes open as editable diffs: edit the right side and ⌘S saves.
+- Unstaged changes open as editable diffs: edit the right side and ⌘S saves. The fold button in its toolbar (and in every other diff: staged changes, commits, comparisons) shows only the changes, three lines around each; the rest folds into "⋯ N unchanged lines". Press it again for the whole file. It switches every open diff at once, and the choice is saved, so diffs open the same way after a restart.
+- **Stage or discard part of a file:** in an unstaged diff, + stages the change at the cursor, or only the lines you selected; the discard button puts it back as it was (⌘Z undoes). In a staged diff, − unstages the selected change.
+- **Peek at a change:** click a change mark in the gutter to see the old lines and the new ones, then Stage only that change, Revert it (⌘Z undoes) or Open diff. Esc closes it. The card floats under the change's last line, over the lines below it.
+- Errors and warnings in the status bar (or `:problems`) open the Problems panel: click one to jump to it.
 - Blame for the current line inline, a blame gutter with ⌥⌘B, and `b` in diffs. Click a blame entry to open that commit.
 
 ### Editing
@@ -122,14 +166,13 @@ Works like VS Code's:
 - ⌘⌥Enter (or double-click a split header) maximizes a split and back.
 - The terminal is a full terminal (vim, htop, less, mouse and scrolling work). ⌘-click a `file:line` it printed to open it.
 
-### Claude (⌘Esc)
+### Agent chat (⌘Esc)
 
-Chats with the Claude Code installed on your Mac (`claude` on your PATH, signed in once in a terminal). The ✦ button in the activity bar or ⌘Esc opens the chat, ⌘⇧Esc a new one, ⌘K ⌘A mentions the selected lines; `:claude <message>` asks from the command line. Claude Code only runs while a chat is in use: it's stopped after two idle minutes and the next message picks the conversation up again.
+Chats with a coding agent over the [Agent Client Protocol](https://agentclientprotocol.com): Claude Code by default (through `npx @agentclientprotocol/claude-agent-acp`, signed in with your `claude login`; needs Node 22+), or Codex, Gemini CLI, GitHub Copilot, OpenCode, Goose or Cursor (the agent button in the chat's header, or `/agent`). The ✦ button in the activity bar or ⌘Esc opens the chat, ⌘⇧Esc a new one, ⌘K ⌘A mentions the selected lines; `:claude <message>` asks from the command line. The agent only runs while a chat is in use: it's stopped after two idle minutes and the next message picks the conversation up again.
 
-- The open file and selection go with each message (click the chip to stop that). `@` mentions files, `/` lists commands, ⇧⇥ switches between Ask before edits, Edit automatically and Plan mode. Paste or drop pictures and files.
-- Claude asks before tools run: Yes, Yes and don't ask again, or No (type in the box what to do instead). Questions, plans and edits (as diffs) show as cards. File names open in the editor; ⌘-click opens them in their default app.
-- Pickers for model, effort and output style list what your Claude Code offers. The ⋯ menu has MCP servers, context and usage, compact, export and "continue in terminal". The clock lists past conversations. The tree icon (with the number running) maps subagents and background commands, nested under what started them: Stop ends one, and a stopped subagent can Resume. Subagent cards in the chat have the same buttons.
-- On your messages: edit or retry (continues as a new conversation), fork into a new tab, or rewind code to before that message.
+- The open file and selection go with each message (click the chip to stop that). `@` mentions files, `/` lists the agent's commands, ⇧⇥ switches modes. Paste or drop pictures and files.
+- The agent asks before tools run, with its own choices (for Claude: Yes, Yes and allow all edits, No); typing a message instead answers No. Edits show as diffs, and the agent's plan is pinned above the box. File names open in the editor; ⌘-click opens them in their default app.
+- The pickers under the box (mode, model…) are the agent's own. The header shows context used, cost, and Claude's plan limits. The clock lists past conversations, when the agent keeps them; the ⋯ menu has compact, export and (Claude) "continue in terminal".
 
 ### Command line (⌘⇧P or ⌘;)
 
@@ -160,6 +203,7 @@ cargo test            # unit and UI tests (the UI tests use real clicks and keys
 | Path | What's there |
 |---|---|
 | `src/workspace.rs` | Window: splits, tabs, command line, status bar, sessions |
+| `src/shell.rs` | Title bar and project switcher, breadcrumb, start screens, zen mode, ⌘K hints, narrow windows |
 | `src/editor.rs`, `src/buffer.rs` | Text editor (rope buffer, multi-cursor, completion, go to definition) |
 | `src/file_tree.rs` | Explorer |
 | `src/git.rs`, `src/repo.rs`, `src/git_panel.rs`, `src/graph.rs` | Git commands, repository state, Source Control panel, commit graph |

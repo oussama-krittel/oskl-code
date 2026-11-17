@@ -8,7 +8,7 @@ use crate::request::Request;
 use crate::theme;
 use crate::ui::{self, px};
 use gpui::prelude::*;
-use gpui::{App, Context, EventEmitter, FocusHandle, SharedString, Task, Window, div};
+use gpui::{App, Context, EventEmitter, FocusHandle, FontWeight, SharedString, Task, Window, div};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -493,7 +493,7 @@ fn note(text: &str) -> gpui::AnyElement {
 }
 
 fn subhead(text: &str) -> gpui::AnyElement {
-    div().px(px(20.)).pt(px(8.)).pb(px(2.)).text_size(px(10.5)).text_color(theme::fg_muted()).child(text.to_uppercase()).into_any_element()
+    div().px(px(20.)).pt(px(8.)).pb(px(2.)).text_size(px(11.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::fg_muted()).child(text.to_string()).into_any_element()
 }
 
 fn pair(k: &str, v: String) -> gpui::AnyElement {
@@ -550,8 +550,10 @@ impl Render for ClaudePanel {
                     .pl(px(20.))
                     .pr(px(6.))
                     .gap(px(1.))
-                    .text_size(px(10.5))
-                    .child(div().flex_1().child("CLAUDE"))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::fg_bright())
+                    .child(div().flex_1().child("Claude"))
                     .child(head_button("claude-new", "plus", "New chat (⌘⇧Esc)").on_click(cx.listener(|_, _, _, cx| cx.emit(Request::OpenChat(None)))))
                     .child(head_button("claude-refresh", "refresh", "Refresh").on_click(cx.listener(|p, _, _, cx| p.refresh(p.root.clone(), cx)))),
             )

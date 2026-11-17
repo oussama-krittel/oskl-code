@@ -78,6 +78,7 @@ tree-sitter-toml-ng = "0.7.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-yaml = "0.7.2"
 yaml-rust2 = "0.13.0"
+agent-client-protocol = "=5.2.0"
 
 # The objc crate's macros check `feature = "cargo-clippy"`, an old clippy convention.
 [lints.rust]

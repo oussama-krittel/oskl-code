@@ -48,6 +48,8 @@ enum Kind {
     Delete,
     Insert,
     Change,
+    /// Unchanged lines left out (`Row::hidden` of them) when the diff shows only the changes.
+    Gap,
 }
 
 #[derive(Clone)]
@@ -57,6 +59,7 @@ struct Row {
     r: Option<usize>,
     l_hl: Vec<Range<usize>>,
     r_hl: Vec<Range<usize>>,
+    hidden: usize,
 }
 
 type BlameLines = Vec<Option<Arc<BlameCommit>>>;
@@ -66,6 +69,9 @@ struct Loaded {
     right: Vec<String>,
     side: Vec<Row>,
     inline: Vec<Row>,
+    /// The same rows with long unchanged runs folded into `Gap` rows.
+    side_short: Vec<Row>,
+    inline_short: Vec<Row>,
     /// Syntax colours per line of each side (char columns), when the language is known.
     left_syn: Option<LineSpans>,
     right_syn: Option<LineSpans>,
@@ -81,6 +87,7 @@ pub struct DiffView {
     right_blame: Option<Arc<BlameLines>>,
     pub show_blame: bool,
     inline: bool,
+    changes_only: bool,
     /// Width of the old (left) side, 0..1; drag the divider to change it.
     split: f32,
     dragging_split: bool,
@@ -96,13 +103,15 @@ pub struct DiffView {
     /// Text selected by dragging, on each side (old, new; inline uses the new one): ⌘C copies it.
     sel_old: crate::sel::Selection,
     sel_new: crate::sel::Selection,
+    /// Code text size, as in the editors (the zoom changes it).
+    pub font_size: f32,
     _tasks: Vec<Task<()>>,
 }
 
 impl EventEmitter<Request> for DiffView {}
 
 impl DiffView {
-    pub fn new(root: PathBuf, spec: DiffSpec, user_email: Option<String>, show_blame: bool, cx: &mut Context<Self>) -> Self {
+    pub fn new(root: PathBuf, spec: DiffSpec, user_email: Option<String>, show_blame: bool, font_size: f32, cx: &mut Context<Self>) -> Self {
         let mut view = Self {
             focus: cx.focus_handle(),
             root,
@@ -113,6 +122,7 @@ impl DiffView {
             right_blame: None,
             show_blame,
             inline: false,
+            changes_only: crate::editor::diff_changes_only(),
             split: 0.5,
             dragging_split: false,
             body_bounds: Default::default(),
@@ -125,10 +135,15 @@ impl DiffView {
             find_current: None,
             sel_old: Default::default(),
             sel_new: Default::default(),
+            font_size,
             _tasks: Vec::new(),
         };
         view.reload(cx);
         view
+    }
+
+    fn row_h(&self) -> f32 {
+        (self.font_size * 1.7).round()
     }
 
     pub fn title(&self) -> String {
@@ -213,10 +228,48 @@ impl DiffView {
 
     fn rows(&self) -> &[Row] {
         match &self.data {
-            Some(d) if self.show_inline() => &d.inline,
-            Some(d) => &d.side,
+            Some(d) => self.rows_of(d),
             None => &[],
         }
+    }
+
+    fn rows_of<'a>(&self, d: &'a Loaded) -> &'a [Row] {
+        match (self.show_inline(), self.changes_only) {
+            (true, false) => &d.inline,
+            (true, true) => &d.inline_short,
+            (false, false) => &d.side,
+            (false, true) => &d.side_short,
+        }
+    }
+
+    /// How many lines each gap row stands for, in order (tests).
+    #[cfg(test)]
+    pub fn gap_rows(&self) -> Vec<usize> {
+        self.rows().iter().filter(|r| r.kind == Kind::Gap).map(|r| r.hidden).collect()
+    }
+
+    /// Only the changes (and a few lines around each) instead of the whole file; every other
+    /// diff follows, and the choice is saved.
+    pub fn toggle_changes_only(&mut self, cx: &mut Context<Self>) {
+        let on = !self.changes_only;
+        self.set_changes_only(on, cx);
+        cx.emit(Request::ChangesOnlyShown(on));
+    }
+
+    pub fn set_changes_only(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.changes_only == on {
+            return;
+        }
+        let line = self.selected.and_then(|s| self.rows().get(s)).and_then(|r| r.r.or(r.l));
+        self.changes_only = on;
+        self.selected = None;
+        self.collect_hits();
+        if let Some(line) = line
+            && let Some(ix) = self.rows().iter().position(|r| r.r == Some(line) || r.l == Some(line))
+        {
+            self.select(ix, cx);
+        }
+        cx.notify();
     }
 
     /// The find bar's query (None clears it). Returns how many matches and which is current
@@ -309,7 +362,7 @@ impl DiffView {
     fn hunk_starts(&self) -> Vec<usize> {
         let rows = self.rows();
         (0..rows.len())
-            .filter(|&i| rows[i].kind != Kind::Equal && (i == 0 || rows[i - 1].kind == Kind::Equal))
+            .filter(|&i| !matches!(rows[i].kind, Kind::Equal | Kind::Gap) && (i == 0 || matches!(rows[i - 1].kind, Kind::Equal | Kind::Gap)))
             .collect()
     }
 
@@ -355,6 +408,37 @@ impl DiffView {
             self.select(ix, cx);
         }
         cx.notify();
+    }
+
+    /// The selected row's line, 1-based: (on the new side, line), or the old side for a removed line.
+    pub fn selected_line(&self) -> Option<(bool, usize)> {
+        let row = self.rows().get(self.selected?)?;
+        row.r.map(|r| (true, r + 1)).or(row.l.map(|l| (false, l + 1)))
+    }
+
+    /// A staged diff (HEAD ↔ Index): its changes can be taken back out of the index one by one.
+    fn is_staged_diff(&self) -> bool {
+        self.spec.left == Rev::Commit("HEAD".into()) && self.spec.right == Rev::Index
+    }
+
+    /// Unstages the change at the selected row.
+    pub fn unstage_part(&mut self, cx: &mut Context<Self>) {
+        let rows = self.rows();
+        let Some(sel) = self.selected.filter(|s| *s < rows.len()) else { return };
+        // A removed line has no index line: it sits before the next one that does.
+        let line = rows[sel..].iter().find_map(|r| r.r).unwrap_or_else(|| self.data.as_ref().map_or(0, |d| d.right.len()));
+        let path = self.spec.path.clone();
+        let index = git::read_rev(&self.root, &Rev::Index, &path).unwrap_or_default();
+        let head = git::read_rev(&self.root, &Rev::Commit("HEAD".into()), self.spec.old_path.as_deref().unwrap_or(&path)).unwrap_or_default();
+        let staged = git::mix(&index, &head, line..line + 1, false, true);
+        if staged == index {
+            return cx.emit(Request::Error("No staged change here".into()));
+        }
+        match git::write_index(&self.root, &path, &staged) {
+            Ok(()) => cx.emit(Request::Message("Unstaged this change".into())),
+            Err(e) => cx.emit(Request::Error(format!("Unstage failed: {e}"))),
+        }
+        self.reload(cx);
     }
 
     fn open_file(&mut self, _: &OpenFile, _: &mut Window, cx: &mut Context<Self>) {
@@ -442,7 +526,7 @@ impl DiffView {
             })
             // One line, whatever the width: a long path and the two versions' names shorten.
             .child(ui::file_icon(&self.spec.path).flex_none())
-            .child(div().min_w(px(40.)).overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_bright()).child(self.spec.path.clone()))
+            .child(div().min_w(px(40.)).overflow_hidden().text_ellipsis().whitespace_nowrap().font_family(theme::MONO_FONT).text_color(theme::fg_bright()).child(self.spec.path.clone()))
             .child(
                 div()
                     .min_w_0()
@@ -455,8 +539,18 @@ impl DiffView {
             .child(div().flex_none().text_color(theme::git_added()).child(format!("+{added}")))
             .child(div().flex_none().text_color(theme::git_deleted()).child(format!("-{removed}")))
             .child(div().flex_1())
+            .when(self.is_staged_diff(), |d| {
+                d.child(ui::icon_button("unstage-hunk", "minus").debug_selector(|| "unstage-hunk".into()).tooltip(ui::tooltip("Unstage the selected change")).on_click(cx.listener(|v, _, _, cx| v.unstage_part(cx))))
+            })
             .child(ui::icon_button("prev-hunk", "arrow-up").on_click(cx.listener(|v, _, w, cx| v.prev_hunk(&PrevHunk, w, cx))))
             .child(ui::icon_button("next-hunk", "arrow-down").on_click(cx.listener(|v, _, w, cx| v.next_hunk(&NextHunk, w, cx))))
+            .child(
+                ui::icon_button("toggle-changes-only", if self.changes_only { "unfold-changes" } else { "fold-changes" })
+                    .debug_selector(|| "toggle-changes-only".into())
+                    .tooltip(ui::tooltip(if self.changes_only { "Show the whole file" } else { "Show only the changes" }))
+                    .when(self.changes_only, |b| b.bg(theme::selected()))
+                    .on_click(cx.listener(|v, _, _, cx| v.toggle_changes_only(cx))),
+            )
             .when(!self.one_sided(), |d| {
                 d.child(
                     ui::icon_button("toggle-inline", if self.inline { "split" } else { "inline" })
@@ -480,6 +574,7 @@ impl DiffView {
                         })),
                 )
             })
+            .child(ui::icon_button("file-history", "history").debug_selector(|| "file-history".into()).tooltip(ui::tooltip("This file's history")).on_click(cx.listener(|v, _, _, cx| cx.emit(Request::FileHistory(v.root.join(&v.spec.path))))))
             .child(ui::icon_button("open-file", "open").on_click(cx.listener(|v, _, w, cx| v.open_file(&OpenFile, w, cx))))
     }
 }
@@ -520,7 +615,7 @@ fn compute(left: &str, right: &str) -> Loaded {
     let diff = TextDiff::configure().timeout(Duration::from_secs(2)).diff_lines(left, right);
     let mut side = Vec::new();
     let mut inline = Vec::new();
-    let row = |kind, l, r| Row { kind, l, r, l_hl: Vec::new(), r_hl: Vec::new() };
+    let row = |kind, l, r| Row { kind, l, r, l_hl: Vec::new(), r_hl: Vec::new(), hidden: 0 };
     for op in diff.ops() {
         match *op {
             DiffOp::Equal { old_index, new_index, len } => {
@@ -552,12 +647,12 @@ fn compute(left: &str, right: &str) -> Loaded {
                         (Some(l), Some(r)) => word_highlights(&left_lines[l], &right_lines[r]),
                         _ => (Vec::new(), Vec::new()),
                     };
-                    side.push(Row { kind: Kind::Change, l, r, l_hl: l_hl.clone(), r_hl: r_hl.clone() });
+                    side.push(Row { kind: Kind::Change, l, r, l_hl: l_hl.clone(), r_hl: r_hl.clone(), hidden: 0 });
                     if let Some(l) = l {
-                        dels.push(Row { kind: Kind::Delete, l: Some(l), r: None, l_hl, r_hl: Vec::new() });
+                        dels.push(Row { kind: Kind::Delete, l: Some(l), r: None, l_hl, r_hl: Vec::new(), hidden: 0 });
                     }
                     if let Some(r) = r {
-                        ins.push(Row { kind: Kind::Insert, l: None, r: Some(r), l_hl: Vec::new(), r_hl });
+                        ins.push(Row { kind: Kind::Insert, l: None, r: Some(r), l_hl: Vec::new(), r_hl, hidden: 0 });
                     }
                 }
                 inline.extend(dels);
@@ -565,7 +660,28 @@ fn compute(left: &str, right: &str) -> Loaded {
             }
         }
     }
-    Loaded { left: left_lines, right: right_lines, side, inline, left_syn: None, right_syn: None }
+    let (side_short, inline_short) = (short(&side), short(&inline));
+    Loaded { left: left_lines, right: right_lines, side, inline, side_short, inline_short, left_syn: None, right_syn: None }
+}
+
+/// `rows` with each long run of unchanged lines folded into one `Gap` row.
+fn short(rows: &[Row]) -> Vec<Row> {
+    let keep = crate::editor::diff_keep_mask(rows.len(), |i| rows[i].kind != Kind::Equal, crate::editor::DIFF_CONTEXT);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        if keep[i] {
+            out.push(rows[i].clone());
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < rows.len() && !keep[i] {
+            i += 1;
+        }
+        out.push(Row { kind: Kind::Gap, l: None, r: None, l_hl: Vec::new(), r_hl: Vec::new(), hidden: i - start });
+    }
+    out
 }
 
 /// Byte ranges that differ between two versions of a line.
@@ -631,7 +747,6 @@ pub(crate) fn styled_line(text: &str, syntax: &[(Range<usize>, u8)], highlights:
     StyledText::new(display).with_runs(runs)
 }
 
-const ROW_H: f32 = 20.;
 const NUM_W: f32 = 44.;
 const BLAME_W: f32 = 190.;
 
@@ -641,7 +756,7 @@ impl DiffView {
         let selected = self.selected == Some(row_ix);
         let line = if left { row.l } else { row.r };
         let (bg, hl, sign) = match (row.kind, left, line.is_some()) {
-            (Kind::Equal, _, _) => (None, theme::diff_del_char(), " "),
+            (Kind::Equal | Kind::Gap, _, _) => (None, theme::diff_del_char(), " "),
             (_, _, false) => (Some(theme::diff_filler()), theme::diff_del_char(), " "),
             (Kind::Delete, _, true) | (Kind::Change, true, true) => (Some(theme::diff_del_line()), theme::diff_del_char(), "-"),
             (Kind::Insert, _, true) | (Kind::Change, false, true) => (Some(theme::diff_ins_line()), theme::diff_ins_char(), "+"),
@@ -755,7 +870,7 @@ impl Render for DiffView {
         let body: AnyElement = if let Some(err) = &self.error {
             div().p(px(20.)).text_color(theme::fg_muted()).child(err.clone()).into_any_element()
         } else if let Some(data) = self.data.clone() {
-            let count = if self.show_inline() { data.inline.len() } else { data.side.len() };
+            let count = self.rows_of(&data).len();
             if count == 0 || (count == 1 && data.side.iter().all(|r| r.kind == Kind::Equal) && data.left == data.right) {
                 div().p(px(20.)).text_color(theme::fg_muted()).child("No changes.").into_any_element()
             } else {
@@ -763,7 +878,7 @@ impl Render for DiffView {
                     "diff-rows",
                     count,
                     cx.processor(move |view, range: Range<usize>, _window, cx| {
-                        let rows = if view.show_inline() { &data.inline } else { &data.side };
+                        let rows = view.rows_of(&data);
                         let first = range.start;
                         range
                             .map(|ix| {
@@ -773,10 +888,10 @@ impl Render for DiffView {
                                 let base = div()
                                     .id(("diff-row", ix))
                                     .flex()
-                                    .h(px(ROW_H))
+                                    .h(px(view.row_h()))
                                     .w_full()
                                     .font_family(theme::MONO_FONT)
-                                    .text_size(px(11.5))
+                                    .text_size(px(view.font_size))
                                     .when(selected, |d| d.border_1().border_color(theme::focus_border()))
                                     .on_click(cx.listener(move |view, ev: &ClickEvent, _, cx| {
                                         view.selected = Some(ix);
@@ -787,7 +902,10 @@ impl Render for DiffView {
                                         }
                                         cx.notify();
                                     }));
-                                if view.show_inline() {
+                                if row.kind == Kind::Gap {
+                                    let n = row.hidden;
+                                    base.bg(theme::diff_filler()).items_center().px(px(10.)).text_color(theme::fg_muted()).child(format!("⋯ {n} unchanged {}", if n == 1 { "line" } else { "lines" }))
+                                } else if view.show_inline() {
                                     let left = row.r.is_none();
                                     base.child(view.render_side(&row, left, &data, ix, top, cx))
                                 } else {
@@ -869,7 +987,7 @@ impl Render for DiffView {
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, _| view.dragging_split = false))
             .on_scroll(cx.listener(|view, ev: &ScrollEvent, _, cx| {
-                let d = ev.delta.pixel_delta(px(ROW_H));
+                let d = ev.delta.pixel_delta(px(view.row_h()));
                 let dx = d.x / px(1.);
                 if dx.abs() > 0.5 {
                     view.scroll_x = (view.scroll_x - dx).max(0.);

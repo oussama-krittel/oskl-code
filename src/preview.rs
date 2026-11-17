@@ -550,7 +550,8 @@ impl PreviewView {
             }
             let file = remote_image_file(&url);
             let get = cx.background_executor().spawn(async move {
-                let ok = download_image(&url, &file);
+                // A panic in a background task aborts the app: a picture that can't be fetched just isn't shown.
+                let ok = std::panic::catch_unwind(|| download_image(&url, &file)).unwrap_or(false);
                 REMOTE_BUSY.lock().unwrap().remove(&url);
                 if !ok {
                     REMOTE_FAILED.lock().unwrap().insert(url);
@@ -1356,7 +1357,9 @@ fn remote_image_file(url: &str) -> PathBuf {
 /// Downloads a picture (at most 5 MB, 15 s) to `file`; whether it worked.
 fn download_image(url: &str, file: &Path) -> bool {
     use std::io::Read;
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(15))).build().into();
+    // ureq is built with native-tls only: without saying so it picks rustls and panics on https.
+    let tls = ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).build();
+    let agent: ureq::Agent = ureq::Agent::config_builder().tls_config(tls).timeout_global(Some(std::time::Duration::from_secs(15))).build().into();
     let Ok(mut resp) = agent.get(url).call() else { return false };
     let mut bytes = Vec::new();
     if resp.body_mut().as_reader().take(5 * 1024 * 1024 + 1).read_to_end(&mut bytes).is_err() || bytes.is_empty() || bytes.len() > 5 * 1024 * 1024 {
@@ -1483,13 +1486,55 @@ impl Markdown {
             wanted: Vec::new(),
             images: images.clone(),
             shown: Vec::new(),
-            near: Bounds::default(),
-            keep: Bounds::default(),
+            // shortcut: every diagram counts as on screen (a PR's few), upgrade by measuring the view if a page has many.
+            near: Bounds::new(point(gpui::px(-1e6), gpui::px(-1e6)), size(gpui::px(2e6), gpui::px(2e6))),
+            keep: Bounds::new(point(gpui::px(-1e6), gpui::px(-1e6)), size(gpui::px(2e6), gpui::px(2e6))),
             paras: 0,
             wrap: true,
         };
         let children: Vec<AnyElement> = self.0.iter().map(|b| r.block(b)).collect();
         div().flex().flex_col().gap(px(8.)).font_family(PROSE_FONT).text_size(px(13.)).line_height(relative(1.5)).text_color(theme::fg()).children(children).into_any_element()
+    }
+}
+
+impl Markdown {
+    /// GitHub-style text (a pull request's description, its comments): ```mermaid fences are
+    /// drawn, once `fetch_waiting` has drawn them (a placeholder meanwhile).
+    pub fn parse_doc(text: &str) -> Self {
+        Markdown(parse(text))
+    }
+
+    /// Draws the diagrams and downloads the web pictures that parsed or drawn documents are
+    /// waiting for, in the background; `done` runs after each (parse again to show it).
+    pub fn fetch_waiting<T: 'static>(cx: &mut Context<T>, done: fn(&mut T, &mut Context<T>)) {
+        for job in PENDING.with(|p| std::mem::take(&mut *p.borrow_mut())) {
+            let draw = cx.background_executor().spawn(async move { job.draw() });
+            cx.spawn(async move |this, cx| {
+                let _ = draw.await;
+                this.update(cx, |v, cx| done(v, cx)).ok();
+            })
+            .detach();
+        }
+        for url in REMOTE_WANTED.with(|w| std::mem::take(&mut *w.borrow_mut())) {
+            if !REMOTE_BUSY.lock().unwrap().insert(url.clone()) {
+                continue;
+            }
+            let file = remote_image_file(&url);
+            let get = cx.background_executor().spawn(async move {
+                let ok = std::panic::catch_unwind(|| download_image(&url, &file)).unwrap_or(false);
+                REMOTE_BUSY.lock().unwrap().remove(&url);
+                if !ok {
+                    REMOTE_FAILED.lock().unwrap().insert(url);
+                }
+                ok
+            });
+            cx.spawn(async move |this, cx| {
+                if get.await {
+                    this.update(cx, |v, cx| done(v, cx)).ok();
+                }
+            })
+            .detach();
+        }
     }
 }
 
@@ -2686,6 +2731,11 @@ mod tests {
         assert!(!super::download_image(&format!("http://127.0.0.1:{port}/missing.png"), &file.with_extension("x")), "a 404 isn't a picture");
         std::fs::remove_file(&file).ok();
         assert_ne!(super::remote_image_file("https://a/x.png"), super::remote_image_file("https://a/y.png"), "one file per address");
+        // https goes through the TLS the app is built with: a failed download, not a panic (the panic took the app down).
+        let plain = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tls_url = format!("https://127.0.0.1:{}/logo.webp", plain.local_addr().unwrap().port());
+        std::thread::spawn(move || drop(plain.accept()));
+        assert!(!super::download_image(&tls_url, &file.with_extension("y")), "not a TLS server: no picture, no panic");
     }
 
     #[test]
@@ -2861,5 +2911,22 @@ mod tests {
         std::fs::write(&gif, b"GIF89a\x40\x01\xf0\x00").unwrap();
         assert_eq!(image_size(&gif), Some((320, 240)));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+
+#[cfg(test)]
+mod doc_tests {
+    use super::{Block, Markdown, PENDING};
+
+    #[test]
+    fn a_pull_requests_text_draws_its_mermaid_diagrams() {
+        let text = "Flow:\n\n```mermaid\ngraph TD; Open-->Review\n```\n";
+        let first = Markdown::parse_doc(text);
+        assert!(first.0.iter().any(|b| matches!(b, Block::MermaidPending)), "drawn in the background, a placeholder meanwhile");
+        for job in PENDING.with(|p| std::mem::take(&mut *p.borrow_mut())) {
+            job.draw().expect("drawn");
+        }
+        assert!(Markdown::parse_doc(text).0.iter().any(|b| matches!(b, Block::Mermaid(Ok(_), _))), "then the picture");
     }
 }

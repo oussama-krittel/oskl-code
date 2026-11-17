@@ -1,7 +1,7 @@
 //! Source Control panel: commit box, staged/unstaged changes and the commit graph.
 
 use crate::editor::{Editor, EditorEvent, EditorMode};
-use crate::git::{self, Change, FileStatus, RefKind, Rev};
+use crate::git::{self, Change, FileStatus, Rev};
 use crate::graph::GraphRow;
 use crate::repo::Repo;
 use crate::request::{DiffSpec, Request};
@@ -14,9 +14,20 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
 
+#[path = "git_refs.rs"]
+pub mod refs;
+#[path = "git_commands.rs"]
+mod commands;
+#[path = "git_view.rs"]
+pub mod view;
+#[path = "git_pr.rs"]
+pub mod pr;
+pub use commands::COMMANDS;
+
 actions!(git_panel, [Down, Up, Open, ToggleStage, Discard, OpenFile, FocusCommit, Refresh, Top, Bottom, Expand, Collapse]);
 
 pub fn bind_keys() {
+    view::bind_keys();
     // Not while typing a commit message: s, d, c… are letters there.
     let c = Some("GitPanel && !typing");
     crate::keybindings::collect([
@@ -193,6 +204,13 @@ fn tree_rows(changes: &[Change], staged: bool, section: &str, collapsed: &std::c
     rows
 }
 
+/// Changes as a flat list: by name, the folder shown beside it.
+fn flat_rows(changes: &[Change], staged: bool) -> Vec<ListRow> {
+    let mut files: Vec<&Change> = changes.iter().collect();
+    files.sort_by(|a, b| (ui::file_name(&a.path), &a.path).cmp(&(ui::file_name(&b.path), &b.path)));
+    files.into_iter().map(|c| ListRow::File { staged, change: c.clone(), depth: 0 }).collect()
+}
+
 const LANE_W: f32 = 11.;
 /// Opacity of graph colors for commits the checkout doesn't contain.
 const MUTED: f32 = 0.38;
@@ -207,6 +225,7 @@ pub struct GitPanel {
     focus: FocusHandle,
     repo: Entity<Repo>,
     pub commit_input: Entity<Editor>,
+    pub drafter: git::draft::Drafter,
     changes_open: bool,
     graph_open: bool,
     staged_open: bool,
@@ -220,8 +239,6 @@ pub struct GitPanel {
     changes_scroll: ScrollHandle,
     commit_task: Option<Task<()>>,
     menu_open: bool,
-    branch_menu: Option<(git::Ref, Point<Pixels>)>,
-    commit_menu: Option<(usize, Point<Pixels>)>,
     scope_open: bool,
     /// The filter's choices: local and remote branches, most useful first.
     scope_local: Vec<String>,
@@ -233,6 +250,8 @@ pub struct GitPanel {
     /// The changes row under the mouse: only it shows its buttons (the others' names get
     /// that room). Tracked here, since a hover style can't change layout.
     hovered_row: Option<String>,
+    /// Changes as a folder tree; off (the default), a flat list with the status letter on the left.
+    as_tree: bool,
     /// `in_checkout` for the current log and HEAD, recomputed when either changes.
     reach: std::cell::RefCell<Option<(String, usize, Rc<(Vec<bool>, Option<usize>)>)>>,
     /// Commits opened in the graph to list their files (by sha), and those files once read.
@@ -246,6 +265,14 @@ pub struct GitPanel {
     repo_sub: Subscription,
     _repos_subs: Vec<Subscription>,
     _subs: Vec<Subscription>,
+    /// The Repository section (branches, remotes, tags…), and its groups folded shut.
+    refs_open: bool,
+    /// Branches, tags, stashes…: also shows the menus, dialogs and rebase card of the graph.
+    pub refs: Entity<refs::RefsTree>,
+    search_open: bool,
+    pub search_input: Entity<Editor>,
+    /// Put `commit.template` in the empty commit box (at the start and after each commit).
+    want_template: bool,
 }
 
 impl EventEmitter<Request> for GitPanel {}
@@ -258,10 +285,35 @@ impl GitPanel {
             ed
         });
         let repo_sub = Self::observe_repo(&repo, cx);
+        let refs = cx.new(|cx| {
+            let mut t = refs::RefsTree::new(repo.clone(), cx);
+            t.max_h = Some(300.);
+            t.show_tree = false;
+            t
+        });
+        let search_input = cx.new(|cx| {
+            let mut ed = Editor::new(EditorMode::SingleLine, cx);
+            ed.font_size = 12.;
+            ed.placeholder = "Message, author or hash".into();
+            ed
+        });
         let subs = vec![
+            cx.subscribe(&refs, |p, _, refs::Reveal(rev), cx| p.reveal(rev, cx)),
             cx.subscribe_in(&commit_input, window, |panel, _, ev: &EditorEvent, window, cx| match ev {
                 EditorEvent::Submit => panel.commit(None, false, panel.amend, window, cx),
                 EditorEvent::Cancel => window.focus(&panel.focus_target(cx), cx),
+                _ => {}
+            }),
+            cx.subscribe_in(&search_input, window, |panel, input, ev: &EditorEvent, window, cx| match ev {
+                EditorEvent::Changed | EditorEvent::Submit => {
+                    let q = input.read(cx).text();
+                    panel.search_graph(q.trim(), window, cx);
+                }
+                EditorEvent::Cancel => {
+                    panel.search_open = false;
+                    panel.search_graph("", window, cx);
+                    window.focus(&panel.focus_target(cx), cx);
+                }
                 _ => {}
             }),
         ];
@@ -270,6 +322,7 @@ impl GitPanel {
             repos: vec![repo.clone()],
             repo,
             commit_input,
+            drafter: Default::default(),
             changes_open: true,
             graph_open: true,
             staged_open: true,
@@ -283,14 +336,13 @@ impl GitPanel {
             changes_scroll: ScrollHandle::new(),
             commit_task: None,
             menu_open: false,
-            branch_menu: None,
-            commit_menu: None,
             scope_open: false,
             scope_local: Vec::new(),
             scope_remote: Vec::new(),
             last_op: None,
             collapsed: Default::default(),
             hovered_row: None,
+            as_tree: false,
             reach: Default::default(),
             expanded: Default::default(),
             commit_files: Default::default(),
@@ -299,6 +351,11 @@ impl GitPanel {
             repo_sub,
             _repos_subs: Vec::new(),
             _subs: subs,
+            refs_open: false,
+            refs,
+            search_open: false,
+            search_input,
+            want_template: true,
         }
     }
 
@@ -314,6 +371,15 @@ impl GitPanel {
                         panel.commit_input.update(cx, |ed, cx| ed.set_text(&msg, cx));
                     }
                     panel.last_op = op;
+                }
+                if panel.want_template
+                    && let Some(t) = repo.read(cx).template.clone().filter(|t| !t.is_empty())
+                    && repo.read(cx).status.op.is_none()
+                {
+                    panel.want_template = false;
+                    if panel.commit_input.read(cx).text().trim().is_empty() {
+                        panel.commit_input.update(cx, |ed, cx| ed.set_text(&t, cx));
+                    }
                 }
                 let branch = repo.read(cx).branch_label();
                 panel.commit_input.update(cx, |ed, cx| {
@@ -344,8 +410,8 @@ impl GitPanel {
             self.commit_files.clear();
             self.reach.replace(None);
             self.scope_open = false;
-            self.branch_menu = None;
-            self.commit_menu = None;
+            let active = self.repo.clone();
+            self.refs.update(cx, |t, cx| t.set_repo(active, cx));
             self.graph_scroll.scroll_to_item(0, ScrollStrategy::Top);
             cx.notify();
             // Show its state (branch in the message box, prepared merge message) right away.
@@ -496,24 +562,30 @@ impl GitPanel {
             if !confirmed {
                 let findings = crate::secrets::scan_staged(&root);
                 if !findings.is_empty() {
-                    return Ok(Err(findings));
+                    return Ok((Err(findings), None));
                 }
             }
-            if amend && message.is_empty() {
-                return git::run(&root, &["commit", "--amend", "--no-edit"]).map(Ok);
-            }
-            git::commit(&root, &message, amend).map(Ok)
+            let (done, undo) = git::undo::track(
+                &root,
+                Some(git::undo::Kind::Commit),
+                || if amend && message.is_empty() { git::run(&root, &["commit", "--amend", "--no-edit"]) } else { git::commit(&root, &message, amend) },
+                |r| r.is_ok(),
+            );
+            done.map(|out| (Ok(out), undo))
         });
         self.commit_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             this.update_in(cx, |panel, _, cx| {
                 match result {
-                    Ok(Err(findings)) => panel.ask_secrets(findings, retry, amend, cx),
-                    Ok(Ok(out)) => {
+                    Ok((Err(findings), _)) => panel.ask_secrets(findings, retry, amend, cx),
+                    Ok((Ok(out), undo)) => {
                         panel.commit_input.update(cx, |ed, cx| ed.set_text("", cx));
                         panel.amend = false;
+                        panel.want_template = true;
                         let summary = out.lines().next().unwrap_or("Committed").to_string();
-                        cx.emit(Request::Message(summary));
+                        if !panel.repo.update(cx, |r, cx| r.remember(undo, cx)) {
+                            cx.emit(Request::Message(summary));
+                        }
                     }
                     Err(e) => cx.emit(Request::Error(format!("Commit failed: {e}"))),
                 }
@@ -554,7 +626,7 @@ impl GitPanel {
         let st = self.repo.read(cx).status.clone();
         if !st.conflicts.is_empty() {
             let n = st.conflicts.len();
-            return cx.emit(Request::Error(format!("Resolve {n} conflicted file{} first (Merge Changes)", if n == 1 { "" } else { "s" })));
+            return cx.emit(Request::Error(format!("Resolve {n} conflicted file{} first (Merge changes)", if n == 1 { "" } else { "s" })));
         }
         if op.kind == git::OpKind::Merge && message.is_empty() {
             self.focus_commit_input(window, cx);
@@ -599,9 +671,9 @@ impl GitPanel {
                 .child(label)
         };
         let detail = if conflicts > 0 {
-            format!("{conflicts} conflicted file{} — open to resolve, save to mark resolved", if conflicts == 1 { "" } else { "s" })
+            format!("{conflicts} conflicted file{} left: open {} to resolve, save to mark resolved", if conflicts == 1 { "" } else { "s" }, if conflicts == 1 { "it" } else { "them" })
         } else {
-            format!("All conflicts resolved — {}", op.kind.continue_label())
+            format!("No conflicts left: {}", op.kind.continue_label())
         };
         div()
             .flex()
@@ -712,7 +784,10 @@ impl GitPanel {
         let st = &repo.status;
         let mut rows = Vec::new();
         let collapsed = &self.collapsed;
-        let group = |rows: &mut Vec<ListRow>, staged: bool, section: &str, changes: &[Change]| rows.extend(tree_rows(changes, staged, section, collapsed));
+        let tree = self.as_tree;
+        let group = |rows: &mut Vec<ListRow>, staged: bool, section: &str, changes: &[Change]| {
+            rows.extend(if tree { tree_rows(changes, staged, section, collapsed) } else { flat_rows(changes, staged) })
+        };
         if !st.conflicts.is_empty() {
             rows.push(ListRow::Section { staged: false, conflicts: true, count: st.conflicts.len() });
             group(&mut rows, false, "merge", &st.conflicts);
@@ -791,6 +866,15 @@ impl GitPanel {
     #[cfg(test)]
     pub fn expanded_count(&self) -> usize { self.expanded.len() }
 
+    /// The commit selected in the graph (tests).
+    #[cfg(test)]
+    pub fn selected_commit(&self) -> Option<usize> {
+        match self.selected {
+            Some(Item::Commit(ix)) => Some(ix),
+            _ => None,
+        }
+    }
+
     /// The graph's rows: every commit, with an expanded one's files right under it.
     fn graph_items(&self, cx: &App) -> Vec<GraphItem> {
         let commits = &self.repo.read(cx).commits;
@@ -836,6 +920,21 @@ impl GitPanel {
             .detach();
         }
         cx.notify();
+    }
+
+    /// In a file's history: that file's change in the commit at `ix` (under the name it had then).
+    fn open_history_diff(&self, ix: usize, preview: bool, cx: &mut Context<Self>) {
+        let repo = self.repo.read(cx);
+        let (Some((file, names)), Some(c)) = (repo.graph_file.as_ref(), repo.commits.get(ix)) else { return };
+        let path = names.get(&c.sha).cloned().unwrap_or(file.clone());
+        let older = repo.commits.get(ix + 1).and_then(|o| names.get(&o.sha)).filter(|o| **o != path).cloned();
+        // The oldest commit listed is where the file was added.
+        let left = match c.parents.first() {
+            Some(p) if ix + 1 < repo.commits.len() => Rev::Commit(p.clone()),
+            _ => Rev::Empty,
+        };
+        let spec = DiffSpec { path, old_path: older, left, right: Rev::Commit(c.sha.clone()), back: None };
+        cx.emit(Request::OpenDiff { spec, preview });
     }
 
     /// A file under an expanded commit: its diff against the commit's first parent.
@@ -967,19 +1066,83 @@ impl GitPanel {
                 r.refresh_log(cx);
             }),
             15 => cx.emit(Request::CommandLine("git ".into())),
+            17 => cx.emit(Request::CommandLine("stash-save ".into())),
+            18 => cx.emit(Request::CommandLine("patch-apply ".into())),
+            19 => {
+                self.search_open = true;
+                window.focus(&self.search_input.read(cx).focus_target(cx), cx);
+            }
+            20 => self.toggle_refs(cx),
             _ => self.repo.update(cx, |r, cx| r.refresh_all(cx)),
         }
         cx.notify();
     }
 
     /// A popup this wide, hung from the panel's right edge, stays inside the window.
+    /// Selects, in the graph, the commit a branch or tag of the tree points at.
+    fn reveal(&mut self, rev: &str, cx: &mut Context<Self>) {
+        let root = self.repo.read(cx).root.clone();
+        let Ok(sha) = git::run(&root, &["rev-parse", "--verify", "-q", rev]).map(|s| s.trim().to_string()) else { return };
+        let Some(ix) = self.repo.read(cx).commits.iter().position(|c| c.sha == sha) else {
+            return cx.emit(Request::Message("Not in the graph: choose more branches with its filter".into()));
+        };
+        self.graph_open = true;
+        self.selected = Some(Item::Commit(ix));
+        if let Some(pos) = self.graph_items(cx).iter().position(|i| *i == GraphItem::Commit(ix)) {
+            self.graph_scroll.scroll_to_item(pos, ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
+    /// Right-click on a commit of the graph.
+    fn open_commit_menu(&mut self, ix: usize, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(commit) = self.repo.read(cx).commits.get(ix).cloned() else { return };
+        let in_checkout = self.reachability(cx).0.get(ix).copied().unwrap_or(false);
+        let items = self.refs.read(cx).commit_menu(&commit, in_checkout, cx);
+        self.refs.update(cx, |t, cx| t.open_menu(items, at, cx));
+    }
+
+    fn toggle_refs(&mut self, cx: &mut Context<Self>) {
+        self.refs_open = !self.refs_open;
+        let open = self.refs_open;
+        self.refs.update(cx, |t, cx| {
+            t.show_tree = open;
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// The Repository section: its header, and the tree when open (closed, the tree still
+    /// draws the graph's menus and dialogs).
+    fn render_refs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let header = ui::section_header("refs-header", "Repository", self.refs_open, cx.listener(|p, _, _, cx| p.toggle_refs(cx))).child(
+            div()
+                .flex()
+                .gap(px(1.))
+                .child(ui::icon_button("refs-open-tab", "maximize").debug_selector(|| "refs-open-tab".into()).tooltip(ui::tooltip("Open the Git tab: history, branches and changes side by side")).on_click(cx.listener(|p, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(Request::OpenGitTab(p.repo.read(cx).root.clone()));
+                })))
+                .child(ui::icon_button("refs-fetch", "fetch").tooltip(ui::tooltip("Fetch all remotes")).on_click(cx.listener(|p, _, _, cx| {
+                    cx.stop_propagation();
+                    p.repo.update(cx, |r, cx| r.run_git(vec!["fetch".into(), "--all".into(), "--prune".into()], cx));
+                }))),
+        );
+        div().flex().flex_col().flex_none().child(header).child(self.refs.clone())
+    }
+
+    /// A text box of the panel has the keyboard: letters type instead of acting on the list.
+    fn typing(&self, window: &Window, cx: &App) -> bool {
+        [&self.commit_input, &self.search_input].into_iter().any(|e| e.read(cx).focus_handle(cx).contains_focused(window, cx)) || self.refs.read(cx).typing(window, cx)
+    }
+
     fn popup_fits(&self, w: f32) -> bool {
         self.panel_bounds.get().right() - px(8.) - px(w) >= px(0.)
     }
 
     fn render_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let graph_all = self.repo.read(cx).graph_all;
-        let items: [(&str, &str); 17] = [
+        let items: [(&str, &str); 21] = [
             ("Pull", ":pull"),
             ("Push", ":push"),
             ("Fetch (all, prune)", ":fetch"),
@@ -997,9 +1160,15 @@ impl GitPanel {
             (if graph_all { "Graph: show all branches ✓" } else { "Graph: show all branches" }, "filter ▾"),
             ("Run git command…", ":git"),
             ("Refresh", "r"),
+            ("Stash with a message…", ":stash-save"),
+            ("Apply a patch file…", ":patch-apply"),
+            ("Search the graph…", ":find"),
+            (if self.refs_open { "Hide branches, tags, stashes…" } else { "Show branches, tags, stashes…" }, ""),
         ];
         div()
             .id("scm-menu-popup")
+            .max_h(self.panel_bounds.get().size.height.max(gpui::px(240.)) - gpui::px(40.))
+            .overflow_y_scroll()
             .occlude()
             .absolute()
             .top(px(32.))
@@ -1027,177 +1196,11 @@ impl GitPanel {
                     .rounded(px(3.))
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::selected_focused()))
-                    .when(matches!(ix, 4 | 7 | 10 | 12 | 14), |d| d.mt(px(4.)).border_t_1().border_color(theme::border()))
+                    .when(matches!(ix, 4 | 7 | 10 | 12 | 14 | 17), |d| d.mt(px(4.)).border_t_1().border_color(theme::border()))
                     .on_click(cx.listener(move |p, _, w, cx| p.run_menu(ix, w, cx)))
                     .child(div().flex_1().child(label.to_string()))
                     .child(div().text_color(theme::fg_muted()).child(hint.to_string()))
             }))
-    }
-
-    /// Right-click menu for any commit in the graph.
-    fn render_commit_menu(&self, ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
-        let repo = self.repo.read(cx);
-        let Some(commit) = repo.commits.get(ix).cloned() else { return div().into_any_element() };
-        let sha = commit.sha.clone();
-        let short = commit.short().to_string();
-        let item = |id: SharedString, label: String| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .h(px(24.))
-                .px(px(10.))
-                .mx(px(4.))
-                .rounded(px(3.))
-                .cursor_pointer()
-                .hover(|s| s.bg(theme::selected_focused()))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .child(label)
-        };
-        let run = |args: Vec<String>| {
-            move |p: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                p.commit_menu = None;
-                let args = args.clone();
-                p.repo.update(cx, |repo, cx| repo.run_git(args, cx));
-                cx.notify();
-            }
-        };
-        let request = |req: fn(&str) -> Request, arg: String| {
-            move |p: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                p.commit_menu = None;
-                cx.emit(req(&arg));
-                cx.notify();
-            }
-        };
-        let sep = || div().my(px(4.)).h(px(1.)).bg(theme::border());
-        let mut menu = div()
-            .id("commit-menu")
-            .occlude()
-            .w(px(290.))
-            .py(px(4.))
-            .bg(theme::bg_popup())
-            .border_1()
-            .border_color(theme::border_input())
-            .rounded(px(6.))
-            .shadow_lg()
-            .text_size(px(11.))
-            .on_mouse_down_out(cx.listener(|p, _, _, cx| {
-                p.commit_menu = None;
-                cx.notify();
-            }))
-            .child(div().px(px(14.)).py(px(4.)).text_color(theme::fg_muted()).overflow_hidden().whitespace_nowrap().child(format!("{short} {}", commit.subject)))
-            .child(item("cm-open".into(), "Open commit".into()).on_click(cx.listener(request(|s| Request::OpenCommit(s.to_string()), sha.clone()))));
-        let locals: Vec<&git::Ref> = commit.refs.iter().filter(|r| r.kind == RefKind::Local && !r.is_head).collect();
-        if !locals.is_empty() {
-            menu = menu.child(sep());
-            for (i, r) in locals.iter().enumerate() {
-                menu = menu.child(item(SharedString::from(format!("cm-co-{i}")), format!("Checkout {}", r.name)).on_click(cx.listener(run(vec!["switch".into(), r.name.clone()]))));
-            }
-        }
-        menu = menu
-            .child(sep())
-            .child(item("cm-detach".into(), format!("Checkout {short} (detached)")).on_click(cx.listener(run(vec!["switch".into(), "--detach".into(), sha.clone()]))))
-            .child(item("cm-branch".into(), "Create branch here…".into()).on_click(cx.listener(request(|s| Request::CommandLine(format!("branch-from {s} ")), short.clone()))))
-            .child(sep())
-            .child(item("cm-pick".into(), "Cherry-pick onto current branch".into()).on_click(cx.listener(run(vec!["cherry-pick".into(), sha.clone()]))))
-            .child(item("cm-revert".into(), "Revert (new commit undoing it)".into()).on_click(cx.listener(run(vec!["revert".into(), "--no-edit".into(), sha.clone()]))))
-            .child(sep())
-            .child(item("cm-copy".into(), "Copy hash".into()).on_click(cx.listener(move |p, _, _, cx| {
-                p.commit_menu = None;
-                cx.write_to_clipboard(ClipboardItem::new_string(sha.clone()));
-                cx.emit(Request::Message("Commit hash copied".into()));
-                cx.notify();
-            })));
-        menu.into_any_element()
-    }
-
-    /// The menu for a branch/tag label in the graph.
-    fn render_branch_menu(&self, r: git::Ref, cx: &mut Context<Self>) -> impl IntoElement {
-        let item = |id: &'static str, label: String, enabled: bool| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .h(px(24.))
-                .px(px(10.))
-                .mx(px(4.))
-                .rounded(px(3.))
-                .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(theme::selected_focused())))
-                .when(!enabled, |d| d.text_color(theme::fg_muted()))
-                .child(label)
-        };
-        let name = r.name.clone();
-        let git = |panel: &mut Self, args: Vec<String>, cx: &mut Context<Self>| {
-            panel.branch_menu = None;
-            panel.repo.update(cx, |repo, cx| repo.run_git(args, cx));
-            cx.notify();
-        };
-        let mut menu = div()
-            .id("branch-menu")
-            .occlude()
-            .w(px(260.))
-            .py(px(4.))
-            .bg(theme::bg_popup())
-            .border_1()
-            .border_color(theme::border_input())
-            .rounded(px(6.))
-            .shadow_lg()
-            .text_size(px(11.))
-            .on_mouse_down_out(cx.listener(|p, _, _, cx| {
-                p.branch_menu = None;
-                cx.notify();
-            }))
-            .child(div().px(px(14.)).py(px(4.)).text_color(theme::fg_muted()).overflow_hidden().whitespace_nowrap().child(name.clone()));
-        match r.kind {
-            git::RefKind::Local => {
-                let (n1, n2, n3) = (name.clone(), name.clone(), name.clone());
-                menu = menu
-                    .child(item("bm-checkout", if r.is_head { "Checked out".into() } else { format!("Checkout {name}") }, !r.is_head).when(!r.is_head, |d| {
-                        d.on_click(cx.listener(move |p, _, _, cx| git(p, vec!["switch".into(), n1.clone()], cx)))
-                    }))
-                    .child(item("bm-detach", "Checkout detached".into(), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["switch".into(), "--detach".into(), n2.clone()], cx))))
-                    .child(div().my(px(4.)).h(px(1.)).bg(theme::border()))
-                    .child(
-                        item("bm-delete", if r.is_head { "Can't delete the checked-out branch".into() } else { format!("Delete {name}") }, !r.is_head)
-                            .when(!r.is_head, |d| d.text_color(theme::git_deleted()).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["branch".into(), "-d".into(), n3.clone()], cx)))),
-                    );
-            }
-            git::RefKind::Remote => {
-                let short = name.split_once('/').map(|(_, b)| b.to_string()).unwrap_or(name.clone());
-                let (n1, n2) = (short.clone(), name.clone());
-                menu = menu
-                    .child(item("bm-checkout", format!("Checkout {short} (tracks {name})"), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["switch".into(), n1.clone()], cx))))
-                    .child(item("bm-detach", "Checkout detached".into(), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["switch".into(), "--detach".into(), n2.clone()], cx))))
-                    .child(div().px(px(14.)).py(px(4.)).text_size(px(10.)).text_color(theme::fg_muted()).child("Remote branches can't be deleted from here"));
-            }
-            git::RefKind::Tag => {
-                let (n1, n2) = (name.clone(), name.clone());
-                menu = menu
-                    .child(item("bm-detach", format!("Checkout {name} (detached)"), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["switch".into(), "--detach".into(), n1.clone()], cx))))
-                    .child(div().my(px(4.)).h(px(1.)).bg(theme::border()))
-                    .child(item("bm-delete", format!("Delete tag {name}"), true).text_color(theme::git_deleted()).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["tag".into(), "-d".into(), n2.clone()], cx))));
-            }
-        }
-        let pick = name.clone();
-        menu = menu.child(div().my(px(4.)).h(px(1.)).bg(theme::border())).child(item("bm-compare-to", "Compare to…".into(), true).on_click(cx.listener(move |p, _, _, cx| {
-            p.branch_menu = None;
-            cx.emit(Request::CompareTo(pick.clone()));
-            cx.notify();
-        })));
-        if !r.is_head {
-            let current = self.repo.read(cx).branch_label();
-            let (n1, n2, n3) = (name.clone(), name.clone(), name.clone());
-            menu = menu
-                .child(item("bm-compare", format!("Compare with {current}"), true).on_click(cx.listener(move |p, _, _, cx| {
-                    p.branch_menu = None;
-                    cx.emit(Request::Compare { base: None, other: n1.clone() });
-                    cx.notify();
-                })))
-                .child(item("bm-merge", format!("Merge into {current}"), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["merge".into(), "--no-edit".into(), n2.clone()], cx))))
-                .child(item("bm-rebase", format!("Rebase {current} onto this"), true).on_click(cx.listener(move |p, _, _, cx| git(p, vec!["rebase".into(), n3.clone()], cx))));
-        }
-        menu
     }
 
     /// Graph filter: Auto, All, or any pick of local and remote branches.
@@ -1239,7 +1242,7 @@ impl GitPanel {
                 p.scope_open = false;
                 cx.notify();
             }))
-            .child(div().px(px(14.)).py(px(4.)).text_color(theme::fg_muted()).child("SHOW IN GRAPH"))
+            .child(div().px(px(14.)).py(px(4.)).text_color(theme::fg_muted()).child("Show in graph"))
             .child(option("scope-auto", "Auto — current, upstream, default", auto).on_click(cx.listener(|p, _, _, cx| {
                 p.repo.update(cx, |r, cx| {
                     r.graph_all = false;
@@ -1276,7 +1279,7 @@ impl GitPanel {
                     .px(px(14.))
                     .py(px(4.))
                     .text_color(theme::fg_muted())
-                    .child(title.to_uppercase())
+                    .child(title.to_string())
                     .child(div().text_color(theme::fg_dim()).child(names.len().to_string())),
             )
             .child(
@@ -1322,7 +1325,7 @@ impl GitPanel {
             ListRow::Section { staged, conflicts, count } => {
                 let (staged, count) = (*staged, *count);
                 let open = if staged { self.staged_open } else { self.unstaged_open };
-                let title = if *conflicts { "Merge Changes" } else if staged { "Staged Changes" } else { "Changes" };
+                let title = if *conflicts { "Merge changes" } else if staged { "Staged changes" } else { "Changes" };
                 let paths: Vec<String> = {
                     let st = &self.repo.read(cx).status;
                     (if staged { &st.staged } else { &st.unstaged }).iter().map(|c| c.path.clone()).collect()
@@ -1348,8 +1351,23 @@ impl GitPanel {
                             panel.stage(p.clone(), cx);
                         })))
                 };
+                let tree = self.as_tree;
+                let actions = actions.when(!staged && !*conflicts, |d| {
+                    d.child(
+                        ui::icon_button("changes-view", if tree { "list-flat" } else { "list-tree" })
+                            .debug_selector(|| "changes-view".into())
+                            .tooltip(ui::tooltip(if tree { "View as list" } else { "View as tree" }))
+                            .on_click(cx.listener(|panel, _, _, cx| {
+                                cx.stop_propagation();
+                                panel.as_tree = !panel.as_tree;
+                                cx.notify();
+                            })),
+                    )
+                });
+                let section_sel = format!("changes-section-{ix}");
                 div()
                     .id(("section", ix))
+                    .debug_selector(move || section_sel)
                     .group("section")
                     .flex()
                     .items_center()
@@ -1444,6 +1462,25 @@ impl GitPanel {
                 let root = self.repo.read(cx).root.clone();
                 let path_open = root.join(&change.path);
                 let selector = format!("change-row-{}", c1.path);
+                let tree = self.as_tree;
+                let hovered = self.hovered_row.as_deref() == Some(&format!("file:{staged}:{}", change.path));
+                let buttons = div()
+                    .flex()
+                    .gap(px(1.))
+                    .child(ui::icon_button(("open", ix), "open").size(px(20.)).tooltip(ui::tooltip("Open the file")).on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(Request::OpenFile { path: path_open.clone(), line: None, preview: false });
+                    })))
+                    .when(!staged, |d| {
+                        d.child(ui::icon_button(("discard", ix), "discard").size(px(20.)).tooltip(ui::tooltip("Discard changes")).on_click(cx.listener(move |panel, _, window, cx| {
+                            cx.stop_propagation();
+                            panel.ask_discard(vec![c2.path.clone()], window, cx);
+                        })))
+                    })
+                    .child(ui::icon_button(("stage", ix), if staged { "minus" } else { "plus" }).size(px(20.)).tooltip(ui::tooltip(if staged { "Unstage" } else { "Stage" })).on_click(cx.listener(move |panel, _, _, cx| {
+                        cx.stop_propagation();
+                        if staged { panel.unstage(vec![c3.path.clone()], cx) } else { panel.stage(vec![c3.path.clone()], cx) }
+                    })));
                 div()
                     .id(("file", ix))
                     .debug_selector(move || selector)
@@ -1455,7 +1492,7 @@ impl GitPanel {
                     .flex()
                     .items_center()
                     .h(theme::row_h())
-                    .pl(px(TREE_LEFT + *depth as f32 * TREE_INDENT))
+                    .pl(px(if tree { TREE_LEFT + *depth as f32 * TREE_INDENT } else { 10. }))
                     .pr(px(8.))
                     .gap(px(4.))
                     .cursor_pointer()
@@ -1470,53 +1507,39 @@ impl GitPanel {
                         panel.open_change(staged, &c1, ev.click_count() < 2, cx);
                         cx.notify();
                     }))
-                    // Lines up with the folder icons, like the explorer.
-                    .child(div().w(px(14.)).flex_none())
-                    .child(ui::file_icon(&name))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(px(6.))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .child({
-                                let name_sel = format!("change-name-{}", change.path);
+                    .map(|d| if tree {
+                        d
+                            // Lines up with the folder icons, like the explorer.
+                            .child(div().w(px(14.)).flex_none())
+                            .child(ui::file_icon(&name))
+                            .child(
                                 div()
-                                    .debug_selector(move || name_sel)
+                                    .flex()
+                                    .flex_1()
                                     .min_w_0()
+                                    .gap(px(6.))
                                     .overflow_hidden()
-                                    .text_ellipsis()
-                                    .text_color(color)
-                                    .when(change.status == FileStatus::Deleted, |d| d.line_through())
-                                    .child(name)
-                            })
-                            .when(*depth == 0 && !dir.is_empty(), |d| d.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(dir))),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(1.))
-                            // Out of the way until hovered (or picked with the keyboard),
-                            // so the name gets the room.
-                            .when(!selected && self.hovered_row.as_deref() != Some(&format!("file:{staged}:{}", change.path)), |d| d.hidden())
-                            .child(ui::icon_button(("open", ix), "open").on_click(cx.listener(move |_, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.emit(Request::OpenFile { path: path_open.clone(), line: None, preview: false });
-                            })))
-                            .when(!staged, |d| {
-                                d.child(ui::icon_button(("discard", ix), "discard").on_click(cx.listener(move |panel, _, window, cx| {
-                                    cx.stop_propagation();
-                                    panel.ask_discard(vec![c2.path.clone()], window, cx);
-                                })))
-                            })
-                            .child(ui::icon_button(("stage", ix), if staged { "minus" } else { "plus" }).on_click(cx.listener(move |panel, _, _, cx| {
-                                cx.stop_propagation();
-                                if staged { panel.unstage(vec![c3.path.clone()], cx) } else { panel.stage(vec![c3.path.clone()], cx) }
-                            }))),
-                    )
-                    .child(div().w(px(14.)).flex_none().text_color(color).text_size(px(11.)).child(change.status.letter()))
+                                    .whitespace_nowrap()
+                                    .child({
+                                        let name_sel = format!("change-name-{}", change.path);
+                                        div()
+                                            .debug_selector(move || name_sel)
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .text_color(color)
+                                            .when(change.status == FileStatus::Deleted, |d| d.line_through())
+                                            .child(name.clone())
+                                    })
+                                    .when(*depth == 0 && !dir.is_empty(), |d| d.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(dir.clone()))),
+                            )
+                            .child(div().flex().gap(px(1.)).when(!selected && !hovered, |d| d.hidden()).child(buttons))
+                            .child(div().w(px(14.)).flex_none().text_color(color).text_size(px(11.)).child(change.status.letter()))
+                    } else {
+                        d.relative()
+                            .child(ui::change_cells(change.status, &change.path, Some(format!("change-name-{}", change.path))))
+                            .child(ui::hover_actions("file", selected, theme::bg_side()).child(buttons))
+                    })
                     .into_any_element()
             }
         }
@@ -1535,6 +1558,8 @@ impl GitPanel {
             None => "Commit",
         };
         let rows = self.list_rows(cx);
+        let st = &repo.status;
+        let clean = !branch.is_empty() && st.conflicts.is_empty() && st.staged.is_empty() && st.unstaged.is_empty();
         div()
             .id("changes-scroll")
             .flex()
@@ -1562,6 +1587,10 @@ impl GitPanel {
                             .border_color(if input_focused { theme::focus_border() } else { theme::border_input() })
                             .child(self.commit_input.clone()),
                     )
+                    .child(div().flex().justify_end().child(git::draft::button("commit-draft", self.drafter.running()).on_click(cx.listener(|panel, _, _, cx| {
+                        let root = panel.repo.read(cx).root.clone();
+                        panel.drafter.toggle(root, &panel.commit_input, cx);
+                    }))))
                     .child(
                         div()
                             .flex()
@@ -1606,7 +1635,26 @@ impl GitPanel {
                     )
                     .when(branch.is_empty(), |d| d.child(div().text_color(theme::fg_muted()).child("Not a git repository"))),
             )
-            .children(rows.iter().enumerate().map(|(ix, row)| self.render_list_row(row, ix, focused, cx)))
+            .when(clean, |d| {
+                d.child(
+                    div()
+                        .id("git-clean")
+                        .debug_selector(|| "git-clean".into())
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(6.))
+                        .px(px(20.))
+                        .py(px(24.))
+                        .text_center()
+                        .text_size(px(12.))
+                        .text_color(theme::fg_dim())
+                        .child(ui::icon("check", theme::accent()).size(px(22.)))
+                        .child(div().text_size(px(14.)).text_color(theme::fg_bright()).child("Nothing to commit"))
+                        .child(format!("The working tree is clean on {branch}. Changes you make show up here.")),
+                )
+            })
+            .when(!clean, |d| d.children(rows.iter().enumerate().map(|(ix, row)| self.render_list_row(row, ix, focused, cx))))
     }
 
     fn reachability(&self, cx: &App) -> Rc<(Vec<bool>, Option<usize>)> {
@@ -1637,100 +1685,24 @@ impl GitPanel {
         let detached = is_head && !commit.refs.iter().any(|r| r.is_head);
         let selected = self.selected == Some(Item::Commit(ix));
         let colors = theme::lane_colors();
-        let row2 = row.clone();
         let is_merge = commit.parents.len() > 1;
-        let graph_w = row.width.max(1) as f32 * LANE_W + 8.;
         let bg = if selected { if focused { theme::selected_focused() } else { theme::selected() } } else { theme::bg_side() };
 
-        let graph = canvas(
-            |_, _, _| (),
-            move |bounds, _, window, _| {
-                let x = |lane: usize| bounds.left() + px(6. + lane as f32 * LANE_W);
-                let top = bounds.top();
-                let mid = bounds.top() + px(GRAPH_ROW_H / 2.);
-                let bottom = bounds.bottom();
-                let mut stroke = |a: Point<Pixels>, b: Point<Pixels>, ctrl: Option<Point<Pixels>>, color: Hsla| {
-                    let mut pb = PathBuilder::stroke(px(1.6));
-                    pb.move_to(a);
-                    match ctrl {
-                        Some(c) => pb.curve_to(b, c),
-                        None => pb.line_to(b),
-                    }
-                    if let Ok(path) = pb.build() {
-                        window.paint_path(path, color);
-                    }
-                };
-                let line_color = |i: usize| {
-                    let c = colors[i % colors.len()];
-                    if above_head { c.opacity(MUTED) } else { c }
-                };
-                for s in &row2.top {
-                    let (a, b) = (point(x(s.from), top), point(x(s.to), mid));
-                    stroke(a, b, (s.from != s.to).then(|| point(x(s.from), mid)), line_color(s.color));
-                }
-                for s in &row2.bottom {
-                    let (a, b) = (point(x(s.from), mid), point(x(s.to), bottom));
-                    // Below HEAD's dot the line is the checkout's own history again.
-                    let c = if is_head { colors[s.color % colors.len()] } else { line_color(s.color) };
-                    stroke(a, b, (s.from != s.to).then(|| point(x(s.to), mid)), c);
-                }
-                let full = colors[row2.color % colors.len()];
-                let color = if contained { full } else { full.opacity(MUTED) };
-                let c = point(x(row2.lane), mid);
-                let circle = |r: f32, color: Hsla| fill(Bounds::new(point(c.x - px(r), c.y - px(r)), size(px(r * 2.), px(r * 2.))), color).corner_radii(px(r));
-                if is_head {
-                    // Current commit: a glowing ring around a solid dot with a bright core.
-                    window.paint_quad(circle(9., full.opacity(0.16)));
-                    window.paint_quad(circle(7., full.opacity(0.35)));
-                    window.paint_quad(circle(5.5, full));
-                    window.paint_quad(circle(2.2, theme::c(0xffffff)));
-                } else if is_merge {
-                    window.paint_quad(circle(5., color));
-                    window.paint_quad(circle(3.2, bg));
-                    window.paint_quad(circle(1.8, color));
-                } else {
-                    window.paint_quad(circle(4., color));
-                }
-            },
-        )
-        .w(px(graph_w))
-        .h(px(GRAPH_ROW_H))
-        .flex_none();
+        let graph = graph_cell(row, is_head, is_merge, contained, above_head, bg);
 
-        // Every branch pointer is shown: local (blue) and its remote origin/… (orange) separately.
-        let badges = commit.refs.iter().enumerate().filter_map(|(ri, r)| {
+        // A local branch and its same-named remote twin show as one chip with a cloud mark.
+        let badges = ui::ref_labels(&commit.refs).into_iter().map(|(r, cloud, ri)| {
             let menu_ref = r.clone();
-            let (color, icon_name) = match r.kind {
-                RefKind::Local => (theme::ref_local(), if r.is_head { "target" } else { "git" }),
-                RefKind::Remote => (theme::ref_remote(), "cloud"),
-                RefKind::Tag => (theme::ref_tag(), "tag"),
-            };
-            Some(
-                div()
-                    .id(SharedString::from(format!("ref-{ix}-{ri}")))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(3.))
-                    .pl(px(5.))
-                    .pr(px(7.))
-                    .h(px(18.))
-                    .rounded(px(9.))
-                    .cursor_pointer()
-                    .hover(|s| s.opacity(0.85))
-                    .on_mouse_down(MouseButton::Right, cx.listener(move |panel, ev: &MouseDownEvent, _, cx| {
-                        // Right-click a branch/tag label: checkout, detached checkout or delete.
-                        cx.stop_propagation();
-                        panel.commit_menu = None;
-                        panel.branch_menu = Some((menu_ref.clone(), ev.position));
-                        cx.notify();
-                    }))
-                    .bg(color)
-                    .text_color(theme::on(color))
-                    .text_size(px(10.5))
-                    .child(ui::small_icon(icon_name, theme::on(color)).size(px(12.)))
-                    .child(r.name.clone()),
-            )
+            ui::ref_chip(r, cloud, 18.)
+                .id(SharedString::from(format!("ref-{ix}-{ri}")))
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.85))
+                .on_mouse_down(MouseButton::Right, cx.listener(move |panel, ev: &MouseDownEvent, _, cx| {
+                    // Right-click a branch/tag label: checkout, detached checkout or delete.
+                    cx.stop_propagation();
+                    let items = panel.refs.read(cx).ref_menu(&menu_ref, cx);
+                    panel.refs.update(cx, |t, cx| t.open_menu(items, ev.position, cx));
+                }))
         });
 
         let lane_color = colors[row.color % colors.len()];
@@ -1763,6 +1735,11 @@ impl GitPanel {
             .on_click(cx.listener(move |panel, ev: &ClickEvent, window, cx| {
                 window.focus(&panel.focus, cx);
                 panel.selected = Some(Item::Commit(ix));
+                if panel.repo.read(cx).graph_file.is_some() {
+                    // A file's history: each commit opens that file's change.
+                    panel.open_history_diff(ix, ev.click_count() < 2, cx);
+                    return cx.notify();
+                }
                 // One click lists the commit's files under it; the second click of a
                 // double-click puts that back and opens the commit page instead.
                 panel.toggle_commit(&sha, cx);
@@ -1774,9 +1751,7 @@ impl GitPanel {
             .on_mouse_down(MouseButton::Right, cx.listener(move |panel, ev: &MouseDownEvent, _, cx| {
                 // Right-click any commit: checkout, branch from it, cherry-pick, revert…
                 panel.selected = Some(Item::Commit(ix));
-                panel.branch_menu = None;
-                panel.commit_menu = Some((ix, ev.position));
-                cx.notify();
+                panel.open_commit_menu(ix, ev.position, cx);
             }))
             .child(graph)
             .child(
@@ -1965,7 +1940,7 @@ impl Render for CommitCard {
                     .text_color(theme::fg_muted())
                     .child(div().text_color(theme::fg()).font_weight(FontWeight::BOLD).child(self.author.clone()))
                     .child(self.when.clone())
-                    .child(self.short.clone()),
+                    .child(div().font_family(theme::MONO_FONT).child(self.short.clone())),
             )
             .child(div().text_color(theme::fg_bright()).child(self.subject.clone()))
             .when(!self.body.is_empty(), |d| d.child(div().text_color(theme::fg_dim()).child(self.body.clone())))
@@ -2030,6 +2005,21 @@ impl Render for GitPanel {
                             .child(format!("{commit_count} Items")),
                     )
                     .child(
+                        ui::icon_button("graph-search", "search").debug_selector(|| "graph-search".into())
+                            .tooltip(ui::tooltip("Search commits by message, author or hash"))
+                            .when(self.search_open, |b| b.bg(theme::selected()))
+                            .on_click(cx.listener(|p, _, w, cx| {
+                                cx.stop_propagation();
+                                p.search_open = !p.search_open;
+                                if p.search_open {
+                                    w.focus(&p.search_input.read(cx).focus_target(cx), cx);
+                                } else {
+                                    p.search_graph("", w, cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         ui::icon_button("graph-scope", "filter")
                             .tooltip(ui::tooltip("Choose branches shown in the graph"))
                             .when(graph_all || !graph_only_empty, |b| b.bg(theme::selected()))
@@ -2064,7 +2054,7 @@ impl Render for GitPanel {
         let both_open = self.changes_open && self.graph_open;
 
         div()
-            .key_context(if self.commit_input.read(cx).focus_handle(cx).contains_focused(window, cx) { "GitPanel typing" } else { "GitPanel" })
+            .key_context(if self.typing(window, cx) { "GitPanel typing" } else { "GitPanel" })
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::up))
@@ -2102,8 +2092,6 @@ impl Render for GitPanel {
             .child(canvas(move |bounds, _, _| bounds_cell.set(bounds), |_, _, _, _| {}).absolute().size_full())
             .when(self.menu_open, |d| d.child(deferred(self.render_menu(cx)).with_priority(1)))
             .when(self.scope_open, |d| d.child(deferred(self.render_scope(cx)).with_priority(1)))
-            .when_some(self.commit_menu, |d, (ix, pos)| d.child(deferred(anchored().position(pos).snap_to_window().child(self.render_commit_menu(ix, cx))).with_priority(2)))
-            .when_some(self.branch_menu.clone(), |d, (r, pos)| d.child(deferred(anchored().position(pos).snap_to_window().child(self.render_branch_menu(r, cx))).with_priority(2)))
             .child(
                 div()
                     .flex()
@@ -2111,8 +2099,10 @@ impl Render for GitPanel {
                     .items_center()
                     .h(px(35.))
                     .px(px(20.))
-                    .text_size(px(10.5))
-                    .child(div().flex_1().child("SOURCE CONTROL"))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::fg_bright())
+                    .child(div().flex_1().child("Source control"))
                     .child(ui::icon_button("scm-menu", "ellipsis").on_click(cx.listener(|p, _, _, cx| {
                         p.menu_open = !p.menu_open;
                         cx.notify();
@@ -2151,6 +2141,8 @@ impl Render for GitPanel {
                 )
             })
             .when(!both_open, |d| d.child(div().flex_none().h(px(1.)).bg(theme::border())))
+            // Under the split, so dragging it still follows the mouse.
+            .when(self.repo.read(cx).is_git, |d| d.child(self.render_refs(cx)).child(div().flex_none().h(px(1.)).bg(theme::border())))
             .child(
                 div()
                     .flex()
@@ -2159,6 +2151,48 @@ impl Render for GitPanel {
                     .when(self.graph_open, |d| d.flex_1())
                     .when(!self.graph_open, |d| d.flex_none())
                     .child(graph_header)
+                    .when(self.graph_open && self.search_open, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .gap(px(6.))
+                                .mx(px(8.))
+                                .mb(px(4.))
+                                .px(px(6.))
+                                .h(px(24.))
+                                .rounded(px(3.))
+                                .bg(theme::bg_input())
+                                .border_1()
+                                .border_color(theme::border_input())
+                                .child(ui::small_icon("search", theme::fg_muted()))
+                                .child(div().flex_1().min_w_0().overflow_hidden().child(self.search_input.clone())),
+                        )
+                    })
+                    .when_some(self.repo.read(cx).graph_file.as_ref().map(|f| f.0.clone()), |d, file| {
+                        d.child(
+                            div()
+                                .id("history-chip")
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .gap(px(6.))
+                                .mx(px(8.))
+                                .mb(px(4.))
+                                .px(px(8.))
+                                .h(px(22.))
+                                .rounded(px(3.))
+                                .bg(theme::selected())
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(ui::small_icon("history", theme::fg()))
+                                .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().child(format!("History of {file}")))
+                                .child(ui::icon_button("history-close", "close").debug_selector(|| "history-close".into()).size(px(18.)).tooltip(ui::tooltip("Back to the whole graph")).on_click(cx.listener(|p, _, _, cx| {
+                                    p.show_history(None, cx);
+                                }))),
+                        )
+                    })
                     .when(self.graph_open, |d| {
                         let items = Rc::new(self.graph_items(cx));
                         d.child(
@@ -2166,6 +2200,11 @@ impl Render for GitPanel {
                                 "graph",
                                 items.len(),
                                 cx.processor(move |panel, range: Range<usize>, _window, cx| {
+                                    let repo = panel.repo.downgrade();
+                                    let end = range.end;
+                                    cx.defer(move |cx| {
+                                        repo.update(cx, |r, cx| r.want_more(end, cx)).ok();
+                                    });
                                     range
                                         .filter_map(|i| {
                                             Some(match items[i] {
@@ -2185,6 +2224,71 @@ impl Render for GitPanel {
     }
 }
 
+/// One row's lanes and dot, for any history list (the panel's graph, the Git tab's table).
+pub(crate) fn graph_cell(row: &GraphRow, is_head: bool, is_merge: bool, contained: bool, above_head: bool, bg: Hsla) -> impl IntoElement {
+    graph_cell_h(row, is_head, is_merge, contained, above_head, bg, GRAPH_ROW_H)
+}
+
+/// `graph_cell` for rows `h` tall (the lines run the whole height, so rows touch).
+pub(crate) fn graph_cell_h(row: &GraphRow, is_head: bool, is_merge: bool, contained: bool, above_head: bool, bg: Hsla, h: f32) -> impl IntoElement {
+    let colors = theme::lane_colors();
+    let row2 = row.clone();
+    canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                let x = |lane: usize| bounds.left() + px(6. + lane as f32 * LANE_W);
+                let top = bounds.top();
+                let mid = bounds.top() + px(h / 2.);
+                let bottom = bounds.bottom();
+                let mut stroke = |a: Point<Pixels>, b: Point<Pixels>, ctrl: Option<Point<Pixels>>, color: Hsla| {
+                    let mut pb = PathBuilder::stroke(px(1.6));
+                    pb.move_to(a);
+                    match ctrl {
+                        Some(c) => pb.curve_to(b, c),
+                        None => pb.line_to(b),
+                    }
+                    if let Ok(path) = pb.build() {
+                        window.paint_path(path, color);
+                    }
+                };
+                let line_color = |i: usize| {
+                    let c = colors[i % colors.len()];
+                    if above_head { c.opacity(MUTED) } else { c }
+                };
+                for s in &row2.top {
+                    let (a, b) = (point(x(s.from), top), point(x(s.to), mid));
+                    stroke(a, b, (s.from != s.to).then(|| point(x(s.from), mid)), line_color(s.color));
+                }
+                for s in &row2.bottom {
+                    let (a, b) = (point(x(s.from), mid), point(x(s.to), bottom));
+                    // Below HEAD's dot the line is the checkout's own history again.
+                    let c = if is_head { colors[s.color % colors.len()] } else { line_color(s.color) };
+                    stroke(a, b, (s.from != s.to).then(|| point(x(s.to), mid)), c);
+                }
+                let full = colors[row2.color % colors.len()];
+                let color = if contained { full } else { full.opacity(MUTED) };
+                let c = point(x(row2.lane), mid);
+                let circle = |r: f32, color: Hsla| fill(Bounds::new(point(c.x - px(r), c.y - px(r)), size(px(r * 2.), px(r * 2.))), color).corner_radii(px(r));
+                if is_head {
+                    // Current commit: a glowing ring around a solid dot with a bright core.
+                    window.paint_quad(circle(9., full.opacity(0.16)));
+                    window.paint_quad(circle(7., full.opacity(0.35)));
+                    window.paint_quad(circle(5.5, full));
+                    window.paint_quad(circle(2.2, theme::c(0xffffff)));
+                } else if is_merge {
+                    window.paint_quad(circle(5., color));
+                    window.paint_quad(circle(3.2, bg));
+                    window.paint_quad(circle(1.8, color));
+                } else {
+                    window.paint_quad(circle(4., color));
+                }
+            },
+        )
+    .w(px(row.width.max(1) as f32 * LANE_W + 8.))
+    .h(px(h))
+    .flex_none()
+}
+
 /// The folder all these paths sit in (to show each repository by where it is).
 fn common_parent(paths: impl Iterator<Item = std::path::PathBuf>) -> Option<std::path::PathBuf> {
     let mut common: Option<std::path::PathBuf> = None;
@@ -2200,7 +2304,7 @@ fn common_parent(paths: impl Iterator<Item = std::path::PathBuf>) -> Option<std:
 
 #[cfg(test)]
 mod tree_tests {
-    use super::{ListRow, tree_rows};
+    use super::{ListRow, flat_rows, tree_rows};
     use crate::git::{Change, FileStatus};
 
     fn change(p: &str) -> Change {
@@ -2250,6 +2354,12 @@ mod tree_tests {
         let (seen, head) = super::in_checkout(&commits, "head");
         assert_eq!(head, Some(2));
         assert_eq!(seen, vec![false, false, true, true, true]);
+    }
+
+    #[test]
+    fn the_flat_list_has_no_folders_and_goes_by_name() {
+        let changes = [change("src/lib/b.ts"), change("README.md"), change("a/a.ts")];
+        assert_eq!(outline(&flat_rows(&changes, false)), vec!["README.md", "a.ts", "b.ts"]);
     }
 
     #[test]

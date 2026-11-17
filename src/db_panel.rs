@@ -624,8 +624,10 @@ impl Render for DbPanel {
                     .pl(px(20.))
                     .pr(px(6.))
                     .gap(px(1.))
-                    .text_size(px(10.5))
-                    .child(div().flex_1().child("DATABASES"))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::fg_bright())
+                    .child(div().flex_1().child("Databases"))
                     .child(head_button("db-new", "plus", "New connection…").on_click(cx.listener(|_, _, _, cx| cx.emit(Request::Db(DbRequest::Open(Open::New))))))
                     .child(head_button("db-refresh-all", "refresh", "Refresh").on_click(cx.listener(|p, _, _, cx| {
                         p.loaded.clear();
