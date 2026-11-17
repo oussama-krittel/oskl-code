@@ -366,6 +366,8 @@ pub struct Editor {
     pub wrap: bool,
     /// A multi-line box as tall as its container (scrolling inside), not its lines (up to 10).
     pub fill_height: bool,
+    /// A multi-line box grows with its lines up to this many, then scrolls inside.
+    pub max_rows: usize,
     /// One line, but brackets and quotes close themselves as in code (a query box).
     pub pairs: bool,
     /// Enter always submits (a suggestion shown is taken with Tab instead).
@@ -469,6 +471,7 @@ impl Editor {
             chat: false,
             wrap: false,
             fill_height: false,
+            max_rows: 10,
             pairs: false,
             enter_submits: false,
             suggest: None,
@@ -3850,7 +3853,7 @@ impl Element for EditorElement {
             if let Some(cols) = ed.wrap_data.as_ref().map(|w| w.key.1).filter(|_| ed.mode == EditorMode::MultiLine && ed.wrap_active()) {
                 ed.ensure_wrap(cols);
             }
-            (ed.mode, ed.line_height(), ed.disp_count().clamp(1, 10) as f32, ed.fill_height)
+            (ed.mode, ed.line_height(), ed.disp_count().clamp(1, ed.max_rows.max(1)) as f32, ed.fill_height)
         });
         let mut style = Style::default();
         style.size.width = relative(1.).into();

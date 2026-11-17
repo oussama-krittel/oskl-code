@@ -397,9 +397,9 @@ impl PrView {
         div()
             .flex()
             .flex_col()
-            .gap(px(4.))
-            .px(px(12.))
-            .py(px(8.))
+            .gap(px(8.))
+            .px(px(16.))
+            .py(px(12.))
             .border_b_1()
             .border_color(theme::border())
             .child(
@@ -426,7 +426,7 @@ impl PrView {
             .debug_selector(move || sel)
             .flex_none()
             .px(px(10.))
-            .h(px(26.))
+            .h(px(30.))
             .flex()
             .items_center()
             .rounded(px(4.))
@@ -449,8 +449,8 @@ impl PrView {
             .flex()
             .items_center()
             .gap(px(8.))
-            .px(px(12.))
-            .h(px(30.))
+            .px(px(16.))
+            .h(px(40.))
             .bg(theme::bg_side())
             .cursor_pointer()
             .hover(|s| s.bg(theme::hover()))
@@ -477,7 +477,7 @@ impl PrView {
                     .items_center()
                     .gap(px(8.))
                     .pl(px(4.))
-                    .h(px(32.))
+                    .h(px(40.))
                     .child(timeline_dot(ui::small_icon("git", theme::fg_muted()).into_any_element()))
                     .child(div().flex_none().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(who))
                     .child(div().flex_none().text_color(theme::fg_dim()).child(format!("added {n} {}", if n == 1 { "commit" } else { "commits" })))
@@ -494,7 +494,7 @@ impl PrView {
                     .gap(px(10.))
                     .pl(px(14.))
                     .pr(px(8.))
-                    .h(px(28.))
+                    .h(px(34.))
                     .rounded(px(4.))
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::hover()))
@@ -520,7 +520,7 @@ impl PrView {
         let mut el = div().flex().flex_col().rounded(px(6.)).border_1().border_color(theme::border()).overflow_hidden();
         el = match (&thread, resolved) {
             (Some(t), true) => el.child(self.folded_thread(t, label, open, cx)),
-            _ => el.child(div().px(px(12.)).h(px(28.)).flex().items_center().bg(theme::bg_side()).font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::accent()).child(label)),
+            _ => el.child(div().px(px(16.)).h(px(38.)).flex().items_center().bg(theme::bg_side()).font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::accent()).child(label)),
         };
         if open {
             el = el.children(hunk_excerpt(root));
@@ -528,7 +528,7 @@ impl PrView {
                 el = el.child(self.line_comment_el(l, self.md.get(first + i).cloned(), cx));
             }
             if let Some(t) = &thread {
-                el = el.child(div().flex().p(px(8.)).child(self.resolve_button(t, cx)));
+                el = el.child(div().flex().px(px(16.)).py(px(12.)).child(self.resolve_button(t, cx)));
             }
         }
         el.into_any_element()
@@ -1164,13 +1164,14 @@ impl PrView {
         div()
             .flex()
             .flex_col()
+            // As wide as its label, not the whole box.
+            .items_start()
             .px(px(14.))
             .py(px(10.))
             .child(
                 div()
                     .flex()
                     .flex_none()
-                    .w_auto()
                     .h(px(28.))
                     .rounded(px(5.))
                     .overflow_hidden()
@@ -1270,8 +1271,8 @@ impl PrView {
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .px(px(12.))
-                    .h(px(32.))
+                    .px(px(16.))
+                    .h(px(44.))
                     .bg(theme::bg_side())
                     .border_b_1()
                     .border_color(theme::border())
@@ -1283,8 +1284,8 @@ impl PrView {
             )
             .children(excerpt)
             .when(editing, |d| d.child(self.edit_box(cx)))
-            .when_some(body.filter(|_| !editing), |d, md| d.child(div().px(px(14.)).py(px(10.)).child(md.render(root, &self.images, opener))))
-            .when(!extra.is_empty(), |d| d.child(div().flex().flex_col().gap(px(8.)).p(px(10.)).children(extra)))
+            .when_some(body.filter(|_| !editing), |d, md| d.child(div().px(px(18.)).py(px(16.)).child(md.render(root, &self.images, opener))))
+            .when(!extra.is_empty(), |d| d.child(div().flex().flex_col().gap(px(14.)).p(px(16.)).children(extra)))
     }
 
     fn render_conversation(&self, root: &Path, d: &PrDetail, lines: &[LineComment], cx: &mut Context<Self>) -> impl IntoElement {
@@ -1352,7 +1353,7 @@ impl PrView {
                         .items_center()
                         .gap(px(8.))
                         .pl(px(4.))
-                        .h(px(30.))
+                        .h(px(40.))
                         .child(timeline_dot(ui::small_icon("arrow-up", theme::fg_muted()).into_any_element()))
                         .child(div().flex_none().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(f.actor.clone()))
                         .child(div().flex_none().text_color(theme::fg_dim()).child(format!("force-pushed the {} branch from", d.head_ref_name)))
@@ -1378,8 +1379,8 @@ impl PrView {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(12.))
-                    .p(px(16.))
+                    .gap(px(20.))
+                    .p(px(24.))
                     .w_full()
                     .max_w(px(1200.))
                     .child(self.card(root, d.author.login.clone(), "opened it".into(), String::new(), None, description, Some((Editable::Body, d.body.clone(), false)), Vec::new(), cx))
@@ -1430,11 +1431,11 @@ impl PrView {
                 .flex()
                 .items_center()
                 .gap(px(10.))
-                .px(px(14.))
-                .py(px(10.))
+                .px(px(16.))
+                .py(px(14.))
                 .border_b_1()
                 .border_color(theme::border())
-                .child(div().flex_none().size(px(26.)).rounded(px(13.)).flex().items_center().justify_center().bg(color.opacity(0.18)).text_color(color).child(icon))
+                .child(div().flex_none().size(px(30.)).rounded(px(13.)).flex().items_center().justify_center().bg(color.opacity(0.18)).text_color(color).child(icon))
                 .child(div().flex().flex_col().min_w_0().child(div().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(title)).when(!sub.is_empty(), |el| el.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(sub))))
         };
         let text = |s: &'static str| div().font_weight(FontWeight::BOLD).child(s).into_any_element();
@@ -2030,11 +2031,38 @@ fn hunk_excerpt(l: &LineComment) -> Option<Div> {
         (Some(s), Some(e)) if s < e => (e - s + 1) as usize,
         _ => 4,
     };
-    let lines: Vec<&str> = l.diff_hunk.lines().filter(|t| !t.starts_with("@@")).collect();
+    // Each line with its old and new numbers, counted from the hunk's header.
+    let (mut old, mut new) = (0usize, 0usize);
+    let mut lines: Vec<(Option<usize>, Option<usize>, &str)> = Vec::new();
+    for t in l.diff_hunk.lines() {
+        if let Some(h) = t.strip_prefix("@@ ") {
+            let mut it = h.split_whitespace();
+            let start = |s: Option<&str>, p: char| s.and_then(|s| s.strip_prefix(p)).and_then(|s| s.split(',').next()).and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+            old = start(it.next(), '-');
+            new = start(it.next(), '+');
+            continue;
+        }
+        match t.chars().next() {
+            Some('+') => {
+                lines.push((None, Some(new), t));
+                new += 1;
+            }
+            Some('-') => {
+                lines.push((Some(old), None, t));
+                old += 1;
+            }
+            _ => {
+                lines.push((Some(old), Some(new), t));
+                old += 1;
+                new += 1;
+            }
+        }
+    }
     if lines.is_empty() {
         return None;
     }
     let shown = &lines[lines.len().saturating_sub(n.min(40))..];
+    let num = |n: Option<usize>| div().flex_none().w(px(40.)).pr(px(10.)).flex().justify_end().text_color(theme::line_number()).child(n.map(|n| n.to_string()).unwrap_or_default());
     Some(
         div()
             .flex()
@@ -2044,10 +2072,26 @@ fn hunk_excerpt(l: &LineComment) -> Option<Div> {
             .border_b_1()
             .border_color(theme::border())
             .font_family(theme::MONO_FONT)
-            .text_size(px(11.5))
-            .children(shown.iter().map(|t| {
-                let bg = if t.starts_with('+') { Some(theme::diff_ins_line()) } else if t.starts_with('-') { Some(theme::diff_del_line()) } else { None };
-                div().px(px(12.)).whitespace_nowrap().overflow_hidden().text_ellipsis().text_color(theme::fg()).when_some(bg, |d, c| d.bg(c)).child(t.replace('\t', "    "))
+            .text_size(px(12.))
+            .children(shown.iter().map(|(o, nw, t)| {
+                let (bg, sign) = match t.chars().next() {
+                    Some('+') => (Some(theme::diff_ins_line()), "+"),
+                    Some('-') => (Some(theme::diff_del_line()), "-"),
+                    _ => (None, " "),
+                };
+                let text = t.get(1..).unwrap_or("").replace('\t', "    ");
+                div()
+                    .flex()
+                    .h(px(22.))
+                    .items_center()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_color(theme::fg())
+                    .when_some(bg, |d, c| d.bg(c))
+                    .child(num(*o))
+                    .child(num(*nw))
+                    .child(div().flex_none().w(px(18.)).text_color(theme::fg_muted()).child(sign))
+                    .child(div().min_w_0().overflow_hidden().text_ellipsis().child(text))
             })),
     )
 }

@@ -28,7 +28,8 @@ pub struct MdPreview {
 impl MdPreview {
     /// `source`'s box, `height` tall, with Write and Preview above it.
     pub fn new(source: Entity<Editor>, root: PathBuf, height: f32, selector: &'static str, cx: &mut Context<Self>) -> Self {
-        source.update(cx, |e, _| e.fill_height = true);
+        // It grows with its text (as on GitHub): the page scrolls, not a box inside it.
+        source.update(cx, |e, _| e.max_rows = 100_000);
         let sub = cx.subscribe(&source, |v, _, ev: &EditorEvent, cx| {
             if matches!(ev, EditorEvent::Changed) {
                 v.parse(cx);
@@ -86,8 +87,8 @@ impl Render for MdPreview {
             div()
                 .id("md-preview")
                 .debug_selector(|| "md-preview".into())
-                .size_full()
-                .overflow_y_scroll()
+                .w_full()
+                .min_h(px(self.height))
                 .px(px(12.))
                 .py(px(8.))
                 .bg(theme::bg_editor())
@@ -95,7 +96,18 @@ impl Render for MdPreview {
                 .into_any_element()
         } else {
             let sel = self.selector;
-            div().debug_selector(move || sel.into()).size_full().p(px(6.)).bg(theme::bg_input()).child(self.source.clone()).into_any_element()
+            // A click below the text still writes in the box.
+            div()
+                .id("md-write")
+                .debug_selector(move || sel.into())
+                .w_full()
+                .min_h(px(self.height))
+                .p(px(6.))
+                .bg(theme::bg_input())
+                .cursor_text()
+                .on_click(cx.listener(|v, _, window, cx| window.focus(&v.source.focus_handle(cx), cx)))
+                .child(self.source.clone())
+                .into_any_element()
         };
         let previewing = self.previewing;
         div()
@@ -103,6 +115,6 @@ impl Render for MdPreview {
             .flex_col()
             .w_full()
             .child(div().flex().gap(px(2.)).child(tab("md-tab-write", "Write", false, !previewing, cx)).child(tab("md-tab-preview", "Preview", true, previewing, cx)))
-            .child(div().h(px(self.height)).rounded_b(px(5.)).rounded_tr(px(5.)).border_1().border_color(theme::border_input()).overflow_hidden().child(body))
+            .child(div().min_h(px(self.height)).rounded_b(px(5.)).rounded_tr(px(5.)).border_1().border_color(theme::border_input()).overflow_hidden().child(body))
     }
 }
