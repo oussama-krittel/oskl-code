@@ -34,6 +34,7 @@ mod java;
 mod js_types;
 mod keybindings;
 mod keymap;
+mod md_preview;
 mod merge_view;
 mod office;
 mod pdf;
