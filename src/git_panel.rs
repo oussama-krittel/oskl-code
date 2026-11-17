@@ -432,88 +432,18 @@ impl GitPanel {
     }
 
     fn render_repo_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let repo = self.repo.read(cx);
-        let (name, branch) = (repo.name(), repo.branch_label());
-        div()
-            .id("repo-picker")
-            .debug_selector(|| "repo-picker".into())
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(6.))
-            .h(px(REPO_H - 6.))
-            .mx(px(10.))
-            .mb(px(6.))
-            .px(px(8.))
-            .rounded(px(4.))
-            .bg(theme::ca(0xffffff0d))
-            .border_1()
-            .border_color(if self.repo_menu { theme::focus_border() } else { theme::border_input() })
-            .cursor_pointer()
-            .hover(|s| s.bg(theme::ca(0xffffff17)))
-            .tooltip(ui::tooltip("Repository shown here"))
-            .on_click(cx.listener(|p, _, _, cx| {
-                p.repo_menu = !p.repo_menu;
-                cx.notify();
-            }))
-            .child(ui::small_icon("repo", theme::fg_dim()))
-            .child(div().flex_none().text_color(theme::fg_bright()).child(name))
-            .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_color(theme::fg_dim()).child(branch))
-            .child(ui::small_icon("chevron-down", theme::fg_dim()))
+        repo_picker("repo-picker", &self.repo, self.repo_menu, cx).on_click(cx.listener(|p, _, _, cx| {
+            p.repo_menu = !p.repo_menu;
+            cx.notify();
+        }))
     }
 
     fn render_repo_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let common = common_parent(self.repos.iter().map(|r| r.read(cx).root.clone()));
-        div()
-            .id("repo-menu")
-            .occlude()
-            .absolute()
-            .top(px(35. + REPO_H - 4.))
-            .left(px(10.))
-            .right(px(10.))
-            .max_h(px(420.))
-            .py(px(4.))
-            .bg(theme::bg_popup())
-            .border_1()
-            .border_color(theme::border_input())
-            .rounded(px(6.))
-            .shadow_lg()
-            .overflow_y_scroll()
-            .on_mouse_down_out(cx.listener(|p, _, _, cx| {
-                p.repo_menu = false;
-                cx.notify();
-            }))
-            .children(self.repos.iter().enumerate().map(|(ix, r)| {
-                let active = *r == self.repo;
-                let repo = r.read(cx);
-                let root = repo.root.clone();
-                let rel = common.as_ref().and_then(|c| root.parent()?.strip_prefix(c).ok()).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-                let changes = repo.status.change_count();
-                let name = repo.name();
-                div()
-                    .id(("repo-item", ix))
-                    .debug_selector(move || format!("repo-item-{name}"))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .h(px(26.))
-                    .px(px(8.))
-                    .mx(px(4.))
-                    .rounded(px(3.))
-                    .cursor_pointer()
-                    .when(active, |d| d.bg(theme::selected()))
-                    .hover(|s| s.bg(theme::selected_focused()))
-                    .on_click(cx.listener(move |p, _, _, cx| {
-                        p.repo_menu = false;
-                        cx.emit(Request::SelectRepo(root.clone()));
-                        cx.notify();
-                    }))
-                    .child(div().w(px(10.)).text_color(theme::frame_focused()).child(if active { "●" } else { "" }))
-                    .child(div().flex_none().text_color(if active { theme::fg_bright() } else { theme::fg() }).child(repo.name()))
-                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_color(theme::fg_muted()).child(rel))
-                    .child(div().flex_none().flex().items_center().gap(px(3.)).text_color(theme::fg_dim()).child(ui::small_icon("git", theme::fg_dim()).size(px(11.))).child(repo.branch_label()))
-                    .when(changes > 0, |d| d.child(ui::badge(changes.to_string(), theme::accent()).text_size(px(10.)).h(px(16.)).min_w(px(16.))))
-            }))
+        let close = |p: &mut Self, cx: &mut Context<Self>| {
+            p.repo_menu = false;
+            cx.notify();
+        };
+        repo_menu("repo", &self.repos, &self.repo, 35., cx).on_mouse_down_out(cx.listener(move |p, _, _, cx| close(p, cx))).on_click(cx.listener(move |p, _, _, cx| close(p, cx)))
     }
 
     #[cfg(test)]
@@ -1633,12 +1563,15 @@ impl GitPanel {
                     div()
                         .id("git-clean")
                         .debug_selector(|| "git-clean".into())
+                        // In the middle of the space the changes would take.
+                        .flex_1()
                         .flex()
                         .flex_col()
                         .items_center()
+                        .justify_center()
                         .gap(px(6.))
                         .px(px(20.))
-                        .py(px(24.))
+                        .py(px(12.))
                         .text_center()
                         .text_size(px(12.))
                         .text_color(theme::fg_dim())
@@ -1651,22 +1584,24 @@ impl GitPanel {
                                 div()
                                     .id("git-new-pr")
                                     .debug_selector(|| "git-new-pr".into())
-                                    .mt(px(8.))
+                                    .mt(px(6.))
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .gap(px(6.))
-                                    .h(px(26.))
-                                    .px(px(12.))
-                                    .rounded(px(2.))
+                                    .gap(px(3.))
+                                    .h(px(16.))
+                                    .px(px(6.))
+                                    .rounded(px(3.))
+                                    .text_size(px(10.))
+                                    .line_height(px(16.))
                                     .bg(theme::accent())
                                     .text_color(theme::on(theme::accent()))
                                     .cursor_pointer()
                                     .hover(|s| s.bg(theme::accent_hover()))
                                     .tooltip(ui::tooltip_text(format!("Propose {branch}: push it and open a pull request")))
                                     .on_click(cx.listener(|_, _, _, cx| cx.emit(Request::NewPr)))
-                                    .child(ui::small_icon("pull-request", theme::on(theme::accent())))
-                                    .child("Create Pull Request"),
+                                    .child(ui::small_icon("pull-request", theme::on(theme::accent())).size(px(9.)))
+                                    .child("Create PR"),
                             )
                         }),
                 )
@@ -2400,4 +2335,88 @@ mod tree_tests {
         let rows = tree_rows(&changes, false, "changes", &collapsed);
         assert_eq!(outline(&rows), vec!["src / lib/", "  auth/", "  api.test.ts", "README.md"]);
     }
+}
+
+/// The repository shown, with its branch: a click opens the menu of the others. Source Control
+/// and Pull requests both show it, for the same repository.
+pub(crate) fn repo_picker(id: &'static str, repo: &Entity<Repo>, open: bool, cx: &App) -> Stateful<Div> {
+    let repo = repo.read(cx);
+    let (name, branch) = (repo.name(), repo.branch_label());
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(6.))
+        .h(px(REPO_H - 6.))
+        .mx(px(10.))
+        .mb(px(6.))
+        .px(px(8.))
+        .rounded(px(4.))
+        .bg(theme::ca(0xffffff0d))
+        .border_1()
+        .border_color(if open { theme::focus_border() } else { theme::border_input() })
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::ca(0xffffff17)))
+        .tooltip(ui::tooltip("Repository shown in Source Control and Pull requests"))
+        .child(ui::small_icon("repo", theme::fg_dim()))
+        .child(div().flex_none().text_color(theme::fg_bright()).child(name))
+        .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_color(theme::fg_dim()).child(branch))
+        .child(ui::small_icon("chevron-down", theme::fg_dim()))
+}
+
+/// The repositories to pick from, under the picker (`top`: where the picker's row starts);
+/// picking one asks the workspace to show it everywhere (Source Control and Pull requests).
+pub(crate) fn repo_menu<V: EventEmitter<Request>>(prefix: &'static str, repos: &[Entity<Repo>], current: &Entity<Repo>, top: f32, cx: &mut Context<V>) -> Stateful<Div> {
+    let common = common_parent(repos.iter().map(|r| r.read(cx).root.clone()));
+    let items: Vec<AnyElement> = repos
+        .iter()
+        .enumerate()
+        .map(|(ix, r)| {
+            let active = r == current;
+            let repo = r.read(cx);
+            let root = repo.root.clone();
+            let rel = common.as_ref().and_then(|c| root.parent()?.strip_prefix(c).ok()).map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            let changes = repo.status.change_count();
+            let name = repo.name();
+            let (label, branch) = (repo.name(), repo.branch_label());
+            div()
+                .id((SharedString::from(format!("{prefix}-item")), ix))
+                .debug_selector(move || format!("{prefix}-item-{name}"))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .h(px(26.))
+                .px(px(8.))
+                .mx(px(4.))
+                .rounded(px(3.))
+                .cursor_pointer()
+                .when(active, |d| d.bg(theme::selected()))
+                .hover(|s| s.bg(theme::selected_focused()))
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(Request::SelectRepo(root.clone()))))
+                .child(div().w(px(10.)).text_color(theme::frame_focused()).child(if active { "●" } else { "" }))
+                .child(div().flex_none().text_color(if active { theme::fg_bright() } else { theme::fg() }).child(label))
+                .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_color(theme::fg_muted()).child(rel))
+                .child(div().flex_none().flex().items_center().gap(px(3.)).text_color(theme::fg_dim()).child(ui::small_icon("git", theme::fg_dim()).size(px(11.))).child(branch))
+                .when(changes > 0, |d| d.child(ui::badge(changes.to_string(), theme::accent()).text_size(px(10.)).h(px(16.)).min_w(px(16.))))
+                .into_any_element()
+        })
+        .collect();
+    div()
+        .id(SharedString::from(format!("{prefix}-menu")))
+        .occlude()
+        .absolute()
+        .top(px(top + REPO_H - 4.))
+        .left(px(10.))
+        .right(px(10.))
+        .max_h(px(420.))
+        .py(px(4.))
+        .bg(theme::bg_popup())
+        .border_1()
+        .border_color(theme::border_input())
+        .rounded(px(6.))
+        .shadow_lg()
+        .overflow_y_scroll()
+        .children(items)
 }

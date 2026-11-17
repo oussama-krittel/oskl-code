@@ -6578,7 +6578,9 @@ impl Render for Workspace {
                     TabKind::Pr(v) => Some(v.clone()),
                     _ => None,
                 });
+                let (repos, git) = (self.repos.clone(), self.git.clone());
                 self.pr_panel.update(cx, |p, cx| {
+                    p.set_repos(repos, git, cx);
                     p.set_root(root, cx);
                     p.set_pr(pr, cx);
                 });
@@ -9095,6 +9097,20 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert_eq!(changed(cx), vec!["page.tsx"], "the panel shows web's changes");
         let panel_repo = ws.read_with(cx, |ws, cx| ws.git_panel.read(cx).repo_name(cx));
         assert_eq!(panel_repo, "web");
+
+        // The Pull requests sidebar has the same picker, for the same repository: a pick there
+        // is Source Control's too.
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Prs, window, cx));
+        cx.run_until_parked();
+        click(cx, "pr-repo-picker");
+        click(cx, "pr-repo-item-api");
+        assert_eq!(shown(cx), "api");
+        assert_eq!(ws.read_with(cx, |ws, cx| ws.git_panel.read(cx).repo_name(cx)), "api");
+        click(cx, "pr-repo-picker");
+        click(cx, "pr-repo-item-web");
+        assert_eq!(shown(cx), "web");
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
+        cx.run_until_parked();
 
         // Add a folder from elsewhere: a second root in the explorer, its repo in the picker.
         let other = std::env::temp_dir().join(format!("oskl-added-{}", std::process::id()));
