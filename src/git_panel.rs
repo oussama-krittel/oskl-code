@@ -1657,7 +1657,31 @@ impl GitPanel {
                         .text_color(theme::fg_dim())
                         .child(ui::icon("check", theme::accent()).size(px(22.)))
                         .child(div().text_size(px(14.)).text_color(theme::fg_bright()).child("Nothing to commit"))
-                        .child(format!("The working tree is clean on {branch}. Changes you make show up here.")),
+                        .child(format!("The working tree is clean on {branch}. Changes you make show up here."))
+                        // A branch of its own, its work committed: next is proposing it.
+                        .when(!["main", "master", "develop", "trunk"].contains(&branch.as_str()), |d| {
+                            d.child(
+                                div()
+                                    .id("git-new-pr")
+                                    .debug_selector(|| "git-new-pr".into())
+                                    .mt(px(8.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap(px(6.))
+                                    .h(px(26.))
+                                    .px(px(12.))
+                                    .rounded(px(2.))
+                                    .bg(theme::accent())
+                                    .text_color(theme::on(theme::accent()))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::accent_hover()))
+                                    .tooltip(ui::tooltip_text(format!("Propose {branch}: push it and open a pull request")))
+                                    .on_click(cx.listener(|_, _, _, cx| cx.emit(Request::NewPr)))
+                                    .child(ui::small_icon("pull-request", theme::on(theme::accent())))
+                                    .child("Create Pull Request"),
+                            )
+                        }),
                 )
             })
             .when(!clean, |d| d.children(rows.iter().enumerate().map(|(ix, row)| self.render_list_row(row, ix, focused, cx))))
@@ -2026,7 +2050,7 @@ impl Render for GitPanel {
                             })),
                     )
                     .child(
-                        ui::icon_button("graph-scope", "filter")
+                        ui::icon_button("graph-scope", "filter").debug_selector(|| "graph-scope".into())
                             .tooltip(ui::tooltip("Choose branches shown in the graph"))
                             .when(graph_all || !graph_only_empty, |b| b.bg(theme::selected()))
                             .on_click(cx.listener(|p, _, _, cx| {

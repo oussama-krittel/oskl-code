@@ -56,6 +56,8 @@ pub enum Request {
     OpenGitTab(PathBuf),
     /// Review pull request n of the repository at this root, in its own tab.
     OpenPr(PathBuf, u64),
+    /// Open a pull request from the current branch: its form.
+    NewPr,
     /// A conflicted file, in the merge editor.
     OpenMergeEditor(PathBuf),
     /// A conflicted file (repo-relative) was resolved in the merge editor: stage it.

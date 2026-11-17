@@ -266,6 +266,7 @@ impl PrPanel {
                             cx.notify();
                         })))
                     })
+                    .child(ui::icon_button("pr-new", "plus").debug_selector(|| "pr-new".into()).tooltip(ui::tooltip("Open a pull request from the current branch")).on_click(cx.listener(|_, _, _, cx| cx.emit(Request::NewPr))))
                     .when(loading, |d| d.child(div().size(px(22.)).flex().flex_none().items_center().justify_center().debug_selector(|| "pr-refreshing".into()).child(spinner("pr-refresh-spin", 14.))))
                     .when(!loading, |d| d.child(ui::icon_button("pr-refresh", "refresh").debug_selector(|| "pr-refresh".into()).tooltip(ui::tooltip("Read them again")).on_click(cx.listener(|p, _, _, cx| p.reload(cx))))),
             )

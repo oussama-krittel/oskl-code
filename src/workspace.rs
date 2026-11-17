@@ -1252,6 +1252,7 @@ impl Workspace {
             }
             Request::OpenGitTab(root) => self.open_git_tab(root.clone(), window, cx),
             Request::OpenPr(root, n) => self.open_pr_tab(root.clone(), *n, window, cx),
+            Request::NewPr => self.open_new_pr(window, cx),
             Request::OpenMergeEditor(path) => self.open_merge_editor(path.clone(), window, cx),
             Request::FileHistory(path) => {
                 let root = self.repo_for(path, cx).read(cx).root.clone();
@@ -2910,7 +2911,7 @@ impl Workspace {
 
     fn open_compare(&mut self, base: String, other: String, window: &mut Window, cx: &mut Context<Self>) {
         let key = crate::commit_view::compare_key(&base, &other);
-        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Commit(c) if c.read(cx).sha == key)) {
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Commit(c) if c.read(cx).sha == key && c.read(cx).create.is_none())) {
             return self.activate(ix, window, cx);
         }
         let root = self.git_root(cx);
@@ -2923,6 +2924,37 @@ impl Workspace {
             }
             ws.handle_request(req, window, cx)
         });
+        self.add_tab(TabKind::Commit(view), sub, false, window, cx);
+    }
+
+    /// The form for a pull request from the current branch into the default one (its tab if
+    /// open); once opened, the pull request's review takes its place.
+    fn open_new_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Commit(c) if c.read(cx).create.is_some())) {
+            return self.activate(ix, window, cx);
+        }
+        let root = self.git_root(cx);
+        let head = self.git.read(cx).status.branch.clone().unwrap_or_default();
+        if head.is_empty() {
+            return self.flash("Check out a branch first: a pull request comes from a branch".into(), true, cx);
+        }
+        let base = git::gh::default_branch(&root);
+        if base == head {
+            return self.flash(format!("You're on {head}: switch to the branch you want to propose, then open a pull request"), true, cx);
+        }
+        let view = cx.new(|cx| CommitView::new_pr(root.clone(), base, head, cx));
+        let sub = Subscription::join(
+            cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
+            cx.subscribe_in(&view, window, move |ws, view, ev: &crate::commit_view::PrCreated, window, cx| {
+                if let Some(ix) = ws.tabs.iter().position(|t| matches!(&t.kind, TabKind::Commit(c) if c == view)) {
+                    ws.close_tab(ix, true, window, cx);
+                }
+                ws.flash(format!("Opened pull request #{}", ev.0), false, cx);
+                ws.pr_panel.update(cx, |p, cx| p.reload(cx));
+                ws.git_panel.update(cx, |p, cx| p.refs.update(cx, |r, cx| r.load_prs(cx)));
+                ws.open_pr_tab(root.clone(), ev.0, window, cx);
+            }),
+        );
         self.add_tab(TabKind::Commit(view), sub, false, window, cx);
     }
 

@@ -1,5 +1,6 @@
 //! Commit details: hash, author, message and the files it changed.
 
+use crate::editor::{Editor, EditorEvent, EditorMode};
 use crate::git::{self, CommitDetails, FileStatus, Rev};
 use crate::request::{Back, DiffSpec, Request};
 use crate::{theme, ui, util};
@@ -68,7 +69,8 @@ pub(crate) fn file_rows(files: &[git::Change], tree: bool, collapsed: &HashSet<S
 actions!(commit_view, [Next, Prev, OpenSelected, CopySha]);
 
 pub fn bind_keys() {
-    let c = Some("CommitView");
+    // Not while typing a pull request's title or description: o and y are letters there.
+    let c = Some("CommitView && !typing");
     crate::keybindings::collect([
         crate::keybindings::kb("{down}", Next, c),
         crate::keybindings::kb("down", Next, c),
@@ -101,8 +103,29 @@ pub struct CommitView {
     collapsed: HashSet<String>,
     /// Shown beside the history in the Git tab: a smaller title and less padding.
     pub compact: bool,
+    /// Opening a pull request from the compared branch into the base.
+    pub create: Option<PrForm>,
     _task: Task<()>,
 }
+
+/// The new pull request's form, above the files it would change.
+pub struct PrForm {
+    title: Entity<Editor>,
+    body: Entity<Editor>,
+    draft: bool,
+    busy: bool,
+    error: Option<String>,
+    /// The branch's open pull request, if it has one (then there's nothing to open).
+    existing: Option<u64>,
+    /// The text last suggested (kept up as the branches change, until it's edited).
+    suggested: (String, String),
+    _subs: Vec<Subscription>,
+    _task: Option<Task<()>>,
+}
+
+/// After a pull request was opened from the form: its number.
+pub struct PrCreated(pub u64);
+impl EventEmitter<PrCreated> for CommitView {}
 
 impl EventEmitter<Request> for CommitView {}
 
@@ -139,8 +162,232 @@ impl CommitView {
             picker: None,
             collapsed: HashSet::new(),
             compact: false,
+            create: None,
             _task: task,
         }
+    }
+
+    /// A pull request from `head` into `base`, to fill in and open.
+    pub fn new_pr(root: PathBuf, base: String, head: String, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::with(root, String::new(), None, Task::ready(()), cx);
+        let title = cx.new(|cx| {
+            let mut e = Editor::new(EditorMode::SingleLine, cx);
+            e.placeholder = "Title".into();
+            e.font_size = 13.;
+            e
+        });
+        let body = cx.new(|cx| {
+            let mut e = Editor::new(EditorMode::MultiLine, cx);
+            e.placeholder = "Description (Markdown)".into();
+            e.font_size = 12.;
+            e.wrap = true;
+            e
+        });
+        let changed = |v: &mut Self, _: Entity<Editor>, ev: &EditorEvent, cx: &mut Context<Self>| {
+            if matches!(ev, EditorEvent::Changed) {
+                cx.notify();
+            }
+            // ⌘Enter in either box opens it.
+            if matches!(ev, EditorEvent::Submit) {
+                v.submit_pr(cx);
+            }
+        };
+        let subs = vec![cx.subscribe(&title, changed), cx.subscribe(&body, changed)];
+        view.create = Some(PrForm { title, body, draft: false, busy: false, error: None, existing: None, suggested: Default::default(), _subs: subs, _task: None });
+        let (r, h) = (view.root.clone(), head.clone());
+        let check = cx.background_executor().spawn(async move { git::gh::open_from(&r, &h) });
+        cx.spawn(async move |this, cx| {
+            let n = check.await;
+            this.update(cx, |v, cx| {
+                if let Some(f) = &mut v.create {
+                    f.existing = n;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        view.set_compare(base, head, cx);
+        view
+    }
+
+    /// Fills the title and description from the branch, unless they were edited.
+    fn suggest_pr_text(&mut self, cx: &mut Context<Self>) {
+        let (Some(form), Some((base, head))) = (&self.create, self.compare.clone()) else { return };
+        let root = self.root.clone();
+        let task = cx.background_executor().spawn(async move { git::gh::suggested_text(&root, &base, &head) });
+        let _ = form;
+        cx.spawn(async move |this, cx| {
+            let text = task.await;
+            this.update(cx, |v, cx| {
+                let Some(f) = &mut v.create else { return };
+                let (title, body) = (f.title.read(cx).text(), f.body.read(cx).text());
+                if title.is_empty() || title == f.suggested.0 {
+                    f.title.update(cx, |e, cx| e.set_text(&text.0, cx));
+                }
+                if body.is_empty() || body == f.suggested.1 {
+                    f.body.update(cx, |e, cx| e.set_text(&text.1, cx));
+                }
+                f.suggested = text;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn can_create(&self, cx: &App) -> bool {
+        let Some(f) = &self.create else { return false };
+        !f.busy && f.existing.is_none() && self.ahead_behind.is_some_and(|(a, _)| a > 0) && !f.title.read(cx).text().trim().is_empty()
+    }
+
+    fn submit_pr(&mut self, cx: &mut Context<Self>) {
+        if !self.can_create(cx) {
+            return;
+        }
+        let (Some(f), Some((base, head))) = (&mut self.create, self.compare.clone()) else { return };
+        let (title, body, draft) = (f.title.read(cx).text().trim().to_string(), f.body.read(cx).text(), f.draft);
+        f.busy = true;
+        f.error = None;
+        let root = self.root.clone();
+        let task = cx.background_executor().spawn(async move { git::gh::create(&root, &base, &head, &title, &body, draft) });
+        f._task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |v, cx| {
+                if let Some(f) = &mut v.create {
+                    f.busy = false;
+                    match result {
+                        Ok(n) => cx.emit(PrCreated(n)),
+                        Err(e) => f.error = Some(e.to_string().lines().next().unwrap_or("").to_string()),
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// The title, description, draft switch and the button, with what's in the way.
+    fn render_pr_form(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let f = self.create.as_ref()?;
+        let (_, head) = self.compare.clone().unwrap_or_default();
+        if let Some(n) = f.existing {
+            let root = self.root.clone();
+            return Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(10.))
+                    .child(div().text_color(theme::fg_dim()).child(format!("{head} already has an open pull request, #{n}.")))
+                    .child(
+                        div()
+                            .id("pr-new-existing")
+                            .debug_selector(|| "pr-new-existing".into())
+                            .flex()
+                            .items_center()
+                            .h(px(26.))
+                            .px(px(12.))
+                            .rounded(px(4.))
+                            .bg(theme::accent())
+                            .text_color(theme::on(theme::accent()))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::accent_hover()))
+                            .on_click(cx.listener(move |_, _, _, cx| cx.emit(Request::OpenPr(root.clone(), n))))
+                            .child(format!("Open #{n}")),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let ahead = self.ahead_behind.map(|(a, _)| a);
+        let ok = self.can_create(cx);
+        let blocked = match ahead {
+            Some(0) => Some(format!("{head} has no commits that the base lacks: nothing to open a pull request for.")),
+            _ if f.title.read(cx).text().trim().is_empty() => Some("Give it a title.".to_string()),
+            _ => None,
+        };
+        let field = |child: Entity<Editor>, sel: &'static str| {
+            div()
+                .debug_selector(move || sel.into())
+                .p(px(6.))
+                .rounded(px(4.))
+                .bg(theme::bg_input())
+                .border_1()
+                .border_color(theme::border_input())
+                .child(child)
+        };
+        let draft = f.draft;
+        let label = if f.busy { "Opening…" } else if draft { "Create draft pull request" } else { "Create pull request" };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .max_w(px(760.))
+                // Clicks in the form stay in its boxes (the page would take the keyboard).
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(field(f.title.clone(), "pr-new-title"))
+                .child(field(f.body.clone(), "pr-new-body").min_h(px(90.)))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .id("pr-new-draft")
+                                .debug_selector(|| "pr-new-draft".into())
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .cursor_pointer()
+                                .text_color(theme::fg_dim())
+                                .on_click(cx.listener(|v, _, _, cx| {
+                                    if let Some(f) = &mut v.create {
+                                        f.draft = !f.draft;
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(div().size(px(14.)).flex().items_center().justify_center().rounded(px(3.)).border_1().border_color(theme::border_input()).when(draft, |d| d.bg(theme::accent()).text_color(theme::on(theme::accent())).child("✓")))
+                                .child("Draft"),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("pr-new-create")
+                                .debug_selector(|| "pr-new-create".into())
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .h(px(28.))
+                                .px(px(14.))
+                                .rounded(px(4.))
+                                .bg(theme::accent())
+                                .text_color(theme::on(theme::accent()))
+                                .when(!ok, |d| d.opacity(0.5))
+                                .when(ok, |d| d.cursor_pointer().hover(|s| s.bg(theme::accent_hover())))
+                                .tooltip(ui::tooltip("Pushes the branch, then opens the pull request on GitHub (⌘Enter)"))
+                                .on_click(cx.listener(|v, _, _, cx| v.submit_pr(cx)))
+                                .child(ui::small_icon("pull-request", theme::on(theme::accent())))
+                                .child(label),
+                        ),
+                )
+                .children(blocked.filter(|_| !f.busy).map(|b| div().text_size(px(11.5)).text_color(theme::fg_muted()).child(b)))
+                .children(f.error.clone().map(|e| div().debug_selector(|| "pr-new-error".into()).text_size(px(11.5)).text_color(theme::git_deleted()).child(e)))
+                .into_any_element(),
+        )
+    }
+
+    /// The form's title and description as typed.
+    #[cfg(test)]
+    pub fn form_text(&self, cx: &App) -> Option<(String, String)> {
+        self.create.as_ref().map(|f| (f.title.read(cx).text(), f.body.read(cx).text()))
+    }
+
+    fn typing(&self, window: &Window, cx: &App) -> bool {
+        self.create.as_ref().is_some_and(|f| [&f.title, &f.body].into_iter().any(|e| e.read(cx).focus_handle(cx).contains_focused(window, cx)))
     }
 
     /// What `other` changed since it split from `base` (like comparing branches on GitHub).
@@ -163,6 +410,7 @@ impl CommitView {
             let (result, branches) = load.await;
             this.update(cx, |view, cx| {
                 view.branches = branches;
+                view.suggest_pr_text(cx);
                 match result {
                     Ok(c) => {
                         view.details = Some(c.details);
@@ -181,6 +429,9 @@ impl CommitView {
     }
 
     pub fn title(&self) -> String {
+        if let (Some(_), Some((_, b))) = (&self.create, &self.compare) {
+            return format!("New pull request: {b}");
+        }
         if let Some((a, b)) = &self.compare {
             return format!("{a} ↔ {b}");
         }
@@ -403,6 +654,10 @@ pub fn compare_key(base: &str, other: &str) -> String {
     format!("{base}...{other}")
 }
 
+fn pr_heading() -> Div {
+    div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child("Open a pull request")
+}
+
 fn meta_row(label: &str, value: impl IntoElement) -> Div {
     div()
         .flex()
@@ -421,7 +676,7 @@ impl Render for CommitView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus.is_focused(window);
         let root = div()
-            .key_context("CommitView")
+            .key_context(if self.typing(window, cx) { "CommitView typing" } else { "CommitView" })
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::next))
             .on_action(cx.listener(Self::prev))
@@ -439,7 +694,9 @@ impl Render for CommitView {
                     .flex()
                     .flex_col()
                     .gap(px(14.))
+                    .when(self.create.is_some(), |el| el.child(pr_heading()))
                     .when(self.compare.is_some(), |el| el.child(self.render_compare_bar(cx).into_any_element()))
+                    .children(self.render_pr_form(cx))
                     .child(div().text_color(theme::fg_muted()).child(msg)),
             );
         };
@@ -460,6 +717,8 @@ impl Render for CommitView {
         }));
 
         let compare_bar = self.compare.is_some().then(|| self.render_compare_bar(cx).into_any_element());
+        let form = self.render_pr_form(cx);
+        let heading = self.create.is_some().then(pr_heading);
         let tree = AS_TREE.load(Ordering::Relaxed);
         let compact = self.compact;
         const INDENT: f32 = 12.;
@@ -552,7 +811,7 @@ impl Render for CommitView {
                 .when(self.compare.is_none(), |el| el.child(div().text_size(px(if compact { 15. } else { 20. })).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(d.subject().to_string())).child(refs))
                 .when_some(self.compare.clone(), |el, (a, b)| {
                     let split = d.parents.first().map(|p| p[..p.len().min(7)].to_string()).unwrap_or_default();
-                    el.children(compare_bar).child(
+                    el.children(heading).children(compare_bar).children(form).child(
                         div()
                             .text_color(theme::fg_muted())
                             .text_size(px(11.5))

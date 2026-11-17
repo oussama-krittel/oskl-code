@@ -171,10 +171,75 @@ pub fn fetch(root: &Path, remote: &str, n: u64, base: &str) -> Result<(String, S
     let head = format!("refs/oskl/pr/{n}");
     // Only gh's sign-in: git's own helpers (the keychain, Git Credential Manager) can wait
     // forever on a prompt nobody sees when the app runs them.
-    let helper = format!("credential.helper=!'{}' auth git-credential", gh_bin().display());
-    let with_gh: &[&str] = if std::env::var_os("OSKL_GH").is_none() { &["-c", "credential.helper=", "-c", &helper] } else { &[] };
-    git_run(root, &[with_gh, &["fetch", "--quiet", remote, &format!("+refs/pull/{n}/head:{head}"), &format!("+refs/heads/{base}:refs/remotes/{remote}/{base}")]].concat())?;
+    let args = with_gh_auth(&["fetch", "--quiet", remote, &format!("+refs/pull/{n}/head:{head}"), &format!("+refs/heads/{base}:refs/remotes/{remote}/{base}")]);
+    git_run(root, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
     Ok((format!("refs/remotes/{remote}/{base}"), head))
+}
+
+/// Git's own credential helpers swapped for gh's sign-in: the keychain or Git Credential
+/// Manager can wait forever on a prompt nobody sees when the app runs them.
+fn with_gh_auth(args: &[&str]) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    if std::env::var_os("OSKL_GH").is_none() {
+        all.extend(["-c".into(), "credential.helper=".into(), "-c".into(), format!("credential.helper=!'{}' auth git-credential", gh_bin().display())]);
+    }
+    all.extend(args.iter().map(|a| a.to_string()));
+    all
+}
+
+/// The branch pull requests go into by default: the remote's HEAD, else main or master.
+pub fn default_branch(root: &Path) -> String {
+    if let Ok(head) = git_run(root, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+        let head = head.trim();
+        if let Some((_, b)) = head.split_once('/') {
+            return b.to_string();
+        }
+    }
+    ["main", "master", "develop"]
+        .into_iter()
+        .find(|b| git_run(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}")]).is_ok())
+        .unwrap_or("main")
+        .to_string()
+}
+
+/// A title and description to start from: one commit's subject and body, or (several) the
+/// branch's name in words.
+pub fn suggested_text(root: &Path, base: &str, head: &str) -> (String, String) {
+    let subjects = git_run(root, &["log", "--format=%s", &format!("{base}..{head}")]).unwrap_or_default();
+    let subjects: Vec<&str> = subjects.lines().filter(|l| !l.trim().is_empty()).collect();
+    if subjects.len() == 1 {
+        let body = git_run(root, &["log", "-1", "--format=%b", head]).unwrap_or_default();
+        return (subjects[0].to_string(), body.trim().to_string());
+    }
+    let name = head.rsplit('/').next().unwrap_or(head).replace(['-', '_'], " ");
+    let mut c = name.chars();
+    let title = c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
+    (title, String::new())
+}
+
+/// The open pull request from `head`, if there is one: its number.
+pub fn open_from(root: &Path, head: &str) -> Option<u64> {
+    let out = gh(root, &["pr", "list", "--head", head, "--state", "open", "--json", "number"]).ok()?;
+    let prs: Vec<serde_json::Value> = serde_json::from_str(&out).ok()?;
+    prs.first()?.get("number")?.as_u64()
+}
+
+/// Opens a pull request from `head` into `base`, pushing `head` first (its upstream set);
+/// returns its number.
+pub fn create(root: &Path, base: &str, head: &str, title: &str, body: &str, draft: bool) -> Result<u64> {
+    let remote = git_run(root, &["config", &format!("branch.{head}.remote")]).ok().map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).unwrap_or_else(|| "origin".into());
+    let push = with_gh_auth(&["push", "--quiet", "-u", &remote, head]);
+    git_run(root, &push.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let mut args = vec!["pr", "create", "--base", base, "--head", head, "--title", title, "--body", body];
+    if draft {
+        args.push("--draft");
+    }
+    let out = gh(root, &args)?;
+    // gh prints the new pull request's address, ending in its number.
+    out.lines()
+        .rev()
+        .find_map(|l| l.trim().rsplit('/').next().and_then(|n| n.parse().ok()))
+        .ok_or_else(|| anyhow::anyhow!("gh didn't say which pull request it opened: {}", out.trim()))
 }
 
 /// `kind`: approve, request-changes or comment.

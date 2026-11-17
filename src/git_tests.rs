@@ -746,19 +746,119 @@ fn the_git_tab_fetches_quietly_and_counts_the_subject(cx: &mut gpui::TestAppCont
 }
 
 /// A stand-in for `gh`: pull request #7 (branch `login` into `main`) with one line comment;
-/// every call is written to `gh.log` beside the project.
+/// every call is written to `gh.log` beside it.
 const FAKE_GH: &str = r#"#!/bin/sh
 echo "$*" >> "$(dirname "$0")/gh.log"
 case "$1 $2" in
-  "pr list") echo '[{"number":7,"title":"Login page","author":{"login":"ann"},"headRefName":"login","baseRefName":"main","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS"}],"updatedAt":"2026-11-14T10:00:00Z"}]' ;;
+  "pr list") case "$*" in *"--head newwork"*) echo '[]' ; exit 0 ;; esac; echo '[{"number":7,"title":"Login page","author":{"login":"ann"},"headRefName":"login","baseRefName":"main","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS"}],"updatedAt":"2026-11-14T10:00:00Z"}]' ;;
   "pr view") echo '{"number":7,"title":"Login page","body":"Adds the login page.","author":{"login":"ann"},"state":"OPEN","url":"https://example.invalid/pr/7","headRefName":"login","baseRefName":"main","headRefOid":"'"$(git rev-parse refs/oskl/pr/7 2>/dev/null)"'","additions":1,"deletions":0,"isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeable":"MERGEABLE","comments":[{"author":{"login":"bob"},"body":"Thanks!","createdAt":"2026-11-14T11:00:00Z"}],"reviews":[],"statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS"}],"commits":[{"oid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/7/head)"'","messageHeadline":"Login page","authors":[{"login":"ann"}],"committedDate":"2026-11-14T10:00:00Z"}]}' ;;
   "api repos/{owner}/{repo}/pulls/7/comments") echo '[{"path":"login.txt","line":1,"body":"Nice","user":{"login":"bob"}}]' ;;
   "api --method") echo '{}' ;;
   "pr review"|"pr comment") echo ok ;;
+  "pr create") echo "https://example.invalid/pr/8" ;;
   "pr checkout") git switch -q -c login refs/oskl/pr/7 ;;
   *) echo "unknown: $*" >&2; exit 1 ;;
 esac
 "#;
+
+/// The fake gh, one for the whole run: `OSKL_GH` is process-wide, so tests running at the same
+/// time share it (it answers any repository) and its log.
+fn fake_gh() -> std::path::PathBuf {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let dir = std::env::temp_dir().join(format!("oskl-fake-gh-{}", std::process::id()));
+    ONCE.call_once(|| {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("gh"), FAKE_GH).unwrap();
+        sh(&dir, "chmod +x gh");
+        unsafe { std::env::set_var("OSKL_GH", dir.join("gh")) };
+    });
+    dir.join("gh")
+}
+
+#[gpui::test]
+fn the_graph_filter_applies_at_once_and_labels_only_the_picked_branches(cx: &mut gpui::TestAppContext) {
+    let (ws, cx) = setup_with(cx, |dir| {
+        sh(dir, INIT);
+        sh(dir, "echo a > a.txt && git add . && git commit -qm base && git tag v1 && git branch stale");
+        sh(dir, "git switch -qc feature && echo f > f.txt && git add . && git commit -qm feat && git tag v2");
+        sh(dir, "git switch -qc other main && echo o > o.txt && git add . && git commit -qm other-work");
+        sh(dir, "git switch -q main && echo m > m.txt && git add . && git commit -qm main-work");
+    });
+    settle(&ws, cx);
+    show_git(&ws, cx);
+    settle(&ws, cx);
+    let shown = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        ws.read_with(cx, |ws, cx| ws.repo.read(cx).commits.iter().map(|c| (c.subject.clone(), c.refs.iter().map(|r| r.name.clone()).collect::<Vec<_>>())).collect::<Vec<_>>())
+    };
+    click(cx, "graph-scope");
+    settle(&ws, cx);
+    click(cx, "scope-local-feature");
+    settle(&ws, cx);
+    // Only feature's history, labelled with feature and its tags: not with stale, another
+    // branch on the shared commit.
+    let picked = shown(&ws, cx);
+    let subjects: Vec<&str> = picked.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(subjects, ["feat", "base"], "{picked:?}");
+    let labels: Vec<&String> = picked.iter().flat_map(|(_, r)| r).collect();
+    assert_eq!(labels, ["feature", "v2", "v1"].map(String::from).iter().collect::<Vec<_>>(), "{picked:?}");
+    // A second pick adds its branch at once.
+    click(cx, "scope-local-other");
+    settle(&ws, cx);
+    let picked = shown(&ws, cx);
+    assert!(picked.iter().any(|(s, _)| s == "other-work") && !picked.iter().any(|(s, _)| s == "main-work"), "{picked:?}");
+    let mut labels: Vec<String> = picked.iter().flat_map(|(_, r)| r.clone()).collect();
+    labels.sort();
+    assert_eq!(labels, ["feature", "other", "v1", "v2"]);
+}
+
+#[gpui::test]
+fn a_pull_request_is_opened_from_the_sidebar_or_source_control(cx: &mut gpui::TestAppContext) {
+    let (ws, cx) = setup_with(cx, |dir| {
+        sh(dir, "git init -q --bare ../$(basename $PWD)-remote.git");
+        sh(dir, INIT);
+        sh(dir, "echo a > a.txt && git add . && git commit -qm one && git remote add origin ../$(basename $PWD)-remote.git && git push -q -u origin main");
+        sh(dir, "git switch -qc newwork && echo b > b.txt && git add . && git commit -qm 'Add the b file' -m 'Because b matters.'");
+        fake_gh();
+    });
+    let dir = root(&ws, cx);
+    let log = || std::fs::read_to_string(fake_gh().with_file_name("gh.log")).unwrap_or_default();
+    settle(&ws, cx);
+    let form = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
+        ws.read_with(cx, |ws, cx| ws.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Commit(c) if c.read(cx).create.is_some() => Some(c.clone()),
+            _ => None,
+        }))
+    };
+
+    // Source Control, the work committed: a button proposes the branch.
+    show_git(&ws, cx);
+    settle(&ws, cx);
+    click(cx, "git-new-pr");
+    settle(&ws, cx);
+    let view = form(&ws, cx).expect("the form opens in a tab");
+    assert_eq!(view.read_with(cx, |v, _| v.compare.clone()), Some(("main".into(), "newwork".into())), "from this branch into the default one");
+    // One commit: its subject and body to start from.
+    let title = cx.debug_bounds("pr-new-title").expect("the title box");
+    let _ = title;
+    assert_eq!(view.read_with(cx, |v, cx| v.form_text(cx)), Some(("Add the b file".into(), "Because b matters.".into())));
+    // The sidebar's + opens the same form, not a second one.
+    click(cx, "act-prs");
+    settle(&ws, cx);
+    click(cx, "pr-new");
+    settle(&ws, cx);
+    assert_eq!(ws.read_with(cx, |ws, cx| ws.tabs.iter().filter(|t| matches!(&t.kind, TabKind::Commit(c) if c.read(cx).create.is_some())).count()), 1);
+
+    // Create: the branch is pushed, gh opens it, and its review takes the form's place.
+    click(cx, "pr-new-create");
+    settle(&ws, cx);
+    assert!(log().contains("pr create --base main --head newwork --title Add the b file --body Because b matters."), "{}", log());
+    assert!(git_out(&dir, &["ls-remote", "origin", "newwork"]).contains("refs/heads/newwork"), "pushed first");
+    assert!(form(&ws, cx).is_none(), "the form closed");
+    assert_eq!(ws.read_with(cx, |ws, cx| match &ws.tabs[ws.active.unwrap()].kind {
+        TabKind::Pr(v) => Some(v.read(cx).number),
+        _ => None,
+    }), Some(8));
+}
 
 #[gpui::test]
 fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui::TestAppContext) {
@@ -767,15 +867,10 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
         sh(dir, INIT);
         sh(dir, "echo a > a.txt && git add . && git commit -qm one && git remote add origin ../$(basename $PWD)-remote.git && git push -q -u origin main");
         sh(dir, "git switch -qc login && echo login > login.txt && git add . && git commit -qm 'Login page' && git push -q origin login:refs/pull/7/head && git switch -q main && git branch -qD login");
-        let gh = dir.with_file_name(format!("{}-gh", dir.file_name().unwrap().to_string_lossy()));
-        std::fs::create_dir_all(&gh).unwrap();
-        std::fs::write(gh.join("gh"), FAKE_GH).unwrap();
-        sh(&gh, "chmod +x gh");
-        // shortcut: process-wide, so other tests running now may reach the fake too (it answers any repository).
-        unsafe { std::env::set_var("OSKL_GH", gh.join("gh")) };
+        fake_gh();
     });
     let dir = root(&ws, cx);
-    let log = || std::fs::read_to_string(dir.with_file_name(format!("{}-gh/gh.log", dir.file_name().unwrap().to_string_lossy()))).unwrap_or_default();
+    let log = || std::fs::read_to_string(fake_gh().with_file_name("gh.log")).unwrap_or_default();
     settle(&ws, cx);
     let pr_tab = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
         ws.read_with(cx, |ws, _| match &ws.tabs[ws.active.unwrap()].kind {
