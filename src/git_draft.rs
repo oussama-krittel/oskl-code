@@ -167,6 +167,23 @@ pub fn button(id: &'static str, running: bool) -> Stateful<Div> {
         .child(if running { "Drafting… ✕" } else { "✦ Draft" })
 }
 
+/// The same, as a sparkle inside a message box (an ✕ while drafting).
+pub fn icon(id: &'static str, running: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(ui::px(20.))
+        .rounded(ui::px(4.))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::hover()))
+        .tooltip(ui::tooltip(if running { "Drafting with Claude Code: click to stop" } else { "Draft the message from the staged changes, with Claude Code" }))
+        .child(if running { ui::small_icon("close", theme::accent()) } else { ui::small_icon("sparkle", theme::fg_muted()) })
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

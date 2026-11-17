@@ -362,6 +362,8 @@ pub struct Editor {
     /// A chat box: Enter sends (⇧Enter for a new line), long lines wrap, pasted pictures are
     /// handed out (`EditorEvent::Image`).
     pub chat: bool,
+    /// Long lines wrap at the box's width, which grows with them (a commit message).
+    pub wrap: bool,
     /// One line, but brackets and quotes close themselves as in code (a query box).
     pub pairs: bool,
     /// Enter always submits (a suggestion shown is taken with Tab instead).
@@ -463,6 +465,7 @@ impl Editor {
             placeholder: SharedString::default(),
             secret: false,
             chat: false,
+            wrap: false,
             pairs: false,
             enter_submits: false,
             suggest: None,
@@ -534,7 +537,7 @@ impl Editor {
 
     pub fn load(&mut self, path: PathBuf, root: Option<PathBuf>, cx: &mut Context<Self>) {
         let bytes = std::fs::read(&path).unwrap_or_default();
-        self.buf = Buffer::new(&String::from_utf8_lossy(&bytes));
+        self.buf = self.buf.replaced(&String::from_utf8_lossy(&bytes));
         self.lang = highlight::detect(&path);
         self.path = Some(path);
         self.root = root;
@@ -617,7 +620,7 @@ impl Editor {
     }
 
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.buf = Buffer::new(text);
+        self.buf = self.buf.replaced(text);
         self.buf.sel = Sel::at(self.buf.len());
         self.scroll_x = 0.;
         self.scroll_y = 0.;
@@ -636,6 +639,12 @@ impl Editor {
 
     pub fn cursor_rc(&self) -> (usize, usize) {
         self.buf.pos_to_rc(self.buf.sel.head)
+    }
+
+    /// The width of a character, once drawn (monospace).
+    #[cfg(test)]
+    pub(crate) fn char_width(&self) -> Option<f32> {
+        self.char_w.map(|(_, w)| w)
     }
 
     pub fn line_height(&self) -> f32 {
@@ -774,7 +783,7 @@ impl Editor {
     /// Replaces the text of a read-only view without touching scroll position.
     pub fn set_view_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if self.buf.text() != text {
-            self.buf = Buffer::new(text);
+            self.buf = self.buf.replaced(text);
             self.schedule_highlight(Duration::ZERO, cx);
             cx.notify();
         }
@@ -980,7 +989,7 @@ impl Editor {
     }
 
     fn wrap_active(&self) -> bool {
-        (word_wrap() && self.mode == EditorMode::Full && self.decor.is_none()) || self.chat
+        (word_wrap() && self.mode == EditorMode::Full && self.decor.is_none()) || self.chat || self.wrap
     }
 
     /// Recomputes wrap points when the text, the width (in columns) or the folds changed.
@@ -2191,7 +2200,10 @@ impl Editor {
         // Word wrap at the editor's width (monospace: a column count).
         let wrap_on = self.wrap_active();
         if wrap_on {
-            self.ensure_wrap(((text_w - 6.) / char_w).floor().max(20.) as usize);
+            // A full editor keeps room for its scrollbar; a box (a chat, a commit message) uses
+            // its whole width.
+            let wrap_w = if full { text_w - 6. } else { width - text_pad - 2. };
+            self.ensure_wrap((wrap_w / char_w).floor().max(if full { 20. } else { 8. }) as usize);
             self.scroll_x = 0.;
         } else {
             self.wrap_data = None;
@@ -2202,7 +2214,7 @@ impl Editor {
         let content_h = if full { (disp_count.saturating_sub(1)) as f32 * line_h + height } else { disp_count as f32 * line_h };
         // The box was sized at the last frame's width: when the new width wraps to another row
         // count, it's sized again next frame (a refresh asked for while drawing is ignored).
-        if self.chat && (disp_count.clamp(1, 10) as f32 * line_h - height).abs() > 0.5 {
+        if (self.chat || self.wrap) && (disp_count.clamp(1, 10) as f32 * line_h - height).abs() > 0.5 {
             window.on_next_frame(|window, _| window.refresh());
         }
         let max_scroll = (content_h - height).max(0.);
@@ -2613,7 +2625,8 @@ impl Editor {
                 let x1 = st.get(k + 1).map(|e| x_for(shaped, map, *e)).unwrap_or(shaped.width / px(1.));
                 let y = y_for(*row) + k as f32 * line_h;
                 let left_x = text_x + ind(*row, k);
-                let clip = Bounds::new(point(px(left_x), px(y)), size(px(x1 - x0 + 1.), px(line_h)));
+                // Exactly the segment: any wider shows a sliver of the next one's first letter.
+                let clip = Bounds::new(point(px(left_x), px(y)), size(px(x1 - x0), px(line_h)));
                 p.text_clipped.push((point(px(left_x - x0), px(y)), shaped.clone(), clip));
             }
         }

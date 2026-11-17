@@ -1325,6 +1325,30 @@ fn claude_drafts_the_commit_message_and_can_be_stopped(cx: &mut gpui::TestAppCon
     let bx = cx.debug_bounds("commit-box").expect("the message box");
     assert!(draft.left() > bx.left() && draft.right() <= bx.right() && draft.top() >= bx.top() && draft.bottom() <= bx.bottom(), "{draft:?} in {bx:?}");
     assert!(draft.right() > bx.right() - gpui::px(12.), "at the right edge: {draft:?} in {bx:?}");
+    // A long message wraps onto more lines (the box grows down, never sideways).
+    ws.update(cx, |ws, cx| ws.git_panel.update(cx, |p, cx| p.commit_input.update(cx, |e, cx| e.set_text(&"word ".repeat(60), cx))));
+    settle(&ws, cx);
+    cx.update(|window, _| window.refresh());
+    settle(&ws, cx);
+    let tall = cx.debug_bounds("commit-box").expect("the message box");
+    assert!(tall.size.height > bx.size.height * 2., "grew: {tall:?} from {bx:?}");
+    assert_eq!(tall.right(), bx.right(), "same width");
+    // The whole width is used: as many letters as fit stay on one line, one more wraps.
+    ws.update(cx, |ws, _| ws.side_w = 320.);
+    let set = |ws: &Entity<Workspace>, cx: &mut VisualTestContext, n: usize| {
+        ws.update(cx, |ws, cx| ws.git_panel.update(cx, |p, cx| p.commit_input.update(cx, |e, cx| e.set_text(&"x".repeat(n), cx))));
+        settle(ws, cx);
+        cx.update(|window, _| window.refresh());
+        settle(ws, cx);
+        cx.debug_bounds("commit-box").expect("the message box").size.height
+    };
+    let one = set(&ws, cx, 1);
+    let text_w = cx.debug_bounds("commit-text").expect("the text").size.width / gpui::px(1.);
+    let cw = ws.read_with(cx, |ws, cx| ws.git_panel.read(cx).commit_input.read(cx).char_width()).expect("measured") * crate::ui::scale();
+    let fit = ((text_w - 4. * crate::ui::scale()) / cw).floor() as usize;
+    assert!(fit > 25, "{fit} letters in {text_w}");
+    assert_eq!(set(&ws, cx, fit), one, "{fit} letters fit on one line");
+    assert!(set(&ws, cx, fit + 1) > one, "one more wraps");
 }
 
 #[gpui::test]

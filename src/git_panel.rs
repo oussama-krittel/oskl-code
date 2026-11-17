@@ -282,6 +282,7 @@ impl GitPanel {
         let commit_input = cx.new(|cx| {
             let mut ed = Editor::new(EditorMode::MultiLine, cx);
             ed.font_size = 12.;
+            ed.wrap = true;
             ed
         });
         let repo_sub = Self::observe_repo(&repo, cx);
@@ -1590,8 +1591,8 @@ impl GitPanel {
                             .flex()
                             .items_start()
                             .gap(px(4.))
-                            .child(div().flex_1().min_w_0().child(self.commit_input.clone()))
-                            .child(git::draft::button("commit-draft", self.drafter.running()).border_0().h(px(20.)).px(px(6.)).on_click(cx.listener(|panel, _, _, cx| {
+                            .child(div().flex_1().min_w_0().debug_selector(|| "commit-text".into()).child(self.commit_input.clone()))
+                            .child(git::draft::icon("commit-draft", self.drafter.running()).on_click(cx.listener(|panel, _, _, cx| {
                                 let root = panel.repo.read(cx).root.clone();
                                 panel.drafter.toggle(root, &panel.commit_input, cx);
                             }))),
