@@ -4995,8 +4995,6 @@ impl Workspace {
             .when(!right && self.lights_pad > 0., |d| d.relative().child(div().absolute().right_0().top(px(24.) + gpui::px(2. + NOTCH_R)).bottom_0().w(gpui::px(1.)).bg(theme::border())))
             .when(right, |d| d.border_l_1())
             .border_color(theme::border())
-            .child(tool("act-go-to-file", "go-to-file", "Go to File (⌘P)", 19.).on_click(cx.listener(|ws, _, w, cx| ws.find_file(&FindFile, w, cx))))
-            .child(div().mx(px(10.)).my(px(2.)).h(px(1.)).bg(theme::border()))
             .child(item("act-files", "files", Side::Files, "Explorer (⇧⌘E)", self, cx))
             .child(item("act-search", "search", Side::Search, "Search (⇧⌘F)", self, cx))
             .child(item("act-git", "git", Side::Git, "Source Control (⌃⇧G)", self, cx).when(changes > 0, |d| {
