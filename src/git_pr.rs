@@ -67,6 +67,10 @@ pub struct LineBox {
     pub path: String,
     pub new_side: bool,
     pub line: usize,
+    /// On several lines: the first (Shift-click a second line's +).
+    pub start: Option<usize>,
+    /// The line clicked first: Shift-click picks from it to another.
+    pub anchor: usize,
     /// Answering the thread this comment starts (sent at once).
     pub reply_to: Option<u64>,
 }
@@ -88,6 +92,8 @@ pub struct PrView {
     pub tab: Tab,
     pub file: Option<String>,
     pub diff: Option<Entity<DiffView>>,
+    /// The commit the open diff is from (None: the whole pull request).
+    diff_commit: Option<String>,
     /// The review's summary (Finish your review).
     pub input: Entity<Editor>,
     /// Comments on lines kept for the review, until it's sent (kept on disk meanwhile).
@@ -146,7 +152,7 @@ impl PrView {
         let root = repo.read(cx).root.clone();
         let comment_preview = {
             let (c, r) = (comment_input.clone(), root.clone());
-            cx.new(|cx| MdPreview::new(c, r, cx))
+            cx.new(|cx| MdPreview::new(c, r, 160., "pr-comment-input", cx))
         };
         let subs = vec![
             cx.subscribe(&line_input, |v, _, ev: &EditorEvent, cx| match ev {
@@ -189,6 +195,7 @@ impl PrView {
             tab: Tab::Conversation,
             file: None,
             diff: None,
+            diff_commit: None,
             input,
             pending: Vec::new(),
             pending_file: None,
@@ -350,9 +357,27 @@ impl PrView {
         }
     }
 
-    /// The files the tree shows: the picked commit's, else the whole pull request's.
+    /// A commit open in Commits (its files and their diff, a back button to the list).
+    fn in_commit(&self) -> bool {
+        self.tab == Tab::Commits && self.commit.is_some()
+    }
+
+    /// The files the tree shows: the open commit's, else the whole pull request's.
     pub fn shown_files(&self) -> Option<&Result<Files, String>> {
-        if self.commit.is_some() { self.commit_files.as_ref() } else { self.files.as_ref() }
+        if self.in_commit() { self.commit_files.as_ref() } else { self.files.as_ref() }
+    }
+
+    /// Shows `tab`; a diff open from elsewhere (a commit, or the whole pull request) closes.
+    pub fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        self.tab = tab;
+        let scope = if self.in_commit() { self.commit.clone() } else { None };
+        if matches!(tab, Tab::Files | Tab::Commits) && self.diff.is_some() && self.diff_commit != scope {
+            self.diff = None;
+            self.file = None;
+            self.line_box = None;
+        }
+        self.matches = None;
+        cx.notify();
     }
 
     pub fn toggle_folder(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -366,16 +391,18 @@ impl PrView {
         cx.notify();
     }
 
-    /// Shows only what `sha` changed (None: the whole pull request again).
+    /// Opens commit `sha` in Commits: what it changed (None: back to the list).
     pub fn pick_commit(&mut self, sha: Option<String>, cx: &mut Context<Self>) {
         self.commit = sha.clone();
         self.commit_files = None;
-        self.file = None;
-        self.diff = None;
-        self.line_box = None;
+        if self.diff_commit.is_some() {
+            self.file = None;
+            self.diff = None;
+            self.diff_commit = None;
+        }
         self.matches = None;
         let Some(sha) = sha else { return cx.notify() };
-        self.tab = Tab::Files;
+        self.set_tab(Tab::Commits, cx);
         let root = self.repo.read(cx).root.clone();
         let collapsed = self.collapsed.clone();
         let task = cx.background_executor().spawn(async move {
@@ -404,7 +431,8 @@ impl PrView {
         let left = if c.status == FileStatus::Added { Rev::Empty } else { Rev::Commit(base) };
         let right = if c.status == FileStatus::Deleted { Rev::Empty } else { Rev::Commit(head) };
         let spec = DiffSpec { path: c.path.clone(), old_path: c.orig_path.clone(), left, right, back: None };
-        let commentable = self.commit.is_none();
+        let commentable = !self.in_commit();
+        self.diff_commit = if commentable { None } else { self.commit.clone() };
         let (me, path) = (cx.entity().downgrade(), c.path.clone());
         let annotate: crate::diff_view::Annotate = Rc::new(move |old, new, window, cx| me.upgrade()?.update(cx, |v, cx| v.line_thread(&path, old, new, window, cx)));
         let diff = cx.new(|cx| {
@@ -414,21 +442,18 @@ impl PrView {
             d
         });
         let path = c.path.clone();
-        self._diff_sub = Some(cx.subscribe(&diff, move |v, _, ev: &CommentOn, cx| v.open_line_box(LineBox { path: path.clone(), new_side: ev.0, line: ev.1, reply_to: None }, cx)));
+        self._diff_sub = Some(cx.subscribe(&diff, move |v, _, ev: &CommentOn, cx| v.comment_on(&path, ev, cx)));
         if self.line_box.as_ref().is_some_and(|b| b.path != c.path) {
             self.line_box = None;
         }
         self.file = Some(c.path.clone());
         self.diff = Some(diff);
-        self.tab = Tab::Files;
         cx.notify();
     }
 
     /// Opens the file of a pending comment.
     fn open_path(&mut self, path: &str, cx: &mut Context<Self>) {
-        if self.commit.is_some() {
-            self.pick_commit(None, cx);
-        }
+        self.set_tab(Tab::Files, cx);
         let ix = match self.shown_files() {
             Some(Ok(f)) => f.list.iter().position(|c| c.path == path),
             _ => None,
@@ -457,10 +482,32 @@ impl PrView {
 
     /// The diff draws what's under its lines again.
     fn refresh_notes(&mut self, cx: &mut Context<Self>) {
+        let marked = self.line_box.as_ref().filter(|b| Some(&b.path) == self.file.as_ref()).map(|b| (b.new_side, b.start.unwrap_or(b.line), b.line));
         if let Some(d) = &self.diff {
-            d.update(cx, |d, cx| d.remeasure(cx));
+            d.update(cx, |d, cx| {
+                d.marked = marked;
+                d.remeasure(cx);
+            });
         }
         cx.notify();
+    }
+
+    /// The + on a line: a box under it, or with Shift (a box open on that side) the lines
+    /// from the first picked to this one.
+    fn comment_on(&mut self, path: &str, ev: &CommentOn, cx: &mut Context<Self>) {
+        if ev.2
+            && let Some(b) = &mut self.line_box
+            && b.path == path
+            && b.new_side == ev.0
+            && b.reply_to.is_none()
+        {
+            let (a, z) = (b.anchor.min(ev.1), b.anchor.max(ev.1));
+            b.start = (a < z).then_some(a);
+            b.line = z;
+            self.focus_line = true;
+            return self.refresh_notes(cx);
+        }
+        self.open_line_box(LineBox { path: path.to_string(), new_side: ev.0, line: ev.1, start: None, anchor: ev.1, reply_to: None }, cx);
     }
 
     pub fn open_line_box(&mut self, b: LineBox, cx: &mut Context<Self>) {
@@ -485,7 +532,7 @@ impl PrView {
         if body.trim().is_empty() {
             return cx.emit(Request::Error("Write the comment first".into()));
         }
-        self.pending.push(DraftComment { path: b.path, line: b.line, new_side: b.new_side, body });
+        self.pending.push(DraftComment { path: b.path, line: b.line, new_side: b.new_side, body, start_line: b.start });
         self.save_pending();
         self.close_line_box(cx);
     }
@@ -506,12 +553,12 @@ impl PrView {
             return cx.emit(Request::Error("Write the comment first".into()));
         }
         let (n, commit) = (self.number, d.head_ref_oid.clone());
-        let label = if b.reply_to.is_some() { "Reply".to_string() } else { format!("Comment on line {}", b.line) };
+        let label = if b.reply_to.is_some() { "Reply".to_string() } else { format!("Comment on {}", lines_label(b.start, b.line)) };
         self.act(
             &label,
             move |root| match b.reply_to {
                 Some(to) => gh::reply(root, n, to, &body),
-                None => gh::line_comment(root, n, &commit, &b.path, b.line, b.new_side, &body),
+                None => gh::line_comment(root, n, &commit, &b.path, b.start, b.line, b.new_side, &body),
             },
             |v, cx| v.close_line_box(cx),
             cx,
@@ -653,7 +700,7 @@ impl PrView {
     }
 
     /// Who did what, when: a card with its Markdown.
-    fn card(&self, root: &Path, who: String, did: String, when: String, body: Option<Rc<Markdown>>) -> Div {
+    fn card(&self, root: &Path, who: String, did: String, when: String, excerpt: Option<Div>, body: Option<Rc<Markdown>>) -> Div {
         let color = if did == "approved" { theme::git_added() } else if did == "requested changes" { theme::git_deleted() } else { theme::fg_dim() };
         let opener: crate::preview::Opener = Rc::new(|path, _, _, _| {
             let _ = std::process::Command::new("open").arg(path).spawn();
@@ -679,17 +726,18 @@ impl PrView {
                     .child(div().text_color(color).child(did))
                     .child(div().text_color(theme::fg_muted()).child(when)),
             )
+            .children(excerpt)
             .when_some(body, |d, md| d.child(div().px(px(14.)).py(px(10.)).child(md.render(root, &self.images, opener))))
     }
 
     fn render_conversation(&self, root: &Path, d: &PrDetail, lines: &[LineComment], cx: &mut Context<Self>) -> impl IntoElement {
         let md = |ix: usize| self.md.get(ix).cloned();
         enum Item {
-            Card(String, String, Option<Rc<Markdown>>),
+            Card(String, String, Option<Rc<Markdown>>, Option<Div>),
             Commit(String, String, String),
         }
         // Comments, reviews, comments on lines and commits, oldest first.
-        let mut items: Vec<(String, Item)> = d.comments.iter().enumerate().map(|(i, c)| (c.created_at.clone(), Item::Card(c.author.login.clone(), "commented".into(), md(1 + i)))).collect();
+        let mut items: Vec<(String, Item)> = d.comments.iter().enumerate().map(|(i, c)| (c.created_at.clone(), Item::Card(c.author.login.clone(), "commented".into(), md(1 + i), None))).collect();
         let n_comments = d.comments.len();
         items.extend(d.reviews.iter().enumerate().map(|(i, r)| {
             let did = match r.state.as_str() {
@@ -698,10 +746,10 @@ impl PrView {
                 "DISMISSED" => "had a review dismissed",
                 _ => "reviewed",
             };
-            (r.submitted_at.clone(), Item::Card(r.author.login.clone(), did.into(), md(1 + n_comments + i).filter(|_| !r.body.trim().is_empty())))
+            (r.submitted_at.clone(), Item::Card(r.author.login.clone(), did.into(), md(1 + n_comments + i).filter(|_| !r.body.trim().is_empty()), None))
         }));
         let first_line = self.first_line_md();
-        items.extend(lines.iter().enumerate().map(|(i, l)| (l.created_at.clone(), Item::Card(l.user.login.clone(), format!("commented on {}:{}", l.path, l.line.or(l.original_line).unwrap_or(0)), md(first_line + i)))));
+        items.extend(lines.iter().enumerate().map(|(i, l)| (l.created_at.clone(), Item::Card(l.user.login.clone(), format!("commented on {} {}", l.path, lines_label(l.start_line.map(|s| s as usize), l.line.or(l.original_line).unwrap_or(0) as usize)), md(first_line + i), hunk_excerpt(l)))));
         items.extend(d.commits.iter().map(|c| (c.committed_date.clone(), Item::Commit(c.oid.clone(), c.message_headline.clone(), c.authors.first().map(|a| a.login.clone()).unwrap_or_default()))));
         items.sort_by(|a, b| a.0.cmp(&b.0));
         let ago = |when: &str| crate::pr_panel::github_time(when).map(crate::util::relative_time).unwrap_or_default();
@@ -709,7 +757,7 @@ impl PrView {
         let mut timeline: Vec<AnyElement> = Vec::new();
         for (when, item) in items {
             timeline.push(match item {
-                Item::Card(who, did, body) => self.card(root, who, did, ago(&when), body).into_any_element(),
+                Item::Card(who, did, body, excerpt) => self.card(root, who, did, ago(&when), excerpt, body).into_any_element(),
                 Item::Commit(sha, headline, who) => {
                     let short = sha.get(..7).unwrap_or(&sha).to_string();
                     let sel = format!("pr-timeline-commit-{short}");
@@ -741,14 +789,19 @@ impl PrView {
             .debug_selector(|| "pr-conversation".into())
             .size_full()
             .overflow_y_scroll()
+            // Centred, up to a readable width; a narrow pane uses all of it.
+            .flex()
+            .flex_col()
+            .items_center()
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(12.))
                     .p(px(16.))
-                    .max_w(px(1000.))
-                    .child(self.card(root, d.author.login.clone(), "opened it".into(), String::new(), description))
+                    .w_full()
+                    .max_w(px(1200.))
+                    .child(self.card(root, d.author.login.clone(), "opened it".into(), String::new(), None, description))
                     .children(timeline)
                     .child(self.render_merge_box(d, cx))
                     // Add a comment: written beside its preview.
@@ -759,11 +812,7 @@ impl PrView {
                             .gap(px(8.))
                             .pt(px(6.))
                             .child(div().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).text_size(px(13.)).child("Add a comment"))
-                            .child(crate::md_preview::side_by_side(
-                                div().id("pr-comment-input").debug_selector(|| "pr-comment-input".into()).size_full().p(px(6.)).bg(theme::bg_input()).child(self.comment_input.clone()).into_any_element(),
-                                self.comment_preview.clone(),
-                                140.,
-                            ))
+                            .child(self.comment_preview.clone())
                             .child(
                                 div()
                                     .flex()
@@ -934,7 +983,7 @@ impl PrView {
     fn render_tree(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let q = self.filter.read(cx).text();
         let matched = if q.trim().is_empty() { None } else { self.matching(q.trim()) };
-        let scope = self.commit_label();
+        let scope = if self.in_commit() { self.commit_label() } else { None };
         let (count, body): (usize, Option<AnyElement>) = match self.shown_files() {
             None => (0, Some(div().px(px(12.)).py(px(8.)).text_color(theme::fg_muted()).child("Bringing its commits here…").into_any_element())),
             Some(Err(e)) => (0, Some(div().px(px(12.)).py(px(8.)).text_color(theme::git_deleted()).child(e.clone()).into_any_element())),
@@ -1041,7 +1090,7 @@ impl PrView {
                         Some(c) => format!("{files_n} files in {c}"),
                         None => format!("{files_n} files changed"),
                     }))
-                    .when(scope.is_some(), |d| d.child(div().id("pr-all-commits").debug_selector(|| "pr-all-commits".into()).flex_none().cursor_pointer().text_color(theme::accent()).child("Show all").on_click(cx.listener(|v, _, _, cx| v.pick_commit(None, cx))))),
+                    ,
             )
             .child(div().id("pr-files-filter").debug_selector(|| "pr-files-filter".into()).flex_none().mx(px(10.)).mb(px(6.)).h(px(24.)).px(px(6.)).flex().items_center().rounded(px(4.)).bg(theme::bg_input()).border_1().border_color(theme::border_input()).overflow_hidden().child(self.filter.clone()))
             .child(div().flex_none().h(px(1.)).bg(theme::border()))
@@ -1070,7 +1119,7 @@ impl PrView {
         let opener: crate::preview::Opener = Rc::new(|path, _, _, _| {
             let _ = std::process::Command::new("open").arg(path).spawn();
         });
-        let comment = |who: String, badge: Option<&'static str>, md: Option<Rc<Markdown>>, del: Option<AnyElement>| {
+        let comment = |who: String, badge: Option<&'static str>, lines: Option<String>, md: Option<Rc<Markdown>>, del: Option<AnyElement>| {
             div()
                 .flex()
                 .flex_col()
@@ -1086,6 +1135,7 @@ impl PrView {
                         .gap(px(6.))
                         .child(div().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(who))
                         .when_some(badge, |d, b| d.child(div().px(px(6.)).rounded(px(8.)).border_1().border_color(theme::git_modified()).text_color(theme::git_modified()).text_size(px(10.)).child(b)))
+                        .when_some(lines, |d, l| d.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(format!("on {l}"))))
                         .child(div().flex_1())
                         .children(del),
                 )
@@ -1096,7 +1146,7 @@ impl PrView {
         let anchor = open.clone().or_else(|| {
             let (_, l) = sent.first()?;
             let new_side = l.side.as_deref() != Some("LEFT");
-            Some(LineBox { path: path.to_string(), new_side, line: l.line? as usize, reply_to: thread })
+            Some(LineBox { path: path.to_string(), new_side, line: l.line? as usize, start: None, anchor: l.line? as usize, reply_to: thread })
         });
         let mut card = div()
             .id(SharedString::from(format!("pr-thread-{path}-{}", old.or(new).unwrap_or(0))))
@@ -1121,7 +1171,8 @@ impl PrView {
             .on_click(|_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         for (i, l) in &sent {
-            card = card.child(comment(l.user.login.clone(), None, self.md.get(first + i).cloned(), None));
+            let range = l.start_line.filter(|s| Some(*s) < l.line).map(|s| lines_label(Some(s as usize), l.line.unwrap_or(0) as usize));
+            card = card.child(comment(l.user.login.clone(), None, range, self.md.get(first + i).cloned(), None));
         }
         for (i, p) in &pending {
             let ix = *i;
@@ -1135,7 +1186,8 @@ impl PrView {
                 .on_click(cx.listener(move |v, _, _, cx| v.remove_pending(ix, cx)))
                 .child("Delete")
                 .into_any_element();
-            card = card.child(comment("You".into(), Some("Pending"), Some(Rc::new(Markdown::parse_doc(&p.body))), Some(del)));
+            let range = p.start_line.filter(|s| *s < p.line).map(|s| lines_label(Some(s), p.line));
+            card = card.child(comment("You".into(), Some("Pending"), range, Some(Rc::new(Markdown::parse_doc(&p.body))), Some(del)));
         }
         match open {
             Some(b) => {
@@ -1155,7 +1207,7 @@ impl PrView {
                                 .gap(px(6.))
                                 .child(div().flex_1().text_size(px(11.)).text_color(theme::fg_muted()).child(match &self.busy {
                                     Some(b) => format!("{b}…"),
-                                    None => format!("Line {} · {}", b.line, if b.new_side { "new" } else { "old" }),
+                                    None => format!("Comment on {} ({}) · Shift-click + on another line for several", lines_label(b.start, b.line), if b.new_side { "new" } else { "old" }),
                                 }))
                                 .child(action_button("pr-line-cancel", "Cancel", None).on_click(cx.listener(|v, _, _, cx| v.close_line_box(cx))))
                                 .when(reply, |d| d.child(action_button("pr-line-reply", "Reply", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.single_comment(cx)))))
@@ -1235,7 +1287,10 @@ impl PrView {
                     .hover(|s| s.bg(theme::hover()))
                     .tooltip(ui::tooltip("Show its file"))
                     .on_click(cx.listener(move |v, _, _, cx| v.open_path(&path, cx)))
-                    .child(div().flex_none().font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::accent()).child(format!("{}:{}", p.path, p.line)))
+                    .child(div().flex_none().font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::accent()).child(match p.start_line.filter(|s| *s < p.line) {
+                        Some(s) => format!("{}:{s}-{}", p.path, p.line),
+                        None => format!("{}:{}", p.path, p.line),
+                    }))
                     .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_dim()).child(p.body.lines().next().unwrap_or("").to_string()))
                     .into_any_element()
             })
@@ -1333,6 +1388,42 @@ impl PrView {
             .on_mouse_up(MouseButton::Left, cx.listener(|v, _, _, _| v.dragging_tree = false))
             .into_any_element()
     }
+}
+
+/// "line 4", or "lines 3 to 7".
+fn lines_label(start: Option<usize>, line: usize) -> String {
+    match start.filter(|s| *s < line) {
+        Some(s) => format!("lines {s} to {line}"),
+        None => format!("line {line}"),
+    }
+}
+
+/// The lines a comment is about, from the end of its diff hunk (as GitHub shows them over it).
+fn hunk_excerpt(l: &LineComment) -> Option<Div> {
+    let n = match (l.start_line, l.line.or(l.original_line)) {
+        (Some(s), Some(e)) if s < e => (e - s + 1) as usize,
+        _ => 4,
+    };
+    let lines: Vec<&str> = l.diff_hunk.lines().filter(|t| !t.starts_with("@@")).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let shown = &lines[lines.len().saturating_sub(n.min(40))..];
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .py(px(4.))
+            .bg(theme::bg_side())
+            .border_b_1()
+            .border_color(theme::border())
+            .font_family(theme::MONO_FONT)
+            .text_size(px(11.5))
+            .children(shown.iter().map(|t| {
+                let bg = if t.starts_with('+') { Some(theme::diff_ins_line()) } else if t.starts_with('-') { Some(theme::diff_del_line()) } else { None };
+                div().px(px(12.)).whitespace_nowrap().overflow_hidden().text_ellipsis().text_color(theme::fg()).when_some(bg, |d, c| d.bg(c)).child(t.replace('\t', "    "))
+            })),
+    )
 }
 
 /// The pull request's state, as its badge says it.
@@ -1439,18 +1530,54 @@ impl Render for PrView {
                 .text_color(if on { theme::fg_bright() } else { theme::fg_dim() })
                 .hover(|s| s.text_color(theme::fg_bright()))
                 .child(label)
-                .on_click(cx.listener(move |v, _, _, cx| {
-                    v.tab = which;
-                    cx.notify();
-                }))
+                .on_click(cx.listener(move |v, _, _, cx| v.set_tab(which, cx)))
         };
         let root = self.repo.read(cx).root.clone();
         let body: AnyElement = match self.tab {
             Tab::Conversation => self.render_conversation(&root, &d, &lines, cx).into_any_element(),
+            Tab::Commits if self.commit.is_some() => {
+                let label = self.commit_label().unwrap_or_default();
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(8.))
+                            .h(px(32.))
+                            .px(px(8.))
+                            .border_b_1()
+                            .border_color(theme::border())
+                            .child(
+                                div()
+                                    .id("pr-commit-back")
+                                    .debug_selector(|| "pr-commit-back".into())
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .px(px(8.))
+                                    .h(px(22.))
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .text_color(theme::fg_dim())
+                                    .hover(|s| s.bg(theme::hover()).text_color(theme::fg_bright()))
+                                    .on_click(cx.listener(|v, _, _, cx| v.pick_commit(None, cx)))
+                                    .child(ui::small_icon("chevron-left", theme::fg_dim()))
+                                    .child("Commits"),
+                            )
+                            .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_bright()).child(label)),
+                    )
+                    .child(div().flex_1().min_h_0().child(self.render_files(cx)))
+                    .into_any_element()
+            }
             Tab::Commits => self.render_commits(&d, cx).into_any_element(),
             Tab::Files => self.render_files(cx),
         };
-        let (tc, cur) = (self.tab, self.commit_label());
+        let tc = self.tab;
         let n_pending = self.pending.len();
         base.child(self.header(&d, cx))
             .child(
@@ -1466,27 +1593,6 @@ impl Render for PrView {
                     .child(tab("pr-tab-conversation", format!("Conversation ({})", d.comments.len() + d.reviews.len() + lines.len()), Tab::Conversation, tc == Tab::Conversation, cx))
                     .child(tab("pr-tab-commits", format!("Commits ({})", d.commits.len()), Tab::Commits, tc == Tab::Commits, cx))
                     .child(tab("pr-tab-files", format!("Files changed ({n_files})"), Tab::Files, tc == Tab::Files, cx))
-                    .when_some(cur, |el, label| {
-                        el.child(
-                            div()
-                                .id("pr-commit-chip")
-                                .debug_selector(|| "pr-commit-chip".into())
-                                .flex()
-                                .items_center()
-                                .gap(px(4.))
-                                .ml(px(6.))
-                                .max_w(px(320.))
-                                .px(px(8.))
-                                .h(px(22.))
-                                .rounded(px(11.))
-                                .bg(theme::hover())
-                                .cursor_pointer()
-                                .tooltip(ui::tooltip("Show the whole pull request again"))
-                                .on_click(cx.listener(|v, _, _, cx| v.pick_commit(None, cx)))
-                                .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_dim()).child(label))
-                                .child(div().flex_none().text_color(theme::fg_muted()).child("×")),
-                        )
-                    })
                     .child(div().flex_1())
                     .child(
                         div()

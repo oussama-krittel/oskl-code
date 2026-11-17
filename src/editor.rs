@@ -364,6 +364,8 @@ pub struct Editor {
     pub chat: bool,
     /// Long lines wrap at the box's width, which grows with them (a commit message).
     pub wrap: bool,
+    /// A multi-line box as tall as its container (scrolling inside), not its lines (up to 10).
+    pub fill_height: bool,
     /// One line, but brackets and quotes close themselves as in code (a query box).
     pub pairs: bool,
     /// Enter always submits (a suggestion shown is taken with Tab instead).
@@ -466,6 +468,7 @@ impl Editor {
             secret: false,
             chat: false,
             wrap: false,
+            fill_height: false,
             pairs: false,
             enter_submits: false,
             suggest: None,
@@ -3843,17 +3846,18 @@ impl Element for EditorElement {
     fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
         // Wrapped rows count (the chat box): a long line grows the box instead of hiding. The wrap
         // is redone for the text as it is now (at the last width), so the box fits it this frame.
-        let (mode, lh, rows) = self.editor.update(cx, |ed, _| {
+        let (mode, lh, rows, fill) = self.editor.update(cx, |ed, _| {
             if let Some(cols) = ed.wrap_data.as_ref().map(|w| w.key.1).filter(|_| ed.mode == EditorMode::MultiLine && ed.wrap_active()) {
                 ed.ensure_wrap(cols);
             }
-            (ed.mode, ed.line_height(), ed.disp_count().clamp(1, 10) as f32)
+            (ed.mode, ed.line_height(), ed.disp_count().clamp(1, 10) as f32, ed.fill_height)
         });
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         style.size.height = match mode {
             EditorMode::Full => relative(1.).into(),
             EditorMode::SingleLine => px(lh + 6.).into(),
+            EditorMode::MultiLine if fill => relative(1.).into(),
             EditorMode::MultiLine => px(rows * lh).into(),
         };
         (window.request_layout(style, [], cx), ())

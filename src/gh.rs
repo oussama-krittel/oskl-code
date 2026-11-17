@@ -192,6 +192,11 @@ pub struct LineComment {
     pub path: String,
     pub line: Option<u64>,
     pub original_line: Option<u64>,
+    /// A comment on several lines: the first of them (to `line`), on `start_side`.
+    pub start_line: Option<u64>,
+    pub start_side: Option<String>,
+    /// The diff up to the comment's line (its last lines are what it's about).
+    pub diff_hunk: String,
     pub side: Option<String>,
     pub body: String,
     pub user: Author,
@@ -308,26 +313,17 @@ pub fn comment(root: &Path, n: u64, body: &str) -> Result<String> {
 }
 
 /// A comment on `line` of `path` (new side, or the old one for a removed line).
-pub fn line_comment(root: &Path, n: u64, commit: &str, path: &str, line: usize, new_side: bool, body: &str) -> Result<String> {
-    gh(
-        root,
-        &[
-            "api",
-            "--method",
-            "POST",
-            &format!("repos/{{owner}}/{{repo}}/pulls/{n}/comments"),
-            "-f",
-            &format!("body={body}"),
-            "-f",
-            &format!("commit_id={commit}"),
-            "-f",
-            &format!("path={path}"),
-            "-F",
-            &format!("line={line}"),
-            "-f",
-            if new_side { "side=RIGHT" } else { "side=LEFT" },
-        ],
-    )
+/// From line `start` to `line`, for a comment on several.
+pub fn line_comment(root: &Path, n: u64, commit: &str, path: &str, start: Option<usize>, line: usize, new_side: bool, body: &str) -> Result<String> {
+    let side = if new_side { "RIGHT" } else { "LEFT" };
+    let range: Vec<String> = match start.filter(|s| *s < line) {
+        Some(s) => vec!["-F".into(), format!("start_line={s}"), "-f".into(), format!("start_side={side}")],
+        None => Vec::new(),
+    };
+    let (url, body, commit, path, line) = (format!("repos/{{owner}}/{{repo}}/pulls/{n}/comments"), format!("body={body}"), format!("commit_id={commit}"), format!("path={path}"), format!("line={line}"));
+    let mut args: Vec<&str> = vec!["api", "--method", "POST", &url, "-f", &body, "-f", &commit, "-f", &path, "-F", &line, "-f", if new_side { "side=RIGHT" } else { "side=LEFT" }];
+    args.extend(range.iter().map(String::as_str));
+    gh(root, &args)
 }
 
 /// A comment of a review not sent yet: on `line` of `path`, new side or (a removed line) the old one.
@@ -337,6 +333,9 @@ pub struct DraftComment {
     pub line: usize,
     pub new_side: bool,
     pub body: String,
+    /// On several lines: the first (to `line`).
+    #[serde(default)]
+    pub start_line: Option<usize>,
 }
 
 /// Sends a review: its comments on lines and `body`, as `event` (COMMENT, APPROVE or
@@ -344,7 +343,15 @@ pub struct DraftComment {
 pub fn submit_review(root: &Path, n: u64, commit: &str, event: &str, body: &str, comments: &[DraftComment]) -> Result<String> {
     let comments: Vec<serde_json::Value> = comments
         .iter()
-        .map(|c| serde_json::json!({"path": c.path, "line": c.line, "side": if c.new_side { "RIGHT" } else { "LEFT" }, "body": c.body}))
+        .map(|c| {
+            let side = if c.new_side { "RIGHT" } else { "LEFT" };
+            let mut j = serde_json::json!({"path": c.path, "line": c.line, "side": side, "body": c.body});
+            if let Some(s) = c.start_line.filter(|s| *s < c.line) {
+                j["start_line"] = s.into();
+                j["start_side"] = side.into();
+            }
+            j
+        })
         .collect();
     let mut review = serde_json::json!({"commit_id": commit, "event": event, "comments": comments});
     if !body.trim().is_empty() {

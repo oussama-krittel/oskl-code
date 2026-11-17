@@ -113,13 +113,16 @@ pub struct DiffView {
     pub commentable: bool,
     /// What shows under a row: (old line, new line), 1-based, as the row shows them.
     pub annotate: Option<Annotate>,
+    /// Lines picked for a comment, tinted: (new side, first, last), 1-based.
+    pub marked: Option<(bool, usize, usize)>,
     _tasks: Vec<Task<()>>,
 }
 
 pub type Annotate = std::rc::Rc<dyn Fn(Option<usize>, Option<usize>, &mut Window, &mut App) -> Option<AnyElement>>;
 
-/// The + on a line's number was clicked: (new side, 1-based line).
-pub struct CommentOn(pub bool, pub usize);
+/// The + on a line's number was clicked: (new side, 1-based line, with shift: to the lines
+/// already picked).
+pub struct CommentOn(pub bool, pub usize, pub bool);
 
 impl EventEmitter<Request> for DiffView {}
 impl EventEmitter<CommentOn> for DiffView {}
@@ -153,6 +156,7 @@ impl DiffView {
             font_size,
             commentable: false,
             annotate: None,
+            marked: None,
             _tasks: Vec::new(),
         };
         view.reload(cx);
@@ -810,6 +814,14 @@ impl DiffView {
         if let Some(bg) = bg {
             side = side.bg(bg);
         }
+        // Picked for a comment: tinted like GitHub's.
+        let cell_new = !left || (self.show_inline() && row.r.is_some());
+        if let (Some((new_side, a, b)), Some(i)) = (self.marked, line)
+            && new_side == cell_new
+            && (a..=b).contains(&(i + 1))
+        {
+            side = side.bg(theme::git_modified().opacity(0.22));
+        }
         if self.show_blame {
             let starts = match (line, &commit) {
                 (Some(i), Some(c)) => i == 0 || blame.as_ref().and_then(|b| b.get(i - 1)).and_then(|p| p.as_ref()).map(|p| p.sha != c.sha).unwrap_or(true),
@@ -869,9 +881,9 @@ impl DiffView {
                 .group_hover("diff-row", |s| s.opacity(1.))
                 .tooltip(ui::tooltip("Comment on this line"))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |_, _, _, cx| {
+                .on_click(cx.listener(move |_, ev: &ClickEvent, _, cx| {
                     cx.stop_propagation();
-                    cx.emit(CommentOn(new_side, i + 1));
+                    cx.emit(CommentOn(new_side, i + 1, ev.modifiers().shift));
                 }))
                 .child("+")
         });

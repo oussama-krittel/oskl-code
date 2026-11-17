@@ -840,8 +840,12 @@ fn a_pull_request_is_opened_from_the_sidebar_or_source_control(cx: &mut gpui::Te
     // One commit: its subject and body to start from.
     let title = cx.debug_bounds("pr-new-title").expect("the title box");
     let _ = title;
-    // The description reads beside its box as it will on GitHub.
+    // Preview shows the description as it will read on GitHub, Write the box again.
+    click(cx, "md-tab-preview");
     let _ = at(cx, "md-preview");
+    assert!(cx.debug_bounds("pr-new-body").is_none());
+    click(cx, "md-tab-write");
+    let _ = at(cx, "pr-new-body");
     assert_eq!(view.read_with(cx, |v, cx| v.form_text(cx)), Some(("Add the b file".into(), "Because b matters.".into())));
     // The sidebar's + opens the same form, not a second one.
     click(cx, "act-prs");
@@ -868,7 +872,7 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
         sh(dir, "git init -q --bare ../$(basename $PWD)-remote.git");
         sh(dir, INIT);
         sh(dir, "echo a > a.txt && git add . && git commit -qm one && git remote add origin ../$(basename $PWD)-remote.git && git push -q -u origin main");
-        sh(dir, "git switch -qc login && echo login > login.txt && git add . && git commit -qm 'Login page' && git push -q origin login:refs/pull/7/head && git switch -q main && git branch -qD login");
+        sh(dir, "git switch -qc login && printf 'login\\nform\\nbutton\\n' > login.txt && git add . && git commit -qm 'Login page' && git push -q origin login:refs/pull/7/head && git switch -q main && git branch -qD login");
         fake_gh();
     });
     let dir = root(&ws, cx);
@@ -908,15 +912,19 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     settle(&ws, cx);
     assert!(pr.read_with(cx, |p, _| p.diff.is_some()));
 
-    // A commit picked in Commits: the tree shows only its files, until "Show all".
+    // A commit picked in Commits opens there: its files and their diff, until Back.
     click(cx, "pr-tab-commits");
     let sha = git_out(&dir, &["rev-parse", "--short=7", "refs/oskl/pr/7"]);
     click(cx, &format!("pr-commit-{sha}"));
     settle(&ws, cx);
-    assert!(pr.read_with(cx, |p, _| p.commit.is_some() && matches!(p.shown_files(), Some(Ok(f)) if f.list.len() == 1)));
-    let _ = at(cx, "pr-commit-chip");
-    click(cx, "pr-all-commits");
-    assert!(pr.read_with(cx, |p, _| p.commit.is_none()));
+    assert!(pr.read_with(cx, |p, _| p.commit.is_some() && p.tab == crate::git_panel::pr::Tab::Commits && matches!(p.shown_files(), Some(Ok(f)) if f.list.len() == 1)));
+    click(cx, "pr-file-login.txt");
+    settle(&ws, cx);
+    assert!(pr.read_with(cx, |p, _| p.diff.is_some()));
+    click(cx, "pr-commit-back");
+    assert!(pr.read_with(cx, |p, _| p.commit.is_none() && p.diff.is_none()));
+    let _ = at(cx, &format!("pr-commit-{sha}"));
+    click(cx, "pr-tab-files");
 
     // The filter lists matching files flat.
     click(cx, "pr-files-filter");
@@ -935,9 +943,15 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     click(cx, "pr-line-single");
     settle(&ws, cx);
     assert!(log().contains("path=login.txt") && log().contains("line=1") && log().contains("body=Looks right"), "{}", log());
-    // Start a review: the comment waits (shown under its line, and kept on disk) ...
+    // Start a review on lines 1 to 3 (Shift-click a second +): the comment waits, shown under
+    // them, and kept on disk ...
     click(cx, "diff-comment-new-1");
     settle(&ws, cx);
+    let third = at(cx, "diff-comment-new-3");
+    cx.simulate_click(third, gpui::Modifiers::shift());
+    settle(&ws, cx);
+    assert_eq!(pr.read_with(cx, |p, _| p.line_box.as_ref().map(|b| (b.start, b.line))), Some((Some(1), 3)));
+    assert_eq!(pr.read_with(cx, |p, cx| p.diff.as_ref().and_then(|d| d.read(cx).marked)), Some((true, 1, 3)), "the lines are tinted");
     click(cx, "pr-line-input");
     cx.simulate_input("Rename this");
     click(cx, "pr-line-review");
@@ -954,6 +968,7 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     settle(&ws, cx);
     assert!(log().contains("pulls/7/reviews --input"), "{}", log());
     assert!(log().contains(r#""event":"APPROVE""#) && log().contains(r#""body":"Rename this""#) && log().contains(r#""side":"RIGHT""#), "{}", log());
+    assert!(log().contains(r#""start_line":1"#) && log().contains(r#""line":3"#), "{}", log());
     assert_eq!(pr.read_with(cx, |p, _| p.pending.len()), 0);
     assert!(!dir.join(&kept).exists(), "nothing pending left");
 
@@ -966,6 +981,7 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     let _ = at(cx, "pr-merge-state");
     click(cx, "pr-comment-input");
     cx.simulate_input("Ship it");
+    click(cx, "md-tab-preview");
     let _ = at(cx, "md-preview");
     click(cx, "pr-comment-post");
     settle(&ws, cx);

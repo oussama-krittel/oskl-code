@@ -1,4 +1,5 @@
-//! A Markdown box's text, drawn as it will read on GitHub, kept up while it's typed.
+//! A Markdown box with GitHub's Write and Preview: the text as typed, or as it will read on
+//! GitHub (kept up while it's typed).
 
 use crate::editor::{Editor, EditorEvent};
 use crate::preview::{Markdown, Opener};
@@ -16,17 +17,24 @@ pub struct MdPreview {
     md: Rc<Markdown>,
     empty: bool,
     images: Entity<RetainAllImageCache>,
+    /// Preview shown instead of the box.
+    pub previewing: bool,
+    height: f32,
+    /// The box's name for the tests.
+    selector: &'static str,
     _sub: Subscription,
 }
 
 impl MdPreview {
-    pub fn new(source: Entity<Editor>, root: PathBuf, cx: &mut Context<Self>) -> Self {
+    /// `source`'s box, `height` tall, with Write and Preview above it.
+    pub fn new(source: Entity<Editor>, root: PathBuf, height: f32, selector: &'static str, cx: &mut Context<Self>) -> Self {
+        source.update(cx, |e, _| e.fill_height = true);
         let sub = cx.subscribe(&source, |v, _, ev: &EditorEvent, cx| {
             if matches!(ev, EditorEvent::Changed) {
                 v.parse(cx);
             }
         });
-        let mut v = Self { source, root, md: Rc::new(Markdown::parse_doc("")), empty: true, images: RetainAllImageCache::new(cx), _sub: sub };
+        let mut v = Self { source, root, md: Rc::new(Markdown::parse_doc("")), empty: true, images: RetainAllImageCache::new(cx), previewing: false, height, selector, _sub: sub };
         v.parse(cx);
         v
     }
@@ -45,33 +53,56 @@ impl MdPreview {
 }
 
 impl Render for MdPreview {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let opener: Opener = Rc::new(|path, _, _, _| {
-            let _ = std::process::Command::new("open").arg(path).spawn();
-        });
-        div()
-            .id("md-preview")
-            .debug_selector(|| "md-preview".into())
-            .size_full()
-            .overflow_y_scroll()
-            .px(px(10.))
-            .py(px(6.))
-            .child(if self.empty { div().text_color(theme::fg_muted()).child("Nothing to preview yet.").into_any_element() } else { self.md.render(&self.root, &self.images, opener).into_any_element() })
-    }
-}
-
-/// A Markdown box beside its preview, GitHub's Write and Preview at once: `editor` (already in
-/// its box) on the left, what it will read like on the right.
-pub fn side_by_side(editor: AnyElement, preview: Entity<MdPreview>, height: f32) -> Div {
-    let pane = |label: &'static str, child: AnyElement| {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab = |id: &'static str, label: &'static str, preview: bool, on: bool, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .px(px(12.))
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .rounded_t(px(5.))
+                .border_1()
+                .border_b_0()
+                .border_color(if on { theme::border_input() } else { gpui::transparent_black() })
+                .when(on, |d| d.bg(theme::bg_input()))
+                .text_color(if on { theme::fg_bright() } else { theme::fg_dim() })
+                .hover(|s| s.text_color(theme::fg_bright()))
+                .child(label)
+                .on_click(cx.listener(move |v, _, window, cx| {
+                    v.previewing = preview;
+                    if !preview {
+                        window.focus(&v.source.focus_handle(cx), cx);
+                    }
+                    cx.notify();
+                }))
+        };
+        let body: AnyElement = if self.previewing {
+            let opener: Opener = Rc::new(|path, _, _, _| {
+                let _ = std::process::Command::new("open").arg(path).spawn();
+            });
+            div()
+                .id("md-preview")
+                .debug_selector(|| "md-preview".into())
+                .size_full()
+                .overflow_y_scroll()
+                .px(px(12.))
+                .py(px(8.))
+                .bg(theme::bg_editor())
+                .child(if self.empty { div().text_color(theme::fg_muted()).child("Nothing to preview").into_any_element() } else { self.md.render(&self.root, &self.images, opener).into_any_element() })
+                .into_any_element()
+        } else {
+            let sel = self.selector;
+            div().debug_selector(move || sel.into()).size_full().p(px(6.)).bg(theme::bg_input()).child(self.source.clone()).into_any_element()
+        };
+        let previewing = self.previewing;
         div()
             .flex()
             .flex_col()
-            .flex_1()
-            .min_w_0()
-            .gap(px(4.))
-            .child(div().text_size(px(10.5)).text_color(theme::fg_muted()).child(label))
-            .child(div().flex_1().min_h_0().h(px(height)).rounded(px(4.)).border_1().border_color(theme::border_input()).overflow_hidden().child(child))
-    };
-    div().flex().gap(px(10.)).w_full().child(pane("Write", editor)).child(pane("Preview", div().size_full().bg(theme::bg_editor()).child(preview).into_any_element()))
+            .w_full()
+            .child(div().flex().gap(px(2.)).child(tab("md-tab-write", "Write", false, !previewing, cx)).child(tab("md-tab-preview", "Preview", true, previewing, cx)))
+            .child(div().h(px(self.height)).rounded_b(px(5.)).rounded_tr(px(5.)).border_1().border_color(theme::border_input()).overflow_hidden().child(body))
+    }
 }
