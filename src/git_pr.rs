@@ -788,6 +788,11 @@ impl PrView {
             && b.reply_to.is_none()
         {
             let (a, z) = (b.anchor.min(ev.1), b.anchor.max(ev.1));
+            if let Some(d) = &self.diff
+                && !d.read(cx).same_hunk(ev.0, a, z)
+            {
+                return cx.emit(Request::Error("GitHub takes a comment on several lines only within one changed part of the diff".into()));
+            }
             b.start = (a < z).then_some(a);
             b.line = z;
             self.focus_line = true;
@@ -936,7 +941,11 @@ impl PrView {
                         cx.emit(PrEvent::Changed);
                         v.refresh_detail(cx);
                     }
-                    Err(e) => cx.emit(Request::Error(format!("{label} failed: {e}"))),
+                    Err(e) => {
+                        let e = e.to_string();
+                        let hint = if e.contains("could not be resolved") { " — a comment is on a line outside the diff's changed parts: remove it from Finish your review and send again" } else { "" };
+                        cx.emit(Request::Error(format!("{label} failed: {e}{hint}")))
+                    }
                 }
                 v.repo.update(cx, |r, cx| r.refresh_all(cx));
                 cx.notify();
@@ -1558,15 +1567,17 @@ impl PrView {
                         .gap(px(6.))
                         .p(px(8.))
                         .child(div().id("pr-line-input").debug_selector(|| "pr-line-input".into()).h(px(90.)).px(px(6.)).py(px(4.)).rounded(px(4.)).bg(theme::bg_input()).border_1().border_color(theme::border_input()).overflow_hidden().child(self.line_input.clone()))
+                        .child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(match &self.busy {
+                            Some(b) => format!("{b}…"),
+                            None => format!("Comment on {} ({}) · drag the + over more lines, or Shift-click another +, for several", lines_label(b.start, b.line), if b.new_side { "new" } else { "old" }),
+                        }))
                         .child(
                             div()
                                 .flex()
+                                .flex_wrap()
+                                .justify_end()
                                 .items_center()
                                 .gap(px(6.))
-                                .child(div().flex_1().text_size(px(11.)).text_color(theme::fg_muted()).child(match &self.busy {
-                                    Some(b) => format!("{b}…"),
-                                    None => format!("Comment on {} ({}) · Shift-click + on another line for several", lines_label(b.start, b.line), if b.new_side { "new" } else { "old" }),
-                                }))
                                 .child(action_button("pr-line-cancel", "Cancel", None).on_click(cx.listener(|v, _, _, cx| v.close_line_box(cx))))
                                 .when(reply, |d| d.child(action_button("pr-line-reply", "Reply", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.single_comment(cx)))))
                                 .when(!reply, |d| {
@@ -1660,7 +1671,23 @@ impl PrView {
                         Some(s) => format!("{}:{s}-{}", p.path, p.line),
                         None => format!("{}:{}", p.path, p.line),
                     }))
-                    .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_dim()).child(p.body.lines().next().unwrap_or("").to_string()))
+                    .child(div().min_w_0().flex_1().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_dim()).child(p.body.lines().next().unwrap_or("").to_string()))
+                    .child(
+                        div()
+                            .id(("pr-pending-remove", i))
+                            .debug_selector(move || format!("pr-pending-remove-{i}"))
+                            .flex_none()
+                            .px(px(4.))
+                            .cursor_pointer()
+                            .text_color(theme::fg_muted())
+                            .hover(|s| s.text_color(theme::git_deleted()))
+                            .tooltip(ui::tooltip("Remove this pending comment"))
+                            .on_click(cx.listener(move |v, _, _, cx| {
+                                cx.stop_propagation();
+                                v.remove_pending(i, cx);
+                            }))
+                            .child("×"),
+                    )
                     .into_any_element()
             })
             .collect();

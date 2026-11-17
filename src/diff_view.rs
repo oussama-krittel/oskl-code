@@ -117,6 +117,9 @@ pub struct DiffView {
     pub marked: Option<(bool, usize, usize)>,
     /// A press on a line's +, being dragged over more lines: (new side, the line pressed).
     comment_drag: Option<(bool, usize)>,
+    /// Each row's part of the diff as GitHub cuts it (a change and 3 lines around it), 0 for
+    /// none: only those lines take comments, and a comment on several stays in one part.
+    hunks: std::rc::Rc<Vec<u32>>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -160,6 +163,7 @@ impl DiffView {
             annotate: None,
             marked: None,
             comment_drag: None,
+            hunks: Default::default(),
             _tasks: Vec::new(),
         };
         view.reload(cx);
@@ -173,7 +177,20 @@ impl DiffView {
         if key != self.list_key {
             self.list_key = key;
             self.list.reset_with_uniform_height(self.rows_of(&data).len(), gpui::px(self.row_h()));
+            self.hunks = std::rc::Rc::new(hunk_ids(self.rows_of(&data)));
         }
+    }
+
+    /// The part of the diff (as GitHub cuts it) that `line` of a side is in, if any.
+    fn hunk_of(&self, new_side: bool, line: usize) -> Option<u32> {
+        let i = line.checked_sub(1)?;
+        let ix = self.rows().iter().position(|r| if new_side { r.r == Some(i) } else { r.l == Some(i) && (r.r.is_none() || !self.show_inline()) })?;
+        self.hunks.get(ix).copied().filter(|h| *h != 0)
+    }
+
+    /// Lines `a` to `b` of a side are in one part of the diff: GitHub takes a comment on them.
+    pub fn same_hunk(&self, new_side: bool, a: usize, b: usize) -> bool {
+        self.hunk_of(new_side, a).is_some_and(|h| self.hunk_of(new_side, b) == Some(h))
     }
 
     /// Measures the rows again: what shows under them changed (comments added or opened).
@@ -784,6 +801,43 @@ pub(crate) fn styled_line(text: &str, syntax: &[(Range<usize>, u8)], highlights:
 }
 
 const NUM_W: f32 = 44.;
+
+/// Which part of the diff each row is in, as GitHub cuts it: a change with up to 3 lines on
+/// either side (parts that touch are one); 0 for rows in none.
+fn hunk_ids(rows: &[Row]) -> Vec<u32> {
+    let n = rows.len();
+    let changed = |r: &Row| !matches!(r.kind, Kind::Equal | Kind::Gap);
+    let mut near = vec![false; n];
+    for order in [false, true] {
+        let mut last: Option<usize> = None;
+        for k in 0..n {
+            let i = if order { n - 1 - k } else { k };
+            if rows[i].kind == Kind::Gap {
+                last = None;
+                continue;
+            }
+            if changed(&rows[i]) {
+                last = Some(k);
+            }
+            if last.is_some_and(|j| k - j <= 3) {
+                near[i] = true;
+            }
+        }
+    }
+    let mut id = 0;
+    near.iter()
+        .enumerate()
+        .map(|(i, &on)| {
+            if !on {
+                return 0;
+            }
+            if i == 0 || !near[i - 1] {
+                id += 1;
+            }
+            id
+        })
+        .collect()
+}
 const BLAME_W: f32 = 190.;
 
 impl DiffView {
@@ -823,6 +877,7 @@ impl DiffView {
             side = side.on_mouse_move(cx.listener(move |view, ev: &MouseMoveEvent, _, cx| {
                 if let Some((s, a)) = view.comment_drag
                     && ev.dragging()
+                    && view.same_hunk(s, a, i + 1)
                 {
                     let picked = Some((s, a.min(i + 1), a.max(i + 1)));
                     if view.marked != picked {
@@ -876,7 +931,8 @@ impl DiffView {
                 });
             side = side.child(cell);
         }
-        let plus = line.filter(|_| self.commentable).map(|i| {
+        let in_hunk = self.hunks.get(row_ix).is_some_and(|h| *h != 0);
+        let plus = line.filter(|_| self.commentable && in_hunk).map(|i| {
             let new_side = !left || (self.show_inline() && row.r.is_some());
             div()
                 .id(("diff-comment", row_ix * 2 + left as usize))
@@ -1122,6 +1178,19 @@ impl Render for DiffView {
 #[cfg(test)]
 mod tests {
     use super::prepare;
+
+    #[test]
+    fn only_lines_near_a_change_take_comments_and_far_changes_are_apart() {
+        let old: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        let new = old.replace("line 10\n", "ten\n").replace("line 25\n", "twenty-five\n");
+        let d = prepare(&old, &new, "a.txt");
+        let ids = super::hunk_ids(&d.side);
+        let at = |line: usize| ids[d.side.iter().position(|r| r.r == Some(line - 1)).unwrap()];
+        assert_eq!(at(1), 0, "far from any change");
+        assert!(at(7) != 0 && at(10) == at(7) && at(13) == at(7), "3 lines either side");
+        assert_eq!(at(14), 0);
+        assert!(at(25) != 0 && at(25) != at(10), "another part");
+    }
 
     #[test]
     fn both_sides_get_syntax_colours() {
