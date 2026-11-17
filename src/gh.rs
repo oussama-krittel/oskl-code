@@ -476,6 +476,67 @@ pub struct DraftComment {
     pub start_line: Option<usize>,
 }
 
+/// A part of a file's diff, as git (and GitHub) cut it: (old start, old count, new start, new
+/// count). Only lines in one take comments.
+pub type Hunk = (usize, usize, usize, usize);
+
+/// The parts of `path`'s diff from `base` to `head`.
+pub fn hunks(root: &Path, base: &str, head: &str, path: &str) -> Vec<Hunk> {
+    let out = git_run(root, &["diff", "-U3", "--no-color", "--no-ext-diff", base, head, "--", path]).unwrap_or_default();
+    out.lines().filter_map(|l| parse_hunk_header(l.strip_prefix("@@ ")?)).collect()
+}
+
+fn parse_hunk_header(h: &str) -> Option<Hunk> {
+    let mut it = h.split_whitespace();
+    let side = |s: &str| -> Option<(usize, usize)> {
+        let (a, n) = s.split_once(',').map(|(a, n)| (a, n.parse().ok())).unwrap_or((s, Some(1)));
+        Some((a.parse().ok()?, n?))
+    };
+    let (os, oc) = side(it.next()?.strip_prefix('-')?)?;
+    let (ns, nc) = side(it.next()?.strip_prefix('+')?)?;
+    Some((os, oc, ns, nc))
+}
+
+/// Which part `line` of a side is in.
+pub fn hunk_index(hunks: &[Hunk], new_side: bool, line: usize) -> Option<usize> {
+    hunks.iter().position(|&(os, oc, ns, nc)| {
+        let (s, c) = if new_side { (ns, nc) } else { (os, oc) };
+        line >= s && line < s + c
+    })
+}
+
+/// GitHub takes this comment: its line, and its first line, in the same part of the diff.
+pub fn fits(hunks: &[Hunk], c: &DraftComment) -> bool {
+    let end = hunk_index(hunks, c.new_side, c.line);
+    end.is_some() && c.start_line.filter(|s| *s < c.line).is_none_or(|s| hunk_index(hunks, c.new_side, s) == end)
+}
+
+/// Sends a review (see `submit_review`) of the diff `base`..`head`, after checking each comment
+/// against it: one GitHub wouldn't take on its line goes into the review's text instead, so
+/// the review isn't refused. Says how many went there.
+#[allow(clippy::too_many_arguments)]
+pub fn send_review(root: &Path, n: u64, base: &str, head: &str, event: &str, body: &str, comments: &[DraftComment]) -> Result<usize> {
+    let mut parts: std::collections::HashMap<&str, Vec<Hunk>> = Default::default();
+    let (mut ok, mut moved) = (Vec::new(), Vec::new());
+    for c in comments {
+        let h = parts.entry(&c.path).or_insert_with(|| hunks(root, base, head, &c.path));
+        if fits(h, c) { ok.push(c.clone()) } else { moved.push(c) }
+    }
+    let mut text = body.trim().to_string();
+    if !moved.is_empty() {
+        text.push_str(if text.is_empty() { "" } else { "\n\n" });
+        for c in &moved {
+            let at = match c.start_line.filter(|s| *s < c.line) {
+                Some(s) => format!("{}:{s}-{}", c.path, c.line),
+                None => format!("{}:{}", c.path, c.line),
+            };
+            text.push_str(&format!("- `{at}`: {}\n", c.body.trim()));
+        }
+    }
+    submit_review(root, n, head, event, &text, &ok)?;
+    Ok(moved.len())
+}
+
 /// Sends a review: its comments on lines and `body`, as `event` (COMMENT, APPROVE or
 /// REQUEST_CHANGES), on the pull request at `commit`.
 pub fn submit_review(root: &Path, n: u64, commit: &str, event: &str, body: &str, comments: &[DraftComment]) -> Result<String> {
@@ -536,6 +597,19 @@ mod tests {
         assert_eq!(checks(&[c(Some("SUCCESS"), None), c(None, Some("SUCCESS"))]), Checks::Passing);
         assert_eq!(checks(&[c(Some("SUCCESS"), None), c(Some("FAILURE"), None)]), Checks::Failing);
         assert_eq!(checks(&[c(Some("SUCCESS"), None), c(None, Some("PENDING"))]), Checks::Pending);
+    }
+
+    #[test]
+    fn comments_fit_only_in_one_part_of_the_diff() {
+        assert_eq!(parse_hunk_header("-34,6 +34,7 @@ mod java;"), Some((34, 6, 34, 7)));
+        assert_eq!(parse_hunk_header("-0,0 +1 @@"), Some((0, 0, 1, 1)));
+        let h = [(15, 7, 15, 8), (149, 8, 149, 8), (159, 12, 159, 46)];
+        let c = |start: Option<usize>, line: usize| DraftComment { path: "a".into(), line, new_side: true, body: String::new(), start_line: start };
+        assert!(fits(&h, &c(None, 20)));
+        assert!(!fits(&h, &c(Some(20), 29)), "runs past its part");
+        assert!(!fits(&h, &c(Some(155), 186)), "two parts");
+        assert!(fits(&h, &c(Some(160), 170)));
+        assert!(!fits(&h, &c(None, 1)));
     }
 
     #[test]

@@ -120,6 +120,8 @@ pub struct DiffView {
     /// Each row's part of the diff as GitHub cuts it (a change and 3 lines around it), 0 for
     /// none: only those lines take comments, and a comment on several stays in one part.
     hunks: std::rc::Rc<Vec<u32>>,
+    /// The parts as git cuts them (what GitHub goes by), once read: they decide over `hunks`.
+    pub git_hunks: Option<Vec<crate::git::gh::Hunk>>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -164,6 +166,7 @@ impl DiffView {
             marked: None,
             comment_drag: None,
             hunks: Default::default(),
+            git_hunks: None,
             _tasks: Vec::new(),
         };
         view.reload(cx);
@@ -183,6 +186,9 @@ impl DiffView {
 
     /// The part of the diff (as GitHub cuts it) that `line` of a side is in, if any.
     fn hunk_of(&self, new_side: bool, line: usize) -> Option<u32> {
+        if let Some(h) = &self.git_hunks {
+            return crate::git::gh::hunk_index(h, new_side, line).map(|i| i as u32 + 1);
+        }
         let i = line.checked_sub(1)?;
         let ix = self.rows().iter().position(|r| if new_side { r.r == Some(i) } else { r.l == Some(i) && (r.r.is_none() || !self.show_inline()) })?;
         self.hunks.get(ix).copied().filter(|h| *h != 0)
@@ -931,7 +937,10 @@ impl DiffView {
                 });
             side = side.child(cell);
         }
-        let in_hunk = self.hunks.get(row_ix).is_some_and(|h| *h != 0);
+        let in_hunk = match (&self.git_hunks, line) {
+            (Some(h), Some(i)) => crate::git::gh::hunk_index(h, cell_new, i + 1).is_some(),
+            _ => self.hunks.get(row_ix).is_some_and(|h| *h != 0),
+        };
         let plus = line.filter(|_| self.commentable && in_hunk).map(|i| {
             let new_side = !left || (self.show_inline() && row.r.is_some());
             div()

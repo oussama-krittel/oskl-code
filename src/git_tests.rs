@@ -974,6 +974,8 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     let _ = at(cx, "pr-pending-del-0");
     let kept = git_out(&dir, &["rev-parse", "--git-path", "oskl/review-7.json"]);
     assert!(std::fs::read_to_string(dir.join(&kept)).unwrap().contains("Rename this"));
+    // One left from before on a line GitHub wouldn't take: it goes into the review's text.
+    pr.update(cx, |p, _| p.pending.push(crate::git::gh::DraftComment { path: "login.txt".into(), line: 50, new_side: true, body: "Far away".into(), start_line: None }));
     // ... until Finish your review sends it with the approval.
     click(cx, "pr-review");
     let _ = at(cx, "pr-pending-0");
@@ -983,6 +985,7 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     assert!(log().contains("pulls/7/reviews --input"), "{}", log());
     assert!(log().contains(r#""event":"APPROVE""#) && log().contains(r#""body":"Rename this""#) && log().contains(r#""side":"RIGHT""#), "{}", log());
     assert!(log().contains(r#""start_line":1"#) && log().contains(r#""line":3"#), "{}", log());
+    assert!(log().contains("`login.txt:50`: Far away") && !log().contains(r#""line":50"#), "{}", log());
     assert_eq!(pr.read_with(cx, |p, _| p.pending.len()), 0);
     assert!(!dir.join(&kept).exists(), "nothing pending left");
 

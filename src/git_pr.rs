@@ -713,6 +713,7 @@ impl PrView {
         let Some(Ok(f)) = self.shown_files() else { return };
         let Some(c) = f.list.get(ix).cloned() else { return };
         let (base, head) = (f.base.clone(), f.head.clone());
+        let (base_for_hunks, head_for_hunks) = (base.clone(), head.clone());
         let (root, email) = (self.repo.read(cx).root.clone(), self.repo.read(cx).user_email.clone());
         let left = if c.status == FileStatus::Added { Rev::Empty } else { Rev::Commit(base) };
         let right = if c.status == FileStatus::Deleted { Rev::Empty } else { Rev::Commit(head) };
@@ -733,6 +734,20 @@ impl PrView {
             self.line_box = None;
         }
         self.file = Some(c.path.clone());
+        // Where GitHub takes comments: the parts of the diff as git cuts them.
+        if commentable {
+            let (root, path, d) = (self.repo.read(cx).root.clone(), c.path.clone(), diff.downgrade());
+            let task = cx.background_executor().spawn(async move { gh::hunks(&root, &base_for_hunks, &head_for_hunks, &path) });
+            cx.spawn(async move |_, cx| {
+                let h = task.await;
+                d.update(cx, |d, cx| {
+                    d.git_hunks = Some(h);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         self.diff = Some(diff);
         cx.notify();
     }
@@ -845,12 +860,24 @@ impl PrView {
             return cx.emit(Request::Error("Write the comment first".into()));
         }
         let (n, commit) = (self.number, d.head_ref_oid.clone());
+        let (commit, base) = match &self.files {
+            Some(Ok(f)) => (f.head.clone(), Some(f.base.clone())),
+            _ => (commit, None),
+        };
         let label = if b.reply_to.is_some() { "Reply".to_string() } else { format!("Comment on {}", lines_label(b.start, b.line)) };
         self.act(
             &label,
             move |root| match b.reply_to {
                 Some(to) => gh::reply(root, n, to, &body),
-                None => gh::line_comment(root, n, &commit, &b.path, b.start, b.line, b.new_side, &body),
+                None => {
+                    let draft = DraftComment { path: b.path.clone(), line: b.line, new_side: b.new_side, body: body.clone(), start_line: b.start };
+                    if let Some(base) = &base
+                        && !gh::fits(&gh::hunks(root, base, &commit, &b.path), &draft)
+                    {
+                        anyhow::bail!("GitHub takes comments only on the diff's changed parts (a change and 3 lines around it)");
+                    }
+                    gh::line_comment(root, n, &commit, &b.path, b.start, b.line, b.new_side, &body)
+                }
             },
             |v, cx| v.close_line_box(cx),
             cx,
@@ -862,7 +889,11 @@ impl PrView {
     pub fn submit_review(&mut self, cx: &mut Context<Self>) {
         let (n, body, kind) = (self.number, self.input.read(cx).text(), self.review_kind);
         let Some(Ok((d, _))) = &self.detail else { return };
-        let commit = d.head_ref_oid.clone();
+        // The diff the comments were written on (its commits here), else GitHub's head.
+        let (base, commit) = match &self.files {
+            Some(Ok(f)) => (Some(f.base.clone()), f.head.clone()),
+            _ => (None, d.head_ref_oid.clone()),
+        };
         let pending = self.pending.clone();
         if kind != "approve" && pending.is_empty() && body.trim().is_empty() {
             return cx.emit(Request::Error(if kind == "comment" { "Write the comment first".into() } else { "Say what should change first".into() }));
@@ -884,7 +915,13 @@ impl PrView {
                         "request-changes" => "REQUEST_CHANGES",
                         _ => "COMMENT",
                     };
-                    gh::submit_review(root, n, &commit, event, &body, &pending)
+                    match base {
+                        Some(base) => gh::send_review(root, n, &base, &commit, event, &body, &pending).map(|moved| match moved {
+                            0 => String::new(),
+                            m => format!("{m} comment(s) on lines outside the diff's changed parts went into the review's text"),
+                        }),
+                        None => gh::submit_review(root, n, &commit, event, &body, &pending),
+                    }
                 }
             },
             move |v, cx| {
@@ -935,8 +972,9 @@ impl PrView {
             v.update(cx, |v, cx| {
                 v.busy = None;
                 match result {
-                    Ok(_) => {
-                        cx.emit(Request::Message(format!("{label}: done")));
+                    Ok(out) => {
+                        let note = if out.contains("outside the diff") { format!(" ({out})") } else { String::new() };
+                        cx.emit(Request::Message(format!("{label}: done{note}")));
                         ok(v, cx);
                         cx.emit(PrEvent::Changed);
                         v.refresh_detail(cx);
