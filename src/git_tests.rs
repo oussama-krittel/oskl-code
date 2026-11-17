@@ -751,8 +751,12 @@ const FAKE_GH: &str = r#"#!/bin/sh
 echo "$*" >> "$(dirname "$0")/gh.log"
 case "$1 $2" in
   "pr list") case "$*" in *"--head newwork"*) echo '[]' ; exit 0 ;; esac; echo '[{"number":7,"title":"Login page","author":{"login":"ann"},"headRefName":"login","baseRefName":"main","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS"}],"updatedAt":"2026-11-14T10:00:00Z"}]' ;;
-  "pr view") echo '{"number":7,"title":"Login page","body":"Adds the login page.","author":{"login":"ann"},"state":"OPEN","url":"https://example.invalid/pr/7","headRefName":"login","baseRefName":"main","headRefOid":"'"$(git rev-parse refs/oskl/pr/7 2>/dev/null)"'","additions":1,"deletions":0,"isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeable":"MERGEABLE","comments":[{"author":{"login":"bob"},"body":"Thanks!","createdAt":"2026-11-14T11:00:00Z"}],"reviews":[],"statusCheckRollup":[{"name":"build","workflowName":"CI","conclusion":"SUCCESS","status":"COMPLETED","detailsUrl":"https://example.invalid/run/1"},{"name":"lint","workflowName":"CI","conclusion":"","status":"IN_PROGRESS","detailsUrl":"https://example.invalid/run/2"}],"commits":[{"oid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/7/head)"'","messageHeadline":"Login page","authors":[{"login":"ann"}],"committedDate":"2026-11-14T10:00:00Z"}]}' ;;
-  "api repos/{owner}/{repo}/pulls/7/comments") echo '[{"path":"login.txt","line":1,"body":"Nice","user":{"login":"bob"}}]' ;;
+  "pr view") echo '{"number":7,"title":"Login page","body":"Adds the login page.","author":{"login":"ann"},"state":"OPEN","url":"https://example.invalid/pr/7","headRefName":"login","baseRefName":"main","headRefOid":"'"$(git rev-parse refs/oskl/pr/7 2>/dev/null)"'","additions":1,"deletions":0,"isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeable":"MERGEABLE","comments":[{"id":"IC_1","author":{"login":"bob"},"body":"Thanks!","createdAt":"2026-11-14T11:00:00Z"},{"id":"IC_2","author":{"login":"me"},"body":"Mine","createdAt":"2026-11-14T11:30:00Z"}],"reviews":[{"id":"R_1","author":{"login":"bob"},"state":"CHANGES_REQUESTED","body":"Needs work","submittedAt":"2026-11-14T12:00:00Z"}],"statusCheckRollup":[{"name":"build","workflowName":"CI","conclusion":"SUCCESS","status":"COMPLETED","detailsUrl":"https://example.invalid/run/1"},{"name":"lint","workflowName":"CI","conclusion":"","status":"IN_PROGRESS","detailsUrl":"https://example.invalid/run/2"}],"commits":[{"oid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/7/head)"'","messageHeadline":"Login page","authors":[{"login":"ann"}],"committedDate":"2026-11-14T10:00:00Z"}]}' ;;
+  "api repos/{owner}/{repo}/pulls/7/comments?per_page=100") echo '[{"id":101,"pull_request_review_id":55,"path":"login.txt","line":1,"body":"Nice","user":{"login":"bob"},"created_at":"2026-11-14T12:00:00Z","diff_hunk":"@@ -0,0 +1,3 @@\\n+login"}]' ;;
+  "api repos/{owner}/{repo}/pulls/7/reviews?per_page=100") echo '[{"id":55,"node_id":"R_1"}]' ;;
+  "api graphql") case "$*" in *reviewThreads*) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"T_1","isResolved":false,"comments":{"nodes":[{"databaseId":101}]}}]},"timelineItems":{"nodes":[{"actor":{"login":"ann"},"beforeCommit":{"abbreviatedOid":"aaaaaaa"},"afterCommit":{"abbreviatedOid":"bbbbbbb"},"createdAt":"2026-11-14T13:00:00Z"}]}}}}}' ;; *) echo '{}' ;; esac ;;
+  "api user") echo me ;;
+  "pr edit") echo ok ;;
   "api --method") case "$*" in *--input*) for a; do last=$a; done; cat "$last" >> "$(dirname "$0")/gh.log"; echo >> "$(dirname "$0")/gh.log" ;; esac; echo '{}' ;;
   "pr review"|"pr comment") echo ok ;;
   "pr create") echo "https://example.invalid/pr/8" ;;
@@ -979,13 +983,40 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     let _ = at(cx, "pr-check-CI / build");
     let _ = at(cx, "pr-check-CI / lint");
     let _ = at(cx, "pr-merge-state");
+    // (scrolled down to the box first)
+    let page = at(cx, "pr-conversation");
+    cx.simulate_event(gpui::ScrollEvent { position: page, delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-5000.))), ..Default::default() });
+    cx.run_until_parked();
     click(cx, "pr-comment-input");
     cx.simulate_input("Ship it");
     click(cx, "md-tab-preview");
     let _ = at(cx, "md-preview");
-    click(cx, "pr-comment-post");
+    // ⌘Enter twice (or two clicks) sends it once.
+    pr.update(cx, |p, cx| {
+        p.post_comment(cx);
+        p.post_comment(cx);
+    });
     settle(&ws, cx);
-    assert!(log().contains("pr comment 7 --body Ship it"), "{}", log());
+    assert_eq!(log().matches("pr comment 7 --body Ship it").count(), 1, "{}", log());
+
+    // Commits grouped, the force push, bob's review with his thread under it (back up top).
+    cx.simulate_event(gpui::ScrollEvent { position: page, delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(5000.))), ..Default::default() });
+    cx.run_until_parked();
+    let _ = at(cx, &format!("pr-timeline-commit-{sha}"));
+    let _ = at(cx, "pr-force-push-0");
+    // Resolve the thread; edit my own comment (Cancel leaves it, Update comment sends it).
+    click(cx, "pr-resolve-101");
+    settle(&ws, cx);
+    assert!(log().contains("resolveReviewThread") && log().contains("id=T_1"), "{}", log());
+    assert!(cx.debug_bounds("pr-edit-IC_1").is_none(), "not mine");
+    click(cx, "pr-edit-IC_2");
+    let _ = at(cx, "pr-edit-input");
+    click(cx, "pr-edit-cancel");
+    assert!(pr.read_with(cx, |p, _| p.editing.is_none()));
+    click(cx, "pr-edit-IC_2");
+    click(cx, "pr-edit-save");
+    settle(&ws, cx);
+    assert!(log().contains("updateIssueComment") && log().contains("id=IC_2"), "{}", log());
 
     // Checked out, the Git tab shows its chip, which comes back to this review's tab.
     click(cx, "pr-checkout");

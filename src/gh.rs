@@ -20,7 +20,25 @@ fn gh_bin() -> std::path::PathBuf {
 fn gh(root: &Path, args: &[&str]) -> Result<String> {
     let out = crate::tools::command(&gh_bin()).current_dir(root).env("GH_PROMPT_DISABLED", "1").env("NO_COLOR", "1").args(args).stdin(Stdio::null()).output()?;
     if !out.status.success() {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        // `gh api` says only "Unprocessable Entity (HTTP 422)": GitHub's reason is in the answer.
+        let why = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok().map(|j| {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(m) = j.get("message").and_then(|m| m.as_str()) {
+                parts.push(m.to_string());
+            }
+            for e in j.get("errors").and_then(|e| e.as_array()).into_iter().flatten() {
+                match e.as_str().or_else(|| e.get("message").and_then(|m| m.as_str())) {
+                    Some(m) => parts.push(m.to_string()),
+                    None => parts.push(e.to_string()),
+                }
+            }
+            parts.join(": ")
+        });
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        match why.filter(|w| !w.is_empty()) {
+            Some(w) => bail!("{w} ({})", err.trim_start_matches("gh: ")),
+            None => bail!("{err}"),
+        }
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -132,6 +150,8 @@ pub struct Pr {
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Comment {
+    /// GitHub's node id (to edit or delete it).
+    pub id: String,
     pub author: Author,
     pub body: String,
     pub created_at: String,
@@ -140,6 +160,11 @@ pub struct Comment {
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Review {
+    /// GitHub's node id (to edit its text).
+    pub id: String,
+    /// Its number in the REST API, which the comments on lines name.
+    #[serde(skip)]
+    pub database_id: u64,
     pub author: Author,
     pub state: String,
     pub body: String,
@@ -169,6 +194,28 @@ pub struct PrDetail {
     pub reviews: Vec<Review>,
     pub status_check_rollup: Vec<Check>,
     pub commits: Vec<PrCommit>,
+    /// Threads of comments on lines, resolved or not.
+    #[serde(skip)]
+    pub threads: Vec<Thread>,
+    /// Its branch pushed over (force-pushed): who, from which commit to which, when.
+    #[serde(skip)]
+    pub force_pushes: Vec<ForcePush>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ForcePush {
+    pub actor: String,
+    pub before: String,
+    pub after: String,
+    pub at: String,
+}
+
+/// A thread of comments on lines: resolved or not, and the comment it starts with.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Thread {
+    pub id: String,
+    pub resolved: bool,
+    pub root: u64,
 }
 
 /// One of a pull request's commits.
@@ -186,6 +233,8 @@ pub struct PrCommit {
 #[serde(default)]
 pub struct LineComment {
     pub id: u64,
+    /// The review it was sent with.
+    pub pull_request_review_id: Option<u64>,
     /// The thread's first comment, for a reply.
     pub in_reply_to_id: Option<u64>,
     pub created_at: String,
@@ -215,10 +264,99 @@ pub fn list(root: &Path, state: &str) -> Result<Vec<Pr>> {
 
 pub fn view(root: &Path, n: u64) -> Result<(PrDetail, Vec<LineComment>)> {
     let fields = "number,title,body,author,state,url,headRefName,baseRefName,headRefOid,additions,deletions,isDraft,reviewDecision,mergeable,mergeStateStatus,comments,reviews,statusCheckRollup,commits";
-    let detail: PrDetail = serde_json::from_str(&gh(root, &["pr", "view", &n.to_string(), "--json", fields])?)?;
+    let mut detail: PrDetail = serde_json::from_str(&gh(root, &["pr", "view", &n.to_string(), "--json", fields])?)?;
     // Line comments aren't in `pr view`; without them the review still works.
-    let lines = gh(root, &["api", &format!("repos/{{owner}}/{{repo}}/pulls/{n}/comments")]).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let lines = gh(root, &["api", &format!("repos/{{owner}}/{{repo}}/pulls/{n}/comments?per_page=100")]).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    // The reviews' numbers, which their comments on lines name.
+    #[derive(Deserialize)]
+    struct Rest {
+        id: u64,
+        node_id: String,
+    }
+    let rest: Vec<Rest> = gh(root, &["api", &format!("repos/{{owner}}/{{repo}}/pulls/{n}/reviews?per_page=100")]).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    for r in &mut detail.reviews {
+        r.database_id = rest.iter().find(|x| x.node_id == r.id).map(|x| x.id).unwrap_or(0);
+    }
+    if let Ok((threads, pushes)) = threads(root, n) {
+        detail.threads = threads;
+        detail.force_pushes = pushes;
+    }
     Ok((detail, lines))
+}
+
+/// The pull request's threads of line comments (resolved or not), and its force pushes.
+fn threads(root: &Path, n: u64) -> Result<(Vec<Thread>, Vec<ForcePush>)> {
+    let query = "query($owner: String!, $name: String!, $n: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $n) { reviewThreads(first: 100) { nodes { id isResolved comments(first: 1) { nodes { databaseId } } } } timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], last: 50) { nodes { ... on HeadRefForcePushedEvent { actor { login } beforeCommit { abbreviatedOid } afterCommit { abbreviatedOid } createdAt } } } } } }";
+    let out = gh(root, &["api", "graphql", "-F", "owner={owner}", "-F", "name={repo}", "-F", &format!("n={n}"), "-f", &format!("query={query}")])?;
+    let j: serde_json::Value = serde_json::from_str(&out)?;
+    let nodes = j.pointer("/data/repository/pullRequest/reviewThreads/nodes").and_then(|n| n.as_array()).cloned().unwrap_or_default();
+    let threads = nodes
+        .iter()
+        .map(|t| Thread {
+            id: t["id"].as_str().unwrap_or_default().to_string(),
+            resolved: t["isResolved"].as_bool().unwrap_or(false),
+            root: t.pointer("/comments/nodes/0/databaseId").and_then(|d| d.as_u64()).unwrap_or(0),
+        })
+        .collect();
+    let s = |v: &serde_json::Value, p: &str| v.pointer(p).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+    let pushes = j
+        .pointer("/data/repository/pullRequest/timelineItems/nodes")
+        .and_then(|n| n.as_array())
+        .into_iter()
+        .flatten()
+        .map(|e| ForcePush { actor: s(e, "/actor/login"), before: s(e, "/beforeCommit/abbreviatedOid"), after: s(e, "/afterCommit/abbreviatedOid"), at: s(e, "/createdAt") })
+        .filter(|f| !f.at.is_empty())
+        .collect();
+    Ok((threads, pushes))
+}
+
+/// Who gh is signed in as.
+pub fn viewer(root: &Path) -> Option<String> {
+    gh(root, &["api", "user", "--jq", ".login"]).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn graphql(root: &Path, query: &str, vars: &[(&str, &str)]) -> Result<String> {
+    let mut args: Vec<String> = vec!["api".into(), "graphql".into(), "-f".into(), format!("query={query}")];
+    for (k, v) in vars {
+        args.extend(["-f".into(), format!("{k}={v}")]);
+    }
+    gh(root, &args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// What can be edited or deleted on the page.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Editable {
+    /// The pull request's description.
+    Body,
+    /// A comment on the conversation (its node id).
+    Comment(String),
+    /// A review's text (its node id).
+    Review(String),
+    /// A comment on a line (its number).
+    Line(u64),
+}
+
+pub fn edit(root: &Path, n: u64, what: &Editable, body: &str) -> Result<String> {
+    match what {
+        Editable::Body => gh(root, &["pr", "edit", &n.to_string(), "--body", body]),
+        Editable::Comment(id) => graphql(root, "mutation($id: ID!, $body: String!) { updateIssueComment(input: {id: $id, body: $body}) { clientMutationId } }", &[("id", id), ("body", body)]),
+        Editable::Review(id) => graphql(root, "mutation($id: ID!, $body: String!) { updatePullRequestReview(input: {pullRequestReviewId: $id, body: $body}) { clientMutationId } }", &[("id", id), ("body", body)]),
+        Editable::Line(id) => gh(root, &["api", "--method", "PATCH", &format!("repos/{{owner}}/{{repo}}/pulls/comments/{id}"), "-f", &format!("body={body}")]),
+    }
+}
+
+pub fn delete(root: &Path, what: &Editable) -> Result<String> {
+    match what {
+        Editable::Comment(id) => graphql(root, "mutation($id: ID!) { deleteIssueComment(input: {id: $id}) { clientMutationId } }", &[("id", id)]),
+        Editable::Line(id) => gh(root, &["api", "--method", "DELETE", &format!("repos/{{owner}}/{{repo}}/pulls/comments/{id}")]),
+        _ => bail!("This can't be deleted"),
+    }
+}
+
+/// Resolves the thread `id` (or opens it again).
+pub fn resolve(root: &Path, id: &str, resolved: bool) -> Result<String> {
+    let m = if resolved { "resolveReviewThread" } else { "unresolveReviewThread" };
+    graphql(root, &format!("mutation($id: ID!) {{ {m}(input: {{threadId: $id}}) {{ clientMutationId }} }}"), &[("id", id)])
 }
 
 /// Brings the PR's commits here (as `refs/oskl/pr/<n>`) and its base up to date; returns

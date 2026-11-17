@@ -6,7 +6,7 @@
 use crate::commit_view::{FileRow, file_rows};
 use crate::diff_view::{CommentOn, DiffView};
 use crate::editor::{Editor, EditorEvent, EditorMode};
-use crate::git::gh::{self, CheckState, Checks, DraftComment, LineComment, PrDetail};
+use crate::git::gh::{self, CheckState, Checks, DraftComment, Editable, LineComment, PrDetail};
 use crate::md_preview::MdPreview;
 use crate::git::{self, Change, FileStatus, Rev};
 use crate::preview::Markdown;
@@ -121,6 +121,14 @@ pub struct PrView {
     busy: Option<String>,
     /// The review dropdown is open, hanging from here.
     pub review_at: Option<Point<Pixels>>,
+    /// Who gh is signed in as: their comments can be edited and deleted.
+    pub viewer: Option<String>,
+    /// What's being edited, in `edit_input` (with Write and Preview).
+    pub editing: Option<Editable>,
+    edit_input: Entity<Editor>,
+    edit_preview: Entity<MdPreview>,
+    /// Resolved threads opened to read (by thread id).
+    open_threads: HashSet<String>,
     _load: Option<Task<()>>,
     _commit_load: Option<Task<()>>,
     _act: Option<Task<()>>,
@@ -149,7 +157,12 @@ impl PrView {
         let line_input = editor("Leave a comment (Markdown)", false, cx);
         let comment_input = editor("Add your comment here… (Markdown)", false, cx);
         let filter = editor("Filter files", true, cx);
+        let edit_input = editor("Leave a comment (Markdown)", false, cx);
         let root = repo.read(cx).root.clone();
+        let edit_preview = {
+            let (c, r) = (edit_input.clone(), root.clone());
+            cx.new(|cx| MdPreview::new(c, r, 160., "pr-edit-input", cx))
+        };
         let comment_preview = {
             let (c, r) = (comment_input.clone(), root.clone());
             cx.new(|cx| MdPreview::new(c, r, 160., "pr-comment-input", cx))
@@ -215,6 +228,11 @@ impl PrView {
             images,
             busy: None,
             review_at: None,
+            viewer: None,
+            editing: None,
+            edit_input,
+            edit_preview,
+            open_threads: HashSet::new(),
             _load: None,
             _commit_load: None,
             _act: None,
@@ -222,9 +240,277 @@ impl PrView {
             _diff_sub: None,
             _subs: subs,
         };
-        v.read_pending(root, cx);
+        v.read_pending(root.clone(), cx);
+        let who = cx.background_executor().spawn(async move { gh::viewer(&root) });
+        cx.spawn(async move |v, cx| {
+            let who = who.await;
+            v.update(cx, |v, cx| {
+                v.viewer = who;
+                v.refresh_notes(cx);
+            })
+            .ok();
+        })
+        .detach();
         v.load(cx);
         v
+    }
+
+    /// `login` is who gh is signed in as.
+    fn mine(&self, login: &str) -> bool {
+        self.viewer.as_deref() == Some(login)
+    }
+
+    /// The thread comment `l` is in.
+    fn thread_of(&self, l: &LineComment) -> Option<gh::Thread> {
+        let root = l.in_reply_to_id.unwrap_or(l.id);
+        match &self.detail {
+            Some(Ok((d, _))) => d.threads.iter().find(|t| t.root == root).cloned(),
+            _ => None,
+        }
+    }
+
+    pub fn start_edit(&mut self, target: Editable, text: String, cx: &mut Context<Self>) {
+        self.edit_input.update(cx, |e, cx| e.set_text(&text, cx));
+        self.edit_preview.update(cx, |p, cx| {
+            p.previewing = false;
+            cx.notify();
+        });
+        self.editing = Some(target);
+        self.refresh_notes(cx);
+    }
+
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing = None;
+        self.edit_input.update(cx, |e, cx| e.set_text("", cx));
+        self.refresh_notes(cx);
+    }
+
+    /// Update comment: the edited text, on GitHub.
+    pub fn save_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.editing.clone() else { return };
+        let (n, body) = (self.number, self.edit_input.read(cx).text());
+        if body.trim().is_empty() && target != Editable::Body {
+            return cx.emit(Request::Error("A comment can't be empty (delete it instead)".into()));
+        }
+        self.act("Edit", move |root| gh::edit(root, n, &target, &body), |v, cx| v.cancel_edit(cx), cx);
+    }
+
+    fn ask_delete(&mut self, target: Editable, cx: &mut Context<Self>) {
+        let me = cx.entity().downgrade();
+        cx.emit(Request::Ask(crate::dialog::Ask {
+            title: "Delete this comment?".into(),
+            detail: "On GitHub, for everyone. It can't be undone.".into(),
+            buttons: vec!["Delete".into()],
+            danger: true,
+            cancel_default: true,
+            cancel_label: None,
+            on_answer: Rc::new(move |_, _, cx| {
+                let t = target.clone();
+                me.update(cx, |v, cx| v.act("Delete", move |root| gh::delete(root, &t), |_, _| {}, cx)).ok();
+            }),
+        }));
+    }
+
+    /// Resolves the thread (or opens it again).
+    fn set_resolved(&mut self, thread: String, resolved: bool, cx: &mut Context<Self>) {
+        self.open_threads.remove(&thread);
+        self.act(if resolved { "Resolve" } else { "Unresolve" }, move |root| gh::resolve(root, &thread, resolved), |_, _| {}, cx);
+    }
+
+    fn toggle_thread(&mut self, thread: String, cx: &mut Context<Self>) {
+        if !self.open_threads.remove(&thread) {
+            self.open_threads.insert(thread);
+        }
+        self.refresh_notes(cx);
+    }
+
+    /// Edit, and Delete, for what's yours.
+    fn tools(&self, target: Editable, text: String, delete: bool, cx: &mut Context<Self>) -> AnyElement {
+        let key = match &target {
+            Editable::Body => "body".to_string(),
+            Editable::Comment(id) | Editable::Review(id) => id.clone(),
+            Editable::Line(n) => n.to_string(),
+        };
+        let t2 = target.clone();
+        div()
+            .flex()
+            .flex_none()
+            .gap(px(10.))
+            .text_size(px(11.))
+            .child(text_link(format!("pr-edit-{key}"), "Edit", theme::fg_muted()).on_click(cx.listener(move |v, _, _, cx| v.start_edit(target.clone(), text.clone(), cx))))
+            .when(delete, |d| d.child(text_link(format!("pr-delete-{key}"), "Delete", theme::git_deleted()).on_click(cx.listener(move |v, _, _, cx| v.ask_delete(t2.clone(), cx)))))
+            .into_any_element()
+    }
+
+    /// The box editing a comment: Write and Preview, Cancel and Update comment.
+    fn edit_box(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p(px(10.))
+            .child(self.edit_preview.clone())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().flex_1().text_size(px(11.)).text_color(theme::fg_muted()).children(self.busy.clone().map(|b| format!("{b}…"))))
+                    .child(action_button("pr-edit-cancel", "Cancel", None).on_click(cx.listener(|v, _, _, cx| v.cancel_edit(cx))))
+                    .child(action_button("pr-edit-save", "Update comment", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.save_edit(cx)))),
+            )
+            .into_any_element()
+    }
+
+    /// One comment on a line, in a thread: who, its text (or its edit box), Edit and Delete if yours.
+    fn line_comment_el(&self, l: &LineComment, md: Option<Rc<Markdown>>, cx: &mut Context<Self>) -> AnyElement {
+        let root = self.repo.read(cx).root.clone();
+        let target = Editable::Line(l.id);
+        let editing = self.editing.as_ref() == Some(&target);
+        let tools = (self.mine(&l.user.login) && !editing && l.id != 0).then(|| self.tools(target, l.body.clone(), true, cx));
+        let when = crate::pr_panel::github_time(&l.created_at).map(crate::util::relative_time).unwrap_or_default();
+        let range = l.start_line.filter(|s| Some(*s) < l.line).map(|s| lines_label(Some(s as usize), l.line.unwrap_or(0) as usize));
+        let opener: crate::preview::Opener = Rc::new(|path, _, _, _| {
+            let _ = std::process::Command::new("open").arg(path).spawn();
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .px(px(12.))
+            .py(px(8.))
+            .border_b_1()
+            .border_color(theme::border())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(l.user.login.clone()))
+                    .child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(when))
+                    .when_some(range, |d, r| d.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(format!("on {r}"))))
+                    .child(div().flex_1())
+                    .children(tools),
+            )
+            .child(if editing { self.edit_box(cx) } else { md.map(|m| m.render(&root, &self.images, opener).into_any_element()).unwrap_or_else(|| div().into_any_element()) })
+            .into_any_element()
+    }
+
+    /// Resolve conversation / Unresolve conversation.
+    fn resolve_button(&self, t: &gh::Thread, cx: &mut Context<Self>) -> AnyElement {
+        let (id, resolved) = (t.id.clone(), t.resolved);
+        let sel = format!("pr-resolve-{}", t.root);
+        div()
+            .id(SharedString::from(sel.clone()))
+            .debug_selector(move || sel)
+            .flex_none()
+            .px(px(10.))
+            .h(px(26.))
+            .flex()
+            .items_center()
+            .rounded(px(4.))
+            .border_1()
+            .border_color(theme::border_input())
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::hover()))
+            .child(if resolved { "Unresolve conversation" } else { "Resolve conversation" })
+            .on_click(cx.listener(move |v, _, _, cx| v.set_resolved(id.clone(), !resolved, cx)))
+            .into_any_element()
+    }
+
+    /// A resolved thread folded to one line: open it to read it.
+    fn folded_thread(&self, t: &gh::Thread, label: String, open: bool, cx: &mut Context<Self>) -> AnyElement {
+        let id = t.id.clone();
+        let sel = format!("pr-thread-toggle-{}", t.root);
+        div()
+            .id(SharedString::from(sel.clone()))
+            .debug_selector(move || sel)
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(12.))
+            .h(px(30.))
+            .bg(theme::bg_side())
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::hover()))
+            .on_click(cx.listener(move |v, _, _, cx| v.toggle_thread(id.clone(), cx)))
+            .child(ui::small_icon(if open { "chevron-down" } else { "chevron-right" }, theme::fg_muted()))
+            .child(div().min_w_0().flex_1().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg_dim()).child(label))
+            .child(div().flex_none().px(px(6.)).rounded(px(8.)).border_1().border_color(theme::c(0xc678dd)).text_color(theme::c(0xc678dd)).text_size(px(10.)).child("Resolved"))
+            .child(div().flex_none().text_size(px(11.)).text_color(theme::accent()).child(if open { "Hide" } else { "Show resolved" }))
+            .into_any_element()
+    }
+
+    /// Commits pushed one after another: "who added N commits, when", then a row each (a
+    /// click shows what it changed).
+    fn commit_group(&self, commits: Vec<(String, String, String, String)>, cx: &mut Context<Self>) -> AnyElement {
+        let who = commits.first().map(|c| c.3.clone()).unwrap_or_default();
+        let when = commits.last().and_then(|c| crate::pr_panel::github_time(&c.0)).map(crate::util::relative_time).unwrap_or_default();
+        let n = commits.len();
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .pl(px(4.))
+                    .h(px(32.))
+                    .child(timeline_dot(ui::small_icon("git", theme::fg_muted()).into_any_element()))
+                    .child(div().flex_none().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(who))
+                    .child(div().flex_none().text_color(theme::fg_dim()).child(format!("added {n} {}", if n == 1 { "commit" } else { "commits" })))
+                    .child(div().flex_none().text_color(theme::fg_muted()).child(when)),
+            )
+            .children(commits.into_iter().map(|(_, sha, headline, _)| {
+                let short = sha.get(..7).unwrap_or(&sha).to_string();
+                let sel = format!("pr-timeline-commit-{short}");
+                div()
+                    .id(SharedString::from(sel.clone()))
+                    .debug_selector(move || sel)
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .pl(px(14.))
+                    .pr(px(8.))
+                    .h(px(28.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .tooltip(ui::tooltip("Show what this commit changed"))
+                    .on_click(cx.listener(move |v, _, _, cx| v.pick_commit(Some(sha.clone()), cx)))
+                    // The thread's line, with a dot for the commit.
+                    .child(div().flex_none().w(px(12.)).h_full().flex().items_center().justify_center().child(div().size(px(9.)).rounded(px(5.)).border_2().border_color(theme::fg_muted())))
+                    .child(div().min_w_0().flex_1().overflow_hidden().text_ellipsis().whitespace_nowrap().font_family(theme::MONO_FONT).text_size(px(11.5)).text_color(theme::fg()).child(headline))
+                    .child(div().flex_none().font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::accent()).child(short))
+            }))
+            .into_any_element()
+    }
+
+    /// A thread of comments on lines, in the conversation: where, the code, the comments, and
+    /// Resolve (a resolved one folded until opened).
+    fn conversation_thread(&self, root_ix: usize, lines: &[LineComment], cx: &mut Context<Self>) -> AnyElement {
+        let first = self.first_line_md();
+        let root = &lines[root_ix];
+        let label = format!("{} {}", root.path, lines_label(root.start_line.map(|s| s as usize), root.line.or(root.original_line).unwrap_or(0) as usize));
+        let thread = self.thread_of(root);
+        let resolved = thread.as_ref().is_some_and(|t| t.resolved);
+        let open = !resolved || thread.as_ref().is_some_and(|t| self.open_threads.contains(&t.id));
+        let mut el = div().flex().flex_col().rounded(px(6.)).border_1().border_color(theme::border()).overflow_hidden();
+        el = match (&thread, resolved) {
+            (Some(t), true) => el.child(self.folded_thread(t, label, open, cx)),
+            _ => el.child(div().px(px(12.)).h(px(28.)).flex().items_center().bg(theme::bg_side()).font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::accent()).child(label)),
+        };
+        if open {
+            el = el.children(hunk_excerpt(root));
+            for (i, l) in lines.iter().enumerate().filter(|(i, l)| *i == root_ix || l.in_reply_to_id == Some(root.id)) {
+                el = el.child(self.line_comment_el(l, self.md.get(first + i).cloned(), cx));
+            }
+            if let Some(t) = &thread {
+                el = el.child(div().flex().p(px(8.)).child(self.resolve_button(t, cx)));
+            }
+        }
+        el.into_any_element()
     }
 
     /// The review's pending comments, as left last time (in the repository's git folder).
@@ -618,6 +904,10 @@ impl PrView {
 
     /// Runs a `gh` action in the background; once done, `ok`, the page read again and the lists told.
     fn act(&mut self, label: &str, op: impl FnOnce(&std::path::Path) -> anyhow::Result<String> + Send + 'static, ok: impl FnOnce(&mut Self, &mut Context<Self>) + 'static, cx: &mut Context<Self>) {
+        // Already sending (⌘Enter pressed again, a second click): once is enough.
+        if self.busy.is_some() {
+            return;
+        }
         let root = self.repo.read(cx).root.clone();
         self.busy = Some(label.to_string());
         let label = label.to_string();
@@ -700,8 +990,12 @@ impl PrView {
     }
 
     /// Who did what, when: a card with its Markdown.
-    fn card(&self, root: &Path, who: String, did: String, when: String, excerpt: Option<Div>, body: Option<Rc<Markdown>>) -> Div {
-        let color = if did == "approved" { theme::git_added() } else if did == "requested changes" { theme::git_deleted() } else { theme::fg_dim() };
+    /// `target`: what Edit changes (and the card shows its edit box while it's edited).
+    #[allow(clippy::too_many_arguments)]
+    fn card(&self, root: &Path, who: String, did: String, when: String, excerpt: Option<Div>, body: Option<Rc<Markdown>>, edit: Option<(Editable, String, bool)>, extra: Vec<AnyElement>, cx: &mut Context<Self>) -> Div {
+        let color = if did.starts_with("approved") { theme::git_added() } else if did.starts_with("requested changes") { theme::git_deleted() } else { theme::fg_dim() };
+        let editing = edit.as_ref().is_some_and(|(t, _, _)| self.editing.as_ref() == Some(t));
+        let tools = edit.filter(|_| !editing && self.mine(&who)).map(|(t, text, del)| self.tools(t, text, del, cx));
         let opener: crate::preview::Opener = Rc::new(|path, _, _, _| {
             let _ = std::process::Command::new("open").arg(path).spawn();
         });
@@ -724,61 +1018,89 @@ impl PrView {
                     .border_color(theme::border())
                     .child(div().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(who))
                     .child(div().text_color(color).child(did))
-                    .child(div().text_color(theme::fg_muted()).child(when)),
+                    .child(div().text_color(theme::fg_muted()).child(when))
+                    .child(div().flex_1())
+                    .children(tools),
             )
             .children(excerpt)
-            .when_some(body, |d, md| d.child(div().px(px(14.)).py(px(10.)).child(md.render(root, &self.images, opener))))
+            .when(editing, |d| d.child(self.edit_box(cx)))
+            .when_some(body.filter(|_| !editing), |d, md| d.child(div().px(px(14.)).py(px(10.)).child(md.render(root, &self.images, opener))))
+            .when(!extra.is_empty(), |d| d.child(div().flex().flex_col().gap(px(8.)).p(px(10.)).children(extra)))
     }
 
     fn render_conversation(&self, root: &Path, d: &PrDetail, lines: &[LineComment], cx: &mut Context<Self>) -> impl IntoElement {
         let md = |ix: usize| self.md.get(ix).cloned();
         enum Item {
-            Card(String, String, Option<Rc<Markdown>>, Option<Div>),
+            Comment(usize),
+            Review(usize),
+            /// A thread of comments on lines that no review shows.
+            Thread(usize),
             Commit(String, String, String),
+            ForcePush(usize),
         }
-        // Comments, reviews, comments on lines and commits, oldest first.
-        let mut items: Vec<(String, Item)> = d.comments.iter().enumerate().map(|(i, c)| (c.created_at.clone(), Item::Card(c.author.login.clone(), "commented".into(), md(1 + i), None))).collect();
+        // Comments, reviews (with their threads), lone threads and commits, oldest first.
+        let mut items: Vec<(String, Item)> = d.comments.iter().enumerate().map(|(i, c)| (c.created_at.clone(), Item::Comment(i))).collect();
         let n_comments = d.comments.len();
-        items.extend(d.reviews.iter().enumerate().map(|(i, r)| {
-            let did = match r.state.as_str() {
-                "APPROVED" => "approved",
-                "CHANGES_REQUESTED" => "requested changes",
-                "DISMISSED" => "had a review dismissed",
-                _ => "reviewed",
-            };
-            (r.submitted_at.clone(), Item::Card(r.author.login.clone(), did.into(), md(1 + n_comments + i).filter(|_| !r.body.trim().is_empty()), None))
-        }));
-        let first_line = self.first_line_md();
-        items.extend(lines.iter().enumerate().map(|(i, l)| (l.created_at.clone(), Item::Card(l.user.login.clone(), format!("commented on {} {}", l.path, lines_label(l.start_line.map(|s| s as usize), l.line.or(l.original_line).unwrap_or(0) as usize)), md(first_line + i), hunk_excerpt(l)))));
+        let review_ids: HashSet<u64> = d.reviews.iter().map(|r| r.database_id).filter(|id| *id != 0).collect();
+        let roots_of = |id: u64| lines.iter().enumerate().filter(move |(_, l)| l.in_reply_to_id.is_none() && l.pull_request_review_id == Some(id)).map(|(i, _)| i).collect::<Vec<_>>();
+        items.extend(d.reviews.iter().enumerate().filter(|(_, r)| !(r.state == "COMMENTED" && r.body.trim().is_empty() && (r.database_id == 0 || roots_of(r.database_id).is_empty()))).map(|(i, r)| (r.submitted_at.clone(), Item::Review(i))));
+        items.extend(lines.iter().enumerate().filter(|(_, l)| l.in_reply_to_id.is_none() && !l.pull_request_review_id.is_some_and(|id| review_ids.contains(&id))).map(|(i, l)| (l.created_at.clone(), Item::Thread(i))));
         items.extend(d.commits.iter().map(|c| (c.committed_date.clone(), Item::Commit(c.oid.clone(), c.message_headline.clone(), c.authors.first().map(|a| a.login.clone()).unwrap_or_default()))));
+        items.extend(d.force_pushes.iter().enumerate().map(|(i, f)| (f.at.clone(), Item::ForcePush(i))));
         items.sort_by(|a, b| a.0.cmp(&b.0));
         let ago = |when: &str| crate::pr_panel::github_time(when).map(crate::util::relative_time).unwrap_or_default();
         let description = md(0).filter(|_| !d.body.trim().is_empty()).or_else(|| Some(Rc::new(Markdown::parse_doc("*No description provided.*"))));
         let mut timeline: Vec<AnyElement> = Vec::new();
-        for (when, item) in items {
+        // Commits one after another make one group: "who added N commits", like GitHub.
+        let mut group: Vec<(String, String, String, String)> = Vec::new();
+        let mut items = items.into_iter().peekable();
+        while let Some((when, item)) = items.next() {
+            if let Item::Commit(sha, headline, who) = item {
+                group.push((when, sha, headline, who));
+                if matches!(items.peek(), Some((_, Item::Commit(..)))) {
+                    continue;
+                }
+                let commits = std::mem::take(&mut group);
+                timeline.push(self.commit_group(commits, cx));
+                continue;
+            }
             timeline.push(match item {
-                Item::Card(who, did, body, excerpt) => self.card(root, who, did, ago(&when), excerpt, body).into_any_element(),
-                Item::Commit(sha, headline, who) => {
-                    let short = sha.get(..7).unwrap_or(&sha).to_string();
-                    let sel = format!("pr-timeline-commit-{short}");
+                Item::Comment(i) => {
+                    let c = &d.comments[i];
+                    self.card(root, c.author.login.clone(), "commented".into(), ago(&when), None, md(1 + i), Some((Editable::Comment(c.id.clone()), c.body.clone(), true)), Vec::new(), cx).into_any_element()
+                }
+                Item::Review(i) => {
+                    let r = &d.reviews[i];
+                    let did = match r.state.as_str() {
+                        "APPROVED" => "approved these changes",
+                        "CHANGES_REQUESTED" => "requested changes",
+                        "DISMISSED" => "had a review dismissed",
+                        _ => "reviewed",
+                    };
+                    let threads: Vec<AnyElement> = if r.database_id == 0 { Vec::new() } else { roots_of(r.database_id).into_iter().map(|ix| self.conversation_thread(ix, lines, cx)).collect() };
+                    let body = md(1 + n_comments + i).filter(|_| !r.body.trim().is_empty());
+                    let edit = (!r.body.trim().is_empty() && !r.id.is_empty()).then(|| (Editable::Review(r.id.clone()), r.body.clone(), false));
+                    self.card(root, r.author.login.clone(), did.into(), ago(&when), None, body, edit, threads, cx).into_any_element()
+                }
+                Item::Thread(ix) => self.conversation_thread(ix, lines, cx),
+                Item::Commit(..) => unreachable!(),
+                Item::ForcePush(i) => {
+                    let f = &d.force_pushes[i];
+                    let sel = format!("pr-force-push-{i}");
                     div()
-                        .id(SharedString::from(sel.clone()))
                         .debug_selector(move || sel)
                         .flex()
                         .items_center()
                         .gap(px(8.))
-                        .pl(px(14.))
-                        .pr(px(6.))
-                        .h(px(26.))
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme::hover()))
-                        .tooltip(ui::tooltip("Show what this commit changed"))
-                        .on_click(cx.listener(move |v, _, _, cx| v.pick_commit(Some(sha.clone()), cx)))
-                        .child(ui::small_icon("git", theme::fg_muted()))
-                        .child(div().flex_none().text_color(theme::fg_muted()).child(who))
-                        .child(div().min_w_0().flex_1().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg()).child(headline))
-                        .child(div().flex_none().font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::fg_dim()).child(short))
+                        .pl(px(4.))
+                        .h(px(30.))
+                        .child(timeline_dot(ui::small_icon("arrow-up", theme::fg_muted()).into_any_element()))
+                        .child(div().flex_none().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(f.actor.clone()))
+                        .child(div().flex_none().text_color(theme::fg_dim()).child(format!("force-pushed the {} branch from", d.head_ref_name)))
+                        .child(div().flex_none().font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::accent()).child(f.before.clone()))
+                        .child(div().flex_none().text_color(theme::fg_dim()).child("to"))
+                        .child(div().flex_none().font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::accent()).child(f.after.clone()))
+                        .child(div().flex_none().text_color(theme::fg_muted()).child(ago(&f.at)))
                         .into_any_element()
                 }
             });
@@ -801,7 +1123,7 @@ impl PrView {
                     .p(px(16.))
                     .w_full()
                     .max_w(px(1200.))
-                    .child(self.card(root, d.author.login.clone(), "opened it".into(), String::new(), None, description))
+                    .child(self.card(root, d.author.login.clone(), "opened it".into(), String::new(), None, description, Some((Editable::Body, d.body.clone(), false)), Vec::new(), cx))
                     .children(timeline)
                     .child(self.render_merge_box(d, cx))
                     // Add a comment: written beside its preview.
@@ -819,6 +1141,7 @@ impl PrView {
                                     .items_center()
                                     .gap(px(8.))
                                     .child(div().flex_1().text_size(px(11.)).text_color(theme::fg_muted()).child(busy.map(|b| format!("{b}…")).unwrap_or_else(|| "⌘Enter to send".into())))
+                                    .when(!self.comment_input.read(cx).text().is_empty(), |d| d.child(action_button("pr-comment-cancel", "Cancel", None).on_click(cx.listener(|v, _, _, cx| v.comment_input.update(cx, |e, cx| e.set_text("", cx))))))
                                     .child(action_button("pr-comment-post", "Comment", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.post_comment(cx)))),
                             ),
                     ),
@@ -1110,6 +1433,8 @@ impl PrView {
         if sent.is_empty() && pending.is_empty() && open.is_none() {
             return None;
         }
+        let thread = sent.first().and_then(|(_, l)| self.thread_of(l));
+        let folded = thread.as_ref().is_some_and(|t| t.resolved && !self.open_threads.contains(&t.id));
         if open.is_some() && self.focus_line {
             self.focus_line = false;
             window.focus(&self.line_input.focus_handle(cx), cx);
@@ -1142,11 +1467,11 @@ impl PrView {
                 .when_some(md, |d, md| d.child(md.render(&root, &self.images, opener.clone())))
         };
         // The thread a reply goes to: its first comment.
-        let thread = sent.first().map(|(_, l)| l.in_reply_to_id.unwrap_or(l.id)).filter(|id| *id != 0);
+        let reply_to = sent.first().map(|(_, l)| l.in_reply_to_id.unwrap_or(l.id)).filter(|id| *id != 0);
         let anchor = open.clone().or_else(|| {
             let (_, l) = sent.first()?;
             let new_side = l.side.as_deref() != Some("LEFT");
-            Some(LineBox { path: path.to_string(), new_side, line: l.line? as usize, start: None, anchor: l.line? as usize, reply_to: thread })
+            Some(LineBox { path: path.to_string(), new_side, line: l.line? as usize, start: None, anchor: l.line? as usize, reply_to })
         });
         let mut card = div()
             .id(SharedString::from(format!("pr-thread-{path}-{}", old.or(new).unwrap_or(0))))
@@ -1170,9 +1495,14 @@ impl PrView {
             // Clicks in it stay in it (the row would take them).
             .on_click(|_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        for (i, l) in &sent {
-            let range = l.start_line.filter(|s| Some(*s) < l.line).map(|s| lines_label(Some(s as usize), l.line.unwrap_or(0) as usize));
-            card = card.child(comment(l.user.login.clone(), None, range, self.md.get(first + i).cloned(), None));
+        if let Some(t) = thread.as_ref().filter(|t| t.resolved) {
+            let n = sent.len();
+            card = card.child(self.folded_thread(t, format!("{n} {}", if n == 1 { "comment" } else { "comments" }), !folded, cx));
+        }
+        if !folded {
+            for (i, l) in &sent {
+                card = card.child(self.line_comment_el(l, self.md.get(first + i).cloned(), cx));
+            }
         }
         for (i, p) in &pending {
             let ix = *i;
@@ -1218,12 +1548,16 @@ impl PrView {
                         ),
                 );
             }
+            None if folded => {}
             None => {
                 // Reply…: answer the thread (or, with no thread, comment on the line again).
                 let anchor = anchor.clone();
+                let resolve = thread.as_ref().map(|t| self.resolve_button(t, cx));
                 card = card.child(
+                    div().flex().items_center().gap(px(8.)).pr(px(8.)).child(
                     div()
                         .id("pr-thread-reply")
+                        .flex_1()
                         .debug_selector(|| "pr-thread-reply".into())
                         .m(px(8.))
                         .px(px(8.))
@@ -1241,7 +1575,8 @@ impl PrView {
                                 v.open_line_box(b, cx);
                             }
                         }))
-                        .child(if thread.is_some() { "Reply…" } else { "Comment on this line again…" }),
+                        .child(if reply_to.is_some() { "Reply…" } else { "Comment on this line again…" }),
+                    ).children(resolve),
                 );
             }
         }
@@ -1251,8 +1586,12 @@ impl PrView {
     /// Finish your review: the pending comments, a summary, and Comment, Approve or Request changes.
     fn render_review_box(&self, at: Point<Pixels>, cx: &mut Context<Self>) -> AnyElement {
         let kind = self.review_kind;
+        // GitHub refuses an approval or changes requested from the pull request's author.
+        let own = matches!((&self.detail, &self.viewer), (Some(Ok((d, _))), Some(me)) if &d.author.login == me);
         let option = |id: &'static str, value: &'static str, title: &'static str, sub: &'static str, cx: &mut Context<Self>| {
             let on = kind == value;
+            let barred = own && value != "comment";
+            let sub = if barred { "Pull request authors can't approve their own pull request or request changes on it." } else { sub };
             div()
                 .id(id)
                 .debug_selector(move || id.to_string())
@@ -1260,11 +1599,13 @@ impl PrView {
                 .items_start()
                 .gap(px(8.))
                 .py(px(3.))
-                .cursor_pointer()
-                .on_click(cx.listener(move |v, _, _, cx| {
-                    v.review_kind = value;
-                    cx.notify();
-                }))
+                .when(barred, |d| d.opacity(0.45))
+                .when(!barred, |d| {
+                    d.cursor_pointer().on_click(cx.listener(move |v, _, _, cx| {
+                        v.review_kind = value;
+                        cx.notify();
+                    }))
+                })
                 .child(div().mt(px(2.)).flex_none().size(px(13.)).rounded(px(7.)).border_1().border_color(if on { theme::accent() } else { theme::border_input() }).flex().items_center().justify_center().when(on, |d| d.child(div().size(px(7.)).rounded(px(4.)).bg(theme::accent()))))
                 .child(div().flex().flex_col().child(div().text_color(theme::fg_bright()).child(title)).child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(sub)))
         };
@@ -1440,6 +1781,16 @@ fn open_url(url: &str) {
     if !url.is_empty() {
         let _ = std::process::Command::new("open").arg(url).spawn();
     }
+}
+
+/// A timeline event's round mark, with its icon.
+fn timeline_dot(icon: AnyElement) -> Div {
+    div().flex_none().size(px(26.)).rounded(px(13.)).flex().items_center().justify_center().bg(theme::bg_side()).border_1().border_color(theme::border()).child(icon)
+}
+
+/// A small text button (Edit, Delete).
+fn text_link(id: String, label: &'static str, color: Hsla) -> Stateful<Div> {
+    div().id(SharedString::from(id.clone())).debug_selector(move || id).cursor_pointer().text_color(color).hover(|s| s.text_color(theme::fg_bright())).child(label)
 }
 
 /// A button: filled with `color`, else outlined.
