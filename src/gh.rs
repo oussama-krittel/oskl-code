@@ -183,6 +183,8 @@ pub struct PrDetail {
     pub head_ref_name: String,
     pub base_ref_name: String,
     pub head_ref_oid: String,
+    /// Whose fork (or repository) the branch is in.
+    pub head_repository_owner: Author,
     pub additions: u64,
     pub deletions: u64,
     pub is_draft: bool,
@@ -224,6 +226,7 @@ pub struct Thread {
 pub struct PrCommit {
     pub oid: String,
     pub message_headline: String,
+    pub message_body: String,
     pub authors: Vec<Author>,
     pub committed_date: String,
 }
@@ -263,7 +266,7 @@ pub fn list(root: &Path, state: &str) -> Result<Vec<Pr>> {
 }
 
 pub fn view(root: &Path, n: u64) -> Result<(PrDetail, Vec<LineComment>)> {
-    let fields = "number,title,body,author,state,url,headRefName,baseRefName,headRefOid,additions,deletions,isDraft,reviewDecision,mergeable,mergeStateStatus,comments,reviews,statusCheckRollup,commits";
+    let fields = "number,title,body,author,state,url,headRefName,baseRefName,headRefOid,headRepositoryOwner,additions,deletions,isDraft,reviewDecision,mergeable,mergeStateStatus,comments,reviews,statusCheckRollup,commits";
     let mut detail: PrDetail = serde_json::from_str(&gh(root, &["pr", "view", &n.to_string(), "--json", fields])?)?;
     // Line comments aren't in `pr view`; without them the review still works.
     let lines = gh(root, &["api", &format!("repos/{{owner}}/{{repo}}/pulls/{n}/comments?per_page=100")]).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
@@ -582,8 +585,24 @@ pub fn checkout(root: &Path, n: u64) -> Result<String> {
 }
 
 /// `how`: merge, squash or rebase.
-pub fn merge(root: &Path, n: u64, how: &str) -> Result<String> {
-    gh(root, &["pr", "merge", &n.to_string(), &format!("--{how}")])
+/// `how`: merge, squash or rebase; the commit's message (`subject`, `body`) for a merge or a
+/// squash (a rebase makes none).
+pub fn merge(root: &Path, n: u64, how: &str, subject: &str, body: &str) -> Result<String> {
+    let (num, flag) = (n.to_string(), format!("--{how}"));
+    let mut args = vec!["pr", "merge", num.as_str(), flag.as_str()];
+    if how != "rebase" {
+        args.extend(["--subject", subject, "--body", body]);
+    }
+    gh(root, &args)
+}
+
+/// The ways the repository lets pull requests merge: merge, squash, rebase (in that order).
+pub fn merge_methods(root: &Path) -> Vec<&'static str> {
+    let out = gh(root, &["repo", "view", "--json", "mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed"]).unwrap_or_default();
+    let j: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+    let all = [("merge", "mergeCommitAllowed"), ("squash", "squashMergeAllowed"), ("rebase", "rebaseMergeAllowed")];
+    let allowed: Vec<&'static str> = all.iter().filter(|(_, k)| j.get(k).and_then(|v| v.as_bool()).unwrap_or(true)).map(|(m, _)| *m).collect();
+    if allowed.is_empty() { vec!["merge", "squash", "rebase"] } else { allowed }
 }
 
 #[cfg(test)]

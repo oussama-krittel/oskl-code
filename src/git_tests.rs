@@ -751,13 +751,14 @@ const FAKE_GH: &str = r#"#!/bin/sh
 echo "$*" >> "$(dirname "$0")/gh.log"
 case "$1 $2" in
   "pr list") case "$*" in *"--head newwork"*) echo '[]' ; exit 0 ;; esac; echo '[{"number":7,"title":"Login page","author":{"login":"ann"},"headRefName":"login","baseRefName":"main","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS"}],"updatedAt":"2026-11-14T10:00:00Z"}]' ;;
-  "pr view") echo '{"number":7,"title":"Login page","body":"Adds the login page.","author":{"login":"ann"},"state":"OPEN","url":"https://example.invalid/pr/7","headRefName":"login","baseRefName":"main","headRefOid":"'"$(git rev-parse refs/oskl/pr/7 2>/dev/null)"'","additions":1,"deletions":0,"isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeable":"MERGEABLE","comments":[{"id":"IC_1","author":{"login":"bob"},"body":"Thanks!","createdAt":"2026-11-14T11:00:00Z"},{"id":"IC_2","author":{"login":"me"},"body":"Mine","createdAt":"2026-11-14T11:30:00Z"}],"reviews":[{"id":"R_1","author":{"login":"bob"},"state":"CHANGES_REQUESTED","body":"Needs work","submittedAt":"2026-11-14T12:00:00Z"}],"statusCheckRollup":[{"name":"build","workflowName":"CI","conclusion":"SUCCESS","status":"COMPLETED","detailsUrl":"https://example.invalid/run/1"},{"name":"lint","workflowName":"CI","conclusion":"","status":"IN_PROGRESS","detailsUrl":"https://example.invalid/run/2"}],"commits":[{"oid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/7/head)"'","messageHeadline":"Login page","authors":[{"login":"ann"}],"committedDate":"2026-11-14T10:00:00Z"}]}' ;;
+  "pr view") echo '{"number":7,"title":"Login page","body":"Adds the login page.","author":{"login":"ann"},"state":"OPEN","url":"https://example.invalid/pr/7","headRefName":"login","baseRefName":"main","headRepositoryOwner":{"login":"ann"},"headRefOid":"'"$(git rev-parse refs/oskl/pr/7 2>/dev/null)"'","additions":1,"deletions":0,"isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeable":"MERGEABLE","comments":[{"id":"IC_1","author":{"login":"bob"},"body":"Thanks!","createdAt":"2026-11-14T11:00:00Z"},{"id":"IC_2","author":{"login":"me"},"body":"Mine","createdAt":"2026-11-14T11:30:00Z"}],"reviews":[{"id":"R_1","author":{"login":"bob"},"state":"CHANGES_REQUESTED","body":"Needs work","submittedAt":"2026-11-14T12:00:00Z"}],"statusCheckRollup":[{"name":"build","workflowName":"CI","conclusion":"SUCCESS","status":"COMPLETED","detailsUrl":"https://example.invalid/run/1"},{"name":"lint","workflowName":"CI","conclusion":"","status":"IN_PROGRESS","detailsUrl":"https://example.invalid/run/2"}],"commits":[{"oid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/7/head)"'","messageHeadline":"Login page","authors":[{"login":"ann"}],"committedDate":"2026-11-14T10:00:00Z"}]}' ;;
   "api repos/{owner}/{repo}/pulls/7/comments?per_page=100") echo '[{"id":101,"pull_request_review_id":55,"path":"login.txt","line":1,"body":"Nice","user":{"login":"bob"},"created_at":"2026-11-14T12:00:00Z","diff_hunk":"@@ -0,0 +1,3 @@\\n+login"}]' ;;
   "api repos/{owner}/{repo}/pulls/7/reviews?per_page=100") echo '[{"id":55,"node_id":"R_1"}]' ;;
   "api graphql") case "$*" in *reviewThreads*) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"T_1","isResolved":false,"comments":{"nodes":[{"databaseId":101}]}}]},"timelineItems":{"nodes":[{"actor":{"login":"ann"},"beforeCommit":{"abbreviatedOid":"aaaaaaa"},"afterCommit":{"abbreviatedOid":"bbbbbbb"},"createdAt":"2026-11-14T13:00:00Z"}]}}}}}' ;; *) echo '{}' ;; esac ;;
   "api user") echo me ;;
   "pr edit") echo ok ;;
-  "pr close"|"pr reopen") echo ok ;;
+  "pr close"|"pr reopen"|"pr merge") echo ok ;;
+  "repo view") echo '{"mergeCommitAllowed":true,"squashMergeAllowed":true,"rebaseMergeAllowed":false}' ;;
   "api --method") case "$*" in *--input*) for a; do last=$a; done; cat "$last" >> "$(dirname "$0")/gh.log"; echo >> "$(dirname "$0")/gh.log" ;; esac; echo '{}' ;;
   "pr review"|"pr comment") echo ok ;;
   "pr create") echo "https://example.invalid/pr/8" ;;
@@ -1031,10 +1032,27 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     settle(&ws, cx);
     assert!(log().contains("updateIssueComment") && log().contains("id=IC_2"), "{}", log());
 
-    // Close pull request, beside Comment.
+    // Merge: the arrow offers the ways the repository allows; Squash and merge asks for the
+    // commit's message, as GitHub suggests it.
     let page = at(cx, "pr-conversation");
     cx.simulate_event(gpui::ScrollEvent { position: page, delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-5000.))), ..Default::default() });
     cx.run_until_parked();
+    click(cx, "pr-merge-choose");
+    let _ = at(cx, "pr-merge-how-merge");
+    assert!(cx.debug_bounds("pr-merge-how-rebase").is_none(), "not allowed here");
+    click(cx, "pr-merge-how-squash");
+    click(cx, "pr-merge");
+    let _ = at(cx, "pr-merge-subject");
+    click(cx, "pr-merge-cancel");
+    assert!(pr.read_with(cx, |p, _| !p.merging && p.merge_how == "squash"));
+    click(cx, "pr-merge");
+    click(cx, "pr-merge-confirm");
+    settle(&ws, cx);
+    assert!(log().contains("pr merge 7 --squash --subject Login page (#7) --body * Login page"), "{}", log());
+    cx.simulate_event(gpui::ScrollEvent { position: page, delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-5000.))), ..Default::default() });
+    cx.run_until_parked();
+
+    // Close pull request, beside Comment.
     click(cx, "pr-close");
     settle(&ws, cx);
     assert!(log().contains("pr close 7"), "{}", log());

@@ -129,6 +129,14 @@ pub struct PrView {
     edit_preview: Entity<MdPreview>,
     /// Resolved threads opened to read (by thread id).
     open_threads: HashSet<String>,
+    /// How Merge merges (merge, squash or rebase), the ways the repository allows, the choice
+    /// open, and the confirm form (its commit message) shown.
+    pub merge_how: &'static str,
+    merge_methods: Vec<&'static str>,
+    merge_menu: bool,
+    pub merging: bool,
+    merge_subject: Entity<Editor>,
+    merge_body: Entity<Editor>,
     _load: Option<Task<()>>,
     _commit_load: Option<Task<()>>,
     _act: Option<Task<()>>,
@@ -158,6 +166,9 @@ impl PrView {
         let comment_input = editor("Add your comment here… (Markdown)", false, cx);
         let filter = editor("Filter files", true, cx);
         let edit_input = editor("Leave a comment (Markdown)", false, cx);
+        let merge_subject = editor("Commit message", true, cx);
+        let merge_body = editor("Extended description", false, cx);
+        merge_body.update(cx, |e, _| e.fill_height = true);
         let root = repo.read(cx).root.clone();
         let edit_preview = {
             let (c, r) = (edit_input.clone(), root.clone());
@@ -233,6 +244,12 @@ impl PrView {
             edit_input,
             edit_preview,
             open_threads: HashSet::new(),
+            merge_how: "merge",
+            merge_methods: vec!["merge", "squash", "rebase"],
+            merge_menu: false,
+            merging: false,
+            merge_subject,
+            merge_body,
             _load: None,
             _commit_load: None,
             _act: None,
@@ -241,11 +258,15 @@ impl PrView {
             _subs: subs,
         };
         v.read_pending(root.clone(), cx);
-        let who = cx.background_executor().spawn(async move { gh::viewer(&root) });
+        let who = cx.background_executor().spawn(async move { (gh::viewer(&root), gh::merge_methods(&root)) });
         cx.spawn(async move |v, cx| {
-            let who = who.await;
+            let (who, methods) = who.await;
             v.update(cx, |v, cx| {
                 v.viewer = who;
+                if !methods.contains(&v.merge_how) {
+                    v.merge_how = methods[0];
+                }
+                v.merge_methods = methods;
                 v.refresh_notes(cx);
             })
             .ok();
@@ -993,21 +1014,199 @@ impl PrView {
         cx.notify();
     }
 
-    fn ask_merge(&mut self, cx: &mut Context<Self>) {
-        let me = cx.entity().downgrade();
-        let n = self.number;
-        cx.emit(Request::Ask(crate::dialog::Ask {
-            title: format!("Merge pull request #{n}?"),
-            detail: "On GitHub, into its base branch.".into(),
-            buttons: vec!["Merge".into(), "Squash and Merge".into(), "Rebase and Merge".into()],
-            danger: false,
-            cancel_default: false,
-            cancel_label: None,
-            on_answer: Rc::new(move |ix, _, cx| {
-                let how = ["merge", "squash", "rebase"][ix.min(2)];
-                me.update(cx, |v, cx| v.act("Merge", move |root| gh::merge(root, n, how), |v, cx| v.load(cx), cx)).ok();
-            }),
-        }));
+    /// The merge button: its confirm form, with the commit message GitHub would suggest.
+    pub fn start_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(Ok((d, _))) = &self.detail else { return };
+        let (subject, body) = match self.merge_how {
+            "squash" => (
+                format!("{} (#{})", d.title, d.number),
+                d.commits
+                    .iter()
+                    .map(|c| if c.message_body.trim().is_empty() { format!("* {}", c.message_headline) } else { format!("* {}\n\n{}", c.message_headline, c.message_body.trim()) })
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            ),
+            _ => (format!("Merge pull request #{} from {}/{}", d.number, d.head_repository_owner.login, d.head_ref_name), d.title.clone()),
+        };
+        self.merge_subject.update(cx, |e, cx| e.set_text(&subject, cx));
+        self.merge_body.update(cx, |e, cx| e.set_text(&body, cx));
+        self.merging = true;
+        self.merge_menu = false;
+        cx.notify();
+    }
+
+    pub fn confirm_merge(&mut self, cx: &mut Context<Self>) {
+        let (n, how) = (self.number, self.merge_how);
+        let (subject, body) = (self.merge_subject.read(cx).text(), self.merge_body.read(cx).text());
+        if how != "rebase" && subject.trim().is_empty() {
+            return cx.emit(Request::Error("Give the commit a message first".into()));
+        }
+        self.act(
+            "Merge",
+            move |root| gh::merge(root, n, how, subject.trim(), &body),
+            |v, cx| {
+                v.merging = false;
+                v.load(cx);
+            },
+            cx,
+        );
+    }
+
+    /// GitHub's merge: the chosen way as one button, the arrow beside it for the others; then
+    /// its confirm form (the commit's message, or for a rebase only Confirm).
+    fn render_merge_action(&self, d: &PrDetail, can: bool, cx: &mut Context<Self>) -> AnyElement {
+        let label = |how: &str| match how {
+            "squash" => "Squash and merge",
+            "rebase" => "Rebase and merge",
+            _ => "Merge pull request",
+        };
+        let n = d.commits.len();
+        let commits = if n == 1 { "The 1 commit".to_string() } else { format!("The {n} commits") };
+        if self.merging {
+            let how = self.merge_how;
+            let confirm = match how {
+                "squash" => "Confirm squash and merge",
+                "rebase" => "Confirm rebase and merge",
+                _ => "Confirm merge",
+            };
+            let field = |label: &'static str, sel: &'static str, child: AnyElement, h: Option<f32>| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(div().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(label))
+                    .child(div().debug_selector(move || sel.into()).when_some(h, |d, h| d.h(px(h))).p(px(6.)).rounded(px(5.)).bg(theme::bg_input()).border_1().border_color(theme::border_input()).overflow_hidden().child(child))
+            };
+            return div()
+                .id("pr-merge-form")
+                .debug_selector(|| "pr-merge-form".into())
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .px(px(14.))
+                .py(px(12.))
+                .when(how == "rebase", |el| el.child(div().text_color(theme::fg_dim()).child(format!("This will rebase your changes and merge them into {}.", d.base_ref_name))))
+                .when(how != "rebase", |el| {
+                    el.child(field("Commit message", "pr-merge-subject", self.merge_subject.clone().into_any_element(), None))
+                        .child(field("Extended description", "pr-merge-body", self.merge_body.clone().into_any_element(), Some(150.)))
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(action_button("pr-merge-confirm", confirm, Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.confirm_merge(cx))))
+                        .child(action_button("pr-merge-cancel", "Cancel", None).on_click(cx.listener(|v, _, _, cx| {
+                            v.merging = false;
+                            cx.notify();
+                        })))
+                        .children(self.busy.clone().map(|b| div().text_color(theme::fg_muted()).child(format!("{b}…")))),
+                )
+                .into_any_element();
+        }
+        let how = self.merge_how;
+        let color = theme::git_added();
+        let fg = if can { theme::on(color) } else { theme::fg_muted() };
+        let bg = if can { color } else { theme::hover() };
+        let menu = self.merge_menu.then(|| {
+            let options = self.merge_methods.iter().map(|&m| {
+                let (title, sub) = match m {
+                    "squash" => ("Squash and merge", format!("{commits} from this branch will be combined into one commit in the base branch.")),
+                    "rebase" => ("Rebase and merge", format!("{commits} from this branch will be rebased and added to the base branch.")),
+                    _ => ("Create a merge commit", "All commits from this branch will be added to the base branch via a merge commit.".to_string()),
+                };
+                let sel = format!("pr-merge-how-{m}");
+                div()
+                    .id(SharedString::from(sel.clone()))
+                    .debug_selector(move || sel)
+                    .flex()
+                    .items_start()
+                    .gap(px(8.))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .on_click(cx.listener(move |v, _, _, cx| {
+                        v.merge_how = m;
+                        v.merge_menu = false;
+                        cx.notify();
+                    }))
+                    .child(div().flex_none().w(px(14.)).text_color(theme::fg_bright()).child(if m == how { "✓" } else { "" }))
+                    .child(div().flex().flex_col().gap(px(2.)).child(div().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(title)).child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(sub)))
+            });
+            deferred(
+                anchored().snap_to_window().child(
+                    div()
+                        .id("pr-merge-menu")
+                        .debug_selector(|| "pr-merge-menu".into())
+                        .occlude()
+                        .mt(px(4.))
+                        .w(px(360.))
+                        .flex()
+                        .flex_col()
+                        .py(px(4.))
+                        .rounded(px(8.))
+                        .bg(theme::bg_popup())
+                        .border_1()
+                        .border_color(theme::border_input())
+                        .shadow_lg()
+                        .text_size(px(12.))
+                        .on_mouse_down_out(cx.listener(|v, _, _, cx| {
+                            v.merge_menu = false;
+                            cx.notify();
+                        }))
+                        .children(options),
+                ),
+            )
+            .with_priority(2)
+        });
+        div()
+            .flex()
+            .flex_col()
+            .px(px(14.))
+            .py(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .w_auto()
+                    .h(px(28.))
+                    .rounded(px(5.))
+                    .overflow_hidden()
+                    .bg(bg)
+                    .text_color(fg)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(
+                        div()
+                            .id("pr-merge")
+                            .debug_selector(|| "pr-merge".into())
+                            .flex()
+                            .items_center()
+                            .px(px(14.))
+                            .when(can, |d| d.cursor_pointer().hover(|s| s.opacity(0.9)).on_click(cx.listener(|v, _, _, cx| v.start_merge(cx))))
+                            .child(label(how)),
+                    )
+                    .child(div().w(px(1.)).h_full().bg(theme::bg_editor().opacity(0.4)))
+                    .child(
+                        div()
+                            .id("pr-merge-choose")
+                            .debug_selector(|| "pr-merge-choose".into())
+                            .flex()
+                            .items_center()
+                            .px(px(8.))
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.9))
+                            .tooltip(ui::tooltip("Choose how it merges"))
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.merge_menu = !v.merge_menu;
+                                cx.notify();
+                            }))
+                            .child(ui::small_icon("chevron-down", fg)),
+                    ),
+            )
+            .children(menu)
+            .into_any_element()
     }
 
     /// One row: state, title, the size; Check out, GitHub.
@@ -1298,14 +1497,7 @@ impl PrView {
                 }
             };
             let can = !(d.is_draft || d.mergeable == "CONFLICTING" || d.merge_state_status == "DIRTY");
-            card = card.child(section(text(icon), title.into(), sub.into(), color).id("pr-merge-state").debug_selector(|| "pr-merge-state".into())).child(
-                div().flex().items_center().gap(px(8.)).px(px(14.)).py(px(10.)).child(
-                    action_button("pr-merge", "Merge pull request…", can.then(theme::git_added))
-                        .when(!can, |b| b.opacity(0.6))
-                        .tooltip(ui::tooltip("Merge on GitHub, into its base branch"))
-                        .on_click(cx.listener(|v, _, _, cx| v.ask_merge(cx))),
-                ),
-            );
+            card = card.child(section(text(icon), title.into(), sub.into(), color).id("pr-merge-state").debug_selector(|| "pr-merge-state".into())).child(self.render_merge_action(d, can, cx));
         } else {
             let (title, sub, color) = if d.state == "MERGED" {
                 ("Pull request successfully merged and closed", format!("{} is in {}.", d.head_ref_name, d.base_ref_name), theme::c(0xc678dd))
