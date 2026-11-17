@@ -108,7 +108,7 @@ pub fn open_window_with(root: PathBuf, file: Option<PathBuf>, cx: &mut App) {
         titlebar: Some(TitlebarOptions {
             title: Some("OSKL Code".into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(12.), px(11.))),
+            traffic_light_position: Some(point(px(12.), px(9.))),
         }),
         window_min_size: Some(size(px(600.), px(400.))),
         focus: true,

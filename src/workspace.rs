@@ -313,6 +313,22 @@ impl Layout {
         }
     }
 
+    /// Which sides of pane `id` lie on the edge of the whole area (top, right, bottom, left),
+    /// splits laid out as drawn (`stack`: side-by-side splits stacked in a narrow window).
+    fn outer_sides(&self, id: usize, stack: bool) -> Option<[bool; 4]> {
+        fn walk(l: &Layout, id: usize, stack: bool, out: [bool; 4]) -> Option<[bool; 4]> {
+            match l {
+                Layout::Pane(p) => (*p == id).then_some(out),
+                Layout::Split { vertical, a, b, .. } => {
+                    let [t, r, bt, lf] = out;
+                    let (oa, ob) = if *vertical && !stack { ([t, false, bt, lf], [t, r, bt, false]) } else { ([t, r, false, lf], [false, r, bt, lf]) };
+                    walk(a, id, stack, oa).or_else(|| walk(b, id, stack, ob))
+                }
+            }
+        }
+        walk(self, id, stack, [true; 4])
+    }
+
     /// Removes a pane; its sibling takes the parent's place.
     fn remove_pane(&mut self, id: usize) -> bool {
         let Layout::Split { a, b, .. } = self else { return false };
@@ -1236,6 +1252,7 @@ impl Workspace {
             }
             Request::OpenGitTab(root) => self.open_git_tab(root.clone(), window, cx),
             Request::OpenPr(root, n) => self.open_pr_tab(root.clone(), *n, window, cx),
+            Request::NewPr => self.open_new_pr(window, cx),
             Request::OpenMergeEditor(path) => self.open_merge_editor(path.clone(), window, cx),
             Request::FileHistory(path) => {
                 let root = self.repo_for(path, cx).read(cx).root.clone();
@@ -2894,7 +2911,7 @@ impl Workspace {
 
     fn open_compare(&mut self, base: String, other: String, window: &mut Window, cx: &mut Context<Self>) {
         let key = crate::commit_view::compare_key(&base, &other);
-        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Commit(c) if c.read(cx).sha == key)) {
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Commit(c) if c.read(cx).sha == key && c.read(cx).create.is_none())) {
             return self.activate(ix, window, cx);
         }
         let root = self.git_root(cx);
@@ -2907,6 +2924,37 @@ impl Workspace {
             }
             ws.handle_request(req, window, cx)
         });
+        self.add_tab(TabKind::Commit(view), sub, false, window, cx);
+    }
+
+    /// The form for a pull request from the current branch into the default one (its tab if
+    /// open); once opened, the pull request's review takes its place.
+    fn open_new_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Commit(c) if c.read(cx).create.is_some())) {
+            return self.activate(ix, window, cx);
+        }
+        let root = self.git_root(cx);
+        let head = self.git.read(cx).status.branch.clone().unwrap_or_default();
+        if head.is_empty() {
+            return self.flash("Check out a branch first: a pull request comes from a branch".into(), true, cx);
+        }
+        let base = git::gh::default_branch(&root);
+        if base == head {
+            return self.flash(format!("You're on {head}: switch to the branch you want to propose, then open a pull request"), true, cx);
+        }
+        let view = cx.new(|cx| CommitView::new_pr(root.clone(), base, head, cx));
+        let sub = Subscription::join(
+            cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
+            cx.subscribe_in(&view, window, move |ws, view, ev: &crate::commit_view::PrCreated, window, cx| {
+                if let Some(ix) = ws.tabs.iter().position(|t| matches!(&t.kind, TabKind::Commit(c) if c == view)) {
+                    ws.close_tab(ix, true, window, cx);
+                }
+                ws.flash(format!("Opened pull request #{}", ev.0), false, cx);
+                ws.pr_panel.update(cx, |p, cx| p.reload(cx));
+                ws.git_panel.update(cx, |p, cx| p.refs.update(cx, |r, cx| r.load_prs(cx)));
+                ws.open_pr_tab(root.clone(), ev.0, window, cx);
+            }),
+        );
         self.add_tab(TabKind::Commit(view), sub, false, window, cx);
     }
 
@@ -4995,8 +5043,6 @@ impl Workspace {
             .when(!right && self.lights_pad > 0., |d| d.relative().child(div().absolute().right_0().top(px(24.) + gpui::px(2. + NOTCH_R)).bottom_0().w(gpui::px(1.)).bg(theme::border())))
             .when(right, |d| d.border_l_1())
             .border_color(theme::border())
-            .child(tool("act-go-to-file", "go-to-file", "Go to File (⌘P)", 19.).on_click(cx.listener(|ws, _, w, cx| ws.find_file(&FindFile, w, cx))))
-            .child(div().mx(px(10.)).my(px(2.)).h(px(1.)).bg(theme::border()))
             .child(item("act-files", "files", Side::Files, "Explorer (⇧⌘E)", self, cx))
             .child(item("act-search", "search", Side::Search, "Search (⇧⌘F)", self, cx))
             .child(item("act-git", "git", Side::Git, "Source Control (⌃⇧G)", self, cx).when(changes > 0, |d| {
@@ -5755,19 +5801,32 @@ impl Workspace {
             .left_0()
             .size_full()
         });
+        // Against the window's edges (the sidebar, title bar, status bar) the card has no gap,
+        // outline or rounding: their own line is the edge. Between splits it keeps all three.
+        // With the window buttons over it, the outline is drawn (over it) instead.
+        let [ot, or, ob, ol] = if notch.is_some() { [false; 4] } else { self.layout.outer_sides(id, self.shell.stack).unwrap_or([false; 4]) };
+        let gap = |outer: bool| if outer { px(0.) } else { px(2.) };
+        let round = |a: bool, b: bool| if a || b { px(0.) } else { px(6.) };
         div()
             .relative()
             .size_full()
-            .p(px(2.))
+            .pt(gap(ot))
+            .pr(gap(or))
+            .pb(gap(ob))
+            .pl(gap(ol))
             .child(
                 div()
                     .relative()
                     .size_full()
                     .flex()
                     .flex_col()
-                    .rounded(px(6.))
-                    // With the buttons over it, the outline is drawn (over it) instead.
-                    .when(notch.is_none(), |d| d.border_1())
+                    .rounded_tl(round(ot, ol))
+                    .rounded_tr(round(ot, or))
+                    .rounded_br(round(ob, or))
+                    .rounded_bl(round(ob, ol))
+                    .when(notch.is_none(), |d| {
+                        d.when(!ot, |d| d.border_t_1()).when(!or, |d| d.border_r_1()).when(!ob, |d| d.border_b_1()).when(!ol, |d| d.border_l_1())
+                    })
                     .border_color(frame)
                     .bg(theme::bg_editor())
                     .overflow_hidden()
@@ -6983,6 +7042,20 @@ mod ui_tests {
         String::from_utf8_lossy(&std::process::Command::new("git").args(args).current_dir(dir).output().unwrap().stdout).trim().to_string()
     }
 
+    #[test]
+    fn panes_know_which_sides_meet_the_window() {
+        use super::Layout;
+        let l = Layout::Split { vertical: true, ratio: 0.5, a: Box::new(Layout::Pane(1)), b: Box::new(Layout::Split { vertical: false, ratio: 0.5, a: Box::new(Layout::Pane(2)), b: Box::new(Layout::Pane(3)) }) };
+        // top, right, bottom, left
+        assert_eq!(l.outer_sides(1, false), Some([true, false, true, true]));
+        assert_eq!(l.outer_sides(2, false), Some([true, true, false, false]));
+        assert_eq!(l.outer_sides(3, false), Some([false, true, true, false]));
+        // Stacked in a narrow window, side by side becomes one above the other.
+        assert_eq!(l.outer_sides(1, true), Some([true, true, false, true]));
+        assert_eq!(Layout::Pane(4).outer_sides(4, false), Some([true; 4]));
+        assert_eq!(l.outer_sides(9, false), None);
+    }
+
     #[gpui::test]
     fn pictures_and_documents_in_commits_open_as_previews(cx: &mut TestAppContext) {
         let (ws, cx) = setup_with(cx, |dir| {
@@ -7478,6 +7551,36 @@ mod ui_tests {
         assert!(panel_focused(cx), "switching files keeps it there too");
         click(cx, "change-row-b.txt", 2);
         assert!(!panel_focused(cx), "double-click goes into the diff");
+    }
+
+    #[gpui::test]
+    fn a_long_commit_message_stays_inside_its_hover_card(cx: &mut TestAppContext) {
+        let (ws, cx) = setup_with(cx, |dir| {
+            let sh = |cmd: &str| {
+                std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output().unwrap();
+            };
+            sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false");
+            let long = "word ".repeat(40);
+            sh(&format!("echo a > a.txt && git add . && git commit -qm 'A subject long enough to need more than one line in the card, {long}' -m 'And a body: {long}'"));
+        });
+        ws.update_in(cx, |ws, window, cx| ws.select_side(super::Side::Git, window, cx));
+        cx.run_until_parked();
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        let row: &'static str = Box::leak(format!("commit-row-{}", git_out(&root, &["rev-parse", "--short", "HEAD"])).into_boxed_str());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let at = cx.debug_bounds(row).expect("the commit's row").center();
+        cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+        cx.executor().advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let card = cx.debug_bounds("commit-card").expect("the hover card");
+        for part in ["commit-card-subject", "commit-card-body"] {
+            let b = cx.debug_bounds(part).expect(part);
+            assert!(b.right() <= card.right() && b.bottom() <= card.bottom(), "{part} {b:?} inside {card:?}");
+        }
+        assert!(cx.debug_bounds("commit-card-body").unwrap().size.height > gpui::px(30.), "the body wraps onto lines of its own");
     }
 
     #[gpui::test]

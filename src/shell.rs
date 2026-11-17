@@ -5,7 +5,7 @@
 use super::*;
 
 /// The title bar's height, a little past the window buttons.
-pub(super) const TITLE_H: f32 = 34.;
+pub(super) const TITLE_H: f32 = 30.;
 /// Below this width (interface pixels) the sidebar lies over the editor instead of beside it.
 const OVERLAY_W: f32 = 860.;
 /// Below this width side-by-side splits stack.
@@ -268,7 +268,7 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .h(px(26.))
+                        .h(px(24.))
                         .px(px(8.))
                         .min_w_0()
                         .rounded(px(6.))
@@ -301,7 +301,7 @@ impl Workspace {
                             .w_full()
                             .max_w(px(440.))
                             .min_w_0()
-                            .h(px(26.))
+                            .h(px(24.))
                             .px(px(8.))
                             .rounded(px(7.))
                             .border_1()

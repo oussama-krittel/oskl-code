@@ -282,6 +282,7 @@ impl GitPanel {
         let commit_input = cx.new(|cx| {
             let mut ed = Editor::new(EditorMode::MultiLine, cx);
             ed.font_size = 12.;
+            ed.wrap = true;
             ed
         });
         let repo_sub = Self::observe_repo(&repo, cx);
@@ -1585,12 +1586,17 @@ impl GitPanel {
                             .bg(theme::bg_input())
                             .border_1()
                             .border_color(if input_focused { theme::focus_border() } else { theme::border_input() })
-                            .child(self.commit_input.clone()),
+                            // Draft sits inside the box, top right, beside the message.
+                            .debug_selector(|| "commit-box".into())
+                            .flex()
+                            .items_start()
+                            .gap(px(4.))
+                            .child(div().flex_1().min_w_0().debug_selector(|| "commit-text".into()).child(self.commit_input.clone()))
+                            .child(git::draft::icon("commit-draft", self.drafter.running()).on_click(cx.listener(|panel, _, _, cx| {
+                                let root = panel.repo.read(cx).root.clone();
+                                panel.drafter.toggle(root, &panel.commit_input, cx);
+                            }))),
                     )
-                    .child(div().flex().justify_end().child(git::draft::button("commit-draft", self.drafter.running()).on_click(cx.listener(|panel, _, _, cx| {
-                        let root = panel.repo.read(cx).root.clone();
-                        panel.drafter.toggle(root, &panel.commit_input, cx);
-                    }))))
                     .child(
                         div()
                             .flex()
@@ -1651,7 +1657,31 @@ impl GitPanel {
                         .text_color(theme::fg_dim())
                         .child(ui::icon("check", theme::accent()).size(px(22.)))
                         .child(div().text_size(px(14.)).text_color(theme::fg_bright()).child("Nothing to commit"))
-                        .child(format!("The working tree is clean on {branch}. Changes you make show up here.")),
+                        .child(format!("The working tree is clean on {branch}. Changes you make show up here."))
+                        // A branch of its own, its work committed: next is proposing it.
+                        .when(!["main", "master", "develop", "trunk"].contains(&branch.as_str()), |d| {
+                            d.child(
+                                div()
+                                    .id("git-new-pr")
+                                    .debug_selector(|| "git-new-pr".into())
+                                    .mt(px(8.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap(px(6.))
+                                    .h(px(26.))
+                                    .px(px(12.))
+                                    .rounded(px(2.))
+                                    .bg(theme::accent())
+                                    .text_color(theme::on(theme::accent()))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::accent_hover()))
+                                    .tooltip(ui::tooltip_text(format!("Propose {branch}: push it and open a pull request")))
+                                    .on_click(cx.listener(|_, _, _, cx| cx.emit(Request::NewPr)))
+                                    .child(ui::small_icon("pull-request", theme::on(theme::accent())))
+                                    .child("Create Pull Request"),
+                            )
+                        }),
                 )
             })
             .when(!clean, |d| d.children(rows.iter().enumerate().map(|(ix, row)| self.render_list_row(row, ix, focused, cx))))
@@ -1918,11 +1948,16 @@ struct CommitCard {
 
 impl Render for CommitCard {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // A set width (from the longest line, up to 420): with only a maximum, the height is
+        // measured for the text on one line and the wrapped lines run out below the card.
+        let longest = self.subject.chars().count().max(self.body.lines().map(|l| l.chars().count()).max().unwrap_or(0)).max(self.author.chars().count() + self.when.chars().count() + 12);
+        let width = (longest as f32 * 7. + 24.).clamp(200., 420.);
         div()
+            .debug_selector(|| "commit-card".into())
             .flex()
             .flex_col()
             .gap(px(6.))
-            .max_w(px(420.))
+            .w(px(width))
             .px(px(10.))
             .py(px(8.))
             .bg(theme::bg_popup())
@@ -1942,8 +1977,8 @@ impl Render for CommitCard {
                     .child(self.when.clone())
                     .child(div().font_family(theme::MONO_FONT).child(self.short.clone())),
             )
-            .child(div().text_color(theme::fg_bright()).child(self.subject.clone()))
-            .when(!self.body.is_empty(), |d| d.child(div().text_color(theme::fg_dim()).child(self.body.clone())))
+            .child(div().w_full().text_color(theme::fg_bright()).debug_selector(|| "commit-card-subject".into()).child(self.subject.clone()))
+            .when(!self.body.is_empty(), |d| d.child(div().w_full().text_color(theme::fg_dim()).debug_selector(|| "commit-card-body".into()).child(self.body.clone())))
             .with_animation("commit-card", Animation::new(std::time::Duration::from_millis(120)).with_easing(ease_out_quint()), |d, t| d.opacity(t))
     }
 }
@@ -2020,7 +2055,7 @@ impl Render for GitPanel {
                             })),
                     )
                     .child(
-                        ui::icon_button("graph-scope", "filter")
+                        ui::icon_button("graph-scope", "filter").debug_selector(|| "graph-scope".into())
                             .tooltip(ui::tooltip("Choose branches shown in the graph"))
                             .when(graph_all || !graph_only_empty, |b| b.bg(theme::selected()))
                             .on_click(cx.listener(|p, _, _, cx| {

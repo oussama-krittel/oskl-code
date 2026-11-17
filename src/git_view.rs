@@ -99,6 +99,7 @@ impl GitView {
             let mut ed = Editor::new(EditorMode::MultiLine, cx);
             ed.font_size = 12.;
             ed.placeholder = "Message (⌘Enter to commit)".into();
+            ed.wrap = true;
             ed
         });
         let subs = vec![

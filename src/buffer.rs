@@ -130,6 +130,15 @@ impl Buffer {
         self.version
     }
 
+    /// New text in place of this buffer's, unmodified, its version moving on from this one so
+    /// what was worked out from the old text (wrapping, colours) isn't taken for the new.
+    pub fn replaced(&self, text: &str) -> Self {
+        let mut b = Self::new(text);
+        b.version = self.version + 1;
+        b.saved_version = b.version;
+        b
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.version != self.saved_version
     }

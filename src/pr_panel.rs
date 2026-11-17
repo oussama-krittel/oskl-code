@@ -24,7 +24,10 @@ pub struct PrPanel {
     root: Option<PathBuf>,
     /// One of `STATES`' keys.
     pub state: &'static str,
-    prs: Option<Result<Vec<gh::Pr>, String>>,
+    /// Each state's list as last read (switching back shows it at once while it's read again).
+    lists: std::collections::HashMap<&'static str, Result<Vec<gh::Pr>, String>>,
+    /// The state being read with gh.
+    loading: Option<&'static str>,
     selected: Option<u64>,
     _load: Option<Task<()>>,
     /// The review tab in front: its files are the tree.
@@ -59,7 +62,8 @@ impl PrPanel {
             focus: cx.focus_handle(),
             root: None,
             state: "open",
-            prs: None,
+            lists: Default::default(),
+            loading: None,
             selected: None,
             _load: None,
             pr: None,
@@ -81,6 +85,7 @@ impl PrPanel {
         if self.root.as_ref() != Some(&root) {
             self.root = Some(root);
             self.selected = None;
+            self.lists.clear();
             self.reload(cx);
         }
     }
@@ -104,12 +109,13 @@ impl PrPanel {
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
         let state = self.state;
-        self.prs = None;
+        self.loading = Some(state);
         let task = cx.background_executor().spawn(async move { gh::list(&root, state).map_err(|e| e.to_string()) });
         self._load = Some(cx.spawn(async move |p, cx| {
             let prs = task.await;
             p.update(cx, |p, cx| {
-                p.prs = Some(prs);
+                p.lists.insert(state, prs);
+                p.loading = None;
                 cx.notify();
             })
             .ok();
@@ -204,10 +210,19 @@ impl PrPanel {
                 .child(label)
         };
         let name = STATES.iter().find(|(k, _)| *k == self.state).map_or("", |s| s.1).to_lowercase();
-        let count = self.prs.as_ref().and_then(|p| p.as_ref().ok()).map(|p| p.len());
-        let body: AnyElement = match &self.prs {
+        let shown = self.lists.get(self.state);
+        let loading = self.loading.is_some();
+        let count = shown.and_then(|p| p.as_ref().ok()).map(|p| p.len());
+        let body: AnyElement = match shown {
             _ if self.root.is_none() => ui::empty_state("pull-request", "No repository", "Open a folder with a GitHub repository.").into_any_element(),
-            None => ui::empty_state("refresh", "Reading them with gh…", "").into_any_element(),
+            None => div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .debug_selector(|| "pr-loading".into())
+                .child(spinner("pr-loading-spin", 20.))
+                .into_any_element(),
             Some(Err(e)) if e.contains("No such file") || e.contains("not found") => {
                 ui::empty_state("pull-request", "GitHub CLI not found", "Install it (brew install gh), then sign in with gh auth login.").into_any_element()
             }
@@ -251,7 +266,9 @@ impl PrPanel {
                             cx.notify();
                         })))
                     })
-                    .child(ui::icon_button("pr-refresh", "refresh").debug_selector(|| "pr-refresh".into()).tooltip(ui::tooltip("Read them again")).on_click(cx.listener(|p, _, _, cx| p.reload(cx)))),
+                    .child(ui::icon_button("pr-new", "plus").debug_selector(|| "pr-new".into()).tooltip(ui::tooltip("Open a pull request from the current branch")).on_click(cx.listener(|_, _, _, cx| cx.emit(Request::NewPr))))
+                    .when(loading, |d| d.child(div().size(px(22.)).flex().flex_none().items_center().justify_center().debug_selector(|| "pr-refreshing".into()).child(spinner("pr-refresh-spin", 14.))))
+                    .when(!loading, |d| d.child(ui::icon_button("pr-refresh", "refresh").debug_selector(|| "pr-refresh".into()).tooltip(ui::tooltip("Read them again")).on_click(cx.listener(|p, _, _, cx| p.reload(cx))))),
             )
             .child(
                 div()
@@ -456,4 +473,11 @@ mod tests {
         assert_eq!(updated_at("2026-11-14T10:00:00Z"), Some(1_794_650_400));
         assert_eq!(updated_at("soon"), None);
     }
+}
+
+/// A turning arrow while something is read.
+fn spinner(id: &'static str, size: f32) -> impl IntoElement {
+    ui::icon("refresh", theme::fg_muted())
+        .size(px(size))
+        .with_animation(id, Animation::new(std::time::Duration::from_millis(900)).repeat(), |icon, t| icon.with_transformation(Transformation::rotate(percentage(t))))
 }
