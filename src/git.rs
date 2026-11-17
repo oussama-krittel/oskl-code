@@ -516,7 +516,21 @@ pub fn log(root: &Path, limit: usize, all: bool, only: &[String]) -> Result<Vec<
     }
     args.push("--".into());
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    Ok(parse_log(&run(root, &arg_refs)?, &remotes))
+    let mut commits = parse_log(&run(root, &arg_refs)?, &remotes);
+    if !only.is_empty() {
+        // Branches picked: only theirs are labelled (and a picked branch's remote twin, its
+        // cloud), not every other branch that happens to point at a shared commit. Tags stay:
+        // they're on the picked history.
+        let picked = |r: &Ref| match r.kind {
+            RefKind::Tag => true,
+            RefKind::Local => only.contains(&r.name),
+            RefKind::Remote => only.contains(&r.name) || r.name.split_once('/').is_some_and(|(_, n)| only.iter().any(|o| o == n)),
+        };
+        for c in &mut commits {
+            c.refs.retain(picked);
+        }
+    }
+    Ok(commits)
 }
 
 fn parse_log(out: &str, remotes: &[String]) -> Vec<Commit> {
