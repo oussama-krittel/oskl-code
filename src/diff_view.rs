@@ -115,14 +115,16 @@ pub struct DiffView {
     pub annotate: Option<Annotate>,
     /// Lines picked for a comment, tinted: (new side, first, last), 1-based.
     pub marked: Option<(bool, usize, usize)>,
+    /// A press on a line's +, being dragged over more lines: (new side, the line pressed).
+    comment_drag: Option<(bool, usize)>,
     _tasks: Vec<Task<()>>,
 }
 
 pub type Annotate = std::rc::Rc<dyn Fn(Option<usize>, Option<usize>, &mut Window, &mut App) -> Option<AnyElement>>;
 
 /// The + on a line's number was clicked: (new side, 1-based line, with shift: to the lines
-/// already picked).
-pub struct CommentOn(pub bool, pub usize, pub bool);
+/// already picked, dragged from: the first of the lines picked).
+pub struct CommentOn(pub bool, pub usize, pub bool, pub Option<usize>);
 
 impl EventEmitter<Request> for DiffView {}
 impl EventEmitter<CommentOn> for DiffView {}
@@ -157,6 +159,7 @@ impl DiffView {
             commentable: false,
             annotate: None,
             marked: None,
+            comment_drag: None,
             _tasks: Vec::new(),
         };
         view.reload(cx);
@@ -816,6 +819,19 @@ impl DiffView {
         }
         // Picked for a comment: tinted like GitHub's.
         let cell_new = !left || (self.show_inline() && row.r.is_some());
+        if let Some(i) = line.filter(|_| self.comment_drag.is_some_and(|(s, _)| s == cell_new)) {
+            side = side.on_mouse_move(cx.listener(move |view, ev: &MouseMoveEvent, _, cx| {
+                if let Some((s, a)) = view.comment_drag
+                    && ev.dragging()
+                {
+                    let picked = Some((s, a.min(i + 1), a.max(i + 1)));
+                    if view.marked != picked {
+                        view.marked = picked;
+                        cx.notify();
+                    }
+                }
+            }));
+        }
         if let (Some((new_side, a, b)), Some(i)) = (self.marked, line)
             && new_side == cell_new
             && (a..=b).contains(&(i + 1))
@@ -880,10 +896,15 @@ impl DiffView {
                 .opacity(0.)
                 .group_hover("diff-row", |s| s.opacity(1.))
                 .tooltip(ui::tooltip("Comment on this line"))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |_, ev: &ClickEvent, _, cx| {
+                // Press, then drag over more lines to pick them all (Shift-click adds to a box open).
+                .on_mouse_down(MouseButton::Left, cx.listener(move |view, ev: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    cx.emit(CommentOn(new_side, i + 1, ev.modifiers().shift));
+                    if ev.modifiers.shift {
+                        return cx.emit(CommentOn(new_side, i + 1, true, None));
+                    }
+                    view.comment_drag = Some((new_side, i + 1));
+                    view.marked = Some((new_side, i + 1, i + 1));
+                    cx.notify();
                 }))
                 .child("+")
         });
@@ -1064,7 +1085,17 @@ impl Render for DiffView {
                     cx.notify();
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, _| view.dragging_split = false))
+            .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, cx| {
+                view.dragging_split = false;
+                // The + let go: comment on the lines dragged over.
+                if let Some((s, a)) = view.comment_drag.take() {
+                    let (lo, hi) = match view.marked {
+                        Some((ms, lo, hi)) if ms == s => (lo, hi),
+                        _ => (a, a),
+                    };
+                    cx.emit(CommentOn(s, hi, false, Some(lo)));
+                }
+            }))
             .on_scroll(cx.listener(|view, ev: &ScrollEvent, _, cx| {
                 let d = ev.delta.pixel_delta(px(view.row_h()));
                 let dx = d.x / px(1.);

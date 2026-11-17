@@ -181,8 +181,11 @@ impl PrPanel {
                 .flex()
                 .items_center()
                 .justify_center()
+                .flex_col()
+                .gap(px(10.))
                 .debug_selector(|| "pr-loading".into())
-                .child(spinner("pr-loading-spin", 20.))
+                .child(fetching("pr-loading", false))
+                .child(div().text_color(theme::fg_muted()).child("Fetching pull requests from GitHub…"))
                 .into_any_element(),
             Some(Err(e)) if e.contains("No such file") || e.contains("not found") => {
                 ui::empty_state("pull-request", "GitHub CLI not found", "Install it (brew install gh), then sign in with gh auth login.").into_any_element()
@@ -221,9 +224,10 @@ impl PrPanel {
                     .when_some(count.filter(|c| *c > 0), |d, c| d.child(div().text_color(theme::fg_muted()).font_weight(FontWeight::NORMAL).child(c.to_string())))
                     .child(div().flex_1())
                     .child(ui::icon_button("pr-new", "plus").debug_selector(|| "pr-new".into()).tooltip(ui::tooltip("Open a pull request from the current branch")).on_click(cx.listener(|_, _, _, cx| cx.emit(Request::NewPr))))
-                    .when(loading, |d| d.child(div().size(px(22.)).flex().flex_none().items_center().justify_center().debug_selector(|| "pr-refreshing".into()).child(spinner("pr-refresh-spin", 14.))))
-                    .when(!loading, |d| d.child(ui::icon_button("pr-refresh", "refresh").debug_selector(|| "pr-refresh".into()).tooltip(ui::tooltip("Read them again")).on_click(cx.listener(|p, _, _, cx| p.reload(cx))))),
+                    .child(ui::icon_button("pr-refresh", "refresh").debug_selector(|| "pr-refresh".into()).tooltip(ui::tooltip("Read them again")).when(!loading, |b| b.on_click(cx.listener(|p, _, _, cx| p.reload(cx))))),
             )
+            // Read again with a list shown: a thin bar running under the header.
+            .child(div().flex_none().h(px(2.)).w_full().when(loading && count.is_some(), |d| d.debug_selector(|| "pr-refreshing".into()).child(progress_bar("pr-refresh-bar", None))))
             .child(
                 div()
                     .flex()
@@ -279,6 +283,59 @@ mod tests {
 }
 
 /// A turning arrow while something is read.
+/// Bringing something down from GitHub: an arrow dropping into its tray, over a running bar
+/// (`big` for a whole page; small for a list).
+pub(crate) fn fetching(id: &'static str, big: bool) -> Div {
+    let (icon, bar) = if big { (30., 200.) } else { (18., 110.) };
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(if big { 12. } else { 8. }))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .size(px(icon + 8.))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .relative()
+                        .child(ui::icon("arrow-down", theme::accent()).size(px(icon)))
+                        .with_animation(SharedString::from(format!("{id}-arrow")), Animation::new(std::time::Duration::from_millis(1100)).repeat(), move |d, t| {
+                            // Drops in, settles, fades into the tray.
+                            let y = -icon * 0.6 + icon * 0.75 * t.min(0.7) / 0.7;
+                            d.top(px(y)).opacity(if t > 0.75 { (1. - t) * 4. } else { 1. })
+                        }),
+                )
+                .child(div().flex_none().w(px(icon * 0.9)).h(px(2.)).rounded(px(1.)).bg(theme::fg_muted())),
+        )
+        .child(progress_bar(id, Some(bar)))
+}
+
+/// A bar with a piece running along it (how long is unknown): `width`, else all there is.
+pub(crate) fn progress_bar(id: &'static str, width: Option<f32>) -> Div {
+    div()
+        .relative()
+        .h(px(if width.is_some() { 3. } else { 2. }))
+        .when_some(width, |d, w| d.w(px(w)))
+        .when(width.is_none(), |d| d.w_full())
+        .rounded(px(2.))
+        .overflow_hidden()
+        .bg(theme::border())
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .h_full()
+                .w(relative(0.35))
+                .rounded(px(2.))
+                .bg(theme::accent())
+                .with_animation(SharedString::from(format!("{id}-run")), Animation::new(std::time::Duration::from_millis(1200)).repeat().with_easing(ease_in_out), |d, t| d.left(relative(-0.35 + 1.35 * t))),
+        )
+}
+
 pub(crate) fn spinner(id: impl Into<ElementId>, size: f32) -> impl IntoElement {
     ui::icon("refresh", theme::fg_muted())
         .size(px(size))

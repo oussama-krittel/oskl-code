@@ -507,6 +507,15 @@ pub fn reply(root: &Path, n: u64, to: u64, body: &str) -> Result<String> {
     gh(root, &["api", "--method", "POST", &format!("repos/{{owner}}/{{repo}}/pulls/{n}/comments/{to}/replies"), "-f", &format!("body={body}")])
 }
 
+/// Closes the pull request (with a comment first, when there's one), or opens it again.
+pub fn set_open(root: &Path, n: u64, open: bool, comment: &str) -> Result<String> {
+    let num = n.to_string();
+    if !comment.trim().is_empty() {
+        gh(root, &["pr", "comment", &num, "--body", comment])?;
+    }
+    gh(root, &["pr", if open { "reopen" } else { "close" }, &num])
+}
+
 pub fn checkout(root: &Path, n: u64) -> Result<String> {
     gh(root, &["pr", "checkout", &n.to_string()])
 }

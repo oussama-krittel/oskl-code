@@ -793,7 +793,8 @@ impl PrView {
             self.focus_line = true;
             return self.refresh_notes(cx);
         }
-        self.open_line_box(LineBox { path: path.to_string(), new_side: ev.0, line: ev.1, start: None, anchor: ev.1, reply_to: None }, cx);
+        let first = ev.3.unwrap_or(ev.1);
+        self.open_line_box(LineBox { path: path.to_string(), new_side: ev.0, line: ev.1, start: (first < ev.1).then_some(first), anchor: first, reply_to: None }, cx);
     }
 
     pub fn open_line_box(&mut self, b: LineBox, cx: &mut Context<Self>) {
@@ -900,6 +901,18 @@ impl PrView {
             return cx.emit(Request::Error("Write the comment first".into()));
         }
         self.act("Comment", move |root| gh::comment(root, n, &body), |v, cx| v.comment_input.update(cx, |e, cx| e.set_text("", cx)), cx);
+    }
+
+    /// Close pull request (with the box's comment, if any), or Reopen pull request.
+    pub fn close_or_reopen(&mut self, cx: &mut Context<Self>) {
+        let Some(Ok((d, _))) = &self.detail else { return };
+        let open = d.state == "CLOSED";
+        let (n, body) = (self.number, self.comment_input.read(cx).text());
+        let label = if open { "Reopen" } else { "Close" };
+        self.act(label, move |root| gh::set_open(root, n, open, &body), |v, cx| {
+            v.comment_input.update(cx, |e, cx| e.set_text("", cx));
+            cx.emit(PrEvent::Changed);
+        }, cx);
     }
 
     /// Runs a `gh` action in the background; once done, `ok`, the page read again and the lists told.
@@ -1142,6 +1155,21 @@ impl PrView {
                                     .gap(px(8.))
                                     .child(div().flex_1().text_size(px(11.)).text_color(theme::fg_muted()).child(busy.map(|b| format!("{b}…")).unwrap_or_else(|| "⌘Enter to send".into())))
                                     .when(!self.comment_input.read(cx).text().is_empty(), |d| d.child(action_button("pr-comment-cancel", "Cancel", None).on_click(cx.listener(|v, _, _, cx| v.comment_input.update(cx, |e, cx| e.set_text("", cx))))))
+                                    .when(d.state != "MERGED", |el| {
+                                        let typed = !self.comment_input.read(cx).text().trim().is_empty();
+                                        let (label, color) = match (d.state == "CLOSED", typed) {
+                                            (true, false) => ("Reopen pull request", theme::git_added()),
+                                            (true, true) => ("Reopen with comment", theme::git_added()),
+                                            (false, false) => ("Close pull request", theme::git_deleted()),
+                                            (false, true) => ("Close with comment", theme::git_deleted()),
+                                        };
+                                        el.child(
+                                            action_button("pr-close", label, None)
+                                                .text_color(color)
+                                                .tooltip(ui::tooltip("On GitHub (the comment in the box goes first)"))
+                                                .on_click(cx.listener(|v, _, _, cx| v.close_or_reopen(cx))),
+                                        )
+                                    })
                                     .child(action_button("pr-comment-post", "Comment", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.post_comment(cx)))),
                             ),
                     ),
@@ -1858,7 +1886,23 @@ impl Render for PrView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let base = div().id("pr-view").debug_selector(|| "pr-view".into()).track_focus(&self.focus).size_full().flex().flex_col().bg(theme::bg_editor()).text_size(px(12.));
         let (d, lines) = match &self.detail {
-            None => return base.child(ui::empty_state("refresh", format!("Loading pull request #{}", self.number), "Reading it from GitHub with gh.")).into_any_element(),
+            None => {
+                return base
+                    .child(
+                        div()
+                            .debug_selector(|| "pr-tab-loading".into())
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(14.))
+                            .child(crate::pr_panel::fetching("pr-tab-loading", true))
+                            .child(div().text_color(theme::fg_bright()).text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(format!("Loading pull request #{}", self.number)))
+                            .child(div().text_color(theme::fg_muted()).child("Downloading its conversation, checks and commits from GitHub…")),
+                    )
+                    .into_any_element();
+            }
             Some(Err(e)) => return base.child(ui::empty_state("warning", format!("Couldn't read pull request #{}", self.number), e.clone())).into_any_element(),
             Some(Ok((d, l))) => (d.clone(), l.clone()),
         };

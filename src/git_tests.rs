@@ -757,6 +757,7 @@ case "$1 $2" in
   "api graphql") case "$*" in *reviewThreads*) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"T_1","isResolved":false,"comments":{"nodes":[{"databaseId":101}]}}]},"timelineItems":{"nodes":[{"actor":{"login":"ann"},"beforeCommit":{"abbreviatedOid":"aaaaaaa"},"afterCommit":{"abbreviatedOid":"bbbbbbb"},"createdAt":"2026-11-14T13:00:00Z"}]}}}}}' ;; *) echo '{}' ;; esac ;;
   "api user") echo me ;;
   "pr edit") echo ok ;;
+  "pr close"|"pr reopen") echo ok ;;
   "api --method") case "$*" in *--input*) for a; do last=$a; done; cat "$last" >> "$(dirname "$0")/gh.log"; echo >> "$(dirname "$0")/gh.log" ;; esac; echo '{}' ;;
   "pr review"|"pr comment") echo ok ;;
   "pr create") echo "https://example.invalid/pr/8" ;;
@@ -951,8 +952,17 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     // them, and kept on disk ...
     click(cx, "diff-comment-new-1");
     settle(&ws, cx);
+    // Shift-click a second + ...
     let third = at(cx, "diff-comment-new-3");
     cx.simulate_click(third, gpui::Modifiers::shift());
+    settle(&ws, cx);
+    assert_eq!(pr.read_with(cx, |p, _| p.line_box.as_ref().map(|b| (b.start, b.line))), Some((Some(1), 3)));
+    // ... or press one + and drag down over the others.
+    click(cx, "pr-line-cancel");
+    let (first, third) = (at(cx, "diff-comment-new-1"), at(cx, "diff-comment-new-3"));
+    cx.simulate_mouse_down(first, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.simulate_mouse_move(third, Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+    cx.simulate_mouse_up(third, gpui::MouseButton::Left, gpui::Modifiers::none());
     settle(&ws, cx);
     assert_eq!(pr.read_with(cx, |p, _| p.line_box.as_ref().map(|b| (b.start, b.line))), Some((Some(1), 3)));
     assert_eq!(pr.read_with(cx, |p, cx| p.diff.as_ref().and_then(|d| d.read(cx).marked)), Some((true, 1, 3)), "the lines are tinted");
@@ -1017,6 +1027,14 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     click(cx, "pr-edit-save");
     settle(&ws, cx);
     assert!(log().contains("updateIssueComment") && log().contains("id=IC_2"), "{}", log());
+
+    // Close pull request, beside Comment.
+    let page = at(cx, "pr-conversation");
+    cx.simulate_event(gpui::ScrollEvent { position: page, delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-5000.))), ..Default::default() });
+    cx.run_until_parked();
+    click(cx, "pr-close");
+    settle(&ws, cx);
+    assert!(log().contains("pr close 7"), "{}", log());
 
     // Checked out, the Git tab shows its chip, which comes back to this review's tab.
     click(cx, "pr-checkout");
