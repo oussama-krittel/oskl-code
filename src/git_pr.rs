@@ -522,7 +522,7 @@ impl PrView {
             .gap(px(8.))
             .px(px(16.))
             .h(px(40.))
-            .bg(theme::bg_side())
+            .bg(theme::bg_card_head())
             .cursor_pointer()
             .hover(|s| s.bg(theme::hover()))
             .on_click(cx.listener(move |v, _, _, cx| v.toggle_thread(id.clone(), cx)))
@@ -588,10 +588,10 @@ impl PrView {
         let thread = self.thread_of(root);
         let resolved = thread.as_ref().is_some_and(|t| t.resolved);
         let open = !resolved || thread.as_ref().is_some_and(|t| self.open_threads.contains(&t.id));
-        let mut el = div().flex().flex_col().rounded(px(6.)).border_1().border_color(theme::border()).overflow_hidden();
+        let mut el = div().flex().flex_col().rounded(px(6.)).border_1().border_color(theme::border()).overflow_hidden().bg(theme::bg_card());
         el = match (&thread, resolved) {
             (Some(t), true) => el.child(self.folded_thread(t, label, open, cx)),
-            _ => el.child(div().px(px(16.)).h(px(38.)).flex().items_center().bg(theme::bg_side()).font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::accent()).child(label)),
+            _ => el.child(div().px(px(16.)).h(px(38.)).flex().items_center().bg(theme::bg_card_head()).font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::accent()).child(label)),
         };
         if open {
             el = el.children(hunk_excerpt(root));
@@ -1386,6 +1386,7 @@ impl PrView {
             .border_1()
             .border_color(theme::border())
             .overflow_hidden()
+            .bg(theme::bg_card())
             .child(
                 div()
                     .flex()
@@ -1393,7 +1394,7 @@ impl PrView {
                     .gap(px(6.))
                     .px(px(16.))
                     .h(px(44.))
-                    .bg(theme::bg_side())
+                    .bg(theme::bg_card_head())
                     .border_b_1()
                     .border_color(theme::border())
                     .child(div().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(who))
@@ -1559,7 +1560,7 @@ impl PrView {
                 .child(div().flex().flex_col().min_w_0().child(div().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(title)).when(!sub.is_empty(), |el| el.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(sub))))
         };
         let text = |s: &'static str| div().font_weight(FontWeight::BOLD).child(s).into_any_element();
-        let mut card = div().id("pr-merge-box").debug_selector(|| "pr-merge-box".into()).flex().flex_col().rounded(px(8.)).border_1().border_color(theme::border()).overflow_hidden();
+        let mut card = div().id("pr-merge-box").debug_selector(|| "pr-merge-box".into()).flex().flex_col().rounded(px(8.)).border_1().border_color(theme::border()).overflow_hidden().bg(theme::bg_card());
 
         if d.state == "OPEN" {
             // Reviews.
@@ -1599,7 +1600,7 @@ impl PrView {
                 card = card.child(section(icon, title.into(), format!("{sub} {}", if list.len() == 1 { "check" } else { "checks" }), color));
                 let mut sorted: Vec<&gh::Check> = list.iter().collect();
                 sorted.sort_by_key(|c| c.state());
-                card = card.child(div().id("pr-checks").flex().flex_col().max_h(px(260.)).overflow_y_scroll().border_b_1().border_color(theme::border()).bg(theme::bg_side()).children(sorted.into_iter().enumerate().map(|(i, c)| check_row(i, c))));
+                card = card.child(div().id("pr-checks").flex().flex_col().max_h(px(260.)).overflow_y_scroll().border_b_1().border_color(theme::border()).bg(theme::bg_card_head()).children(sorted.into_iter().enumerate().map(|(i, c)| check_row(i, c))));
             }
 
             // Whether it merges.
@@ -1878,7 +1879,7 @@ impl PrView {
             .rounded(px(6.))
             .border_1()
             .border_color(theme::border_input())
-            .bg(theme::bg_editor())
+            .bg(theme::bg_card())
             .overflow_hidden()
             // Clicks in it stay in it (the row would take them).
             .on_click(|_, _, cx| cx.stop_propagation())
