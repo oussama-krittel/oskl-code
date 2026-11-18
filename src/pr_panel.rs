@@ -23,6 +23,11 @@ pub struct PrPanel {
     loading: Option<&'static str>,
     selected: Option<u64>,
     _load: Option<Task<()>>,
+    /// The workspace's repositories (a picker shows when there are several, the same one as
+    /// Source Control's) and the one shown.
+    repos: Vec<Entity<crate::repo::Repo>>,
+    current: Option<Entity<crate::repo::Repo>>,
+    repo_menu: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -38,6 +43,9 @@ impl PrPanel {
             loading: None,
             selected: None,
             _load: None,
+            repos: Vec::new(),
+            current: None,
+            repo_menu: false,
             _subs: Vec::new(),
         }
     }
@@ -53,6 +61,16 @@ impl PrPanel {
             self.selected = None;
             self.lists.clear();
             self.reload(cx);
+        }
+    }
+
+    /// The workspace's repositories and the one shown (Source Control's too).
+    pub fn set_repos(&mut self, repos: Vec<Entity<crate::repo::Repo>>, current: Entity<crate::repo::Repo>, cx: &mut Context<Self>) {
+        if self.current.as_ref() != Some(&current) || self.repos != repos {
+            self.repo_menu = false;
+            self.repos = repos;
+            self.current = Some(current);
+            cx.notify();
         }
     }
 
@@ -226,6 +244,12 @@ impl PrPanel {
                     .child(ui::icon_button("pr-new", "plus").debug_selector(|| "pr-new".into()).tooltip(ui::tooltip("Open a pull request from the current branch")).on_click(cx.listener(|_, _, _, cx| cx.emit(Request::NewPr))))
                     .child(ui::icon_button("pr-refresh", "refresh").debug_selector(|| "pr-refresh".into()).tooltip(ui::tooltip("Read them again")).when(!loading, |b| b.on_click(cx.listener(|p, _, _, cx| p.reload(cx))))),
             )
+            .when_some(self.current.clone().filter(|_| self.repos.len() > 1), |d, repo| {
+                d.child(crate::git_panel::repo_picker("pr-repo-picker", &repo, self.repo_menu, cx).on_click(cx.listener(|p, _, _, cx| {
+                    p.repo_menu = !p.repo_menu;
+                    cx.notify();
+                })))
+            })
             // Read again with a list shown: a thin bar running under the header.
             .child(div().flex_none().h(px(2.)).w_full().when(loading && count.is_some(), |d| d.debug_selector(|| "pr-refreshing".into()).child(progress_bar("pr-refresh-bar", None))))
             .child(
@@ -253,7 +277,17 @@ impl PrPanel {
 impl Render for PrPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = self.render_list(cx);
-        div().key_context("PrPanel").track_focus(&self.focus).size_full().text_size(px(12.)).child(body)
+        let menu = match (&self.current, self.repo_menu && self.repos.len() > 1) {
+            (Some(current), true) => {
+                let close = |p: &mut Self, cx: &mut Context<Self>| {
+                    p.repo_menu = false;
+                    cx.notify();
+                };
+                Some(deferred(crate::git_panel::repo_menu("pr-repo", &self.repos.clone(), &current.clone(), 35., cx).on_mouse_down_out(cx.listener(move |p, _, _, cx| close(p, cx))).on_click(cx.listener(move |p, _, _, cx| close(p, cx)))).with_priority(2))
+            }
+            _ => None,
+        };
+        div().key_context("PrPanel").track_focus(&self.focus).relative().size_full().text_size(px(12.)).child(body).children(menu)
     }
 }
 

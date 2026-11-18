@@ -100,6 +100,24 @@ pub fn on(bg: Hsla) -> Hsla {
     if luminance > 0.5 { self::c(0x15171c) } else { self::c(0xffffff) }
 }
 
+/// The editor's background moved by `step` in lightness, away from its own side: lighter on a
+/// dark theme, darker on a light one. Works for every theme, none written out.
+fn off_editor(step: f32) -> Hsla {
+    let mut b = bg_editor();
+    b.l = if b.l > 0.5 { (b.l - step).max(0.) } else { (b.l + step).min(1.) };
+    b
+}
+
+/// A card on the editor's background (a comment, a review): just enough apart to pick out.
+pub fn bg_card() -> Hsla {
+    off_editor(0.03)
+}
+
+/// A card's header row: a step further than its body.
+pub fn bg_card_head() -> Hsla {
+    off_editor(0.06)
+}
+
 /// Three colors that show what a theme looks like: background, sidebar, accent.
 pub fn preview(t: Theme) -> [u32; 3] {
     match t {

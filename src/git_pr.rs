@@ -119,6 +119,13 @@ pub struct PrView {
     md: Vec<Rc<Markdown>>,
     images: Entity<RetainAllImageCache>,
     busy: Option<String>,
+    /// What the action being sent is for (a button shows "Resolving…" and waits).
+    busy_target: Option<String>,
+    /// Threads resolved or opened again here, shown so at once and kept until GitHub's own
+    /// answer agrees (a read right after can still say the old thing).
+    resolve_override: std::collections::HashMap<String, bool>,
+    /// Reload clicked: the page is being read again.
+    reloading: bool,
     /// The review dropdown is open, hanging from here.
     pub review_at: Option<Point<Pixels>>,
     /// Who gh is signed in as: their comments can be edited and deleted.
@@ -238,6 +245,9 @@ impl PrView {
             md: Vec::new(),
             images,
             busy: None,
+            busy_target: None,
+            resolve_override: Default::default(),
+            reloading: false,
             review_at: None,
             viewer: None,
             editing: None,
@@ -284,10 +294,34 @@ impl PrView {
     /// The thread comment `l` is in.
     fn thread_of(&self, l: &LineComment) -> Option<gh::Thread> {
         let root = l.in_reply_to_id.unwrap_or(l.id);
-        match &self.detail {
+        let mut t = match &self.detail {
             Some(Ok((d, _))) => d.threads.iter().find(|t| t.root == root).cloned(),
             _ => None,
+        }?;
+        if let Some(r) = self.resolve_override.get(&t.id) {
+            t.resolved = *r;
         }
+        Some(t)
+    }
+
+    /// The action for `target` is being sent (its button says so and waits).
+    fn sending(&self, target: &str) -> bool {
+        self.busy_target.as_deref() == Some(target)
+    }
+
+    /// A button that sends to GitHub: while it's sending, `busy` ("Commenting…"), dimmed.
+    fn send_button(&self, id: &'static str, label: impl Into<SharedString>, busy: &'static str, target: &str, color: Option<Hsla>) -> Stateful<Div> {
+        let on = self.sending(target);
+        action_button(id, if on { SharedString::from(busy) } else { label.into() }, color).when(on, |b| b.opacity(0.6).cursor_default())
+    }
+
+    /// Reads everything again (the Reload button): page, comments, checks and files.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.reloading = true;
+        // Fresh from GitHub: what it says about each thread counts again.
+        self.resolve_override.clear();
+        self.load(cx);
+        cx.notify();
     }
 
     pub fn start_edit(&mut self, target: Editable, text: String, cx: &mut Context<Self>) {
@@ -313,6 +347,7 @@ impl PrView {
         if body.trim().is_empty() && target != Editable::Body {
             return cx.emit(Request::Error("A comment can't be empty (delete it instead)".into()));
         }
+        self.busy_target = Some("edit".into());
         self.act("Edit", move |root| gh::edit(root, n, &target, &body), |v, cx| v.cancel_edit(cx), cx);
     }
 
@@ -327,15 +362,41 @@ impl PrView {
             cancel_label: None,
             on_answer: Rc::new(move |_, _, cx| {
                 let t = target.clone();
-                me.update(cx, |v, cx| v.act("Delete", move |root| gh::delete(root, &t), |_, _| {}, cx)).ok();
+                me.update(cx, |v, cx| {
+                    if v.busy.is_none() {
+                        v.busy_target = Some(format!("delete:{t:?}"));
+                    }
+                    v.act("Delete", move |root| gh::delete(root, &t), |_, _| {}, cx)
+                })
+                .ok();
             }),
         }));
     }
 
     /// Resolves the thread (or opens it again).
+    /// Shown so at once (a resolved thread folds, an unresolved one stays open); undone if
+    /// GitHub refuses.
     fn set_resolved(&mut self, thread: String, resolved: bool, cx: &mut Context<Self>) {
-        self.open_threads.remove(&thread);
-        self.act(if resolved { "Resolve" } else { "Unresolve" }, move |root| gh::resolve(root, &thread, resolved), |_, _| {}, cx);
+        if self.busy.is_some() {
+            return;
+        }
+        if resolved {
+            self.open_threads.remove(&thread);
+        }
+        self.resolve_override.insert(thread.clone(), resolved);
+        self.busy_target = Some(thread.clone());
+        self.refresh_notes(cx);
+        let id = thread.clone();
+        self.act_full(
+            if resolved { "Resolve" } else { "Unresolve" },
+            move |root| gh::resolve(root, &thread, resolved),
+            |_, _| {},
+            move |v, cx| {
+                v.resolve_override.remove(&id);
+                v.refresh_notes(cx);
+            },
+            cx,
+        );
     }
 
     fn toggle_thread(&mut self, thread: String, cx: &mut Context<Self>) {
@@ -359,7 +420,10 @@ impl PrView {
             .gap(px(10.))
             .text_size(px(11.))
             .child(text_link(format!("pr-edit-{key}"), "Edit", theme::fg_muted()).on_click(cx.listener(move |v, _, _, cx| v.start_edit(target.clone(), text.clone(), cx))))
-            .when(delete, |d| d.child(text_link(format!("pr-delete-{key}"), "Delete", theme::git_deleted()).on_click(cx.listener(move |v, _, _, cx| v.ask_delete(t2.clone(), cx)))))
+            .when(delete, |d| {
+                let deleting = self.sending(&format!("delete:{t2:?}"));
+                d.child(text_link(format!("pr-delete-{key}"), if deleting { "Deleting…" } else { "Delete" }, theme::git_deleted()).on_click(cx.listener(move |v, _, _, cx| v.ask_delete(t2.clone(), cx))))
+            })
             .into_any_element()
     }
 
@@ -378,7 +442,7 @@ impl PrView {
                     .gap(px(8.))
                     .child(div().flex_1().text_size(px(11.)).text_color(theme::fg_muted()).children(self.busy.clone().map(|b| format!("{b}…"))))
                     .child(action_button("pr-edit-cancel", "Cancel", None).on_click(cx.listener(|v, _, _, cx| v.cancel_edit(cx))))
-                    .child(action_button("pr-edit-save", "Update comment", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.save_edit(cx)))),
+                    .child(self.send_button("pr-edit-save", "Update comment", "Updating…", "edit", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.save_edit(cx)))),
             )
             .into_any_element()
     }
@@ -421,6 +485,7 @@ impl PrView {
     fn resolve_button(&self, t: &gh::Thread, cx: &mut Context<Self>) -> AnyElement {
         let (id, resolved) = (t.id.clone(), t.resolved);
         let sel = format!("pr-resolve-{}", t.root);
+        let sending = self.sending(&t.id);
         div()
             .id(SharedString::from(sel.clone()))
             .debug_selector(move || sel)
@@ -432,9 +497,15 @@ impl PrView {
             .rounded(px(4.))
             .border_1()
             .border_color(theme::border_input())
-            .cursor_pointer()
-            .hover(|s| s.bg(theme::hover()))
-            .child(if resolved { "Unresolve conversation" } else { "Resolve conversation" })
+            .when(!sending, |d| d.cursor_pointer().hover(|s| s.bg(theme::hover())))
+            .when(sending, |d| d.opacity(0.6))
+            .child(match (sending, resolved) {
+                // Already shown the other way: this says what's being sent.
+                (true, true) => "Resolving…",
+                (true, false) => "Unresolving…",
+                (false, true) => "Unresolve conversation",
+                (false, false) => "Resolve conversation",
+            })
             .on_click(cx.listener(move |v, _, _, cx| v.set_resolved(id.clone(), !resolved, cx)))
             .into_any_element()
     }
@@ -451,7 +522,7 @@ impl PrView {
             .gap(px(8.))
             .px(px(16.))
             .h(px(40.))
-            .bg(theme::bg_side())
+            .bg(theme::bg_card_head())
             .cursor_pointer()
             .hover(|s| s.bg(theme::hover()))
             .on_click(cx.listener(move |v, _, _, cx| v.toggle_thread(id.clone(), cx)))
@@ -517,10 +588,10 @@ impl PrView {
         let thread = self.thread_of(root);
         let resolved = thread.as_ref().is_some_and(|t| t.resolved);
         let open = !resolved || thread.as_ref().is_some_and(|t| self.open_threads.contains(&t.id));
-        let mut el = div().flex().flex_col().rounded(px(6.)).border_1().border_color(theme::border()).overflow_hidden();
+        let mut el = div().flex().flex_col().rounded(px(6.)).border_1().border_color(theme::border()).overflow_hidden().bg(theme::bg_card());
         el = match (&thread, resolved) {
             (Some(t), true) => el.child(self.folded_thread(t, label, open, cx)),
-            _ => el.child(div().px(px(16.)).h(px(38.)).flex().items_center().bg(theme::bg_side()).font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::accent()).child(label)),
+            _ => el.child(div().px(px(16.)).h(px(38.)).flex().items_center().bg(theme::bg_card_head()).font_family(theme::MONO_FONT).text_size(px(11.)).text_color(theme::accent()).child(label)),
         };
         if open {
             el = el.children(hunk_excerpt(root));
@@ -621,6 +692,11 @@ impl PrView {
     }
 
     fn got_detail(&mut self, detail: Result<(PrDetail, Vec<LineComment>), String>, cx: &mut Context<Self>) {
+        self.reloading = false;
+        // GitHub now says what was done here: its own answer counts again.
+        if let Ok((d, _)) = &detail {
+            self.resolve_override.retain(|id, r| d.threads.iter().find(|t| &t.id == id).is_some_and(|t| t.resolved != *r));
+        }
         self.detail = Some(detail);
         self.parse_md(cx);
         self.refresh_notes(cx);
@@ -886,6 +962,9 @@ impl PrView {
             _ => (commit, None),
         };
         let label = if b.reply_to.is_some() { "Reply".to_string() } else { format!("Comment on {}", lines_label(b.start, b.line)) };
+        if self.busy.is_none() {
+            self.busy_target = Some("line".into());
+        }
         self.act(
             &label,
             move |root| match b.reply_to {
@@ -925,6 +1004,9 @@ impl PrView {
             _ => "Review",
         };
         let sent = pending.len();
+        if self.busy.is_none() {
+            self.busy_target = Some("review".into());
+        }
         self.act(
             label,
             move |root| {
@@ -963,6 +1045,9 @@ impl PrView {
         if body.trim().is_empty() {
             return cx.emit(Request::Error("Write the comment first".into()));
         }
+        if self.busy.is_none() {
+            self.busy_target = Some("comment".into());
+        }
         self.act("Comment", move |root| gh::comment(root, n, &body), |v, cx| v.comment_input.update(cx, |e, cx| e.set_text("", cx)), cx);
     }
 
@@ -972,6 +1057,9 @@ impl PrView {
         let open = d.state == "CLOSED";
         let (n, body) = (self.number, self.comment_input.read(cx).text());
         let label = if open { "Reopen" } else { "Close" };
+        if self.busy.is_none() {
+            self.busy_target = Some("close".into());
+        }
         self.act(label, move |root| gh::set_open(root, n, open, &body), |v, cx| {
             v.comment_input.update(cx, |e, cx| e.set_text("", cx));
             cx.emit(PrEvent::Changed);
@@ -980,6 +1068,18 @@ impl PrView {
 
     /// Runs a `gh` action in the background; once done, `ok`, the page read again and the lists told.
     fn act(&mut self, label: &str, op: impl FnOnce(&std::path::Path) -> anyhow::Result<String> + Send + 'static, ok: impl FnOnce(&mut Self, &mut Context<Self>) + 'static, cx: &mut Context<Self>) {
+        self.act_full(label, op, ok, |_, _| {}, cx);
+    }
+
+    /// `act`, and `failed` when GitHub refuses.
+    fn act_full(
+        &mut self,
+        label: &str,
+        op: impl FnOnce(&std::path::Path) -> anyhow::Result<String> + Send + 'static,
+        ok: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+        failed: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
         // Already sending (⌘Enter pressed again, a second click): once is enough.
         if self.busy.is_some() {
             return;
@@ -992,6 +1092,7 @@ impl PrView {
             let result = task.await;
             v.update(cx, |v, cx| {
                 v.busy = None;
+                v.busy_target = None;
                 match result {
                     Ok(out) => {
                         let note = if out.contains("outside the diff") { format!(" ({out})") } else { String::new() };
@@ -1003,6 +1104,7 @@ impl PrView {
                     Err(e) => {
                         let e = e.to_string();
                         let hint = if e.contains("could not be resolved") { " — a comment is on a line outside the diff's changed parts: remove it from Finish your review and send again" } else { "" };
+                        failed(v, cx);
                         cx.emit(Request::Error(format!("{label} failed: {e}{hint}")))
                     }
                 }
@@ -1040,6 +1142,9 @@ impl PrView {
         let (subject, body) = (self.merge_subject.read(cx).text(), self.merge_body.read(cx).text());
         if how != "rebase" && subject.trim().is_empty() {
             return cx.emit(Request::Error("Give the commit a message first".into()));
+        }
+        if self.busy.is_none() {
+            self.busy_target = Some("merge".into());
         }
         self.act(
             "Merge",
@@ -1096,7 +1201,17 @@ impl PrView {
                         .flex_wrap()
                         .items_center()
                         .gap(px(8.))
-                        .child(action_button("pr-merge-confirm", confirm, Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.confirm_merge(cx))))
+                        .child(self.send_button(
+                            "pr-merge-confirm",
+                            confirm,
+                            match how {
+                                "squash" => "Squashing and merging…",
+                                "rebase" => "Rebasing and merging…",
+                                _ => "Merging…",
+                            },
+                            "merge",
+                            Some(theme::git_added()),
+                        ).on_click(cx.listener(|v, _, _, cx| v.confirm_merge(cx))))
                         .child(action_button("pr-merge-cancel", "Cancel", None).on_click(cx.listener(|v, _, _, cx| {
                             v.merging = false;
                             cx.notify();
@@ -1242,6 +1357,11 @@ impl PrView {
             .child(div().flex_none().text_color(theme::git_deleted()).child(format!("−{}", d.deletions)))
             .when_some(check, |el, (c, color)| el.child(div().flex_none().text_color(color).child(c)))
             .child(div().flex_1())
+            .child(if self.reloading {
+                div().id("pr-reloading").debug_selector(|| "pr-reloading".into()).size(px(24.)).flex().flex_none().items_center().justify_center().child(crate::pr_panel::spinner("pr-reload-spin", 14.)).into_any_element()
+            } else {
+                button("pr-reload", "refresh", "Reload: read it again from GitHub (comments, checks, files)").on_click(cx.listener(|v, _, _, cx| v.reload(cx))).into_any_element()
+            })
             .child(button("pr-checkout", "arrow-down", "Check out this pull request's branch").on_click(cx.listener(|v, _, _, cx| {
                 let n = v.number;
                 v.act("Check out", move |root| gh::checkout(root, n), |_, _| {}, cx);
@@ -1266,6 +1386,7 @@ impl PrView {
             .border_1()
             .border_color(theme::border())
             .overflow_hidden()
+            .bg(theme::bg_card())
             .child(
                 div()
                     .flex()
@@ -1273,7 +1394,7 @@ impl PrView {
                     .gap(px(6.))
                     .px(px(16.))
                     .h(px(44.))
-                    .bg(theme::bg_side())
+                    .bg(theme::bg_card_head())
                     .border_b_1()
                     .border_color(theme::border())
                     .child(div().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(who))
@@ -1411,13 +1532,13 @@ impl PrView {
                                             (false, true) => ("Close with comment", theme::git_deleted()),
                                         };
                                         el.child(
-                                            action_button("pr-close", label, None)
+                                            self.send_button("pr-close", label, if d.state == "CLOSED" { "Reopening…" } else { "Closing…" }, "close", None)
                                                 .text_color(color)
                                                 .tooltip(ui::tooltip("On GitHub (the comment in the box goes first)"))
                                                 .on_click(cx.listener(|v, _, _, cx| v.close_or_reopen(cx))),
                                         )
                                     })
-                                    .child(action_button("pr-comment-post", "Comment", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.post_comment(cx)))),
+                                    .child(self.send_button("pr-comment-post", "Comment", "Commenting…", "comment", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.post_comment(cx)))),
                             ),
                     ),
             )
@@ -1439,7 +1560,7 @@ impl PrView {
                 .child(div().flex().flex_col().min_w_0().child(div().text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(title)).when(!sub.is_empty(), |el| el.child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(sub))))
         };
         let text = |s: &'static str| div().font_weight(FontWeight::BOLD).child(s).into_any_element();
-        let mut card = div().id("pr-merge-box").debug_selector(|| "pr-merge-box".into()).flex().flex_col().rounded(px(8.)).border_1().border_color(theme::border()).overflow_hidden();
+        let mut card = div().id("pr-merge-box").debug_selector(|| "pr-merge-box".into()).flex().flex_col().rounded(px(8.)).border_1().border_color(theme::border()).overflow_hidden().bg(theme::bg_card());
 
         if d.state == "OPEN" {
             // Reviews.
@@ -1479,7 +1600,7 @@ impl PrView {
                 card = card.child(section(icon, title.into(), format!("{sub} {}", if list.len() == 1 { "check" } else { "checks" }), color));
                 let mut sorted: Vec<&gh::Check> = list.iter().collect();
                 sorted.sort_by_key(|c| c.state());
-                card = card.child(div().id("pr-checks").flex().flex_col().max_h(px(260.)).overflow_y_scroll().border_b_1().border_color(theme::border()).bg(theme::bg_side()).children(sorted.into_iter().enumerate().map(|(i, c)| check_row(i, c))));
+                card = card.child(div().id("pr-checks").flex().flex_col().max_h(px(260.)).overflow_y_scroll().border_b_1().border_color(theme::border()).bg(theme::bg_card_head()).children(sorted.into_iter().enumerate().map(|(i, c)| check_row(i, c))));
             }
 
             // Whether it merges.
@@ -1758,7 +1879,7 @@ impl PrView {
             .rounded(px(6.))
             .border_1()
             .border_color(theme::border_input())
-            .bg(theme::bg_editor())
+            .bg(theme::bg_card())
             .overflow_hidden()
             // Clicks in it stay in it (the row would take them).
             .on_click(|_, _, cx| cx.stop_propagation())
@@ -1810,9 +1931,9 @@ impl PrView {
                                 .items_center()
                                 .gap(px(6.))
                                 .child(action_button("pr-line-cancel", "Cancel", None).on_click(cx.listener(|v, _, _, cx| v.close_line_box(cx))))
-                                .when(reply, |d| d.child(action_button("pr-line-reply", "Reply", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.single_comment(cx)))))
+                                .when(reply, |d| d.child(self.send_button("pr-line-reply", "Reply", "Replying…", "line", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.single_comment(cx)))))
                                 .when(!reply, |d| {
-                                    d.child(action_button("pr-line-single", "Add single comment", None).on_click(cx.listener(|v, _, _, cx| v.single_comment(cx))))
+                                    d.child(self.send_button("pr-line-single", "Add single comment", "Commenting…", "line", None).on_click(cx.listener(|v, _, _, cx| v.single_comment(cx))))
                                         .child(action_button("pr-line-review", review_label, Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.add_pending(cx))))
                                 }),
                         ),
@@ -1959,7 +2080,7 @@ impl PrView {
                     .gap(px(6.))
                     .when_some(self.busy.clone(), |d, b| d.child(div().text_color(theme::fg_muted()).child(format!("{b}…"))))
                     .child(div().flex_1())
-                    .child(action_button("pr-submit-review", "Submit review", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.submit_review(cx)))),
+                    .child(self.send_button("pr-submit-review", "Submit review", "Submitting…", "review", Some(theme::git_added())).on_click(cx.listener(|v, _, _, cx| v.submit_review(cx)))),
             );
         deferred(anchored().anchor(Anchor::TopRight).position(at).snap_to_window().child(card)).with_priority(2).into_any_element()
     }
@@ -2123,7 +2244,7 @@ fn text_link(id: String, label: &'static str, color: Hsla) -> Stateful<Div> {
 }
 
 /// A button: filled with `color`, else outlined.
-fn action_button(id: &'static str, label: &'static str, color: Option<Hsla>) -> Stateful<Div> {
+fn action_button(id: &'static str, label: impl Into<SharedString>, color: Option<Hsla>) -> Stateful<Div> {
     div()
         .id(id)
         .debug_selector(move || id.to_string())
@@ -2137,7 +2258,7 @@ fn action_button(id: &'static str, label: &'static str, color: Option<Hsla>) -> 
         .font_weight(FontWeight::SEMIBOLD)
         .when_some(color, |d, c| d.bg(c).text_color(theme::on(c)).hover(|s| s.opacity(0.9)))
         .when(color.is_none(), |d| d.border_1().border_color(theme::border_input()).hover(|s| s.bg(theme::hover())))
-        .child(label)
+        .child(label.into())
 }
 
 /// One check: where it stands, its name, and (a click) its run on GitHub.

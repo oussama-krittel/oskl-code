@@ -1020,8 +1020,16 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     let _ = at(cx, "pr-force-push-0");
     // Resolve the thread; edit my own comment (Cancel leaves it, Update comment sends it).
     click(cx, "pr-resolve-101");
+    // Shown resolved at once (folded), before GitHub answers ...
+    let _ = at(cx, "pr-thread-toggle-101");
     settle(&ws, cx);
     assert!(log().contains("resolveReviewThread") && log().contains("id=T_1"), "{}", log());
+    // ... and kept so though a read right after still says otherwise.
+    let _ = at(cx, "pr-thread-toggle-101");
+    // Reload reads it all again: GitHub's answer (here: not resolved) counts.
+    click(cx, "pr-reload");
+    settle(&ws, cx);
+    let _ = at(cx, "pr-resolve-101");
     assert!(cx.debug_bounds("pr-edit-IC_1").is_none(), "not mine");
     click(cx, "pr-edit-IC_2");
     let _ = at(cx, "pr-edit-input");
