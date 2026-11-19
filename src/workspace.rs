@@ -407,8 +407,6 @@ impl DropZone {
 /// Splits are limited by size, not count: an area can be halved until it is 1/8 of the
 /// window (half → quarter → eighth), which also caps the layout at 8 splits.
 const MAX_SPLIT_DEPTH: usize = 3;
-/// How long the pointer stays still on the spaces rail before it opens.
-const RAIL_DWELL_MS: u64 = 70;
 
 /// A space: a main area of its own (its splits, their tabs, the sidebar section it shows).
 /// The current one's state is in the workspace's own fields; the others keep theirs here.
@@ -674,11 +672,8 @@ pub struct Workspace {
     last_space: usize,
     /// The spaces rail is open (hovered), and the overview of all spaces is shown.
     rail_open: bool,
-    rail_hover: bool,
     rail_panel_hover: bool,
-    rail_gen: usize,
     rail_pill_hover: Option<usize>,
-    rail_last_pos: Option<gpui::Point<Pixels>>,
     overview: bool,
     overview_focus: FocusHandle,
     panes: Vec<Pane>,
@@ -835,11 +830,8 @@ impl Workspace {
             space: 0,
             last_space: 0,
             rail_open: false,
-            rail_hover: false,
             rail_panel_hover: false,
-            rail_gen: 0,
             rail_pill_hover: None,
-            rail_last_pos: None,
             overview: false,
             overview_focus: cx.focus_handle(),
             focused_pane: 0,
@@ -5342,61 +5334,12 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The pointer moved on the closed rail: it opens once the pointer stays still a moment,
-    /// so crossing it on the way to the side panel (however slowly) doesn't open it.
-    fn rail_moved(&mut self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        self.rail_hover = true;
-        let last = self.rail_last_pos.replace(pos);
-        if self.rail_open {
-            return;
-        }
-        // Moving along the rail (not across it) means it's wanted: open now.
-        if let Some(l) = last {
-            let (dx, dy) = ((pos.x - l.x).abs(), (pos.y - l.y).abs());
-            if dy > px(2.) && dy > dx * 2. {
-                self.rail_open = true;
-                cx.notify();
-                return;
-            }
-        }
-        self.rail_gen += 1;
-        let gen_ = self.rail_gen;
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(RAIL_DWELL_MS)).await;
-            this.update(cx, |ws, cx| {
-                if ws.rail_gen == gen_ && ws.rail_hover && !ws.rail_open {
-                    ws.rail_open = true;
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// The pointer left the rail or its open column: close unless it came back meanwhile.
-    fn rail_left(&mut self, cx: &mut Context<Self>) {
-        self.rail_gen += 1;
-        let gen_ = self.rail_gen;
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(180)).await;
-            this.update(cx, |ws, cx| {
-                if ws.rail_gen == gen_ && !ws.rail_hover && !ws.rail_panel_hover && ws.rail_open {
-                    ws.rail_open = false;
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// The spaces rail: a thin strip beside the main area, one mark per space. Rested on, it
-    /// opens into a column of pills (over the main area, taking no room from it), each with
+    /// The spaces rail: a thin strip beside the main area, one mark per space. Clicked (never
+    /// just hovered: the side panel's edge is right there, to be dragged), it opens into a column of pills (over the main area, taking no room from it), each with
     /// the space's color and its name written downwards.
     fn render_space_rail(&self, right: bool, top: f32, cx: &mut Context<Self>) -> AnyElement {
         let open = self.rail_open;
-        let marks = div().flex().flex_col().items_center().gap(px(5.)).pt(px(10.)).children(self.spaces.iter().enumerate().map(|(i, sp)| {
+        let marks = div().flex().flex_col().items_center().gap(px(5.)).pt(px(38.)).children(self.spaces.iter().enumerate().map(|(i, sp)| {
             let on = i == self.space;
             div()
                 .id(("space-mark", i))
@@ -5406,10 +5349,46 @@ impl Workspace {
                 .rounded(px(2.))
                 .cursor_pointer()
                 .bg(space_color(sp.color).opacity(if on { 1. } else { 0.4 }))
-                .on_click(cx.listener(move |ws, _, w, cx| ws.switch_space(i, w, cx)))
+                .on_click(cx.listener(move |ws, _, w, cx| {
+                    cx.stop_propagation();
+                    ws.switch_space(i, w, cx);
+                }))
         }));
-        // A grip says it opens.
-        let grip = div().mt(px(8.)).flex().flex_col().items_center().gap(px(2.)).children((0..3).map(|_| div().size(px(2.)).rounded(px(1.)).bg(theme::fg_muted())));
+        // The open button: a small box sticking out a little on the side panel's side (never
+        // over the main area); open, it closes them.
+        let toggle = {
+            let icon = if open { "close" } else if right { "chevron-left" } else { "chevron-right" };
+            deferred(
+                div()
+                    .id("space-toggle")
+                    .debug_selector(|| "space-toggle".into())
+                    .absolute()
+                    .top(px(top + 8.))
+                    .when(!right, |d| d.right(px(1.)))
+                    .when(right, |d| d.left(px(1.)))
+                    .w(px(17.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .bg(theme::bg_side())
+                    .border_1()
+                    .border_color(theme::border_input())
+                    .shadow_sm()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()).border_color(theme::focus_border()))
+                    .tooltip(ui::tooltip(if open { "Close spaces" } else { "Spaces: show them all (⌃1–9 go to one, ⌘K O the overview)" }))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|ws, _, _, cx| {
+                        cx.stop_propagation();
+                        ws.rail_open = !ws.rail_open;
+                        cx.notify();
+                    }))
+                    .child(ui::icon(icon, theme::fg()).size(px(11.))),
+            )
+            .with_priority(4)
+        };
         let panel = open.then(|| {
             let pills = self.spaces.iter().enumerate().map(|(i, sp)| {
                 let on = i == self.space;
@@ -5497,7 +5476,8 @@ impl Workspace {
                     .w(px(50.))
                     .h_full()
                     .overflow_hidden()
-                    .pt(px(top))
+                    // Below the button that closes it.
+                    .pt(px(top + 32.))
                     .flex()
                     .flex_col()
                     .items_center()
@@ -5508,9 +5488,11 @@ impl Workspace {
                     .shadow_lg()
                     .on_hover(cx.listener(|ws, h: &bool, _, cx| {
                         ws.rail_panel_hover = *h;
-                        if !*h {
-                            ws.rail_left(cx);
-                        }
+                        cx.notify();
+                    }))
+                    // A click anywhere else closes it.
+                    .on_mouse_down_out(cx.listener(|ws, _, _, cx| {
+                        ws.rail_open = false;
                         cx.notify();
                     }))
                     .child(
@@ -5583,21 +5565,13 @@ impl Workspace {
             .border_color(theme::border())
             .cursor_pointer()
             .hover(|s| s.bg(theme::hover()))
-            .on_mouse_move(cx.listener(|ws, ev: &gpui::MouseMoveEvent, _, cx| {
-                // Not while dragging (the side panel's edge, a tab…): only a free pointer opens it.
-                if ev.pressed_button.is_none() && !cx.has_active_drag() {
-                    ws.rail_moved(ev.position, cx);
-                }
-            }))
-            .on_hover(cx.listener(|ws, h: &bool, _, cx| {
-                ws.rail_hover = *h;
-                if !*h {
-                    ws.rail_last_pos = None;
-                    ws.rail_left(cx);
-                }
+            .tooltip(ui::tooltip("Spaces: click to show them all (⌃1–9 go to one, ⌘K O the overview)"))
+            .on_click(cx.listener(|ws, _, _, cx| {
+                ws.rail_open = !ws.rail_open;
+                cx.notify();
             }))
             .child(marks)
-            .child(grip)
+            .child(toggle)
             .children(panel)
             .into_any_element()
     }
@@ -10998,7 +10972,7 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
     }
 
     #[gpui::test]
-    fn the_spaces_rail_opens_on_hover_and_switches(cx: &mut TestAppContext) {
+    fn the_spaces_rail_opens_on_click_and_switches(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         cx.simulate_keystrokes("cmd-k n");
         cx.simulate_keystrokes("cmd-k n");
@@ -11006,18 +10980,31 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert_eq!(ws.read_with(cx, |ws, _| (ws.spaces.len(), ws.space)), (3, 2));
         let rail = cx.debug_bounds("space-rail").expect("the rail");
         assert!(rail.size.width < gpui::px(16.), "thin: {:?}", rail.size.width);
-        assert!(cx.debug_bounds("space-panel").is_none(), "closed until hovered");
+        assert!(cx.debug_bounds("space-panel").is_none(), "closed");
+        // Resting on it (on the way to the side panel's edge) opens nothing.
         cx.simulate_mouse_move(rail.center(), None, gpui::Modifiers::none());
+        cx.simulate_mouse_move(rail.center() + gpui::point(gpui::px(0.), gpui::px(12.)), None, gpui::Modifiers::none());
+        cx.executor().advance_clock(std::time::Duration::from_millis(500));
         cx.run_until_parked();
-        assert!(!ws.read_with(cx, |ws, _| ws.rail_open), "passing over: still shut");
-        cx.executor().advance_clock(std::time::Duration::from_millis(40));
-        cx.simulate_mouse_move(rail.center() + gpui::point(gpui::px(1.), gpui::px(0.)), None, gpui::Modifiers::none());
-        cx.executor().advance_clock(std::time::Duration::from_millis(40));
+        assert!(!ws.read_with(cx, |ws, _| ws.rail_open), "hovering: still shut");
+        // A click opens it.
+        // Its button, sticking out on the side panel's side, not over the main area.
+        let toggle = cx.debug_bounds("space-toggle").expect("the open button");
+        assert!(toggle.left() < rail.left() && toggle.right() <= rail.right(), "{toggle:?} over the side panel, beside {rail:?}");
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
         cx.run_until_parked();
-        assert!(!ws.read_with(cx, |ws, _| ws.rail_open), "still moving: still shut");
-        cx.executor().advance_clock(std::time::Duration::from_millis(super::RAIL_DWELL_MS + 50));
+        assert!(ws.read_with(cx, |ws, _| ws.rail_open), "clicked: open");
+        // Open, the button closes it.
+        cx.update(|w, _| w.refresh());
         cx.run_until_parked();
-        assert!(ws.read_with(cx, |ws, _| ws.rail_open), "rested on: open");
+        let toggle = cx.debug_bounds("space-toggle").expect("now a close button");
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(!ws.read_with(cx, |ws, _| ws.rail_open), "closed by its button");
+        // Clicking the strip itself opens it too.
+        cx.simulate_click(rail.center() + gpui::point(gpui::px(0.), gpui::px(80.)), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(ws.read_with(cx, |ws, _| ws.rail_open));
         cx.update(|w, _| w.refresh());
         cx.run_until_parked();
         let row = cx.debug_bounds("space-row-0").expect("a row per space");
@@ -11033,19 +11020,11 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         cx.simulate_click(x.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(ws.read_with(cx, |ws, _| (ws.spaces.len(), ws.space)), (2, 0), "closed; still in the first");
-        // Moving away closes it.
+        // A click anywhere else closes it.
         let far = rail.center() + gpui::point(gpui::px(700.), gpui::px(0.));
-        cx.simulate_mouse_move(far, None, gpui::Modifiers::none());
-        cx.executor().advance_clock(std::time::Duration::from_millis(300));
+        cx.simulate_click(far, gpui::Modifiers::none());
         cx.run_until_parked();
-        assert!(!ws.read_with(cx, |ws, _| ws.rail_open || ws.rail_panel_hover));
-        // Moving along the rail opens it at once.
-        cx.simulate_mouse_move(rail.center(), None, gpui::Modifiers::none());
-        cx.simulate_mouse_move(rail.center() + gpui::point(gpui::px(0.), gpui::px(12.)), None, gpui::Modifiers::none());
-        assert!(ws.read_with(cx, |ws, _| ws.rail_open), "moving along: open now");
-        cx.simulate_mouse_move(far, None, gpui::Modifiers::none());
-        cx.executor().advance_clock(std::time::Duration::from_millis(300));
-        cx.run_until_parked();
+        assert!(!ws.read_with(cx, |ws, _| ws.rail_open));
         // With the side panel hidden it sits clear of the window's buttons.
         cx.simulate_keystrokes("cmd-b");
         cx.run_until_parked();
