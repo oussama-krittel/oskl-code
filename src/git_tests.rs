@@ -751,7 +751,7 @@ const FAKE_GH: &str = r#"#!/bin/sh
 echo "$*" >> "$(dirname "$0")/gh.log"
 case "$1 $2" in
   "pr list") case "$*" in *"--head newwork"*) echo '[]' ; exit 0 ;; esac; echo '[{"number":7,"title":"Login page","author":{"login":"ann"},"headRefName":"login","baseRefName":"main","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS"}],"updatedAt":"2026-11-14T10:00:00Z"}]' ;;
-  "pr view") echo '{"number":7,"title":"Login page","body":"Adds the login page.","author":{"login":"ann"},"state":"OPEN","url":"https://example.invalid/pr/7","headRefName":"login","baseRefName":"main","headRepositoryOwner":{"login":"ann"},"headRefOid":"'"$(git rev-parse refs/oskl/pr/7 2>/dev/null)"'","additions":1,"deletions":0,"isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeable":"MERGEABLE","comments":[{"id":"IC_1","author":{"login":"bob"},"body":"Thanks!","createdAt":"2026-11-14T11:00:00Z"},{"id":"IC_2","author":{"login":"me"},"body":"Mine","createdAt":"2026-11-14T11:30:00Z"}],"reviews":[{"id":"R_1","author":{"login":"bob"},"state":"CHANGES_REQUESTED","body":"Needs work","submittedAt":"2026-11-14T12:00:00Z"}],"statusCheckRollup":[{"name":"build","workflowName":"CI","conclusion":"SUCCESS","status":"COMPLETED","detailsUrl":"https://example.invalid/run/1"},{"name":"lint","workflowName":"CI","conclusion":"","status":"IN_PROGRESS","detailsUrl":"https://example.invalid/run/2"}],"commits":[{"oid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/7/head)"'","messageHeadline":"Login page","authors":[{"login":"ann"}],"committedDate":"2026-11-14T10:00:00Z"}]}' ;;
+  "pr view") case "$*" in *"pr view 9 "*) echo '{"number":9,"title":"Feature","body":"","author":{"login":"ann"},"state":"MERGED","url":"https://example.invalid/pr/9","headRefName":"feat","baseRefName":"main","headRepositoryOwner":{"login":"ann"},"headRefOid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/9/head)"'","baseRefOid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse main^1)"'","additions":1,"deletions":0,"isDraft":false,"mergeable":"UNKNOWN","comments":[],"reviews":[],"statusCheckRollup":[],"commits":[{"oid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/9/head)"'","messageHeadline":"Feature","authors":[{"login":"ann"}],"committedDate":"2026-11-14T10:00:00Z"}]}'; exit 0 ;; esac; echo '{"number":7,"title":"Login page","body":"Adds the login page.","author":{"login":"ann"},"state":"OPEN","url":"https://example.invalid/pr/7","headRefName":"login","baseRefName":"main","headRepositoryOwner":{"login":"ann"},"headRefOid":"'"$(git rev-parse refs/oskl/pr/7 2>/dev/null)"'","additions":1,"deletions":0,"isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeable":"MERGEABLE","comments":[{"id":"IC_1","author":{"login":"bob"},"body":"Thanks!","createdAt":"2026-11-14T11:00:00Z"},{"id":"IC_2","author":{"login":"me"},"body":"Mine","createdAt":"2026-11-14T11:30:00Z"}],"reviews":[{"id":"R_1","author":{"login":"bob"},"state":"CHANGES_REQUESTED","body":"Needs work","submittedAt":"2026-11-14T12:00:00Z"}],"statusCheckRollup":[{"name":"build","workflowName":"CI","conclusion":"SUCCESS","status":"COMPLETED","detailsUrl":"https://example.invalid/run/1"},{"name":"lint","workflowName":"CI","conclusion":"","status":"IN_PROGRESS","detailsUrl":"https://example.invalid/run/2"}],"commits":[{"oid":"'"$(git --git-dir=../$(basename $PWD)-remote.git rev-parse refs/pull/7/head)"'","messageHeadline":"Login page","authors":[{"login":"ann"}],"committedDate":"2026-11-14T10:00:00Z"}]}' ;;
   "api repos/{owner}/{repo}/pulls/7/comments?per_page=100") echo '[{"id":101,"pull_request_review_id":55,"path":"login.txt","line":1,"body":"Nice","user":{"login":"bob"},"created_at":"2026-11-14T12:00:00Z","diff_hunk":"@@ -0,0 +1,3 @@\\n+login"}]' ;;
   "api repos/{owner}/{repo}/pulls/7/reviews?per_page=100") echo '[{"id":55,"node_id":"R_1"}]' ;;
   "api graphql") case "$*" in *reviewThreads*) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"T_1","isResolved":false,"comments":{"nodes":[{"databaseId":101}]}}]},"timelineItems":{"nodes":[{"actor":{"login":"ann"},"beforeCommit":{"abbreviatedOid":"aaaaaaa"},"afterCommit":{"abbreviatedOid":"bbbbbbb"},"createdAt":"2026-11-14T13:00:00Z"}]}}}}}' ;; *) echo '{}' ;; esac ;;
@@ -908,6 +908,33 @@ fn a_pull_request_is_opened_from_the_sidebar(cx: &mut gpui::TestAppContext) {
     settle(&ws, cx);
     let view = form(&ws, cx).expect("the form opens");
     assert_eq!(view.read_with(cx, |v, _| v.compare.clone()), Some(("main".into(), String::new())));
+}
+
+#[gpui::test]
+fn a_merged_pull_request_still_lists_what_it_changed(cx: &mut gpui::TestAppContext) {
+    let (ws, cx) = setup_with(cx, |dir| {
+        sh(dir, "git init -q --bare ../$(basename $PWD)-remote.git");
+        sh(dir, INIT);
+        sh(dir, "echo a > a.txt && git add . && git commit -qm one && git remote add origin ../$(basename $PWD)-remote.git && git push -q -u origin main");
+        sh(dir, "git switch -qc feat && echo f > f.txt && git add . && git commit -qm Feature && git push -q origin feat:refs/pull/9/head");
+        // Merged: main now holds it.
+        sh(dir, "git switch -q main && git merge -q --no-ff -m 'Merge feat' feat && git push -q origin main");
+        fake_gh();
+    });
+    let dir = root(&ws, cx);
+    settle(&ws, cx);
+    ws.update_in(cx, |ws, window, cx| ws.open_pr_tab(dir.clone(), 9, window, cx));
+    settle(&ws, cx);
+    let pr = ws.read_with(cx, |ws, _| match &ws.tabs[ws.active.unwrap()].kind {
+        TabKind::Pr(v) => Some(v.clone()),
+        _ => None,
+    });
+    let files = pr.unwrap().read_with(cx, |p, _| match &p.files {
+        Some(Ok(f)) => Ok(f.list.iter().map(|c| c.path.clone()).collect::<Vec<_>>()),
+        Some(Err(e)) => Err(e.clone()),
+        None => Err("not read".into()),
+    });
+    assert_eq!(files, Ok(vec!["f.txt".to_string()]), "what it changed, against main as it was");
 }
 
 #[gpui::test]

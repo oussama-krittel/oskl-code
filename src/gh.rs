@@ -183,6 +183,9 @@ pub struct PrDetail {
     pub head_ref_name: String,
     pub base_ref_name: String,
     pub head_ref_oid: String,
+    /// The base branch's commit the pull request was last compared with (for a merged one:
+    /// where the base was before it went in).
+    pub base_ref_oid: String,
     /// Whose fork (or repository) the branch is in.
     pub head_repository_owner: Author,
     pub additions: u64,
@@ -266,7 +269,7 @@ pub fn list(root: &Path, state: &str) -> Result<Vec<Pr>> {
 }
 
 pub fn view(root: &Path, n: u64) -> Result<(PrDetail, Vec<LineComment>)> {
-    let fields = "number,title,body,author,state,url,headRefName,baseRefName,headRefOid,headRepositoryOwner,additions,deletions,isDraft,reviewDecision,mergeable,mergeStateStatus,comments,reviews,statusCheckRollup,commits";
+    let fields = "number,title,body,author,state,url,headRefName,baseRefName,headRefOid,baseRefOid,headRepositoryOwner,additions,deletions,isDraft,reviewDecision,mergeable,mergeStateStatus,comments,reviews,statusCheckRollup,commits";
     let mut detail: PrDetail = serde_json::from_str(&gh(root, &["pr", "view", &n.to_string(), "--json", fields])?)?;
     // Line comments aren't in `pr view`; without them the review still works.
     let lines = gh(root, &["api", &format!("repos/{{owner}}/{{repo}}/pulls/{n}/comments?per_page=100")]).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();

@@ -653,6 +653,9 @@ impl PrView {
             let detail = view.await;
             let base = detail.as_ref().ok().map(|(d, _)| d.base_ref_name.clone());
             let branch = detail.as_ref().ok().map(|(d, _)| d.head_ref_name.clone()).unwrap_or_default();
+            // Merged or closed: the base as it was then (now it holds the pull request itself, so
+            // the two would meet at its tip and show nothing changed).
+            let then = detail.as_ref().ok().filter(|(d, _)| d.state != "OPEN").map(|(d, _)| (d.base_ref_oid.clone(), d.commits.first().map(|c| c.oid.clone()).unwrap_or_default()));
             let failed = detail.as_ref().err().cloned();
             v.update(cx, |v, cx| {
                 v.got_detail(detail, cx);
@@ -664,8 +667,22 @@ impl PrView {
                 .background_executor()
                 .spawn(async move {
                     let (base, head) = gh::fetch(&root, &remote, n, &base)?;
-                    let mb = git::run(&root, &["merge-base", &base, &head])?.trim().to_string();
                     let head = git::run(&root, &["rev-parse", &head])?.trim().to_string();
+                    let known = |r: &str| !r.is_empty() && git::run(&root, &["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")]).is_ok();
+                    let from = match &then {
+                        Some((oid, _)) if known(oid) => oid.clone(),
+                        _ => base,
+                    };
+                    let mut mb = git::run(&root, &["merge-base", &from, &head])?.trim().to_string();
+                    // Still at its own tip (the base it was compared with isn't here): from
+                    // before its first commit.
+                    if let Some((_, first)) = &then
+                        && mb == head
+                        && known(first)
+                        && let Ok(p) = git::run(&root, &["rev-parse", &format!("{first}^")])
+                    {
+                        mb = p.trim().to_string();
+                    }
                     let list = changed_files(&root, &mb, &head)?;
                     // Its branch here, with commits the pull request doesn't have yet.
                     let local = format!("refs/heads/{branch}");
