@@ -80,6 +80,10 @@ pub enum Request {
     SelectRepo(PathBuf),
     /// Pick a folder to add to the workspace.
     AddFolder,
+    /// An HTML file opened in the default browser, straight from disk.
+    OpenInBrowser(PathBuf),
+    /// Live Server for an HTML file (from the folder it's in) or a folder.
+    GoLive(PathBuf),
     /// Take this added folder out of the workspace.
     RemoveFolder(PathBuf),
     /// From the Databases panel and tabs.

@@ -514,6 +514,8 @@ const OUTPUT_KEEP: usize = 25;
 const OUTPUT_KEEP_LINES: usize = 40_000;
 
 const COMMANDS: &[(&str, &str, bool)] = &[
+    ("golive", "Live Server: serve this HTML file's folder and reload on changes (golive stop | copy | open)", true),
+    ("browser", "Open this HTML file in the default browser", false),
     ("w", "Save the current file", false),
     ("q", "Close the current tab (q! discards changes)", false),
     ("wq", "Save and close", false),
@@ -648,6 +650,9 @@ pub struct Workspace {
     format_save_task: Option<Task<()>>,
     watch_task: Option<Task<()>>,
     _watcher: Option<notify::RecommendedWatcher>,
+    /// Live Server, while it runs (one at a time); its menu in the status bar, if open.
+    live: Option<crate::live_server::LiveServer>,
+    live_menu: Option<Point<Pixels>>,
     _subs: Vec<Subscription>,
     diff_rights: Vec<(Entity<DiffEditView>, Entity<Editor>)>,
     /// Result editor of each merge editor tab.
@@ -809,6 +814,8 @@ impl Workspace {
             format_save_task: None,
             watch_task: None,
             _watcher: None,
+            live: None,
+            live_menu: None,
             _subs: subs,
             diff_rights: Vec::new(),
             merge_results: Vec::new(),
@@ -1050,6 +1057,189 @@ impl Workspace {
             let _ = w.unwatch(dir);
         }
         self.refresh_repos(window, cx);
+    }
+
+    // ------------------------------------------------------------ live server
+
+    /// An HTML file in the default browser, from disk (no server).
+    fn open_in_browser(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !path.is_file() {
+            return self.flash(format!("{} isn't a file", path.display()), true, cx);
+        }
+        match crate::live_server::open_external(&path.to_string_lossy()) {
+            Ok(_) => self.flash(format!("Opened {} in the browser", ui::file_name(&path.to_string_lossy())), false, cx),
+            Err(e) => self.flash(format!("Couldn't open the browser: {e}"), true, cx),
+        }
+    }
+
+    /// Live Server for `target`: an HTML file (served from the workspace folder it's in, so
+    /// links up out of its own folder still work; else from its folder) or a folder (its
+    /// open HTML file, else index.html, else one to pick). One server at a time: another root
+    /// moves it there.
+    fn go_live(&mut self, target: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::live_server::{html_files, is_html};
+        let roots = self.roots(cx);
+        let (root, entry) = if target.is_file() {
+            if !is_html(&target) {
+                return self.flash("Live Server serves web pages: pick an HTML file or a folder".into(), true, cx);
+            }
+            let root = roots.iter().filter(|r| target.starts_with(r)).max_by_key(|r| r.components().count()).cloned().or_else(|| target.parent().map(Path::to_path_buf));
+            let Some(root) = root else { return };
+            (root, Some(target))
+        } else if target.is_dir() {
+            let active = self.active_editor().and_then(|e| e.read(cx).path.clone()).filter(|p| is_html(p) && p.starts_with(&target));
+            let entry = active.or_else(|| Some(target.join("index.html")).filter(|p| p.is_file()));
+            match entry {
+                Some(e) => (target, Some(e)),
+                None => {
+                    let found = html_files(&target, 8);
+                    match found.len() {
+                        0 => return self.flash(format!("No HTML file in {}: Live Server needs a page to open (an index.html, or any .html)", target.display()), true, cx),
+                        1 => (target, found.into_iter().next()),
+                        _ => return self.pick_live_entry(target, found, window, cx),
+                    }
+                }
+            }
+        } else {
+            return self.flash("Open a folder or pick an HTML file for Live Server".into(), true, cx);
+        };
+        let root = root.canonicalize().unwrap_or(root);
+        // Running already on this root: just open the page.
+        if let Some(live) = &self.live
+            && live.root == root
+        {
+            let url = entry.as_deref().and_then(|e| live.url_of(e)).unwrap_or_else(|| live.entry_url());
+            let _ = crate::live_server::open_external(&url);
+            return self.flash(format!("Live Server: {url}"), false, cx);
+        }
+        let moved = self.live.take().is_some();
+        match crate::live_server::LiveServer::start(root, entry.as_deref()) {
+            Ok(live) => {
+                let url = live.entry_url();
+                let _ = crate::live_server::open_external(&url);
+                let root = live.root.display().to_string();
+                self.live = Some(live);
+                self.flash(format!("{} {url} (serving {root})", if moved { "Live Server moved:" } else { "Live Server on" }), false, cx);
+            }
+            Err(e) => self.flash(format!("Live Server couldn't start: {e}"), true, cx),
+        }
+        cx.notify();
+    }
+
+    /// Several pages and none to go by: which one opens first.
+    fn pick_live_entry(&mut self, root: PathBuf, found: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let me = cx.entity().downgrade();
+        let names: Vec<String> = found.iter().map(|p| p.strip_prefix(&root).unwrap_or(p).to_string_lossy().into_owned()).collect();
+        let files = found.clone();
+        let ask = crate::dialog::Ask {
+            title: "Which page should Live Server open?".into(),
+            detail: format!("{} has no index.html.", root.display()),
+            buttons: names,
+            danger: false,
+            cancel_default: false,
+            cancel_label: None,
+            on_answer: Rc::new(move |ix, _, cx| {
+                let (root, file) = (root.clone(), files.get(ix).cloned());
+                me.update(cx, |ws, cx| {
+                    if let Some(file) = file {
+                        ws.start_live_at(root, file, cx);
+                    }
+                })
+                .ok();
+            }),
+        };
+        self.open_ask(ask, window, cx);
+    }
+
+    fn start_live_at(&mut self, root: PathBuf, entry: PathBuf, cx: &mut Context<Self>) {
+        self.live = None;
+        match crate::live_server::LiveServer::start(root, Some(&entry)) {
+            Ok(live) => {
+                let url = live.entry_url();
+                let _ = crate::live_server::open_external(&url);
+                self.live = Some(live);
+                self.flash(format!("Live Server on {url}"), false, cx);
+            }
+            Err(e) => self.flash(format!("Live Server couldn't start: {e}"), true, cx),
+        }
+    }
+
+    fn stop_live(&mut self, cx: &mut Context<Self>) {
+        self.live_menu = None;
+        match self.live.take() {
+            Some(live) => {
+                let port = live.port;
+                drop(live);
+                self.flash(format!("Live Server stopped (port {port} free again)"), false, cx);
+            }
+            None => self.flash("Live Server isn't running".into(), true, cx),
+        }
+    }
+
+    fn open_live(&mut self, cx: &mut Context<Self>) {
+        self.live_menu = None;
+        match &self.live {
+            Some(live) => {
+                let _ = crate::live_server::open_external(&live.entry_url());
+                cx.notify();
+            }
+            None => self.flash("Live Server isn't running".into(), true, cx),
+        }
+    }
+
+    fn copy_live_url(&mut self, cx: &mut Context<Self>) {
+        self.live_menu = None;
+        match self.live.as_ref().map(|l| l.entry_url()) {
+            Some(url) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                self.flash(format!("Copied {url}"), false, cx);
+            }
+            None => self.flash("Live Server isn't running".into(), true, cx),
+        }
+    }
+
+    /// The Live Server menu over the status bar: where it serves, and Open, Copy URL, Stop.
+    fn render_live_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (at, live) = (self.live_menu?, self.live.as_ref()?);
+        let row = |id: &'static str, label: &'static str| {
+            div().id(id).debug_selector(move || id.into()).flex().items_center().h(px(26.)).px(px(10.)).mx(px(4.)).rounded(px(4.)).cursor_pointer().hover(|s| s.bg(theme::selected_focused())).child(label)
+        };
+        let info = |k: &'static str, v: String| div().flex().gap(px(8.)).px(px(12.)).child(div().w(px(44.)).flex_none().text_color(theme::fg_muted()).child(k)).child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_color(theme::fg()).child(v));
+        Some(
+            deferred(
+                anchored().anchor(Anchor::BottomRight).position(at).snap_to_window().child(
+                    div()
+                        .id("live-menu")
+                        .debug_selector(|| "live-menu".into())
+                        .occlude()
+                        .w(px(340.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .py(px(8.))
+                        .rounded(px(6.))
+                        .bg(theme::bg_popup())
+                        .border_1()
+                        .border_color(theme::border_input())
+                        .shadow_lg()
+                        .text_size(px(12.))
+                        .on_mouse_down_out(cx.listener(|ws, _, _, cx| {
+                            ws.live_menu = None;
+                            cx.notify();
+                        }))
+                        .child(div().px(px(12.)).pb(px(2.)).flex().items_center().gap(px(6.)).text_color(theme::fg_bright()).font_weight(FontWeight::SEMIBOLD).child(div().size(px(7.)).rounded(px(4.)).bg(theme::git_added())).child("Live Server"))
+                        .child(info("URL", live.url()))
+                        .child(info("Root", live.root.display().to_string()))
+                        .child(info("Opens", live.entry.clone()))
+                        .child(div().h(px(1.)).my(px(4.)).bg(theme::border()))
+                        .child(row("live-open", "Open in Browser").on_click(cx.listener(|ws, _, _, cx| ws.open_live(cx))))
+                        .child(row("live-copy", "Copy URL").on_click(cx.listener(|ws, _, _, cx| ws.copy_live_url(cx))))
+                        .child(row("live-stop", "Stop Live Server").text_color(theme::git_deleted()).on_click(cx.listener(|ws, _, _, cx| ws.stop_live(cx)))),
+                ),
+            )
+            .with_priority(3)
+            .into_any_element(),
+        )
     }
 
     fn flash(&mut self, msg: String, err: bool, cx: &mut Context<Self>) {
@@ -1321,6 +1511,8 @@ impl Workspace {
             },
             Request::SelectRepo(root) => self.select_repo(root, window, cx),
             Request::AddFolder => self.add_folder_prompt(window, cx),
+            Request::OpenInBrowser(p) => self.open_in_browser(p.clone(), cx),
+            Request::GoLive(p) => self.go_live(p.clone(), window, cx),
             Request::RemoveFolder(dir) => self.remove_folder(dir, window, cx),
             Request::Message(m) => self.flash(m.clone(), false, cx),
             Request::Error(e) => self.flash(e.clone(), true, cx),
@@ -4670,6 +4862,27 @@ impl Workspace {
                 };
                 self.set_word_wrap(on, cx);
             }
+            "golive" | "live" => match rest {
+                "stop" => self.stop_live(cx),
+                "copy" => self.copy_live_url(cx),
+                "open" => self.open_live(cx),
+                "" => match self.active_editor().and_then(|e| e.read(cx).path.clone()) {
+                    Some(p) => self.go_live(p, window, cx),
+                    None => {
+                        let root = self.root(cx);
+                        self.go_live(root, window, cx)
+                    }
+                },
+                path => {
+                    let p = PathBuf::from(path);
+                    let p = if p.is_absolute() { p } else { self.root(cx).join(p) };
+                    self.go_live(p, window, cx)
+                }
+            },
+            "browser" => match self.active_editor().and_then(|e| e.read(cx).path.clone()) {
+                Some(p) if crate::live_server::is_html(&p) => self.open_in_browser(p, cx),
+                _ => self.flash("Open an HTML file first".into(), true, cx),
+            },
             "minimap" => {
                 let on = match rest {
                     "on" => true,
@@ -6316,7 +6529,56 @@ impl Workspace {
                 .when(pane_count > 1, |d| d.child(hint(&format!("⌘⌥ {dirs}"), "move")))
         })
         ;
+        // Web pages: Open in Browser and Go Live, while an HTML file is in front; the server's
+        // address (its menu) while it runs.
+        let html = self.active_editor().and_then(|e| e.read(cx).path.clone()).filter(|p| crate::live_server::is_html(p));
+        let live_port = self.live.as_ref().map(|l| l.port);
         let right = div().flex().flex_none().h_full().items_center()
+        .when_some(html.clone(), |d, p| {
+            d.child(
+                item("status-open-browser")
+                    .tooltip(ui::tooltip("Open this page in the default browser, from disk (:browser)"))
+                    .child(ui::small_icon("globe", theme::fg()))
+                    .when(show_toggles, |d| d.child("Open in Browser"))
+                    .on_click(cx.listener(move |ws, _, _, cx| ws.open_in_browser(p.clone(), cx))),
+            )
+        })
+        .when_some(html.filter(|_| live_port.is_none()), |d, p| {
+            d.child(
+                item("status-go-live")
+                    .tooltip(ui::tooltip("Live Server: serve this page and reload the browser when a file changes (:golive)"))
+                    .child(ui::small_icon("play", theme::fg()))
+                    .child("Go Live")
+                    .on_click(cx.listener(move |ws, _, window, cx| ws.go_live(p.clone(), window, cx))),
+            )
+        })
+        .when_some(live_port, |d, port| {
+            d.child(
+                item("status-live")
+                    .tooltip(ui::tooltip("Live Server is running: open, copy its address or stop it"))
+                    .child(div().size(px(7.)).rounded(px(4.)).bg(theme::git_added()))
+                    .child(format!("Live :{port}"))
+                    .on_click(cx.listener(|ws, ev: &ClickEvent, _, cx| {
+                        ws.live_menu = if ws.live_menu.is_some() { None } else { Some(point(ev.position().x + gpui::px(60.), ev.position().y - gpui::px(14.))) };
+                        cx.notify();
+                    })),
+            )
+            // Stop in one click, right beside it.
+            .child(
+                div()
+                    .id("status-live-stop")
+                    .debug_selector(|| "status-live-stop".into())
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .h_full()
+                    .pr(px(6.))
+                    .cursor_pointer()
+                    .tooltip(ui::tooltip("Stop Live Server"))
+                    .on_click(cx.listener(|ws, _, _, cx| ws.stop_live(cx)))
+                    .child(ui::small_icon("close", theme::fg_muted())),
+            )
+        })
         .child({
             let (e, w) = self.problem_counts();
             item("status-problems")
@@ -6906,6 +7168,7 @@ impl Render for Workspace {
             })
             // The command line lives in the status bar, so it stays while one is open.
             .children((!self.shell.zen || self.cmd_mode.is_some()).then(|| self.render_status(window, cx)))
+            .children(self.render_live_menu(cx))
             .children(self.render_cmd_popup(cx))
             .children(self.render_chord_hints(window))
             .children(self.render_project_menu(window, cx))
@@ -8023,6 +8286,56 @@ mod ui_tests {
         assert!(!folder.contains(&"Add Folder to Workspace…"));
         let top = labels(cx, root.clone());
         assert!(top.contains(&"Add Folder to Workspace…") && top.contains(&"Open in Integrated Terminal"), "root: {top:?}");
+    }
+
+    #[gpui::test]
+    fn live_server_serves_the_workspace_and_lives_in_the_status_bar(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("css")).unwrap();
+        std::fs::write(root.join("pages/dashboard.html"), "<link rel=stylesheet href=../css/style.css><body>Hi</body>").unwrap();
+        std::fs::write(root.join("css/style.css"), "body{}").unwrap();
+        let labels = |cx: &mut VisualTestContext, p: std::path::PathBuf| ws.read_with(cx, |ws, cx| ws.tree.read(cx).menu_labels(&p));
+        let page = labels(cx, root.join("pages/dashboard.html"));
+        assert!(page.contains(&"Open in Browser") && page.contains(&"Open with Live Server") && page.contains(&"Rename…"), "{page:?}");
+        assert!(labels(cx, root.join("pages")).contains(&"Start Live Server from Folder"));
+        assert!(!labels(cx, root.join("css/style.css")).contains(&"Open with Live Server"));
+
+        // An HTML file in front: Open in Browser and Go Live in the status bar.
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("pages/dashboard.html"), None, false, window, cx));
+        cx.run_until_parked();
+        let click = |cx: &mut VisualTestContext, sel: &'static str| {
+            cx.run_until_parked();
+            let at = cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} is on screen")).center();
+            cx.simulate_click(at, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        crate::live_server::OPENED.with(|o| o.borrow_mut().clear());
+        click(cx, "status-open-browser");
+        assert!(crate::live_server::OPENED.with(|o| o.borrow().last().is_some_and(|p| p.ends_with("pages/dashboard.html"))));
+        click(cx, "status-go-live");
+        // Served from the workspace folder: ../css/style.css still loads.
+        let (port, served, entry) = ws.read_with(cx, |ws, _| ws.live.as_ref().map(|l| (l.port, l.root.clone(), l.entry.clone()))).expect("running");
+        assert_eq!(served, root.canonicalize().unwrap());
+        assert_eq!(entry, "/pages/dashboard.html");
+        assert!(crate::live_server::OPENED.with(|o| o.borrow().last().cloned()) == Some(format!("http://127.0.0.1:{port}/pages/dashboard.html")));
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        use std::io::{Read, Write};
+        write!(c, "GET /css/style.css HTTP/1.1\r\n\r\n").unwrap();
+        let mut got = String::new();
+        c.read_to_string(&mut got).unwrap();
+        assert!(got.starts_with("HTTP/1.1 200") && got.ends_with("body{}"), "{got}");
+        assert!(cx.debug_bounds("status-go-live").is_none(), "running: the bar shows its address instead");
+        click(cx, "status-live");
+        click(cx, "live-stop");
+        assert!(ws.read_with(cx, |ws, _| ws.live.is_none()));
+        // Or the × beside it.
+        click(cx, "status-go-live");
+        assert!(ws.read_with(cx, |ws, _| ws.live.is_some()));
+        click(cx, "status-live-stop");
+        assert!(ws.read_with(cx, |ws, _| ws.live.is_none()));
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() || port != crate::live_server::DEFAULT_PORT, "stopped");
     }
 
     #[gpui::test]

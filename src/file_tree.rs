@@ -687,6 +687,28 @@ impl FileTree {
             None,
             Some(("Reveal in Finder", "⌥⌘R", true, |t, w, cx| t.reveal_in_finder(&RevealInFinder, w, cx))),
         ];
+        // Web pages: straight in the browser, or served with Live Server (reloading on changes).
+        if crate::live_server::is_html(path) {
+            items.push(Some(("Open in Browser", "", true, |t, _, cx| {
+                if let Some((_, p)) = t.menu.take() {
+                    cx.emit(Request::OpenInBrowser(p));
+                }
+                cx.notify();
+            })));
+            items.push(Some(("Open with Live Server", "", true, |t, _, cx| {
+                if let Some((_, p)) = t.menu.take() {
+                    cx.emit(Request::GoLive(p));
+                }
+                cx.notify();
+            })));
+        } else if path.is_dir() {
+            items.push(Some(("Start Live Server from Folder", "", true, |t, _, cx| {
+                if let Some((_, p)) = t.menu.take() {
+                    cx.emit(Request::GoLive(p));
+                }
+                cx.notify();
+            })));
+        }
         // A terminal opens in a folder, so only folders offer it.
         if path.is_dir() {
             items.push(Some(("Open in Integrated Terminal", "", true, |t, _, cx| t.open_in_terminal(cx))));
