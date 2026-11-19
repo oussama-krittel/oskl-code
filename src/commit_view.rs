@@ -97,6 +97,10 @@ pub struct CommitView {
     ahead_behind: Option<(usize, usize)>,
     /// Branches to pick from when comparing.
     branches: Vec<String>,
+    /// For a new pull request: origin's branches (and ones only here), with what isn't pushed.
+    pr_branches: Vec<git::gh::PrBranch>,
+    /// A branch being pushed from the form.
+    pushing: Option<String>,
     /// The open branch picker: true for the base side.
     picker: Option<bool>,
     /// Collapsed folders of the tree view.
@@ -161,6 +165,8 @@ impl CommitView {
             compare,
             ahead_behind: None,
             branches: Vec::new(),
+            pr_branches: Vec::new(),
+            pushing: None,
             picker: None,
             collapsed: HashSet::new(),
             compact: false,
@@ -201,7 +207,7 @@ impl CommitView {
         };
         view.create = Some(PrForm { title, body, preview, draft: false, busy: false, error: None, existing: None, suggested: Default::default(), _subs: subs, _task: None });
         let (r, h) = (view.root.clone(), head.clone());
-        let check = cx.background_executor().spawn(async move { git::gh::open_from(&r, &h) });
+        let check = cx.background_executor().spawn(async move { if h.is_empty() { None } else { git::gh::open_from(&r, &h) } });
         cx.spawn(async move |this, cx| {
             let n = check.await;
             this.update(cx, |v, cx| {
@@ -309,6 +315,7 @@ impl CommitView {
         let ahead = self.ahead_behind.map(|(a, _)| a);
         let ok = self.can_create(cx);
         let blocked = match ahead {
+            _ if head.is_empty() => Some("Choose the branch to propose (compare).".to_string()),
             Some(0) => Some(format!("{head} has no commits that the base lacks: nothing to open a pull request for.")),
             _ if f.title.read(cx).text().trim().is_empty() => Some("Give it a title.".to_string()),
             _ => None,
@@ -411,11 +418,24 @@ impl CommitView {
         self.error = None;
         self.selected = 0;
         let r = self.root.clone();
-        let load = cx.background_executor().spawn(async move { (git::compare(&r, &base, &other), git::branches(&r)) });
+        let pr = self.create.is_some();
+        let load = cx.background_executor().spawn(async move {
+            // A pull request: the base as origin has it, the branch as it is here.
+            let (b, o) = if pr { git::gh::pr_refs(&r, &base, &other) } else { (base.clone(), other.clone()) };
+            let result = if other.is_empty() { None } else { Some(git::compare(&r, &b, &o)) };
+            (result, git::branches(&r), if pr { git::gh::pr_branches(&r) } else { Vec::new() })
+        });
         self._task = cx.spawn(async move |this, cx| {
-            let (result, branches) = load.await;
+            let (result, branches, pr_branches) = load.await;
             this.update(cx, |view, cx| {
                 view.branches = branches;
+                view.pr_branches = pr_branches;
+                let Some(result) = result else {
+                    // Nothing picked to compare yet.
+                    view.details = None;
+                    view.ahead_behind = None;
+                    return cx.notify();
+                };
                 view.suggest_pr_text(cx);
                 match result {
                     Ok(c) => {
@@ -436,7 +456,7 @@ impl CommitView {
 
     pub fn title(&self) -> String {
         if let (Some(_), Some((_, b))) = (&self.create, &self.compare) {
-            return format!("New pull request: {b}");
+            return if b.is_empty() { "New pull request".into() } else { format!("New pull request: {b}") };
         }
         if let Some((a, b)) = &self.compare {
             return format!("{a} ↔ {b}");
@@ -560,6 +580,7 @@ impl CommitView {
                     ),
             )
             .children(counts)
+            .children(self.render_unpushed(cx))
     }
 
     fn branch_chip(&self, base_side: bool, name: &str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -590,7 +611,7 @@ impl CommitView {
                         cx.notify();
                     }))
                     .child(ui::small_icon("git", theme::fg_dim()))
-                    .child(name.to_string())
+                    .child(if name.is_empty() { "choose a branch".to_string() } else { name.to_string() })
                     .child(ui::small_icon("chevron-down", theme::fg_dim())),
             )
             .when(open, |d| d.child(deferred(anchored().snap_to_window().child(self.render_picker(base_side, cx))).with_priority(2)))
@@ -616,7 +637,53 @@ impl CommitView {
                 v.picker = None;
                 cx.notify();
             }))
-            .children(self.branches.iter().enumerate().map(|(ix, b)| {
+            .when(self.create.is_some(), |d| {
+                // A pull request goes between branches on origin: the base is one, the branch
+                // compared one (or one only here, pushed on Create); never both the same.
+                let skip = if base_side { other.clone() } else { base.clone() };
+                d.children(self.pr_branches.iter().filter(|b| b.name != skip && (b.on_remote || !base_side)).enumerate().map(|(ix, b)| {
+                    let active = &b.name == current;
+                    let pick = b.name.clone();
+                    let (base, other) = (base.clone(), other.clone());
+                    let note = if !b.on_remote {
+                        Some("not on GitHub yet".to_string())
+                    } else if b.unpushed > 0 {
+                        Some(format!("{} {} behind", b.unpushed, if b.unpushed == 1 { "commit" } else { "commits" }))
+                    } else {
+                        None
+                    };
+                    let name = b.name.clone();
+                    div()
+                        .id(("pr-branch", ix))
+                        .debug_selector(move || format!("compare-branch-{name}"))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .py(px(4.))
+                        .px(px(8.))
+                        .mx(px(4.))
+                        .rounded(px(3.))
+                        .cursor_pointer()
+                        .when(active, |d| d.bg(theme::selected()))
+                        .hover(|s| s.bg(theme::selected_focused()))
+                        .on_click(cx.listener(move |v, _, _, cx| {
+                            if base_side {
+                                v.set_compare(pick.clone(), other.clone(), cx);
+                            } else {
+                                v.set_compare(base.clone(), pick.clone(), cx);
+                            }
+                        }))
+                        .child(div().w(px(10.)).text_color(theme::frame_focused()).child(if active { "●" } else { "" }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().font_family(theme::MONO_FONT).child(b.name.clone()))
+                                .children(note.map(|n| div().text_size(px(10.5)).text_color(theme::git_modified()).child(n))),
+                        )
+                }))
+            })
+            .when(self.create.is_none(), |d| d.children(self.branches.iter().enumerate().map(|(ix, b)| {
                 let active = b == current;
                 let pick = b.clone();
                 let (base, other) = (base.clone(), other.clone());
@@ -646,7 +713,90 @@ impl CommitView {
                     }))
                     .child(div().w(px(10.)).text_color(theme::frame_focused()).child(if active { "●" } else { "" }))
                     .child(b.clone())
-            }))
+            })))
+    }
+
+    /// Pushes `branch` from the form (origin is behind it, or doesn't have it), then reads the
+    /// branches again.
+    fn push_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        if self.pushing.is_some() {
+            return;
+        }
+        self.pushing = Some(branch.clone());
+        let root = self.root.clone();
+        let b = branch.clone();
+        let task = cx.background_executor().spawn(async move { git::gh::push(&root, &b) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |v, cx| {
+                v.pushing = None;
+                match result {
+                    Ok(_) => cx.emit(Request::Message(format!("Pushed {branch}"))),
+                    Err(e) => cx.emit(Request::Error(format!("Push failed: {}", e.to_string().lines().next().unwrap_or("")))),
+                }
+                if let Some((base, other)) = v.compare.clone() {
+                    v.set_compare(base, other, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Under the pickers: a picked branch origin is behind (or doesn't have), with Push.
+    fn render_unpushed(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.create.as_ref()?;
+        let (base, other) = self.compare.clone().unwrap_or_default();
+        let rows: Vec<AnyElement> = [&base, &other]
+            .into_iter()
+            .filter_map(|n| self.pr_branches.iter().find(|b| &b.name == n && b.local && (!b.on_remote || b.unpushed > 0)))
+            .map(|b| {
+                let text = if b.on_remote {
+                    format!("origin/{0} is {1} {2} behind your local {0}.", b.name, b.unpushed, if b.unpushed == 1 { "commit" } else { "commits" })
+                } else {
+                    format!("{} isn't on GitHub yet.", b.name)
+                };
+                let pushing = self.pushing.as_deref() == Some(b.name.as_str());
+                let name = b.name.clone();
+                let sel = format!("compare-push-{}", b.name);
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(theme::git_modified().opacity(0.5))
+                    .bg(theme::git_modified().opacity(0.08))
+                    .child(ui::small_icon("arrow-up", theme::git_modified()))
+                    .child(div().flex_1().text_color(theme::fg()).child(text))
+                    .child(
+                        div()
+                            .id(SharedString::from(sel.clone()))
+                            .debug_selector(move || sel)
+                            .flex_none()
+                            .px(px(10.))
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(theme::border_input())
+                            .when(pushing, |d| d.opacity(0.6))
+                            .when(!pushing, |d| d.cursor_pointer().hover(|s| s.bg(theme::hover())).on_click(cx.listener(move |v, _, _, cx| v.push_branch(name.clone(), cx))))
+                            .child(if pushing { "Pushing…" } else { "Push" }),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        (!rows.is_empty()).then(|| div().flex().flex_col().gap(px(6.)).children(rows).into_any_element())
+    }
+
+    #[cfg(test)]
+    pub fn pr_branch(&self, name: &str) -> Option<git::gh::PrBranch> {
+        self.pr_branches.iter().find(|b| b.name == name).cloned()
     }
 
     #[cfg(test)]

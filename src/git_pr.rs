@@ -126,6 +126,8 @@ pub struct PrView {
     resolve_override: std::collections::HashMap<String, bool>,
     /// Reload clicked: the page is being read again.
     reloading: bool,
+    /// Commits on its branch here that GitHub doesn't have yet.
+    pub unpushed: usize,
     /// The review dropdown is open, hanging from here.
     pub review_at: Option<Point<Pixels>>,
     /// Who gh is signed in as: their comments can be edited and deleted.
@@ -248,6 +250,7 @@ impl PrView {
             busy_target: None,
             resolve_override: Default::default(),
             reloading: false,
+            unpushed: 0,
             review_at: None,
             viewer: None,
             editing: None,
@@ -649,6 +652,7 @@ impl PrView {
         self._load = Some(cx.spawn(async move |v, cx| {
             let detail = view.await;
             let base = detail.as_ref().ok().map(|(d, _)| d.base_ref_name.clone());
+            let branch = detail.as_ref().ok().map(|(d, _)| d.head_ref_name.clone()).unwrap_or_default();
             let failed = detail.as_ref().err().cloned();
             v.update(cx, |v, cx| {
                 v.got_detail(detail, cx);
@@ -663,12 +667,20 @@ impl PrView {
                     let mb = git::run(&root, &["merge-base", &base, &head])?.trim().to_string();
                     let head = git::run(&root, &["rev-parse", &head])?.trim().to_string();
                     let list = changed_files(&root, &mb, &head)?;
-                    anyhow::Ok((mb, head, list))
+                    // Its branch here, with commits the pull request doesn't have yet.
+                    let local = format!("refs/heads/{branch}");
+                    let unpushed = git::run(&root, &["rev-parse", "--verify", "--quiet", &local])
+                        .ok()
+                        .and_then(|_| git::run(&root, &["rev-list", "--count", &format!("{head}..{local}")]).ok())
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    anyhow::Ok((mb, head, list, unpushed))
                 })
                 .await
                 .map_err(|e| format!("Couldn't bring its commits here: {e}"));
             v.update(cx, |v, cx| {
-                v.files = Some(found.map(|(b, h, list)| Files::new(b, h, list, &v.collapsed)));
+                v.unpushed = found.as_ref().map(|f| f.3).unwrap_or(0);
+                v.files = Some(found.map(|(b, h, list, _)| Files::new(b, h, list, &v.collapsed)));
                 cx.notify();
             })
             .ok();
@@ -1367,6 +1379,42 @@ impl PrView {
                 v.act("Check out", move |root| gh::checkout(root, n), |_, _| {}, cx);
             })))
             .child(button("pr-browser", "globe", "Open on GitHub").on_click(cx.listener(move |_, _, _, _| open_url(&url))))
+    }
+
+    /// Its branch here is ahead of GitHub's: says so, with Push.
+    fn render_unpushed(&self, d: &PrDetail, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let n = self.unpushed;
+        if n == 0 || d.state != "OPEN" {
+            return None;
+        }
+        let branch = d.head_ref_name.clone();
+        let pushing = self.sending("push");
+        Some(
+            div()
+                .id("pr-unpushed")
+                .debug_selector(|| "pr-unpushed".into())
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(10.))
+                .px(px(12.))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(theme::border())
+                .bg(theme::git_modified().opacity(0.08))
+                .child(ui::small_icon("arrow-up", theme::git_modified()))
+                .child(div().flex_1().text_color(theme::fg()).child(format!("origin/{branch} is {n} {} behind your local {branch}: this pull request doesn't have {} yet.", if n == 1 { "commit" } else { "commits" }, if n == 1 { "it" } else { "them" })))
+                .child(self.send_button("pr-push", "Push", "Pushing…", "push", None).when(!pushing, |b| {
+                    b.on_click(cx.listener(move |v, _, _, cx| {
+                        let branch = branch.clone();
+                        if v.busy.is_none() {
+                            v.busy_target = Some("push".into());
+                        }
+                        v.act("Push", move |root| gh::push(root, &branch), |v, cx| v.reload(cx), cx);
+                    }))
+                }))
+                .into_any_element(),
+        )
     }
 
     /// Who did what, when: a card with its Markdown.
@@ -2397,6 +2445,7 @@ impl Render for PrView {
         let tc = self.tab;
         let n_pending = self.pending.len();
         base.child(self.header(&d, cx))
+            .children(self.render_unpushed(&d, cx))
             .child(
                 div()
                     .flex()

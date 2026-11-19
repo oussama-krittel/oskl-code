@@ -414,6 +414,51 @@ pub fn suggested_text(root: &Path, base: &str, head: &str) -> (String, String) {
     (title, String::new())
 }
 
+/// A branch a pull request can go from or into: on origin (as GitHub knows it), here, or both;
+/// `unpushed`: commits here that origin doesn't have yet.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct PrBranch {
+    pub name: String,
+    pub on_remote: bool,
+    pub local: bool,
+    pub unpushed: usize,
+}
+
+/// Origin's branches (by their name there), then branches only here; each with how far origin
+/// is behind the one here.
+pub fn pr_branches(root: &Path) -> Vec<PrBranch> {
+    let refs = |pat: &str| git_run(root, &["for-each-ref", "--format=%(refname)", pat]).unwrap_or_default();
+    let remote: Vec<String> = refs("refs/remotes/origin").lines().filter_map(|r| r.strip_prefix("refs/remotes/origin/")).filter(|b| *b != "HEAD").map(String::from).collect();
+    let local: Vec<String> = refs("refs/heads").lines().filter_map(|r| r.strip_prefix("refs/heads/")).map(String::from).collect();
+    let count = |range: String| git_run(root, &["rev-list", "--count", &range]).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let mut out: Vec<PrBranch> = remote
+        .iter()
+        .map(|b| {
+            let here = local.contains(b);
+            PrBranch { name: b.clone(), on_remote: true, local: here, unpushed: if here { count(format!("refs/remotes/origin/{b}..refs/heads/{b}")) } else { 0 } }
+        })
+        .collect();
+    out.extend(local.iter().filter(|b| !remote.contains(b)).map(|b| PrBranch { name: b.clone(), on_remote: false, local: true, unpushed: 0 }));
+    out
+}
+
+/// What to compare for a pull request from `head` into `base`: the base as origin has it, the
+/// head as it is here (Create pushes it), else as origin has it.
+pub fn pr_refs(root: &Path, base: &str, head: &str) -> (String, String) {
+    let has = |r: &str| git_run(root, &["rev-parse", "--verify", "--quiet", r]).is_ok();
+    let on = |b: &str| format!("refs/remotes/origin/{b}");
+    let base = if has(&on(base)) { on(base) } else { base.to_string() };
+    let head = if has(&format!("refs/heads/{head}")) { format!("refs/heads/{head}") } else if has(&on(head)) { on(head) } else { head.to_string() };
+    (base, head)
+}
+
+/// Pushes `branch` to its remote (origin unless it has another), its upstream set.
+pub fn push(root: &Path, branch: &str) -> Result<String> {
+    let remote = git_run(root, &["config", &format!("branch.{branch}.remote")]).ok().map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).unwrap_or_else(|| "origin".into());
+    let args = with_gh_auth(&["push", "--quiet", "-u", &remote, branch]);
+    git_run(root, &args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
 /// The open pull request from `head`, if there is one: its number.
 pub fn open_from(root: &Path, head: &str) -> Option<u64> {
     let out = gh(root, &["pr", "list", "--head", head, "--state", "open", "--json", "number"]).ok()?;

@@ -1578,32 +1578,6 @@ impl GitPanel {
                         .child(ui::icon("check", theme::accent()).size(px(22.)))
                         .child(div().text_size(px(14.)).text_color(theme::fg_bright()).child("Nothing to commit"))
                         .child(format!("The working tree is clean on {branch}. Changes you make show up here."))
-                        // A branch of its own, its work committed: next is proposing it.
-                        .when(!["main", "master", "develop", "trunk"].contains(&branch.as_str()), |d| {
-                            d.child(
-                                div()
-                                    .id("git-new-pr")
-                                    .debug_selector(|| "git-new-pr".into())
-                                    .mt(px(6.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap(px(3.))
-                                    .h(px(16.))
-                                    .px(px(6.))
-                                    .rounded(px(3.))
-                                    .text_size(px(10.))
-                                    .line_height(px(16.))
-                                    .bg(theme::accent())
-                                    .text_color(theme::on(theme::accent()))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::accent_hover()))
-                                    .tooltip(ui::tooltip_text(format!("Propose {branch}: push it and open a pull request")))
-                                    .on_click(cx.listener(|_, _, _, cx| cx.emit(Request::NewPr)))
-                                    .child(ui::small_icon("pull-request", theme::on(theme::accent())).size(px(9.)))
-                                    .child("Create PR"),
-                            )
-                        }),
                 )
             })
             .when(!clean, |d| d.children(rows.iter().enumerate().map(|(ix, row)| self.render_list_row(row, ix, focused, cx))))

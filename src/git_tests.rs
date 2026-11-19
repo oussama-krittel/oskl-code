@@ -818,17 +818,22 @@ fn the_graph_filter_applies_at_once_and_labels_only_the_picked_branches(cx: &mut
 }
 
 #[gpui::test]
-fn a_pull_request_is_opened_from_the_sidebar_or_source_control(cx: &mut gpui::TestAppContext) {
+fn a_pull_request_is_opened_from_the_sidebar(cx: &mut gpui::TestAppContext) {
     let (ws, cx) = setup_with(cx, |dir| {
         sh(dir, "git init -q --bare ../$(basename $PWD)-remote.git");
         sh(dir, INIT);
         sh(dir, "echo a > a.txt && git add . && git commit -qm one && git remote add origin ../$(basename $PWD)-remote.git && git push -q -u origin main");
+        sh(dir, "git switch -qc shared && echo s > s.txt && git add . && git commit -qm shared && git push -q -u origin shared && echo t > t.txt && git add . && git commit -qm later && git switch -q main");
         sh(dir, "git switch -qc newwork && echo b > b.txt && git add . && git commit -qm 'Add the b file' -m 'Because b matters.'");
         fake_gh();
     });
     let dir = root(&ws, cx);
     let log = || std::fs::read_to_string(fake_gh().with_file_name("gh.log")).unwrap_or_default();
     settle(&ws, cx);
+    // Source Control, the work committed: no button there (the sidebar's + proposes it).
+    show_git(&ws, cx);
+    settle(&ws, cx);
+    assert!(cx.debug_bounds("git-new-pr").is_none());
     let form = |ws: &Entity<Workspace>, cx: &mut VisualTestContext| {
         ws.read_with(cx, |ws, cx| ws.tabs.iter().find_map(|t| match &t.kind {
             TabKind::Commit(c) if c.read(cx).create.is_some() => Some(c.clone()),
@@ -836,10 +841,9 @@ fn a_pull_request_is_opened_from_the_sidebar_or_source_control(cx: &mut gpui::Te
         }))
     };
 
-    // Source Control, the work committed: a button proposes the branch.
-    show_git(&ws, cx);
+    click(cx, "act-prs");
     settle(&ws, cx);
-    click(cx, "git-new-pr");
+    click(cx, "pr-new");
     settle(&ws, cx);
     let view = form(&ws, cx).expect("the form opens in a tab");
     assert_eq!(view.read_with(cx, |v, _| v.compare.clone()), Some(("main".into(), "newwork".into())), "from this branch into the default one");
@@ -853,9 +857,34 @@ fn a_pull_request_is_opened_from_the_sidebar_or_source_control(cx: &mut gpui::Te
     click(cx, "md-tab-write");
     let _ = at(cx, "pr-new-body");
     assert_eq!(view.read_with(cx, |v, cx| v.form_text(cx)), Some(("Add the b file".into(), "Because b matters.".into())));
-    // The sidebar's + opens the same form, not a second one.
-    click(cx, "act-prs");
+    // The pickers: origin's branches for the base (not the one compared), and for the compared
+    // one those too and the ones only here; how far origin is behind each, and Push.
+    click(cx, "compare-base");
+    let _ = at(cx, "compare-branch-shared");
+    let _ = at(cx, "compare-branch-main");
+    assert!(cx.debug_bounds("compare-branch-newwork").is_none(), "not on origin, and it's the compared one");
+    assert!(cx.debug_bounds("compare-branch-origin/main").is_none(), "named as on GitHub");
+    click(cx, "compare-base");
+    click(cx, "compare-other");
+    let _ = at(cx, "compare-branch-newwork");
+    let _ = at(cx, "compare-branch-shared");
+    assert!(cx.debug_bounds("compare-branch-main").is_none(), "the base isn't offered again");
+    let behind = view.read_with(cx, |v, _| v.pr_branch("shared"));
+    assert_eq!(behind.map(|b| (b.on_remote, b.unpushed)), Some((true, 1)), "origin/shared is a commit behind");
+    // Picking shared (origin a commit behind it): a banner says so, with Push.
+    click(cx, "compare-branch-shared");
     settle(&ws, cx);
+    let _ = at(cx, "compare-push-shared");
+    click(cx, "compare-push-shared");
+    settle(&ws, cx);
+    assert_eq!(git_out(&dir, &["rev-parse", "origin/shared"]), git_out(&dir, &["rev-parse", "shared"]), "pushed");
+    assert!(cx.debug_bounds("compare-push-shared").is_none(), "nothing left to push");
+    // Back to newwork, not on GitHub yet: Push there too (Create pushes it anyway).
+    click(cx, "compare-other");
+    click(cx, "compare-branch-newwork");
+    settle(&ws, cx);
+    let _ = at(cx, "compare-push-newwork");
+    // The sidebar's + opens the same form, not a second one.
     click(cx, "pr-new");
     settle(&ws, cx);
     assert_eq!(ws.read_with(cx, |ws, cx| ws.tabs.iter().filter(|t| matches!(&t.kind, TabKind::Commit(c) if c.read(cx).create.is_some())).count()), 1);
@@ -870,6 +899,15 @@ fn a_pull_request_is_opened_from_the_sidebar_or_source_control(cx: &mut gpui::Te
         TabKind::Pr(v) => Some(v.read(cx).number),
         _ => None,
     }), Some(8));
+
+    // On the default branch (here the only one of its own), + still opens the form: the branch
+    // to propose is chosen there.
+    sh(&dir, "git switch -q main");
+    settle(&ws, cx);
+    click(cx, "pr-new");
+    settle(&ws, cx);
+    let view = form(&ws, cx).expect("the form opens");
+    assert_eq!(view.read_with(cx, |v, _| v.compare.clone()), Some(("main".into(), String::new())));
 }
 
 #[gpui::test]
@@ -1075,6 +1113,13 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     click(cx, "git-pr-chip");
     settle(&ws, cx);
     assert_eq!(pr_tab(&ws, cx).map(|p| p.entity_id()), Some(pr.entity_id()), "the same tab, not a second one");
+
+    // A commit on its branch here, not pushed: the pull request says GitHub doesn't have it.
+    sh(&dir, "echo more >> login.txt && git commit -qam more");
+    pr.update(cx, |p, cx| p.reload(cx));
+    settle(&ws, cx);
+    assert_eq!(pr.read_with(cx, |p, _| p.unpushed), 1);
+    let _ = at(cx, "pr-push");
 }
 
 #[gpui::test]

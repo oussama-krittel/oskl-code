@@ -2934,14 +2934,10 @@ impl Workspace {
             return self.activate(ix, window, cx);
         }
         let root = self.git_root(cx);
-        let head = self.git.read(cx).status.branch.clone().unwrap_or_default();
-        if head.is_empty() {
-            return self.flash("Check out a branch first: a pull request comes from a branch".into(), true, cx);
-        }
+        // From the branch checked out, into the default one; on the default branch (or none),
+        // the form opens with the branch to propose still to choose.
         let base = git::gh::default_branch(&root);
-        if base == head {
-            return self.flash(format!("You're on {head}: switch to the branch you want to propose, then open a pull request"), true, cx);
-        }
+        let head = self.git.read(cx).status.branch.clone().filter(|h| *h != base).unwrap_or_default();
         let view = cx.new(|cx| CommitView::new_pr(root.clone(), base, head, cx));
         let sub = Subscription::join(
             cx.subscribe_in(&view, window, |ws, _, req: &Request, window, cx| ws.handle_request(req, window, cx)),
