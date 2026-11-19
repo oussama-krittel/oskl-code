@@ -3151,7 +3151,7 @@ impl Workspace {
             return;
         }
         if self.tab_dirty(ix, cx) && !force {
-            return self.flash("Unsaved changes — :w to save, :q! to discard".into(), true, cx);
+            return self.ask_close_dirty(ix, window, cx);
         }
         let id = self.tabs[ix].id;
         let pane = self.pane_of_tab(id);
@@ -3173,6 +3173,54 @@ impl Workspace {
             window.focus(&self.focus, cx);
         }
         cx.notify();
+    }
+
+    /// Closing a tab with unsaved changes: Save (a file deleted meanwhile is written back) or
+    /// Don't Save, as in VS Code; Cancel keeps it.
+    fn ask_close_dirty(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.tabs[ix].id;
+        let editor = match &self.tabs[ix].kind {
+            TabKind::Editor(e) => Some(e.clone()),
+            _ => None,
+        };
+        let (name, _, _) = self.tab_title(&self.tabs[ix], cx);
+        let gone = editor.as_ref().and_then(|e| e.read(cx).path.clone()).is_some_and(|p| !p.exists());
+        let detail = match (gone, editor.is_some()) {
+            (true, _) => "The file was deleted from disk. Save puts it back; Don't Save closes it and the changes are lost.".to_string(),
+            (false, true) => "Your changes will be lost if you don't save them.".to_string(),
+            (false, false) => "Its changes will be lost.".to_string(),
+        };
+        let buttons = if editor.is_some() { vec!["Save".into(), "Don't Save".into()] } else { vec!["Don't Save".into()] };
+        let me = cx.entity().downgrade();
+        let ask = crate::dialog::Ask {
+            title: format!("Do you want to save the changes you made to {name}?"),
+            detail,
+            buttons,
+            danger: false,
+            cancel_default: false,
+            cancel_label: None,
+            on_answer: Rc::new(move |answer, window, cx| {
+                let (editor, me) = (editor.clone(), me.clone());
+                // The dialog answers from inside the workspace: close once it's done.
+                window.defer(cx, move |window, cx| {
+                me.update(cx, |ws, cx| {
+                    let Some(ix) = ws.tab_ix(id) else { return };
+                    if let (0, Some(ed)) = (answer, editor) {
+                        // A deleted file's folder may be gone too.
+                        if let Some(dir) = ed.read(cx).path.as_ref().and_then(|p| p.parent()) {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        if let Err(e) = ed.update(cx, |ed, cx| ed.save(cx)) {
+                            return ws.flash(format!("Save failed: {e}"), true, cx);
+                        }
+                    }
+                    ws.close_tab(ix, true, window, cx);
+                })
+                .ok();
+                });
+            }),
+        };
+        self.open_ask(ask, window, cx);
     }
 
     fn tab_title(&self, tab: &Tab, cx: &App) -> (String, String, bool) {
@@ -7274,6 +7322,7 @@ mod ui_tests {
             crate::git_panel::bind_keys();
             crate::db_view::bind_keys();
             crate::preview::bind_keys();
+            crate::git_panel::pr::bind_keys();
             crate::api_view::bind_keys();
             crate::diff_view::bind_keys();
             crate::commit_view::bind_keys();
@@ -8289,6 +8338,45 @@ mod ui_tests {
     }
 
     #[gpui::test]
+    fn a_tab_with_changes_closes_after_asking_even_when_its_file_was_deleted(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        let root = ws.read_with(cx, |ws, cx| ws.root(cx));
+        std::fs::write(root.join("gone.txt"), "x\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("gone.txt"), None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).unwrap();
+        ed.update_in(cx, |e, window, cx| window.focus(&e.focus_target(cx), cx));
+        cx.simulate_input("edited ");
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        ws.update_in(cx, |ws, _, cx| ws.on_fs_change([root.join("gone.txt")].into_iter().collect(), cx));
+        // Closing asks; Don't Save closes it.
+        ws.update_in(cx, |ws, window, cx| ws.close_active(&super::CloseTab, window, cx));
+        cx.run_until_parked();
+        let click = |cx: &mut VisualTestContext, sel: &str| {
+            cx.run_until_parked();
+            let at = cx.debug_bounds(Box::leak(sel.to_string().into_boxed_str())).unwrap_or_else(|| panic!("{sel} is on screen")).center();
+            cx.simulate_click(at, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        assert_eq!(ws.read_with(cx, |ws, _| ws.tabs.len()), 1, "asked first");
+        click(cx, "dialog-button-Don't Save");
+        assert_eq!(ws.read_with(cx, |ws, _| ws.tabs.len()), 0, "Don't Save closed it");
+        assert!(!root.join("gone.txt").exists());
+        // Save writes it back, then closes.
+        std::fs::write(root.join("gone.txt"), "x\n").unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("gone.txt"), None, false, window, cx));
+        cx.run_until_parked();
+        let ed = ws.read_with(cx, |ws, _| ws.active_editor()).unwrap();
+        ed.update_in(cx, |e, window, cx| window.focus(&e.focus_target(cx), cx));
+        cx.simulate_input("kept ");
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        ws.update_in(cx, |ws, window, cx| ws.close_active(&super::CloseTab, window, cx));
+        click(cx, "dialog-button-Save");
+        assert_eq!(ws.read_with(cx, |ws, _| ws.tabs.len()), 0);
+        assert_eq!(std::fs::read_to_string(root.join("gone.txt")).unwrap(), "kept x\n");
+    }
+
+    #[gpui::test]
     fn live_server_serves_the_workspace_and_lives_in_the_status_bar(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));
@@ -9155,6 +9243,27 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         settle(cx);
         let end = decoded(cx);
         assert!((1..12).contains(&end), "only those near the end now ({end})");
+        // Read with the keyboard: the arrows a line at a time, Page Down a screen, Home the top.
+        preview.update(cx, |v, cx| v.scroll_page_to(0., cx));
+        settle(cx);
+        let page = cx.debug_bounds("preview-markdown").unwrap().center();
+        cx.simulate_click(page, gpui::Modifiers::none());
+        let y = |cx: &mut VisualTestContext| -(preview.read_with(cx, |v, _| v.page_scroll().0.y) / gpui::px(1.));
+        cx.simulate_keystrokes("down down");
+        settle(cx);
+        assert_eq!(y(cx), 80., "two lines down");
+        cx.simulate_keystrokes("up");
+        settle(cx);
+        assert_eq!(y(cx), 40.);
+        cx.simulate_keystrokes("pagedown");
+        settle(cx);
+        assert!(y(cx) > 200., "a screen down: {}", y(cx));
+        cx.simulate_keystrokes("end");
+        settle(cx);
+        assert_eq!(y(cx), max, "the end");
+        cx.simulate_keystrokes("home");
+        settle(cx);
+        assert_eq!(y(cx), 0.);
     }
 
     #[gpui::test]

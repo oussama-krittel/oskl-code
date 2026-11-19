@@ -1055,6 +1055,18 @@ fn pull_requests_have_their_own_sidebar_and_are_reviewed_in_a_tab(cx: &mut gpui:
     assert_eq!(pr.read_with(cx, |p, _| p.pending.len()), 0);
     assert!(!dir.join(&kept).exists(), "nothing pending left");
 
+    // The description's text is selectable: dragged across, ⌘C copies it.
+    click(cx, "pr-tab-conversation");
+    settle(&ws, cx);
+    let body = cx.debug_bounds("pr-md-0").expect("the description");
+    let (from, to) = (gpui::point(body.left() + gpui::px(1.), body.top() + gpui::px(4.)), gpui::point(body.right() - gpui::px(1.), body.bottom() - gpui::px(2.)));
+    cx.simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.simulate_mouse_move(to, Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+    cx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert!(pr.read_with(cx, |p, _| p.sel.text()).contains("Adds the login page"), "{:?}", pr.read_with(cx, |p, _| p.sel.text()));
+    cx.simulate_keystrokes("cmd-c");
+    assert!(cx.read_from_clipboard().and_then(|c| c.text()).is_some_and(|t| t.contains("Adds the login page")), "⌘C copied it");
     // The conversation: its checks (each a link to its run), whether it merges, a comment box
     // with its preview.
     click(cx, "pr-tab-conversation");

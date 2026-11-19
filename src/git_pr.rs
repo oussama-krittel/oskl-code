@@ -21,6 +21,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+actions!(pr_view, [CopyPrText]);
+
+/// ⌘C copies the text selected in the page (description, comments), when no box has the keyboard.
+pub fn bind_keys() {
+    crate::keybindings::collect([crate::keybindings::kb("cmd-c", CopyPrText, Some("PrView"))]);
+}
+
 pub enum PrEvent {
     /// Something changed on GitHub (a review, a merge): lists should refresh.
     Changed,
@@ -128,6 +135,8 @@ pub struct PrView {
     reloading: bool,
     /// Commits on its branch here that GitHub doesn't have yet.
     pub unpushed: usize,
+    /// Text selected by dragging across the description and comments (⌘C copies it).
+    pub sel: crate::sel::Selection,
     /// The review dropdown is open, hanging from here.
     pub review_at: Option<Point<Pixels>>,
     /// Who gh is signed in as: their comments can be edited and deleted.
@@ -251,6 +260,7 @@ impl PrView {
             resolve_override: Default::default(),
             reloading: false,
             unpushed: 0,
+            sel: Default::default(),
             review_at: None,
             viewer: None,
             editing: None,
@@ -480,7 +490,7 @@ impl PrView {
                     .child(div().flex_1())
                     .children(tools),
             )
-            .child(if editing { self.edit_box(cx) } else { md.map(|m| m.render(&root, &self.images, opener).into_any_element()).unwrap_or_else(|| div().into_any_element()) })
+            .child(if editing { self.edit_box(cx) } else { md.map(|m| self.md_el(&root, &m, opener)).unwrap_or_else(|| div().into_any_element()) })
             .into_any_element()
     }
 
@@ -1434,6 +1444,12 @@ impl PrView {
         )
     }
 
+    /// Markdown on the page, its text selectable: in reading order by where it is in `md`.
+    fn md_el(&self, root: &Path, md: &Rc<Markdown>, opener: crate::preview::Opener) -> AnyElement {
+        let at = self.md.iter().position(|m| Rc::ptr_eq(m, md)).unwrap_or(self.md.len() + 1) as u64;
+        div().debug_selector(move || format!("pr-md-{at}")).child(md.render_selectable(root, &self.images, opener, &self.sel, at * 1_000_000)).into_any_element()
+    }
+
     /// Who did what, when: a card with its Markdown.
     /// `target`: what Edit changes (and the card shows its edit box while it's edited).
     #[allow(clippy::too_many_arguments)]
@@ -1470,7 +1486,7 @@ impl PrView {
             )
             .children(excerpt)
             .when(editing, |d| d.child(self.edit_box(cx)))
-            .when_some(body.filter(|_| !editing), |d, md| d.child(div().px(px(18.)).py(px(16.)).child(md.render(root, &self.images, opener))))
+            .when_some(body.filter(|_| !editing), |d, md| d.child(div().px(px(18.)).py(px(16.)).child(self.md_el(root, &md, opener))))
             .when(!extra.is_empty(), |d| d.child(div().flex().flex_col().gap(px(14.)).p(px(16.)).children(extra)))
     }
 
@@ -1918,7 +1934,7 @@ impl PrView {
                         .child(div().flex_1())
                         .children(del),
                 )
-                .when_some(md, |d, md| d.child(md.render(&root, &self.images, opener.clone())))
+                .when_some(md, |d, md| d.child(self.md_el(&root, &md, opener.clone())))
         };
         // The thread a reply goes to: its first comment.
         let reply_to = sent.first().map(|(_, l)| l.in_reply_to_id.unwrap_or(l.id)).filter(|id| *id != 0);
@@ -2371,7 +2387,33 @@ impl Focusable for PrView {
 
 impl Render for PrView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let base = div().id("pr-view").debug_selector(|| "pr-view".into()).track_focus(&self.focus).size_full().flex().flex_col().bg(theme::bg_editor()).text_size(px(12.));
+        self.sel.begin_frame();
+        let base = div()
+            .id("pr-view")
+            .debug_selector(|| "pr-view".into())
+            .key_context("PrView")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|v, _: &CopyPrText, _, cx| {
+                let text = v.sel.text();
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    cx.emit(Request::Message("Copied".into()));
+                }
+            }))
+            // A press starts afresh (a drag selects anew); the page takes the keyboard so ⌘C
+            // reaches it (a box clicked takes it back right after).
+            .capture_any_mouse_down(cx.listener(|v, _, window, cx| {
+                if v.sel.has_selection() {
+                    v.sel.clear();
+                    cx.notify();
+                }
+                window.focus(&v.focus, cx);
+            }))
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme::bg_editor())
+            .text_size(px(12.));
         let (d, lines) = match &self.detail {
             None => {
                 return base

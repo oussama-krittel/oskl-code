@@ -537,6 +537,7 @@ mod defaults {
         crate::file_tree::bind_keys();
         crate::git_panel::bind_keys();
         crate::diff_view::bind_keys();
+        crate::git_panel::pr::bind_keys();
         crate::commit_view::bind_keys();
         crate::search::bind_keys();
         crate::diff_edit::bind_keys();

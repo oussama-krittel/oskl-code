@@ -16,11 +16,28 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-actions!(preview, [CopyText, SelectAllText]);
+actions!(preview, [CopyText, SelectAllText, LineDown, LineUp, PageDown, PageUp, ToTop, ToBottom]);
 
 /// ⌘C / ⌘A in a preview: its text (Markdown, Word, PDF) or its cells (CSV, Excel).
 pub fn bind_keys() {
-    crate::keybindings::collect([crate::keybindings::kb("cmd-c", CopyText, Some("Preview")), crate::keybindings::kb("cmd-a", SelectAllText, Some("Preview"))]);
+    let c = Some("Preview");
+    // Only a Markdown page: tables and sheets move between cells with these.
+    let m = Some("Preview && markdown");
+    crate::keybindings::collect([
+        crate::keybindings::kb("cmd-c", CopyText, c),
+        crate::keybindings::kb("cmd-a", SelectAllText, c),
+        // A page read with the keyboard, like a browser.
+        crate::keybindings::kb("down", LineDown, m),
+        crate::keybindings::kb("up", LineUp, m),
+        crate::keybindings::kb("pagedown", PageDown, m),
+        crate::keybindings::kb("space", PageDown, m),
+        crate::keybindings::kb("pageup", PageUp, m),
+        crate::keybindings::kb("shift-space", PageUp, m),
+        crate::keybindings::kb("home", ToTop, m),
+        crate::keybindings::kb("cmd-up", ToTop, m),
+        crate::keybindings::kb("end", ToBottom, m),
+        crate::keybindings::kb("cmd-down", ToBottom, m),
+    ]);
 }
 
 /// Prose in Markdown reads better in the system font than in the code font.
@@ -167,6 +184,22 @@ impl PreviewView {
         };
         view.refresh(window, cx);
         view
+    }
+
+    /// Scrolls a Markdown page by `by` pixels (down is positive), within its length.
+    fn scroll_by(&mut self, by: f32, cx: &mut Context<Self>) {
+        if self.kind != Kind::Markdown {
+            return;
+        }
+        let (off, max) = (self.scroll.offset(), self.scroll.max_offset());
+        let y = (f32::from(off.y) - by).clamp(-f32::from(max.y), 0.);
+        self.scroll.set_offset(point(off.x, gpui::px(y)));
+        cx.notify();
+    }
+
+    /// A screen less a line, so the last line read stays in view.
+    fn page(&self) -> f32 {
+        (f32::from(self.scroll.bounds().size.height) - 40.).max(40.)
     }
 
     fn copy_text(&mut self, _: &CopyText, _: &mut Window, cx: &mut Context<Self>) {
@@ -905,10 +938,16 @@ impl Render for PreviewView {
             },
         };
         div()
-            .key_context("Preview")
+            .key_context(if self.kind == Kind::Markdown { "Preview markdown" } else { "Preview" })
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::copy_text))
             .on_action(cx.listener(Self::select_all_text))
+            .on_action(cx.listener(|v, _: &LineDown, _, cx| v.scroll_by(40., cx)))
+            .on_action(cx.listener(|v, _: &LineUp, _, cx| v.scroll_by(-40., cx)))
+            .on_action(cx.listener(|v, _: &PageDown, _, cx| v.scroll_by(v.page(), cx)))
+            .on_action(cx.listener(|v, _: &PageUp, _, cx| v.scroll_by(-v.page(), cx)))
+            .on_action(cx.listener(|v, _: &ToTop, _, cx| v.scroll_by(-1e9, cx)))
+            .on_action(cx.listener(|v, _: &ToBottom, _, cx| v.scroll_by(1e9, cx)))
             // A press starts afresh (a drag makes a new selection); ⌘C then works here.
             .capture_any_mouse_down(cx.listener(|v, _, window, cx| {
                 if v.sel.has_selection() {
@@ -1471,9 +1510,19 @@ impl Markdown {
 
     /// The blocks in a column; relative links and pictures are from `base`, files open with `open`.
     pub fn render(&self, base: &Path, images: &Entity<RetainAllImageCache>, open: Opener) -> AnyElement {
+        self.render_in(base, images, open, None, 0)
+    }
+
+    /// `render`, its text selectable (dragged across, ⌘C) as part of `sel`; `first_line` puts
+    /// it in reading order among the others on the page.
+    pub fn render_selectable(&self, base: &Path, images: &Entity<RetainAllImageCache>, open: Opener, sel: &crate::sel::Selection, first_line: u64) -> AnyElement {
+        self.render_in(base, images, open, Some(sel.clone()), first_line)
+    }
+
+    fn render_in(&self, base: &Path, images: &Entity<RetainAllImageCache>, open: Opener, sel: Option<crate::sel::Selection>, first_line: u64) -> AnyElement {
         let mut r = Renderer {
-            sel: None,
-            line: 0,
+            sel,
+            line: first_line,
             cell: None,
             base: base.to_path_buf(),
             open,

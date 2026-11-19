@@ -193,6 +193,7 @@ fn main() {
         dialog::bind_keys();
         db_view::bind_keys();
         preview::bind_keys();
+        git_panel::pr::bind_keys();
         api_view::bind_keys();
         keybindings::apply(cx);
         cx.on_action(|_: &QuitApp, cx| cx.quit());
