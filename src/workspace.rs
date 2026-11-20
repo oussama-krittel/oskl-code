@@ -6097,6 +6097,12 @@ impl Workspace {
                                 d.child(div().absolute().top(px(4.)).left(px(6.)).right(px(14.)).flex().justify_end().child(self.find.clone()))
                             }),
                     )
+                    // Several splits: the one with the keyboard has a line across its top in the
+                    // theme's own color (an empty one too); the others stay as they are, to be read.
+                    .when(self.panes.len() > 1 && id == self.focused_pane, |d| {
+                        let color = theme::accent();
+                        d.child(div().debug_selector(move || format!("pane-focus-line-{id}")).absolute().top_0().left_0().right_0().h(px(2.)).bg(color))
+                    })
                     .when_some(self.drop_hint.filter(|(p, _)| *p == id && cx.has_active_drag()).map(|(_, z)| z), |d, zone| {
                         // Shows where the drop lands: the whole pane, or the half that becomes a new split.
                         let overlay = div().absolute().bg(theme::frame_focused().opacity(0.16)).border_2().border_color(theme::frame_focused()).rounded(px(4.));
@@ -8348,6 +8354,35 @@ mod ui_tests {
         click(cx, "dialog-button-Save");
         assert_eq!(ws.read_with(cx, |ws, _| ws.tabs.len()), 0);
         assert_eq!(std::fs::read_to_string(root.join("gone.txt")).unwrap(), "kept x\n");
+    }
+
+    #[gpui::test]
+    fn the_split_with_the_keyboard_has_a_line_across_its_top(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        // One split: neither.
+        cx.run_until_parked();
+        let first = ws.read_with(cx, |ws, _| ws.focused_pane);
+        assert!(cx.debug_bounds(Box::leak(format!("pane-focus-line-{first}").into_boxed_str())).is_none());
+        cx.simulate_keystrokes("cmd-\\");
+        cx.run_until_parked();
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+        let second = ws.read_with(cx, |ws, _| ws.focused_pane);
+        assert_ne!(first, second);
+        let sel = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        assert!(cx.debug_bounds(sel(format!("pane-focus-line-{second}"))).is_some(), "the new split has the line");
+        assert!(cx.debug_bounds(sel(format!("pane-focus-line-{first}"))).is_none(), "the other hasn't");
+        // The empty split's page: what to do, not the recent projects (that's the no-project screen).
+        assert!(cx.debug_bounds(sel(format!("start-screen-{second}"))).is_some());
+        assert!(cx.debug_bounds("start-recent").is_none());
+        // A click in the other one gives it the keyboard, and the line.
+        let other = cx.debug_bounds(sel(format!("start-screen-{first}"))).unwrap().center();
+        cx.simulate_click(other, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(ws.read_with(cx, |ws, _| ws.focused_pane), first);
+        cx.update(|w, _| w.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds(sel(format!("pane-focus-line-{first}"))).is_some());
     }
 
     #[gpui::test]

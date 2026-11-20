@@ -732,7 +732,6 @@ impl Workspace {
         let name = self.root(cx).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let branch = self.git.read(cx).branch_label();
         let nothing = if self.panes.len() > 1 { "Nothing is open in this split yet." } else { "Nothing is open yet." };
-        let home = std::env::var("HOME").unwrap_or_default();
         let heading = |text: &str| div().mb(px(6.)).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_muted()).child(text.to_string());
         let command = format!("{} or :", shortcut("CommandPalette", "⌘;"));
 
@@ -751,34 +750,7 @@ impl Workspace {
             .child(self.start_row("claude", pane, "Ask Claude", &shortcut("OpenClaude", "⌘Esc"), cx, |ws, w, cx| ws.open_agent(false, None, None, w, cx)))
             .child(self.start_row("keys", pane, "Every shortcut", &shortcut("ShowKeysPanel", "⌘K ⌘S"), cx, |ws, w, cx| ws.show_keys_panel(&ShowKeysPanel, w, cx)));
 
-        let recent: Vec<PathBuf> = self.recent_projects(cx).into_iter().take(5).collect();
-        let projects = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w(px(220.))
-            .child(heading("Recent projects"))
-            .children(recent.into_iter().enumerate().map(|(i, dir)| {
-                let label = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                let parent = dir.parent().map(|p| p.to_string_lossy().replacen(&home, "~", 1)).unwrap_or_default();
-                div()
-                    .id(("start-recent", i))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .h(px(26.))
-                    .px(px(8.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::hover()))
-                    .child(ui::folder_icon(&label, false))
-                    .child(div().flex_none().text_color(theme::fg_bright()).child(label))
-                    .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().text_size(px(11.)).text_color(theme::fg_muted()).child(parent))
-                    .on_click(cx.listener(move |ws, _, w, cx| ws.switch_project(dir.clone(), w, cx)))
-            }))
-            .child(self.start_row("open", pane, "Open a folder", &shortcut("OpenFolder", "⌘O"), cx, |ws, w, cx| ws.open_folder(&OpenFolder, w, cx)))
-            .child(self.start_row("new-window", pane, "New window", &shortcut("OpenFolderNewWindow", "⌘⇧N"), cx, |ws, w, cx| ws.pick_folder(true, w, cx)));
-
+        // Recent projects are on the screen shown before a project is open, not here.
         let sel = format!("start-screen-{pane}");
         div()
             .id(SharedString::from(sel.clone()))
@@ -800,7 +772,7 @@ impl Workspace {
                     .gap_x(px(40.))
                     .gap_y(px(24.))
                     .w_full()
-                    .max_w(px(640.))
+                    .max_w(px(360.))
                     .p(px(24.))
                     .child(
                         div()
@@ -811,8 +783,7 @@ impl Workspace {
                             .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child("OSKL Code"))
                             .child(div().child(if branch.is_empty() { format!("{name}. {nothing}") } else { format!("{name}, on {branch}. {nothing}") })),
                     )
-                    .child(start)
-                    .child(projects),
+                    .child(start),
             )
             .into_any_element()
     }
