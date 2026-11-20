@@ -111,6 +111,8 @@ pub struct DiffView {
     pub font_size: f32,
     /// A + on each line's number, to comment on it (a pull request's review).
     pub commentable: bool,
+    /// The file's history button (off in a pull request, where it has no place).
+    pub history: bool,
     /// What shows under a row: (old line, new line), 1-based, as the row shows them.
     pub annotate: Option<Annotate>,
     /// Lines picked for a comment, tinted: (new side, first, last), 1-based.
@@ -162,6 +164,7 @@ impl DiffView {
             sel_new: Default::default(),
             font_size,
             commentable: false,
+            history: true,
             annotate: None,
             marked: None,
             comment_drag: None,
@@ -650,7 +653,7 @@ impl DiffView {
                         })),
                 )
             })
-            .child(ui::icon_button("file-history", "history").debug_selector(|| "file-history".into()).tooltip(ui::tooltip("This file's history")).on_click(cx.listener(|v, _, _, cx| cx.emit(Request::FileHistory(v.root.join(&v.spec.path))))))
+            .when(self.history, |d| d.child(ui::icon_button("file-history", "history").debug_selector(|| "file-history".into()).tooltip(ui::tooltip("This file's history")).on_click(cx.listener(|v, _, _, cx| cx.emit(Request::FileHistory(v.root.join(&v.spec.path)))))))
             .child(ui::icon_button("open-file", "open").debug_selector(|| "open-file".into()).tooltip(ui::tooltip("Open the file")).on_click(cx.listener(|v, _, w, cx| v.open_file(&OpenFile, w, cx))))
     }
 }

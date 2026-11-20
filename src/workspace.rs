@@ -505,6 +505,8 @@ struct OutputEntry {
     err: bool,
     /// When it ran (unix seconds).
     time: i64,
+    /// A push the remote rejected: Force Push (with lease) under the output, for this repo.
+    force_push: Option<WeakEntity<Repo>>,
 }
 
 /// The output history's limits: entries, and lines across all of them (oldest go first).
@@ -536,7 +538,6 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("fetch", "git fetch --all --prune", false),
     ("pull", "git pull", false),
     ("push", "git push", false),
-    ("sync", "Pull then push: sync (rebase) | sync merge", true),
     ("compare", "Compare branches: compare <branch> (with the current one) or compare <base> <branch>", true),
     ("abort", "Abort the merge / rebase / cherry-pick in progress", false),
     ("undo-git", "Undo the last git action: commit, amend, reset, merge, rebase, stash, branch delete, discard, fix up", false),
@@ -969,9 +970,12 @@ impl Workspace {
         [
             cx.subscribe_in(repo, window, |ws, repo, ev: &RepoEvent, window, cx| match ev {
                 RepoEvent::PushRejected => {
-                    // The remote moved on: Enter pulls (rebase) then pushes; "sync merge" merges instead.
-                    ws.open_cmd(CmdMode::Command, "sync", window, cx);
-                    ws.flash("Push rejected: the remote has new commits. Enter = pull --rebase then push · sync merge = merge instead".into(), true, cx);
+                    // The remote has commits this branch doesn't: Force Push sits under the output.
+                    if let Some(e) = ws.outputs.last_mut() {
+                        e.force_push = Some(repo.downgrade());
+                    }
+                    ws.flash("Push rejected: the remote has commits you don't have".into(), true, cx);
+                    cx.notify();
                 }
                 RepoEvent::Message(m) => ws.flash(m.clone(), false, cx),
                 RepoEvent::Undoable(m) => ws.offer_undo(repo.clone(), m.clone(), cx),
@@ -1372,7 +1376,7 @@ impl Workspace {
         if same {
             self.outputs.pop();
         }
-        self.outputs.push(OutputEntry { title, lines, err, time: util::now() });
+        self.outputs.push(OutputEntry { title, lines, err, time: util::now(), force_push: None });
         while self.outputs.len() > OUTPUT_KEEP || (self.outputs.len() > 1 && self.outputs.iter().map(|e| e.lines.len()).sum::<usize>() > OUTPUT_KEEP_LINES) {
             self.outputs.remove(0);
         }
@@ -1675,12 +1679,17 @@ impl Workspace {
                         )
                         .child(div().pl(px(28.)).min_w_0().flex().flex_col().text_size(px(12.)).line_height(relative(1.45)).text_color(theme::fg_dim()).children(detail))
                         .when_some(st.ask.output.clone(), |d, out| {
+                            let text = out.clone();
                             d.child(
+                                div()
+                                    .relative()
+                                    .ml(px(28.))
+                                    .child(
                                 div()
                                     .id("dialog-output")
                                     .debug_selector(|| "dialog-output".into())
-                                    .ml(px(28.))
                                     .max_h(px(320.))
+                                    .pr(px(30.))
                                     .overflow_y_scroll()
                                     .p(px(8.))
                                     .rounded(px(4.))
@@ -1692,6 +1701,20 @@ impl Workspace {
                                     .line_height(relative(1.45))
                                     .text_color(theme::fg())
                                     .children(out.lines().take(2000).map(|l| div().min_w_0().min_h(px(16.)).child(l.to_string())).collect::<Vec<_>>()),
+                                    )
+                                    // Copies all of it, and the dialog stays.
+                                    .child(
+                                        ui::icon_button("dialog-copy", "copy")
+                                            .debug_selector(|| "dialog-copy".into())
+                                            .tooltip(ui::tooltip("Copy the output"))
+                                            .absolute()
+                                            .top(px(4.))
+                                            .right(px(4.))
+                                            .on_click(cx.listener(move |ws, _, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                                                ws.flash("Copied".into(), false, cx);
+                                            })),
+                                    ),
                             )
                         })
                         .child(div().flex().flex_wrap().justify_end().gap(px(8.)).pt(px(4.)).children(buttons)),
@@ -5116,10 +5139,6 @@ impl Workspace {
                 self.git.update(cx, |r, cx| r.run_git(vec!["switch".into(), "-c".into(), rest.to_string()], cx));
             }
             "fetch" => self.git.update(cx, |r, cx| r.run_git(vec!["fetch".into(), "--all".into(), "--prune".into()], cx)),
-            "sync" => {
-                let rebase = rest != "merge";
-                self.git.update(cx, |r, cx| r.run_op(if rebase { "Pull (rebase) & push" } else { "Pull (merge) & push" }, cx, move |root| git::sync(root, rebase)));
-            }
             "compare" => {
                 // `compare <branch>` (against the current one) or `compare <base> <branch>`.
                 let words: Vec<&str> = rest.split_whitespace().collect();
@@ -6400,7 +6419,9 @@ impl Workspace {
                     }))),
             )
             .when(self.output_history_open && total > 0 && !problems, |d| d.child(deferred(self.render_output_history(cx)).with_priority(2)))
-            .child(if problems { self.render_problems(cx) } else {
+            .child(if problems { self.render_problems(cx) } else if let Some(repo) = self.outputs.get(self.output_shown).and_then(|e| e.force_push.clone()) {
+                self.render_rejected_push(repo, cx)
+            } else {
                 uniform_list(
                     "output",
                     count,
@@ -6434,6 +6455,63 @@ impl Workspace {
                 .flex_1()
                 .into_any_element()
             })
+    }
+
+    /// A rejected push's output (short), with Force Push right under the text, where you're
+    /// reading: it replaces the remote branch only if nobody pushed since you last fetched.
+    fn render_rejected_push(&self, repo: WeakEntity<Repo>, cx: &mut Context<Self>) -> AnyElement {
+        let busy = repo.upgrade().is_some_and(|r| r.read(cx).busy.is_some());
+        let branch = repo.upgrade().map(|r| r.read(cx).branch_label()).unwrap_or_default();
+        div()
+            .id("output-rejected")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .py(px(4.))
+            .children(self.output().iter().map(|line| {
+                div()
+                    .px(px(12.))
+                    .min_h(px(18.))
+                    .font_family(theme::MONO_FONT)
+                    .text_size(px(11.))
+                    .text_color(if line.err { theme::git_deleted() } else { theme::fg_dim() })
+                    .child(line.text.clone())
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(12.))
+                    .pt(px(10.))
+                    .child(
+                        div()
+                            .id("force-push")
+                            .debug_selector(|| "force-push".into())
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .h(px(24.))
+                            .px(px(10.))
+                            .rounded(px(4.))
+                            .text_size(px(12.))
+                            .bg(theme::c(0xc74e39))
+                            .text_color(theme::on(theme::c(0xc74e39)))
+                            .when(busy, |d| d.opacity(0.6).child(crate::pr_panel::spinner("force-push-spinner", 12.)).child("Pushing…"))
+                            .when(!busy, |d| {
+                                d.cursor_pointer().hover(|s| s.opacity(0.9)).child(ui::small_icon("arrow-up", theme::on(theme::c(0xc74e39)))).child("Force Push").on_click(cx.listener(move |ws, _, _, cx| {
+                                    let Some(repo) = repo.upgrade() else { return };
+                                    if let Some(e) = ws.outputs.get_mut(ws.output_shown) {
+                                        e.force_push = None;
+                                    }
+                                    repo.update(cx, |r, cx| r.run_git(vec!["push".into(), "--force-with-lease".into()], cx));
+                                    cx.notify();
+                                }))
+                            }),
+                    )
+                    .child(div().text_size(px(11.)).text_color(theme::fg_muted()).child(format!("Replaces {branch} on the remote with yours (--force-with-lease: only if nobody pushed since your last fetch)"))),
+            )
+            .into_any_element()
     }
 
     /// The output history: newest first, each with when it ran and a ×; Clear all at the bottom.

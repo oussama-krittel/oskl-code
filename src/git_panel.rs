@@ -238,6 +238,10 @@ pub struct GitPanel {
     graph_scroll: UniformListScrollHandle,
     changes_scroll: ScrollHandle,
     commit_task: Option<Task<()>>,
+    /// A commit is running: the button says so and takes no clicks.
+    committing: bool,
+    /// The main button pushes instead of committing (picked under its arrow).
+    push_mode: bool,
     menu_open: bool,
     /// The menu under the commit button's arrow: Commit, Commit (Amend), Push.
     commit_menu_open: bool,
@@ -338,6 +342,8 @@ impl GitPanel {
             graph_scroll: UniformListScrollHandle::new(),
             changes_scroll: ScrollHandle::new(),
             commit_task: None,
+            committing: false,
+            push_mode: false,
             menu_open: false,
             commit_menu_open: false,
             scope_open: false,
@@ -470,6 +476,9 @@ impl GitPanel {
 
     /// `confirmed`: the user already chose to commit what the secrets check found.
     fn commit_with(&mut self, message: Option<String>, all: bool, amend: bool, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.committing {
+            return;
+        }
         let message = message.unwrap_or_else(|| self.commit_input.read(cx).text()).trim().to_string();
         let repo = self.repo.read(cx);
         if let Some(op) = repo.status.op.clone() {
@@ -507,9 +516,13 @@ impl GitPanel {
             );
             done.map(|out| (Ok(out), undo))
         });
+        self.committing = true;
+        cx.notify();
         self.commit_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             this.update_in(cx, |panel, _, cx| {
+                panel.committing = false;
+                cx.notify();
                 match result {
                     Ok((Err(findings), _)) => panel.ask_secrets(findings, retry, amend, cx),
                     Ok((Ok(out), undo)) => {
@@ -1079,10 +1092,11 @@ impl GitPanel {
         self.panel_bounds.get().right() - px(8.) - px(w) >= px(0.)
     }
 
-    /// Under the commit button's arrow: commit, commit amending the last one, or push the
-    /// current branch (setting its upstream when it has none, like the terminal's advice).
+    /// Under the commit button's arrow: what the button does — commit, commit amending the last
+    /// one, or push the current branch (setting its upstream when it has none, like the terminal).
     fn render_commit_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let items: [(&'static str, &'static str); 3] = [("commit-menu-commit", "Commit"), ("commit-menu-amend", "Commit (Amend)"), ("commit-menu-push", "Push")];
+        let current = if self.push_mode { 2 } else if self.amend { 1 } else { 0 };
         div()
             .id("commit-menu-popup")
             .occlude()
@@ -1114,17 +1128,14 @@ impl GitPanel {
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::selected_focused()))
                     .when(ix == 2, |d| d.mt(px(4.)).border_t_1().border_color(theme::border()))
-                    .on_click(cx.listener(move |p, _, window, cx| {
+                    // Picks what the main button does; nothing runs until it's clicked.
+                    .on_click(cx.listener(move |p, _, _, cx| {
                         p.commit_menu_open = false;
-                        match ix {
-                            0 | 1 => {
-                                p.amend = ix == 1;
-                                p.commit(None, false, ix == 1, window, cx);
-                            }
-                            _ => p.repo.update(cx, |r, cx| r.run_git(vec!["push".into()], cx)),
-                        }
+                        p.push_mode = ix == 2;
+                        p.amend = ix == 1;
                         cx.notify();
                     }))
+                    .child(div().w(px(16.)).flex_none().when(ix == current, |d| d.child(ui::small_icon("check", theme::fg()))))
                     .child(label)
             }))
     }
@@ -1530,9 +1541,19 @@ impl GitPanel {
         let conflicts = repo.status.conflicts.len();
         let commit_label = match &op {
             Some(op) => op.kind.continue_label(),
+            None if self.push_mode => "Push",
             None if self.amend => "Commit (Amend)",
             None => "Commit",
         };
+        // Running: what it's doing, and neither half takes clicks.
+        let running = if self.committing || busy.as_deref() == Some("Commit") {
+            Some("Committing…".to_string())
+        } else if busy.as_deref().is_some_and(|b| b.starts_with("git push")) {
+            Some("Pushing…".to_string())
+        } else {
+            busy.clone()
+        };
+        let idle = running.is_none();
         let rows = self.list_rows(cx);
         let st = &repo.status;
         let clean = !branch.is_empty() && st.conflicts.is_empty() && st.staged.is_empty() && st.unstaged.is_empty();
@@ -1579,6 +1600,7 @@ impl GitPanel {
                             .rounded(px(2.))
                             .bg(theme::accent())
                             .text_color(theme::on(theme::accent()))
+                            .when(!idle, |d| d.opacity(0.75))
                             .child(
                                 div()
                                     .id("commit-button")
@@ -1587,14 +1609,20 @@ impl GitPanel {
                                     .items_center()
                                     .justify_center()
                                     .gap(px(6.))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::accent_hover()))
-                                    .on_click(cx.listener(|panel, _, window, cx| {
-                                        let amend = panel.amend;
-                                        panel.commit(None, false, amend, window, cx)
-                                    }))
-                                    .child(ui::icon("check", theme::on(theme::accent())))
-                                    .child(busy.unwrap_or(commit_label.to_string())),
+                                    .debug_selector(|| "commit-button".into())
+                                    .when(idle, |d| {
+                                        d.cursor_pointer().hover(|s| s.bg(theme::accent_hover())).on_click(cx.listener(|panel, _, window, cx| {
+                                            if panel.push_mode && panel.repo.read(cx).status.op.is_none() {
+                                                panel.repo.update(cx, |r, cx| r.run_git(vec!["push".into()], cx));
+                                            } else {
+                                                let amend = panel.amend;
+                                                panel.commit(None, false, amend, window, cx)
+                                            }
+                                        }))
+                                    })
+                                    .when(!idle, |d| d.child(crate::pr_panel::spinner("commit-spinner", 12.)))
+                                    .when(idle, |d| d.child(ui::icon(if self.push_mode { "arrow-up" } else { "check" }, theme::on(theme::accent()))))
+                                    .child(running.clone().unwrap_or(commit_label.to_string())),
                             )
                             .child(div().w(px(1.)).my(px(4.)).bg(theme::ca(0xffffff55)))
                             .child(
@@ -1604,13 +1632,13 @@ impl GitPanel {
                                     .items_center()
                                     .justify_center()
                                     .w(px(26.))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::accent_hover()))
                                     .debug_selector(|| "commit-menu".into())
-                                    .on_click(cx.listener(|panel, _, _, cx| {
-                                        panel.commit_menu_open = !panel.commit_menu_open;
-                                        cx.notify();
-                                    }))
+                                    .when(idle, |d| {
+                                        d.cursor_pointer().hover(|s| s.bg(theme::accent_hover())).on_click(cx.listener(|panel, _, _, cx| {
+                                            panel.commit_menu_open = !panel.commit_menu_open;
+                                            cx.notify();
+                                        }))
+                                    })
                                     .child(ui::small_icon("chevron-down", theme::on(theme::accent()))),
                             )
                             .relative()

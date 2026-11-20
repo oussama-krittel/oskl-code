@@ -936,7 +936,7 @@ fn a_merged_pull_request_still_lists_what_it_changed(cx: &mut gpui::TestAppConte
     });
     assert_eq!(files, Ok(vec!["f.txt".to_string()]), "what it changed, against main as it was");
 
-    // The diff's own buttons work here too: the file's history, and the file itself.
+    // The diff's own buttons work here too (no file history: it has no place in a pull request).
     let pr = ws.read_with(cx, |ws, _| match &ws.tabs[ws.active.unwrap()].kind {
         TabKind::Pr(v) => v.clone(),
         _ => panic!("the pull request"),
@@ -946,14 +946,7 @@ fn a_merged_pull_request_still_lists_what_it_changed(cx: &mut gpui::TestAppConte
         p.open_ix(0, cx);
     });
     settle(&ws, cx);
-    click(cx, "file-history");
-    settle(&ws, cx);
-    assert!(cx.debug_bounds("history-close").is_some(), "Source Control shows the file's history");
-    ws.update_in(cx, |ws, window, cx| {
-        let ix = ws.tabs.iter().position(|t| matches!(&t.kind, TabKind::Pr(_))).unwrap();
-        ws.activate(ix, window, cx);
-    });
-    settle(&ws, cx);
+    assert!(cx.debug_bounds("open-file").is_some() && cx.debug_bounds("file-history").is_none());
     click(cx, "open-file");
     settle(&ws, cx);
     let opened = ws.read_with(cx, |ws, cx| match &ws.tabs[ws.active.unwrap()].kind {
@@ -1802,6 +1795,10 @@ fn a_commit_hook_that_finds_problems_shows_them_and_one_that_passes_commits(cx: 
     assert_eq!(title, "A Git hook stopped the commit");
     assert!(output.contains("src.ts:1:1  error  Unexpected console statement") && output.contains("1 problem"), "what it printed, stdout and stderr: {output}");
     assert!(cx.debug_bounds("dialog-output").is_some(), "shown in the dialog");
+    click(cx, "dialog-copy");
+    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default();
+    assert!(copied.contains("Unexpected console statement"), "{copied}");
+    assert!(ws.read_with(cx, |ws, _| ws.ask.is_some()), "copying leaves the dialog open");
     assert_eq!(count(), "1", "nothing committed");
     click(cx, "dialog-button-Show in Output");
     settle(&ws, cx);
@@ -1829,6 +1826,10 @@ fn push_sets_the_upstream_when_the_branch_has_none_and_is_in_the_commit_menu(cx:
     click(cx, "commit-menu");
     click(cx, "commit-menu-push");
     settle(&ws, cx);
+    assert!(sh(&dir, "git rev-parse --abbrev-ref topic@{u} 2>&1").contains("no upstream"), "picking it only changes the button");
+    click(cx, "commit-button");
+    cx.run_until_parked();
+    settle(&ws, cx);
     assert_eq!(sh(&dir, "git rev-parse --abbrev-ref topic@{u}").trim(), "origin/topic", "pushed and tracked");
     assert_eq!(sh(&dir, "git rev-parse origin/topic").trim(), sh(&dir, "git rev-parse topic").trim());
     // Tracked now: a plain push of a new commit goes to the same branch.
@@ -1841,7 +1842,23 @@ fn push_sets_the_upstream_when_the_branch_has_none_and_is_in_the_commit_menu(cx:
     click(cx, "commit-menu");
     click(cx, "commit-menu-amend");
     settle(&ws, cx);
+    assert_eq!(sh(&dir, "git status --porcelain").trim(), "M  c.txt", "not yet");
+    click(cx, "commit-button");
+    settle(&ws, cx);
     assert_eq!(sh(&dir, "git log -1 --format=%s").trim(), "three");
     assert_eq!(sh(&dir, "git rev-list --count HEAD").trim(), "3", "amended, not a new commit");
     assert_eq!(sh(&dir, "git status --porcelain").trim(), "");
+
+    // Rejected (someone else pushed): Force Push right under the output, no sync prompt.
+    sh(&dir, "git push -q --force origin topic && git reset -q --hard HEAD~1 && echo e > e.txt && git add . && git commit -qm other");
+    click(cx, "commit-menu");
+    click(cx, "commit-menu-push");
+    click(cx, "commit-button");
+    settle(&ws, cx);
+    assert!(sh(&dir, "git rev-parse origin/topic").trim() != sh(&dir, "git rev-parse topic").trim(), "rejected");
+    assert!(ws.read_with(cx, |ws, _| ws.cmd_mode.is_none()), "no command line opened");
+    click(cx, "force-push");
+    settle(&ws, cx);
+    assert_eq!(sh(&dir, "git rev-parse origin/topic").trim(), sh(&dir, "git rev-parse topic").trim(), "forced");
+    assert!(cx.debug_bounds("force-push").is_none(), "done: the button goes");
 }

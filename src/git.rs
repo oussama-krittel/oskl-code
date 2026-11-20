@@ -306,13 +306,6 @@ pub fn skip_op(root: &Path, kind: OpKind) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Pulls (rebase or merge), then pushes: what to do after a push was rejected.
-pub fn sync(root: &Path, rebase: bool) -> Result<String> {
-    run(root, &["pull", if rebase { "--rebase" } else { "--no-rebase" }, "--no-edit"])?;
-    let args: Vec<String> = push_args(root, &["push".to_string()]);
-    run(root, &args.iter().map(String::as_str).collect::<Vec<_>>())
-}
-
 /// Two branches side by side: what `other` changed since it split from `base`, and how far
 /// apart they are.
 pub struct Comparison {

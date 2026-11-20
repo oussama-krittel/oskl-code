@@ -864,15 +864,15 @@ impl PrView {
         let diff = cx.new(|cx| {
             let mut d = DiffView::new(root, spec, email, false, 12., cx);
             d.commentable = commentable;
+            d.history = false;
             d.annotate = commentable.then_some(annotate);
             d
         });
         let path = c.path.clone();
         self._diff_sub = Some(cx.subscribe(&diff, move |v, _, ev: &CommentOn, cx| v.comment_on(&path, ev, cx)));
-        // The diff's own buttons (history, open the file, the layout switches…) go to the workspace.
+        // The diff's own buttons (open the file, the layout switches…) go to the workspace.
         self._diff_req_sub = Some(cx.subscribe(&diff, |_, _, ev: &Request, cx| {
             let fwd = match ev {
-                Request::FileHistory(p) => Request::FileHistory(p.clone()),
                 Request::OpenFile { path, line, preview } => Request::OpenFile { path: path.clone(), line: *line, preview: *preview },
                 Request::OpenAt { path, line, cols } => Request::OpenAt { path: path.clone(), line: *line, cols: cols.clone() },
                 Request::PreviewRev { rev, path } => Request::PreviewRev { rev: rev.clone(), path: path.clone() },
