@@ -1814,3 +1814,34 @@ fn a_commit_hook_that_finds_problems_shows_them_and_one_that_passes_commits(cx: 
     assert!(ws.read_with(cx, |ws, _| ws.ask.is_none()), "no dialog");
     assert_eq!(count(), "2");
 }
+
+#[gpui::test]
+fn push_sets_the_upstream_when_the_branch_has_none_and_is_in_the_commit_menu(cx: &mut gpui::TestAppContext) {
+    let (ws, cx) = setup_with(cx, |dir| {
+        sh(dir, "git init -q --bare ../$(basename $PWD)-remote.git");
+        sh(dir, INIT);
+        sh(dir, "echo a > a.txt && git add . && git commit -qm one && git remote add origin ../$(basename $PWD)-remote.git && git push -q -u origin main");
+        sh(dir, "git switch -qc topic && echo b > b.txt && git add . && git commit -qm two");
+    });
+    let dir = root(&ws, cx);
+    settle(&ws, cx);
+    show_git(&ws, cx);
+    click(cx, "commit-menu");
+    click(cx, "commit-menu-push");
+    settle(&ws, cx);
+    assert_eq!(sh(&dir, "git rev-parse --abbrev-ref topic@{u}").trim(), "origin/topic", "pushed and tracked");
+    assert_eq!(sh(&dir, "git rev-parse origin/topic").trim(), sh(&dir, "git rev-parse topic").trim());
+    // Tracked now: a plain push of a new commit goes to the same branch.
+    sh(&dir, "echo c > c.txt && git add . && git commit -qm three");
+    command(&ws, cx, "push");
+    settle(&ws, cx);
+    assert_eq!(sh(&dir, "git rev-parse origin/topic").trim(), sh(&dir, "git rev-parse topic").trim(), "the next push goes to the same place");
+    // Amend from the same menu, keeping the message.
+    sh(&dir, "echo d >> c.txt && git add c.txt");
+    click(cx, "commit-menu");
+    click(cx, "commit-menu-amend");
+    settle(&ws, cx);
+    assert_eq!(sh(&dir, "git log -1 --format=%s").trim(), "three");
+    assert_eq!(sh(&dir, "git rev-list --count HEAD").trim(), "3", "amended, not a new commit");
+    assert_eq!(sh(&dir, "git status --porcelain").trim(), "");
+}

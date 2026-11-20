@@ -239,6 +239,8 @@ pub struct GitPanel {
     changes_scroll: ScrollHandle,
     commit_task: Option<Task<()>>,
     menu_open: bool,
+    /// The menu under the commit button's arrow: Commit, Commit (Amend), Push.
+    commit_menu_open: bool,
     scope_open: bool,
     /// The filter's choices: local and remote branches, most useful first.
     scope_local: Vec<String>,
@@ -337,6 +339,7 @@ impl GitPanel {
             changes_scroll: ScrollHandle::new(),
             commit_task: None,
             menu_open: false,
+            commit_menu_open: false,
             scope_open: false,
             scope_local: Vec::new(),
             scope_remote: Vec::new(),
@@ -1076,6 +1079,56 @@ impl GitPanel {
         self.panel_bounds.get().right() - px(8.) - px(w) >= px(0.)
     }
 
+    /// Under the commit button's arrow: commit, commit amending the last one, or push the
+    /// current branch (setting its upstream when it has none, like the terminal's advice).
+    fn render_commit_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let items: [(&'static str, &'static str); 3] = [("commit-menu-commit", "Commit"), ("commit-menu-amend", "Commit (Amend)"), ("commit-menu-push", "Push")];
+        div()
+            .id("commit-menu-popup")
+            .occlude()
+            .absolute()
+            .top(px(28.))
+            .right_0()
+            .w(px(180.))
+            .py(px(4.))
+            .bg(theme::bg_popup())
+            .border_1()
+            .border_color(theme::border_input())
+            .rounded(px(6.))
+            .shadow_lg()
+            .text_color(theme::fg())
+            .on_mouse_down_out(cx.listener(|p, _, _, cx| {
+                p.commit_menu_open = false;
+                cx.notify();
+            }))
+            .children(items.into_iter().enumerate().map(|(ix, (id, label))| {
+                div()
+                    .id(id)
+                    .debug_selector(move || id.to_string())
+                    .flex()
+                    .items_center()
+                    .h(px(24.))
+                    .px(px(10.))
+                    .mx(px(4.))
+                    .rounded(px(3.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::selected_focused()))
+                    .when(ix == 2, |d| d.mt(px(4.)).border_t_1().border_color(theme::border()))
+                    .on_click(cx.listener(move |p, _, window, cx| {
+                        p.commit_menu_open = false;
+                        match ix {
+                            0 | 1 => {
+                                p.amend = ix == 1;
+                                p.commit(None, false, ix == 1, window, cx);
+                            }
+                            _ => p.repo.update(cx, |r, cx| r.run_git(vec!["push".into()], cx)),
+                        }
+                        cx.notify();
+                    }))
+                    .child(label)
+            }))
+    }
+
     fn render_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let graph_all = self.repo.read(cx).graph_all;
         let items: [(&str, &str); 21] = [
@@ -1553,13 +1606,15 @@ impl GitPanel {
                                     .w(px(26.))
                                     .cursor_pointer()
                                     .hover(|s| s.bg(theme::accent_hover()))
+                                    .debug_selector(|| "commit-menu".into())
                                     .on_click(cx.listener(|panel, _, _, cx| {
-                                        panel.amend = !panel.amend;
-                                        cx.emit(Request::Message(if panel.amend { "Amend mode on: the next commit amends HEAD".into() } else { "Amend mode off".into() }));
+                                        panel.commit_menu_open = !panel.commit_menu_open;
                                         cx.notify();
                                     }))
                                     .child(ui::small_icon("chevron-down", theme::on(theme::accent()))),
-                            ),
+                            )
+                            .relative()
+                            .when(self.commit_menu_open, |d| d.child(deferred(self.render_commit_menu(cx)).with_priority(1))),
                     )
                     .when(branch.is_empty(), |d| d.child(div().text_color(theme::fg_muted()).child("Not a git repository"))),
             )

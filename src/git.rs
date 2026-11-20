@@ -62,9 +62,31 @@ pub fn run_with_stdin(root: &Path, args: &[&str], input: &str) -> Result<String>
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// A plain `git push` (no remote or branch named) of a branch that tracks nothing yet: push it
+/// to its remote and track it there (`-u`), as the terminal suggests, instead of failing.
+/// The remote is the branch's pushRemote, else remote.pushDefault, else origin, else the only one.
+pub fn push_args(root: &Path, args: &[String]) -> Vec<String> {
+    let plain = args.first().is_some_and(|a| a == "push") && args[1..].iter().all(|a| a.starts_with('-'));
+    if !plain || run(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).is_ok() {
+        return args.to_vec();
+    }
+    let Ok(branch) = run(root, &["symbolic-ref", "--short", "-q", "HEAD"]).map(|b| b.trim().to_string()) else { return args.to_vec() };
+    let remotes = remotes(root);
+    let config = |key: String| run(root, &["config", "--get", &key]).ok().map(|v| v.trim().to_string()).filter(|v| remotes.contains(v));
+    let remote = config(format!("branch.{branch}.pushRemote"))
+        .or_else(|| config("remote.pushDefault".into()))
+        .or_else(|| remotes.iter().find(|r| *r == "origin").cloned())
+        .or_else(|| (remotes.len() == 1).then(|| remotes[0].clone()));
+    let Some(remote) = remote.filter(|_| !branch.is_empty()) else { return args.to_vec() };
+    let mut out = args.to_vec();
+    out.extend(["-u".to_string(), remote, branch]);
+    out
+}
+
 /// Runs git with arbitrary user args, returning combined output and success.
 pub fn run_user(root: &Path, args: &[String]) -> (bool, String) {
-    match git(root).args(args).output() {
+    let args = push_args(root, args);
+    match git(root).args(&args).output() {
         Ok(out) => {
             let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
             text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -287,7 +309,8 @@ pub fn skip_op(root: &Path, kind: OpKind) -> Result<String> {
 /// Pulls (rebase or merge), then pushes: what to do after a push was rejected.
 pub fn sync(root: &Path, rebase: bool) -> Result<String> {
     run(root, &["pull", if rebase { "--rebase" } else { "--no-rebase" }, "--no-edit"])?;
-    run(root, &["push"])
+    let args: Vec<String> = push_args(root, &["push".to_string()]);
+    run(root, &args.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 /// Two branches side by side: what `other` changed since it split from `base`, and how far
