@@ -919,6 +919,9 @@ fn a_merged_pull_request_still_lists_what_it_changed(cx: &mut gpui::TestAppConte
         sh(dir, "git switch -qc feat && echo f > f.txt && git add . && git commit -qm Feature && git push -q origin feat:refs/pull/9/head");
         // Merged: main now holds it.
         sh(dir, "git switch -q main && git merge -q --no-ff -m 'Merge feat' feat && git push -q origin main");
+        // A stale remote branch where the base's would go (origin/main/old next to origin/main):
+        // git can't update origin/main, which mustn't matter here.
+        sh(dir, "git branch -q --unset-upstream && git update-ref -d refs/remotes/origin/main && git update-ref refs/remotes/origin/main/old HEAD");
         fake_gh();
     });
     let dir = root(&ws, cx);

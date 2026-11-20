@@ -371,11 +371,11 @@ pub fn fetch(root: &Path, remote: &str, n: u64, base: &str) -> Result<(String, S
     let head = format!("refs/oskl/pr/{n}");
     // Only gh's sign-in: git's own helpers (the keychain, Git Credential Manager) can wait
     // forever on a prompt nobody sees when the app runs them.
-    // The base goes to a ref of our own too: updating refs/remotes/<remote>/<base> can fail in
-    // a clone with stale remote branches in the way (origin/fix next to origin/fix/…), which
-    // has nothing to do with this pull request.
+    // The base goes to a ref of our own too, and `--refmap=` stops git from also updating
+    // refs/remotes/<remote>/<base> on its own: that fails in a clone with a stale remote branch
+    // in the way (origin/fix next to origin/fix/…), which has nothing to do with this pull request.
     let base_ref = format!("refs/oskl/base/{n}");
-    let args = with_gh_auth(&["fetch", "--quiet", "--no-write-fetch-head", remote, &format!("+refs/pull/{n}/head:{head}"), &format!("+refs/heads/{base}:{base_ref}")]);
+    let args = with_gh_auth(&["fetch", "--quiet", "--no-write-fetch-head", "--refmap=", remote, &format!("+refs/pull/{n}/head:{head}"), &format!("+refs/heads/{base}:{base_ref}")]);
     git_run(root, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
     Ok((base_ref, head))
 }
