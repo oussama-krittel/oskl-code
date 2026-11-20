@@ -3089,6 +3089,16 @@ pub const DIFF_CONTEXT: usize = 3;
 thread_local! {
     /// Diffs show only the changes: the last choice, so every diff opens that way. Per UI thread, like word wrap.
     static DIFF_CHANGES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Diffs show both versions in one column (inline) rather than side by side: the last choice.
+    static DIFF_INLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn diff_inline() -> bool {
+    DIFF_INLINE.with(|c| c.get())
+}
+
+pub fn set_diff_inline(on: bool) {
+    DIFF_INLINE.with(|c| c.set(on));
 }
 
 pub fn diff_changes_only() -> bool {

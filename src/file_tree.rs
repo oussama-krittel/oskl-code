@@ -520,6 +520,7 @@ impl FileTree {
         cx.emit(Request::Ask(crate::dialog::Ask {
             cancel_default: false,
             cancel_label: None,
+            output: None,
             title: format!("Are you sure you want to delete {what}?"),
             detail: "You can restore it from the Trash.".into(),
             buttons: vec!["Move to Trash".into()],

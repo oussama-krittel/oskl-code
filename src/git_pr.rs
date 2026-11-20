@@ -161,6 +161,7 @@ pub struct PrView {
     /// Reads it again while its checks run (or GitHub works out whether it merges).
     _poll: Option<Task<()>>,
     _diff_sub: Option<Subscription>,
+    _diff_req_sub: Option<Subscription>,
     _subs: Vec<Subscription>,
 }
 
@@ -278,6 +279,7 @@ impl PrView {
             _act: None,
             _poll: None,
             _diff_sub: None,
+            _diff_req_sub: None,
             _subs: subs,
         };
         v.read_pending(root.clone(), cx);
@@ -373,6 +375,7 @@ impl PrView {
             danger: true,
             cancel_default: true,
             cancel_label: None,
+            output: None,
             on_answer: Rc::new(move |_, _, cx| {
                 let t = target.clone();
                 me.update(cx, |v, cx| {
@@ -866,6 +869,22 @@ impl PrView {
         });
         let path = c.path.clone();
         self._diff_sub = Some(cx.subscribe(&diff, move |v, _, ev: &CommentOn, cx| v.comment_on(&path, ev, cx)));
+        // The diff's own buttons (history, open the file, the layout switches…) go to the workspace.
+        self._diff_req_sub = Some(cx.subscribe(&diff, |_, _, ev: &Request, cx| {
+            let fwd = match ev {
+                Request::FileHistory(p) => Request::FileHistory(p.clone()),
+                Request::OpenFile { path, line, preview } => Request::OpenFile { path: path.clone(), line: *line, preview: *preview },
+                Request::OpenAt { path, line, cols } => Request::OpenAt { path: path.clone(), line: *line, cols: cols.clone() },
+                Request::PreviewRev { rev, path } => Request::PreviewRev { rev: rev.clone(), path: path.clone() },
+                Request::BlameShown(on) => Request::BlameShown(*on),
+                Request::ChangesOnlyShown(on) => Request::ChangesOnlyShown(*on),
+                Request::InlineShown(on) => Request::InlineShown(*on),
+                Request::Message(m) => Request::Message(m.clone()),
+                Request::Error(m) => Request::Error(m.clone()),
+                _ => return,
+            };
+            cx.emit(fwd);
+        }));
         if self.line_box.as_ref().is_some_and(|b| b.path != c.path) {
             self.line_box = None;
         }
@@ -911,6 +930,19 @@ impl PrView {
     }
 
     /// The picked commit's first line.
+    /// The layout switches, changed in another diff: this one follows.
+    pub fn diff_changes_only(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Some(d) = &self.diff {
+            d.update(cx, |d, cx| d.set_changes_only(on, cx));
+        }
+    }
+
+    pub fn diff_inline(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Some(d) = &self.diff {
+            d.update(cx, |d, cx| d.set_inline(on, cx));
+        }
+    }
+
     pub fn commit_label(&self) -> Option<String> {
         let sha = self.commit.as_ref()?;
         let Some(Ok((d, _))) = &self.detail else { return Some(sha[..7.min(sha.len())].to_string()) };

@@ -256,6 +256,7 @@ impl DbPanel {
             danger: false,
             cancel_default: false,
             cancel_label: Some("Close"),
+            output: None,
             on_answer: std::rc::Rc::new(move |choice, _, cx: &mut App| {
                 if let Some(p) = weak.upgrade() {
                     let id = id.clone();
@@ -323,6 +324,7 @@ impl DbPanel {
             danger: true,
             cancel_default: false,
             cancel_label: None,
+            output: None,
             on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
                 db::delete(&id).ok();
                 if let Some(p) = weak.upgrade() {

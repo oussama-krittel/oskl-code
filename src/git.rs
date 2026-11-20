@@ -26,6 +26,11 @@ fn git(root: &Path) -> Command {
         .env("GCM_INTERACTIVE", "never")
         .args(["-c", "core.quotepath=off", "-c", "color.ui=false"])
         .stdin(Stdio::null());
+    // Hooks (husky, lint-staged, pre-commit…) need node, npx, python from the user's shell;
+    // from the Dock the app's own PATH has none of them.
+    if let Some(path) = crate::tools::shell_path_ready() {
+        cmd.env("PATH", path);
+    }
     cmd
 }
 
@@ -870,12 +875,95 @@ pub fn discard(root: &Path, paths: &[String]) -> Result<()> {
     run(root, &args).map(|_| ())
 }
 
-pub fn commit(root: &Path, message: &str, amend: bool) -> Result<String> {
-    let mut args = vec!["commit", "-F", "-"];
-    if amend {
-        args.push("--amend");
+/// A commit git refused, with everything it and its hooks printed (stdout and stderr, colors
+/// removed), so what a pre-commit hook found can be shown in full.
+#[derive(Debug, Clone)]
+pub struct CommitFailed {
+    pub output: String,
+    /// The repository runs commit hooks (husky, pre-commit…): most likely one of them said no.
+    pub hook: bool,
+}
+
+impl std::fmt::Display for CommitFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.output.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("git commit failed").trim())
     }
-    run_with_stdin(root, &args, message)
+}
+
+impl std::error::Error for CommitFailed {}
+
+/// Commits the index with `message`. An amend with no message keeps the last one.
+/// Waits for the shell's PATH first, so hooks find their tools; a refusal is a `CommitFailed`.
+pub fn commit(root: &Path, message: &str, amend: bool) -> Result<String> {
+    crate::tools::init_shell_path();
+    let mut args = vec!["commit"];
+    if amend && message.is_empty() {
+        args.extend(["--amend", "--no-edit"]);
+    } else {
+        args.extend(["-F", "-"]);
+        if amend {
+            args.push("--amend");
+        }
+    }
+    let mut child = git(root)
+        .args(&args)
+        .env("NO_COLOR", "1")
+        .env("FORCE_COLOR", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+    let input = message.to_string();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let out = child.wait_with_output()?;
+    let _ = writer.join();
+    if !out.status.success() {
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !text.is_empty() && !text.ends_with('\n') && !err.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&err);
+        return Err(CommitFailed { output: strip_ansi(&text).trim().to_string(), hook: has_commit_hooks(root) }.into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Whether a commit runs hooks: pre-commit, prepare-commit-msg or commit-msg in the hooks
+/// folder git uses (core.hooksPath, as husky sets it, or .git/hooks).
+pub fn has_commit_hooks(root: &Path) -> bool {
+    let Ok(dir) = run(root, &["rev-parse", "--git-path", "hooks"]) else { return false };
+    let dir = root.join(dir.trim());
+    ["pre-commit", "prepare-commit-msg", "commit-msg"].iter().any(|h| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(dir.join(h)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
+}
+
+/// Removes terminal color and cursor codes (ESC [ … letter) from tool output.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(n) = chars.next() {
+                    if n.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if c != '\r' {
+            out.push(c);
+        }
+    }
+    out
 }
 
 pub fn branches(root: &Path) -> Vec<String> {

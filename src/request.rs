@@ -44,6 +44,8 @@ pub enum Request {
     BlameShown(bool),
     /// "Show only the changes" was switched in a diff: every diff, open or opened later, follows.
     ChangesOnlyShown(bool),
+    /// A diff was switched between inline and side by side: every diff follows, and it's saved.
+    InlineShown(bool),
     /// What `other` changed since it split from `base` (the current branch when None).
     Compare { base: Option<String>, other: String },
     /// Show a file (repo-relative) rendered as it is in a revision.
@@ -70,6 +72,8 @@ pub enum Request {
     Deleted(Vec<PathBuf>),
     /// Ask in the in-app dialog (themed, not the macOS alert).
     Ask(crate::dialog::Ask),
+    /// A commit was refused (a hook found problems): what it printed, in a dialog.
+    CommitFailed(crate::git::CommitFailed),
     /// A terminal in this folder.
     OpenTerminal(PathBuf),
     /// A terminal in this folder running a command.

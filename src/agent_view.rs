@@ -884,6 +884,7 @@ impl AgentView {
             danger: true,
             cancel_default: true,
             cancel_label: None,
+            output: None,
             on_answer: Rc::new(move |_, _, cx| {
                 weak.update(cx, |v, cx| v.set_option(id.clone(), value.clone(), cx)).ok();
             }),
@@ -2075,6 +2076,7 @@ impl AgentView {
                                     danger: true,
                                     cancel_default: true,
                                     cancel_label: None,
+                                    output: None,
                                     on_answer: Rc::new(move |_, _, cx| {
                                         weak.update(cx, |v, cx| v.delete_session(id.clone(), cx)).ok();
                                     }),

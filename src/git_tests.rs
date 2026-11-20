@@ -935,6 +935,32 @@ fn a_merged_pull_request_still_lists_what_it_changed(cx: &mut gpui::TestAppConte
         None => Err("not read".into()),
     });
     assert_eq!(files, Ok(vec!["f.txt".to_string()]), "what it changed, against main as it was");
+
+    // The diff's own buttons work here too: the file's history, and the file itself.
+    let pr = ws.read_with(cx, |ws, _| match &ws.tabs[ws.active.unwrap()].kind {
+        TabKind::Pr(v) => v.clone(),
+        _ => panic!("the pull request"),
+    });
+    pr.update(cx, |p, cx| {
+        p.set_tab(crate::git_panel::pr::Tab::Files, cx);
+        p.open_ix(0, cx);
+    });
+    settle(&ws, cx);
+    click(cx, "file-history");
+    settle(&ws, cx);
+    assert!(cx.debug_bounds("history-close").is_some(), "Source Control shows the file's history");
+    ws.update_in(cx, |ws, window, cx| {
+        let ix = ws.tabs.iter().position(|t| matches!(&t.kind, TabKind::Pr(_))).unwrap();
+        ws.activate(ix, window, cx);
+    });
+    settle(&ws, cx);
+    click(cx, "open-file");
+    settle(&ws, cx);
+    let opened = ws.read_with(cx, |ws, cx| match &ws.tabs[ws.active.unwrap()].kind {
+        TabKind::Editor(e) => e.read(cx).path.clone(),
+        _ => None,
+    });
+    assert_eq!(opened, Some(dir.join("f.txt")));
 }
 
 #[gpui::test]
@@ -1739,4 +1765,52 @@ fn every_diff_can_show_only_the_changes_open_ones_follow_and_it_is_saved(cx: &mu
     click(cx, "de-changes-only");
     assert!(staged.read_with(cx, |d, _| d.gap_rows()).is_empty());
     assert!(!crate::editor::diff_changes_only() && saved().contains("changesonly = off"));
+
+    // One column instead of side by side: the same, everywhere and for the next launch.
+    assert!(!edit.read_with(cx, |d, _| d.is_inline()) && !staged.read_with(cx, |d, _| d.is_inline()));
+    click(cx, "de-inline");
+    assert!(edit.read_with(cx, |d, _| d.is_inline()) && staged.read_with(cx, |d, _| d.is_inline()), "the other diff follows");
+    assert!(saved().contains("diffinline = on"));
+    sh(&root(&ws, cx), "git add b.txt");
+    open(&ws, cx, "b.txt", Rev::Commit("HEAD".into()), Rev::Index);
+    let fresh = diff(&ws, cx).0.unwrap();
+    assert!(fresh.read_with(cx, |d, _| d.is_inline()), "a diff opened later starts in one column");
+    click(cx, "toggle-inline");
+    assert!(!edit.read_with(cx, |d, _| d.is_inline()) && !fresh.read_with(cx, |d, _| d.is_inline()));
+    assert!(!crate::editor::diff_inline() && saved().contains("diffinline = off"));
+}
+
+#[gpui::test]
+fn a_commit_hook_that_finds_problems_shows_them_and_one_that_passes_commits(cx: &mut gpui::TestAppContext) {
+    let (ws, cx) = setup_with(cx, |dir| {
+        sh(dir, INIT);
+        sh(dir, "echo hi > a.txt && git add . && git commit -qm first");
+        // Like husky: hooks in a folder of the repository, through core.hooksPath.
+        sh(dir, "mkdir -p .hooks && printf '#!/bin/sh\\nif grep -q console src.ts; then echo \"src.ts:1:1  error  Unexpected console statement\"; echo \"1 problem\" >&2; exit 1; fi\\n' > .hooks/pre-commit && chmod +x .hooks/pre-commit && git config core.hooksPath .hooks");
+        sh(dir, "echo 'console.log(1)' > src.ts && git add src.ts");
+    });
+    let dir = root(&ws, cx);
+    settle(&ws, cx);
+    let count = || sh(&dir, "git rev-list --count HEAD").trim().to_string();
+    let commit = |cx: &mut VisualTestContext| {
+        ws.update_in(cx, |ws, window, cx| ws.git_panel.update(cx, |p, cx| p.commit(Some("add src".into()), false, false, window, cx)));
+        cx.run_until_parked();
+    };
+    commit(cx);
+    let ask = ws.read_with(cx, |ws, _| ws.ask.as_ref().map(|a| (a.ask.title.clone(), a.ask.output.clone().unwrap_or_default())));
+    let (title, output) = ask.expect("a dialog says why");
+    assert_eq!(title, "A Git hook stopped the commit");
+    assert!(output.contains("src.ts:1:1  error  Unexpected console statement") && output.contains("1 problem"), "what it printed, stdout and stderr: {output}");
+    assert!(cx.debug_bounds("dialog-output").is_some(), "shown in the dialog");
+    assert_eq!(count(), "1", "nothing committed");
+    click(cx, "dialog-button-Show in Output");
+    settle(&ws, cx);
+    assert!(ws.read_with(cx, |ws, _| ws.ask.is_none()));
+
+    // Fixed: the hook passes and the commit goes through.
+    sh(&dir, "echo 'export const x = 1' > src.ts && git add src.ts");
+    commit(cx);
+    settle(&ws, cx);
+    assert!(ws.read_with(cx, |ws, _| ws.ask.is_none()), "no dialog");
+    assert_eq!(count(), "2");
 }

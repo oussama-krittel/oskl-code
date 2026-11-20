@@ -499,7 +499,7 @@ impl GitPanel {
             let (done, undo) = git::undo::track(
                 &root,
                 Some(git::undo::Kind::Commit),
-                || if amend && message.is_empty() { git::run(&root, &["commit", "--amend", "--no-edit"]) } else { git::commit(&root, &message, amend) },
+                || git::commit(&root, &message, amend),
                 |r| r.is_ok(),
             );
             done.map(|out| (Ok(out), undo))
@@ -518,7 +518,10 @@ impl GitPanel {
                             cx.emit(Request::Message(summary));
                         }
                     }
-                    Err(e) => cx.emit(Request::Error(format!("Commit failed: {e}"))),
+                    Err(e) => match e.downcast::<git::CommitFailed>() {
+                        Ok(failed) => cx.emit(Request::CommitFailed(failed)),
+                        Err(e) => cx.emit(Request::Error(format!("Commit failed: {e}"))),
+                    },
                 }
                 panel.repo.update(cx, |repo, cx| {
                     repo.refresh_status(cx);
@@ -545,6 +548,7 @@ impl GitPanel {
             danger: true,
             cancel_default: true,
             cancel_label: None,
+            output: None,
             on_answer: Rc::new(move |_, window, cx| {
                 let message = message.clone();
                 panel.update(cx, |p, cx| p.commit_with(Some(message), false, amend, true, window, cx)).ok();
@@ -649,6 +653,7 @@ impl GitPanel {
         cx.emit(Request::Ask(crate::dialog::Ask {
             cancel_default: false,
             cancel_label: None,
+            output: None,
             title: ask.message,
             detail: ask.detail,
             buttons: ask.buttons.into_iter().map(|(label, _)| label).collect(),

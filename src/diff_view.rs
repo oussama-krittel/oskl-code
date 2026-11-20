@@ -145,7 +145,7 @@ impl DiffView {
             left_blame: None,
             right_blame: None,
             show_blame,
-            inline: false,
+            inline: crate::editor::diff_inline(),
             changes_only: crate::editor::diff_changes_only(),
             split: 0.5,
             dragging_split: false,
@@ -462,10 +462,25 @@ impl DiffView {
         self.toggle_blame(cx);
         cx.emit(Request::BlameShown(self.show_blame));
     }
+    /// The button or the key: every diff follows, and the choice is saved.
     fn toggle_inline(&mut self, _: &ToggleInline, _: &mut Window, cx: &mut Context<Self>) {
+        let on = !self.inline;
+        self.set_inline(on, cx);
+        cx.emit(Request::InlineShown(on));
+    }
+
+    #[cfg(test)]
+    pub fn is_inline(&self) -> bool {
+        self.inline
+    }
+
+    pub fn set_inline(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.inline == on {
+            return;
+        }
         // Keep roughly the same position when switching layouts.
         let line = self.selected.and_then(|s| self.rows().get(s)).and_then(|r| r.r.or(r.l));
-        self.inline = !self.inline;
+        self.inline = on;
         self.collect_hits();
         if let Some(line) = line
             && let Some(ix) = self.rows().iter().position(|r| r.r == Some(line) || r.l == Some(line))
@@ -613,6 +628,8 @@ impl DiffView {
             .when(!self.one_sided(), |d| {
                 d.child(
                     ui::icon_button("toggle-inline", if self.inline { "split" } else { "inline" })
+                        .debug_selector(|| "toggle-inline".into())
+                        .tooltip(ui::tooltip(if self.inline { "Show side by side" } else { "Show in one column" }))
                         .on_click(cx.listener(|v, _, w, cx| v.toggle_inline(&ToggleInline, w, cx))),
                 )
             })
@@ -634,7 +651,7 @@ impl DiffView {
                 )
             })
             .child(ui::icon_button("file-history", "history").debug_selector(|| "file-history".into()).tooltip(ui::tooltip("This file's history")).on_click(cx.listener(|v, _, _, cx| cx.emit(Request::FileHistory(v.root.join(&v.spec.path))))))
-            .child(ui::icon_button("open-file", "open").on_click(cx.listener(|v, _, w, cx| v.open_file(&OpenFile, w, cx))))
+            .child(ui::icon_button("open-file", "open").debug_selector(|| "open-file".into()).tooltip(ui::tooltip("Open the file")).on_click(cx.listener(|v, _, w, cx| v.open_file(&OpenFile, w, cx))))
     }
 }
 

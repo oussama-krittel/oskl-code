@@ -18,6 +18,8 @@ pub enum RepoEvent {
     Message(String),
     Error(String),
     Output { title: String, text: String, ok: bool },
+    /// A commit was refused (a hook found problems): shown in a dialog with the full output.
+    CommitFailed(git::CommitFailed),
     /// The remote has commits we don't: offer pull-then-push.
     PushRejected,
     /// Something was done that `Repo::undo` can take back (the text says what).
@@ -330,7 +332,10 @@ impl Repo {
                             cx.emit(RepoEvent::Message(if msg.is_empty() { format!("{label}: done") } else { msg.lines().last().unwrap_or("").to_string() }));
                         }
                     }
-                    Err(e) => cx.emit(RepoEvent::Error(format!("{label} failed: {e}"))),
+                    Err(e) => match e.downcast::<git::CommitFailed>() {
+                        Ok(failed) => cx.emit(RepoEvent::CommitFailed(failed)),
+                        Err(e) => cx.emit(RepoEvent::Error(format!("{label} failed: {e}"))),
+                    },
                 }
                 repo.refresh_status(cx);
                 repo.refresh_log(cx);

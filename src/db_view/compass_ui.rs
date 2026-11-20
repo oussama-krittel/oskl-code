@@ -468,6 +468,7 @@ impl DbView {
             danger: true,
             cancel_default: false,
             cancel_label: None,
+            output: None,
             on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
                 let (conn, db, coll, name) = (conn.clone(), db.clone(), coll.clone(), name.clone());
                 let Some(v) = weak.upgrade() else { return };

@@ -38,6 +38,11 @@ fn shell_path() -> Option<&'static String> {
         .as_ref()
 }
 
+/// The login-shell PATH if it has been resolved already (never waits).
+pub(crate) fn shell_path_ready() -> Option<&'static String> {
+    SHELL_PATH.get().and_then(|p| p.as_ref())
+}
+
 pub(crate) fn command(program: &Path) -> Command {
     let mut cmd = Command::new(program);
     if let Some(path) = shell_path() {

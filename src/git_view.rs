@@ -376,6 +376,7 @@ impl GitView {
             danger: true,
             cancel_default: false,
             cancel_label: None,
+            output: None,
             on_answer: Rc::new(move |_, _, cx| {
                 let p = path.clone();
                 repo.update(cx, |r, cx| {
@@ -414,19 +415,14 @@ impl GitView {
                 danger: true,
                 cancel_default: true,
                 cancel_label: None,
+                output: None,
                 on_answer: Rc::new(move |_, window, cx| {
                     me.update(cx, |v, cx| v.commit(true, window, cx)).ok();
                 }),
             }));
         }
         self.repo.update(cx, |r, cx| {
-            r.run_op("Commit", cx, move |root| {
-                if amend && msg.is_empty() {
-                    git::run(root, &["commit", "--amend", "--no-edit"])
-                } else {
-                    git::commit(root, &msg, amend)
-                }
-            })
+            r.run_op("Commit", cx, move |root| git::commit(root, &msg, amend))
         });
         self.commit_msg.update(cx, |e, cx| e.set_text("", cx));
         self.amend = false;

@@ -45,7 +45,7 @@ impl DiffEditView {
         let path = root.join(&spec.path);
         let right = cx.new(|cx| {
             let mut ed = Editor::new(EditorMode::Full, cx);
-            ed.diff_role = DiffRole::Right { inline: false };
+            ed.diff_role = DiffRole::Right { inline: crate::editor::diff_inline() };
             ed.changes_only = crate::editor::diff_changes_only();
             ed.scroll_link = Some(link.clone());
             ed.font_size = font_size;
@@ -85,7 +85,7 @@ impl DiffEditView {
                 }
             }),
         ];
-        let mut view = Self { root, spec, left, right, inline: false, split: 0.5, dragging_split: false, body_bounds: Default::default(), _subs: subs, _blame_task: None };
+        let mut view = Self { root, spec, left, right, inline: crate::editor::diff_inline(), split: 0.5, dragging_split: false, body_bounds: Default::default(), _subs: subs, _blame_task: None };
         view.load_left_blame(cx);
         view
     }
@@ -137,10 +137,24 @@ impl DiffEditView {
         cx.notify();
     }
 
+    /// The button or the key: every diff follows, and the choice is saved.
     pub fn toggle_inline(&mut self, cx: &mut Context<Self>) {
-        self.inline = !self.inline;
-        let inline = self.inline;
-        self.right.update(cx, |r, cx| r.set_inline_diff(inline, cx));
+        let on = !self.inline;
+        self.set_inline(on, cx);
+        cx.emit(Request::InlineShown(on));
+    }
+
+    #[cfg(test)]
+    pub fn is_inline(&self) -> bool {
+        self.inline
+    }
+
+    pub fn set_inline(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.inline == on {
+            return;
+        }
+        self.inline = on;
+        self.right.update(cx, |r, cx| r.set_inline_diff(on, cx));
         cx.notify();
     }
 
@@ -248,7 +262,7 @@ impl Render for DiffEditView {
                     .when(changes_only, |b| b.bg(theme::selected()))
                     .on_click(cx.listener(|v, _, _, cx| v.toggle_changes_only(cx))),
             )
-            .when(!one_sided, |d| d.child(ui::icon_button("de-inline", if self.inline { "split" } else { "inline" }).on_click(cx.listener(|v, _, _, cx| v.toggle_inline(cx)))))
+            .when(!one_sided, |d| d.child(ui::icon_button("de-inline", if self.inline { "split" } else { "inline" }).debug_selector(|| "de-inline".into()).tooltip(ui::tooltip(if self.inline { "Show side by side" } else { "Show in one column" })).on_click(cx.listener(|v, _, _, cx| v.toggle_inline(cx)))))
             .child(
                 ui::icon_button("de-blame", "blame")
                     .tooltip(ui::tooltip("Blame: who wrote each line, on both sides"))
@@ -260,7 +274,7 @@ impl Render for DiffEditView {
                     })),
             )
             .child(ui::icon_button("de-history", "history").debug_selector(|| "de-history".into()).tooltip(ui::tooltip("This file's history")).on_click(cx.listener(|v, _, _, cx| cx.emit(Request::FileHistory(v.root.join(&v.spec.path))))))
-            .child(ui::icon_button("de-open", "open").on_click(cx.listener(move |_, _, _, cx| {
+            .child(ui::icon_button("de-open", "open").tooltip(ui::tooltip("Open the file")).on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(Request::OpenFile { path: path.clone(), line: None, preview: false });
             })));
 

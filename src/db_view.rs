@@ -201,6 +201,7 @@ pub(crate) fn confirm_destructive(what: &str, on: &str, weak: gpui::WeakEntity<D
         danger: true,
         cancel_default: true,
         cancel_label: None,
+        output: None,
         on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
             if let Some(v) = weak.upgrade() {
                 v.update(cx, |v, cx| go(v, cx));
@@ -628,6 +629,7 @@ impl DbView {
             danger: true,
             cancel_default: true,
             cancel_label: Some("Keep editing"),
+            output: None,
             on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
                 let wanted = wanted.clone();
                 if let Some(v) = weak.upgrade() {
@@ -1382,6 +1384,7 @@ impl DbView {
             danger: true,
             cancel_default: false,
             cancel_label: None,
+            output: None,
             on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
                 db::delete(&id).ok();
                 if let Some(v) = weak.upgrade() {
@@ -2406,6 +2409,7 @@ impl DbView {
             danger: true,
             cancel_default: true,
             cancel_label: None,
+            output: None,
             on_answer: std::rc::Rc::new(move |_, _, cx: &mut App| {
                 if let Some(v) = weak.upgrade() {
                     let original = target.clone();

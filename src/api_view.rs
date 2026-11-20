@@ -3428,6 +3428,7 @@ impl ApiView {
             danger: true,
             cancel_default: false,
             cancel_label: None,
+            output: None,
             on_answer: Rc::new(move |_, _, cx: &mut App| {
                 api::delete_environment(&env).ok();
                 if let Some(v) = weak.upgrade() {

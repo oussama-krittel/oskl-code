@@ -426,6 +426,7 @@ impl ClaudePanel {
                                 danger: true,
                                 cancel_default: false,
                                 cancel_label: None,
+                                output: None,
                                 on_answer: Rc::new(move |_, _, cx| {
                                     weak.update(cx, |p, cx| match agent::trash_session(&agent::sessions_dir(&p.root), &id) {
                                         Ok(()) => p.load_sessions(cx),

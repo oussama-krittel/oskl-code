@@ -616,6 +616,7 @@ impl RefsTree {
                     danger: true,
                     cancel_default: false,
                     cancel_label: None,
+                    output: None,
                     on_answer: Rc::new(move |ix, window, cx| {
                         let Some(s) = steps.get(ix).cloned() else { return };
                         let label = label.clone();
@@ -659,6 +660,7 @@ impl RefsTree {
                         danger: true,
                         cancel_default: true,
                         cancel_label: None,
+                        output: None,
                         on_answer: Rc::new(move |_, window, cx| {
                             tree.update(cx, |t, cx| t.run_act(Act::Fixup(sha.clone(), true), window, cx)).ok();
                         }),

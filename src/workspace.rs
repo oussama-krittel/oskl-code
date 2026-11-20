@@ -728,6 +728,7 @@ impl Workspace {
         crate::editor::set_word_wrap(settings.word_wrap);
         crate::editor::set_minimap(settings.minimap);
         crate::editor::set_diff_changes_only(settings.diff_changes_only);
+        crate::editor::set_diff_inline(settings.diff_inline);
         if has_project {
             settings.add_recent(repo.read(cx).root.clone());
             settings.save();
@@ -975,6 +976,7 @@ impl Workspace {
                 RepoEvent::Message(m) => ws.flash(m.clone(), false, cx),
                 RepoEvent::Undoable(m) => ws.offer_undo(repo.clone(), m.clone(), cx),
                 RepoEvent::Error(e) => ws.flash(e.clone(), true, cx),
+                RepoEvent::CommitFailed(f) => ws.commit_failed(f.clone(), window, cx),
                 RepoEvent::Output { title, text, ok } => {
                     ws.show_output(title.clone(), text, !*ok, cx);
                     let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(if *ok { "done" } else { "failed" });
@@ -1130,6 +1132,7 @@ impl Workspace {
             danger: false,
             cancel_default: false,
             cancel_label: None,
+            output: None,
             on_answer: Rc::new(move |ix, _, cx| {
                 let (root, file) = (root.clone(), files.get(ix).cloned());
                 me.update(cx, |ws, cx| {
@@ -1280,6 +1283,7 @@ impl Workspace {
                 danger: false,
                 cancel_default: false,
                 cancel_label: None,
+                output: None,
                 on_answer: std::rc::Rc::new(move |_, _, cx| {
                     repo.update(cx, |r, cx| r.undo_last(true, cx));
                 }),
@@ -1477,6 +1481,19 @@ impl Workspace {
                 self.settings.blame_default = *on;
                 self.settings.save();
             }
+            Request::InlineShown(on) => {
+                let on = *on;
+                crate::editor::set_diff_inline(on);
+                self.settings.diff_inline = on;
+                self.settings.save();
+                cx.defer(move |cx| {
+                    for w in cx.windows() {
+                        if let Some(ws) = w.downcast::<Workspace>() {
+                            ws.update(cx, |ws, _, cx| ws.set_diffs_inline(on, cx)).ok();
+                        }
+                    }
+                });
+            }
             Request::ChangesOnlyShown(on) => {
                 let on = *on;
                 crate::editor::set_diff_changes_only(on);
@@ -1495,6 +1512,7 @@ impl Workspace {
             Request::Moved { from, to } => self.path_moved(from, to, cx),
             Request::Deleted(paths) => self.paths_deleted(paths, window, cx),
             Request::Ask(ask) => self.open_ask(ask.clone(), window, cx),
+            Request::CommitFailed(f) => self.commit_failed(f.clone(), window, cx),
             Request::OpenTerminal(dir) => self.open_terminal_in(dir.clone(), None, window, cx),
             Request::RunInTerminal { dir, command } => self.open_terminal_in(dir.clone(), Some(command.clone()), window, cx),
             Request::OpenChat(session) => match session.as_ref().and_then(|id| self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Agent(v) if v.read(cx).session().as_ref() == Some(id)))) {
@@ -1509,6 +1527,39 @@ impl Workspace {
             Request::Message(m) => self.flash(m.clone(), false, cx),
             Request::Error(e) => self.flash(e.clone(), true, cx),
         }
+    }
+
+    /// A refused commit, as VS Code shows it: a dialog with what the hook (or git) printed,
+    /// and Show in Output to keep it, where file:line references open the file.
+    fn commit_failed(&mut self, failed: git::CommitFailed, window: &mut Window, cx: &mut Context<Self>) {
+        let ws = cx.entity().downgrade();
+        let text = failed.output.clone();
+        let (title, detail) = if failed.hook {
+            ("A Git hook stopped the commit", "Nothing was committed. Fix what it found, stage the fixes and commit again.")
+        } else {
+            ("Commit failed", "Nothing was committed.")
+        };
+        self.open_ask(
+            crate::dialog::Ask {
+                title: title.into(),
+                detail: detail.into(),
+                buttons: vec!["Show in Output".into()],
+                danger: false,
+                cancel_default: true,
+                cancel_label: Some("Close"),
+                output: Some(if failed.output.is_empty() { "(git printed nothing)".into() } else { failed.output }),
+                on_answer: Rc::new(move |_, window, cx| {
+                    let text = text.clone();
+                    // Deferred: the dialog's answer runs inside a workspace update.
+                    let ws = ws.clone();
+                    window.defer(cx, move |_, cx| {
+                        ws.update(cx, |ws, cx| ws.show_output("git commit".into(), &text, true, cx)).ok();
+                    });
+                }),
+            },
+            window,
+            cx,
+        );
     }
 
     fn open_ask(&mut self, ask: crate::dialog::Ask, window: &mut Window, cx: &mut Context<Self>) {
@@ -1602,7 +1653,7 @@ impl Workspace {
                         .on_action(cx.listener(|ws, _: &DialogCancel, window, cx| ws.answer_ask(None, window, cx)))
                         .on_action(cx.listener(|ws, _: &DialogNext, _, cx| ws.ask_step(1, cx)))
                         .on_action(cx.listener(|ws, _: &DialogPrev, _, cx| ws.ask_step(-1, cx)))
-                        .w(px(480.))
+                        .w(px(if st.ask.output.is_some() { 680. } else { 480. }))
                         .max_w(relative(0.9))
                         .flex()
                         .flex_col()
@@ -1623,6 +1674,26 @@ impl Workspace {
                                 .child(div().debug_selector(|| "dialog-title".into()).flex_1().min_w_0().text_size(px(13.)).line_height(relative(1.4)).font_weight(FontWeight::SEMIBOLD).text_color(theme::fg_bright()).child(st.ask.title.clone())),
                         )
                         .child(div().pl(px(28.)).min_w_0().flex().flex_col().text_size(px(12.)).line_height(relative(1.45)).text_color(theme::fg_dim()).children(detail))
+                        .when_some(st.ask.output.clone(), |d, out| {
+                            d.child(
+                                div()
+                                    .id("dialog-output")
+                                    .debug_selector(|| "dialog-output".into())
+                                    .ml(px(28.))
+                                    .max_h(px(320.))
+                                    .overflow_y_scroll()
+                                    .p(px(8.))
+                                    .rounded(px(4.))
+                                    .bg(theme::bg_card())
+                                    .border_1()
+                                    .border_color(theme::border_input())
+                                    .font_family(theme::MONO_FONT)
+                                    .text_size(px(11.5))
+                                    .line_height(relative(1.45))
+                                    .text_color(theme::fg())
+                                    .children(out.lines().take(2000).map(|l| div().min_w_0().min_h(px(16.)).child(l.to_string())).collect::<Vec<_>>()),
+                            )
+                        })
                         .child(div().flex().flex_wrap().justify_end().gap(px(8.)).pt(px(4.)).children(buttons)),
                 )
                 .into_any_element(),
@@ -3191,6 +3262,7 @@ impl Workspace {
             danger: false,
             cancel_default: false,
             cancel_label: None,
+            output: None,
             on_answer: Rc::new(move |answer, window, cx| {
                 let (editor, me) = (editor.clone(), me.clone());
                 // The dialog answers from inside the workspace: close once it's done.
@@ -3503,6 +3575,18 @@ impl Workspace {
             match &tab.kind {
                 TabKind::Diff(d) => d.update(cx, |d, cx| d.set_changes_only(on, cx)),
                 TabKind::DiffEdit(d) => d.update(cx, |d, cx| d.right.update(cx, |r, cx| r.set_changes_only(on, cx))),
+                TabKind::Pr(p) => p.update(cx, |p, cx| p.diff_changes_only(on, cx)),
+                _ => {}
+            }
+        }
+    }
+
+    fn set_diffs_inline(&mut self, on: bool, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            match &tab.kind {
+                TabKind::Diff(d) => d.update(cx, |d, cx| d.set_inline(on, cx)),
+                TabKind::DiffEdit(d) => d.update(cx, |d, cx| d.set_inline(on, cx)),
+                TabKind::Pr(p) => p.update(cx, |p, cx| p.diff_inline(on, cx)),
                 _ => {}
             }
         }
@@ -8359,10 +8443,10 @@ mod ui_tests {
     #[gpui::test]
     fn the_split_with_the_keyboard_has_a_line_across_its_top(cx: &mut TestAppContext) {
         let (ws, cx) = setup(cx);
-        // One split: neither.
+        // One split: it has the line too, the same as with several.
         cx.run_until_parked();
         let first = ws.read_with(cx, |ws, _| ws.focused_pane);
-        assert!(cx.debug_bounds(Box::leak(format!("pane-focus-line-{first}").into_boxed_str())).is_none());
+        assert!(cx.debug_bounds(Box::leak(format!("pane-focus-line-{first}").into_boxed_str())).is_some());
         cx.simulate_keystrokes("cmd-\\");
         cx.run_until_parked();
         cx.update(|w, _| w.refresh());
@@ -8445,6 +8529,7 @@ mod ui_tests {
             danger: true,
             cancel_default: false,
             cancel_label: None,
+            output: None,
             on_answer: std::rc::Rc::new(|_, _, _| {}),
         };
         ws.update_in(cx, |ws, window, cx| ws.open_ask(ask, window, cx));
@@ -8706,8 +8791,8 @@ mod ui_tests {
         let (ws, cx) = setup(cx);
         let root = ws.read_with(cx, |ws, cx| ws.root(cx));
         let md = "| Service | Status | What was added |\n|---|---|---|\n\
-| `finbloom-admin` | Updated | Stored KYC fields shown on the customer page, with the review history and who approved each change |\n\
-| `finbloom-app`, `finbloom-banking`, `finbloom-custody`, `finbloom-infra`, `finbloom-ledger` | ✅ No change | — |\n\
+| `acme-admin` | Updated | Stored KYC fields shown on the customer page, with the review history and who approved each change |\n\
+| `acme-app`, `acme-banking`, `acme-custody`, `acme-infra`, `acme-ledger` | ✅ No change | — |\n\
 | Tue 17 Nov | Done | Withdrawal fee and spread settings |\n";
         std::fs::write(root.join("README.md"), md).unwrap();
         ws.update_in(cx, |ws, window, cx| ws.open_file(root.join("README.md"), None, false, window, cx));

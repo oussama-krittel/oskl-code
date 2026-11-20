@@ -34,6 +34,8 @@ pub struct Ask {
     pub cancel_default: bool,
     /// What the Cancel button says (None: "Cancel").
     pub cancel_label: Option<&'static str>,
+    /// Tool output shown under the details, monospaced and scrollable (a failed hook's report).
+    pub output: Option<String>,
     pub on_answer: Answer,
 }
 
