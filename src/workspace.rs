@@ -5850,7 +5850,6 @@ impl Workspace {
                             .h_full()
                             .cursor_pointer()
                             .when(active, |d| d.bg(theme::bg_editor()).text_color(if focused { theme::fg_bright() } else { theme::fg() }))
-                            .when(active && focused, |d| d.child(div().absolute().top_0().left_0().right_0().h(gpui::px(2.)).bg(theme::frame_focused())))
                             .when(!active, |d| d.text_color(theme::fg_muted()).hover(|s| s.bg(theme::hover()).text_color(theme::fg())))
                             .on_click(cx.listener({
                                 let tid = *tid;
@@ -6097,9 +6096,10 @@ impl Workspace {
                                 d.child(div().absolute().top(px(4.)).left(px(6.)).right(px(14.)).flex().justify_end().child(self.find.clone()))
                             }),
                     )
-                    // Several splits: the one with the keyboard has a line across its top in the
-                    // theme's own color (an empty one too); the others stay as they are, to be read.
-                    .when(self.panes.len() > 1 && id == self.focused_pane, |d| {
+                    // The split with the keyboard has a line across its top in the theme's own
+                    // color (one split or several, empty too); its tabs show the open one by
+                    // brightness alone.
+                    .when(id == self.focused_pane, |d| {
                         let color = theme::accent();
                         d.child(div().debug_selector(move || format!("pane-focus-line-{id}")).absolute().top_0().left_0().right_0().h(px(2.)).bg(color))
                     })
