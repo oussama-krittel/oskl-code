@@ -110,6 +110,10 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-k n", NewSpace, None),
         crate::keybindings::kb("cmd-k w", CloseSpace, None),
         crate::keybindings::kb("cmd-k o", SpaceOverview, None),
+        // The same in one press.
+        crate::keybindings::kb("ctrl-cmd-n", NewSpace, None),
+        crate::keybindings::kb("ctrl-cmd-w", CloseSpace, None),
+        crate::keybindings::kb("ctrl-cmd-o", SpaceOverview, None),
         crate::keybindings::kb("cmd-k z", ToggleZen, None),
         crate::keybindings::kb("escape", ExitZen, Some("Workspace && zen")),
         crate::keybindings::kb("cmd-alt-enter", ZoomPane, None),
@@ -166,6 +170,7 @@ pub fn bind_keys() {
         crate::keybindings::kb("cmd-o", OpenFolder, None),
         crate::keybindings::kb("cmd-shift-v", TogglePreview, None),
         crate::keybindings::kb("cmd-k v", PreviewToSide, None),
+        crate::keybindings::kb("ctrl-cmd-v", PreviewToSide, None),
         crate::keybindings::kb("cmd-k f", CloseFolder, None),
         crate::keybindings::kb("cmd-shift-n", OpenFolderNewWindow, None),
         crate::keybindings::kb("ctrl--", GoBack, None),
@@ -546,7 +551,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("open", "Open a folder in this window: open <dir> (⌘O for a picker)", true),
     ("window", "Open a project in a new window: window [dir] (⌘⇧N)", true),
     ("add-folder", "Add a folder to the workspace: add-folder [dir] (a picker without one)", true),
-    ("preview", "Preview this Markdown / SVG file beside it (⌘K V; ⇧⌘V in place)", false),
+    ("preview", "Preview this Markdown / SVG file beside it (⌃⌘V; ⇧⌘V in place)", false),
     ("remove-folder", "Take an added folder out of the workspace: remove-folder <dir>", true),
     ("recent", "Open a recent folder", true),
     ("search", "Search in all files: search <text> (⇧⌘F)", true),
@@ -562,7 +567,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("term", "Terminal in this pane (⌘T); term <cmd> runs a command", true),
     ("claude", "Chat with Claude Code (⌘Esc; ⌘⇧Esc a new chat); claude <message> asks right away", true),
     ("close", "Close this pane (⌘⇧W)", false),
-    ("space", "Spaces: space new [name] · rename <name> · close · move <n> · <n> (⌃1–9 go, ⌃⌥1–9 move, ⌘K O overview)", true),
+    ("space", "Spaces: space new [name] · rename <name> · close · move <n> · <n> (⌃1–9 go, ⌃⌥1–9 move, ⌃⌘O overview)", true),
     ("only", "Close all other panes", false),
     ("max", "Maximize / restore this pane (⌘⌥Enter)", false),
     ("window-color", "Tint this window's title bar: window-color <#rrggbb or a name: blue, teal, green, amber, clay, rose, violet, gray> · off", true),
@@ -2005,8 +2010,37 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Closes the shown space; its tabs go to the space shown before it.
-    /// Closes space `i` (going back where you were if it wasn't the shown one).
+    /// Asks first, in the dialog: close space `i`? Its tabs aren't closed, they move.
+    fn ask_close_space(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.spaces.len() < 2 {
+            return self.flash("This is the only space".into(), true, cx);
+        }
+        let Some(name) = self.spaces.get(i).map(|s| s.name.clone()) else { return };
+        let ws = cx.entity().downgrade();
+        self.open_ask(
+            crate::dialog::Ask {
+                title: format!("Close the space “{name}”?"),
+                detail: "Its tabs stay open: they move to another space.".into(),
+                buttons: vec!["Close Space".into()],
+                danger: false,
+                cancel_default: false,
+                cancel_label: None,
+                output: None,
+                on_answer: Rc::new(move |_, window, cx| {
+                    let ws = ws.clone();
+                    // Deferred: the dialog's answer runs inside a workspace update.
+                    window.defer(cx, move |window, cx| {
+                        ws.update(cx, |ws, cx| ws.close_space_at(i, window, cx)).ok();
+                    });
+                }),
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Closes space `i` (going back where you were if it wasn't the shown one); its tabs go to
+    /// the space shown before it.
     fn close_space_at(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         if i >= self.spaces.len() {
             return;
@@ -2828,7 +2862,7 @@ impl Workspace {
         }
     }
 
-    /// ⌘K V: the preview in the split to the right (made if there's none); typing stays here.
+    /// ⌃⌘V (or ⌘K V): the preview in the split to the right (made if there's none); typing stays here.
     fn preview_to_side(&mut self, _: &PreviewToSide, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.active else { return };
         let TabKind::Editor(e) = &self.tabs[ix].kind else { return };
@@ -4930,7 +4964,7 @@ impl Workspace {
                         self.new_space((!arg.is_empty()).then(|| arg.to_string()), window, cx);
                     }
                     "rename" | "name" => self.rename_space(arg, cx),
-                    "close" => self.close_space(window, cx),
+                    "close" => self.ask_close_space(self.space, window, cx),
                     "move" => match arg.parse::<usize>() {
                         Ok(n) if n >= 1 => self.move_tab_to_space(n - 1, window, cx),
                         _ => self.flash("space move <number>".into(), true, cx),
@@ -5481,7 +5515,7 @@ impl Workspace {
                     .shadow_sm()
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::hover()).border_color(theme::focus_border()))
-                    .tooltip(ui::tooltip(if open { "Close spaces" } else { "Spaces: show them all (⌃1–9 go to one, ⌘K O the overview)" }))
+                    .tooltip(ui::tooltip(if open { "Close spaces" } else { "Spaces: show them all (⌃1–9 go to one, ⌃⌘O the overview)" }))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|ws, _, _, cx| {
                         cx.stop_propagation();
@@ -5504,7 +5538,7 @@ impl Workspace {
                     sp.name,
                     if what.is_empty() { format!("{} split{}, empty", titles.len(), if titles.len() == 1 { "" } else { "s" }) } else { format!("{what} ({tabs} tab{})", if tabs == 1 { "" } else { "s" }) },
                     i + 1,
-                    if on && self.spaces.len() > 1 { " · ⌘K W closes it" } else { "" }
+                    if on && self.spaces.len() > 1 { " · ⌃⌘W closes it" } else { "" }
                 );
                 let name: String = if sp.name.chars().count() > 14 { sp.name.chars().take(13).chain(['…']).collect() } else { sp.name.clone() };
                 let (tw, th) = crate::assets::vtext_size(&name);
@@ -5557,7 +5591,7 @@ impl Workspace {
                             .on_click(cx.listener(move |ws, _, w, cx| {
                                 cx.stop_propagation();
                                 ws.rail_pill_hover = None;
-                                ws.close_space_at(i, w, cx);
+                                ws.ask_close_space(i, w, cx);
                             }))
                             .into_any_element()
                     } else {
@@ -5612,10 +5646,10 @@ impl Workspace {
                             .text_color(theme::fg_dim())
                             .cursor_pointer()
                             .hover(|s| s.text_color(theme::fg_bright()))
-                            .tooltip(ui::tooltip("Overview of all spaces (⌘K O)"))
+                            .tooltip(ui::tooltip("Overview of all spaces (⌃⌘O)"))
                             .flex_col()
                             .child(div().flex().items_center().gap(px(2.)).child("Spaces").child(ui::icon("chevron-right", theme::fg_muted()).size(px(9.))))
-                            .child(keys("⌘K O"))
+                            .child(keys("⌃⌘O"))
                             .on_click(cx.listener(|ws, _, w, cx| {
                                 ws.rail_open = false;
                                 ws.toggle_overview(w, cx);
@@ -5638,13 +5672,13 @@ impl Workspace {
                             .border_color(theme::border_input())
                             .cursor_pointer()
                             .hover(|s| s.bg(theme::hover()))
-                            .tooltip(ui::tooltip("New space (⌘K N)"))
+                            .tooltip(ui::tooltip("New space (⌃⌘N)"))
                             .child(ui::icon("plus", theme::fg()).size(px(13.)))
                             .on_click(cx.listener(|ws, _, w, cx| {
                                 ws.new_space(None, w, cx);
                             })),
                     )
-                    .child(div().mb(px(4.)).child(keys("⌘K N")))
+                    .child(div().mb(px(4.)).child(keys("⌃⌘N")))
                     .child(div().mb(px(10.)).text_size(px(9.)).text_color(theme::fg_muted()).child("⌃⌘↑↓"))
                     // Slides out of the strip.
                     .with_animation("space-panel-open", gpui::Animation::new(Duration::from_millis(130)).with_easing(gpui::ease_out_quint()), |d, t| d.w(px(12. + 38. * t)).opacity(0.35 + 0.65 * t)),
@@ -5668,7 +5702,7 @@ impl Workspace {
             .border_color(theme::border())
             .cursor_pointer()
             .hover(|s| s.bg(theme::hover()))
-            .tooltip(ui::tooltip("Spaces: click to show them all (⌃1–9 go to one, ⌘K O the overview)"))
+            .tooltip(ui::tooltip("Spaces: click to show them all (⌃1–9 go to one, ⌃⌘O the overview)"))
             .on_click(cx.listener(|ws, _, _, cx| {
                 ws.rail_open = !ws.rail_open;
                 cx.notify();
@@ -7265,7 +7299,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &NewSpace, w, cx| {
                 ws.new_space(None, w, cx);
             }))
-            .on_action(cx.listener(|ws, _: &CloseSpace, w, cx| ws.close_space(w, cx)))
+            .on_action(cx.listener(|ws, _: &CloseSpace, w, cx| ws.ask_close_space(ws.space, w, cx)))
             .on_action(cx.listener(|ws, _: &SpaceOverview, w, cx| ws.toggle_overview(w, cx)))
             .on_action(cx.listener(|ws, _: &ToggleZen, w, cx| ws.toggle_zen(w, cx)))
             .on_action(cx.listener(Self::exit_zen))
@@ -11140,7 +11174,12 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         assert_eq!(ws.read_with(cx, |ws, _| ws.space), 1);
         assert_eq!(shown(cx).as_deref(), Some("a.rs"));
         // Closing space 2: its tabs go to space 1.
-        cx.simulate_keystrokes("cmd-k w");
+        cx.simulate_keystrokes("ctrl-cmd-w");
+        assert_eq!(ws.read_with(cx, |ws, _| ws.spaces.len()), 2, "asks first");
+        let title = ws.read_with(cx, |ws, _| ws.ask.as_ref().map(|a| a.ask.title.clone()));
+        assert!(title.is_some_and(|t| t.starts_with("Close the space")));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
         assert_eq!(ws.read_with(cx, |ws, _| (ws.spaces.len(), ws.space)), (1, 0));
         let in_main: usize = ws.read_with(cx, |ws, _| ws.panes.iter().map(|p| p.items.len()).sum());
         assert_eq!(in_main, 3, "nothing lost");
@@ -11216,6 +11255,10 @@ No change in `admin`, `app`, `custody`, `infra`, `trading`, and none in `pricing
         cx.run_until_parked();
         let x = cx.debug_bounds("space-close-2").expect("its close button");
         cx.simulate_click(x.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(ws.read_with(cx, |ws, _| ws.spaces.len()), 3, "asks first");
+        let yes = cx.debug_bounds("dialog-button-Close Space").expect("the dialog's button").center();
+        cx.simulate_click(yes, gpui::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(ws.read_with(cx, |ws, _| (ws.spaces.len(), ws.space)), (2, 0), "closed; still in the first");
         // A click anywhere else closes it.

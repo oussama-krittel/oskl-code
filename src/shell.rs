@@ -683,7 +683,7 @@ impl Workspace {
                     )
                 })
                 .when(can_preview, |d| {
-                    d.child(action("crumb-preview", "eye", "Preview in place (⇧⌘V); ⌘K V opens it beside", false).on_click(cx.listener(move |ws, _, w, cx| {
+                    d.child(action("crumb-preview", "eye", "Preview in place (⇧⌘V); ⌃⌘V opens it beside", false).on_click(cx.listener(move |ws, _, w, cx| {
                         ws.set_focused_pane(id);
                         ws.toggle_preview(&TogglePreview, w, cx);
                     })))
